@@ -1,0 +1,220 @@
+import functools
+import logging
+import queue
+import threading
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from contextvars import Context
+from dataclasses import dataclass
+from typing import Any, Literal, ParamSpec, TypeVar
+
+from pydantic import BaseModel, Field
+
+from hatchet_sdk.features.events import EventClient
+from hatchet_sdk.logger import logger
+from hatchet_sdk.runnables.contextvars import (
+    ctx_action_key,
+    ctx_additional_metadata,
+    ctx_hatchet_context,
+    ctx_hatchet_span_attributes,
+    ctx_task_retry_count,
+    ctx_task_run_external_id,
+    ctx_worker_id,
+    ctx_workflow_run_id,
+)
+
+try:
+    from opentelemetry import context as otel_context
+
+    _opentelemetry_is_installed = True
+except ImportError:
+    _opentelemetry_is_installed = False
+from hatchet_sdk.utils.typing import (
+    STOP_LOOP,
+    STOP_LOOP_TYPE,
+    JSONSerializableMapping,
+    LogLevel,
+)
+
+T = TypeVar("T")
+P = ParamSpec("P")
+
+
+class ContextVarToCopyStr(BaseModel):
+    name: Literal[
+        "ctx_workflow_run_id",
+        "ctx_task_run_external_id",
+        "ctx_action_key",
+        "ctx_worker_id",
+    ]
+    value: str | None
+
+
+class ContextVarToCopyInt(BaseModel):
+    name: Literal["ctx_task_retry_count"]
+    value: int | None
+
+
+class ContextVarToCopyDict(BaseModel):
+    name: Literal["ctx_additional_metadata"]
+    value: JSONSerializableMapping | None
+
+
+class ContextVarToCopyHatchetContext(BaseModel):
+    name: Literal["ctx_hatchet_context"]
+    value: Any
+
+
+class ContextVarToCopySpanAttributes(BaseModel):
+    name: Literal["ctx_hatchet_span_attributes"]
+    value: dict[str, str | int] | None
+
+
+class ContextVarToCopyOtelContext(BaseModel):
+    name: Literal["ctx_otel_context"]
+    value: Any  # opentelemetry.context.Context (optional dependency)
+
+
+class ContextVarToCopy(BaseModel):
+    var: (
+        ContextVarToCopyStr
+        | ContextVarToCopyDict
+        | ContextVarToCopyInt
+        | ContextVarToCopyHatchetContext
+        | ContextVarToCopySpanAttributes
+        | ContextVarToCopyOtelContext
+    ) = Field(discriminator="name")
+
+
+def set_context_vars(ctx_vars: list[ContextVarToCopy]) -> None:
+    for var in ctx_vars:
+        if var.var.name == "ctx_workflow_run_id":
+            ctx_workflow_run_id.set(var.var.value)
+        elif var.var.name == "ctx_task_run_external_id":
+            ctx_task_run_external_id.set(var.var.value)
+        elif var.var.name == "ctx_task_retry_count":
+            ctx_task_retry_count.set(var.var.value)
+        elif var.var.name == "ctx_action_key":
+            ctx_action_key.set(var.var.value)
+        elif var.var.name == "ctx_worker_id":
+            ctx_worker_id.set(var.var.value)
+        elif var.var.name == "ctx_additional_metadata":
+            ctx_additional_metadata.set(var.var.value or {})
+        elif var.var.name == "ctx_hatchet_context":
+            ctx_hatchet_context.set(var.var.value)
+        elif var.var.name == "ctx_hatchet_span_attributes":
+            ctx_hatchet_span_attributes.set(var.var.value)
+        elif var.var.name == "ctx_otel_context":
+            if _opentelemetry_is_installed and var.var.value is not None:
+                otel_context.attach(  # pyright: ignore[reportPossiblyUnboundVariable]
+                    var.var.value
+                )
+        else:
+            raise ValueError(f"Unknown context variable name: {var.var.name}")
+
+
+@dataclass
+class LogRecord:
+    message: str
+    task_run_external_id: str
+    level: LogLevel
+    task_retry_count: int
+
+
+class AsyncLogSender:
+    def __init__(self, event_client: EventClient) -> None:
+        self._event_client = event_client
+        self.q: queue.Queue[LogRecord | STOP_LOOP_TYPE] = queue.Queue(
+            maxsize=event_client.client_config.log_queue_size
+        )
+        self._thread: threading.Thread | None = None
+
+    def _consume(self) -> None:
+        while True:
+            record = self.q.get()
+            if record == STOP_LOOP:
+                break
+            try:
+                self._event_client._log(
+                    message=record.message,
+                    task_run_external_id=record.task_run_external_id,
+                    level=record.level,
+                    task_retry_count=record.task_retry_count,
+                )
+            except Exception:
+                logger.exception("failed to send log to Hatchet")
+
+    def publish(self, record: LogRecord | STOP_LOOP_TYPE) -> None:
+        try:
+            self.q.put_nowait(record)
+        except queue.Full:
+            # logged outside the task's context so that `LogForwardingHandler` does not forward the warning back into this full queue
+            Context().run(logger.warning, "log queue is full, dropping log message")
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._consume, daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        if self._thread is None:
+            return
+        with suppress(queue.Full):
+            self.q.put(STOP_LOOP, timeout=timeout)
+        self._thread.join(timeout)
+        self._thread = None
+
+
+class LogForwardingHandler(logging.Handler):
+    def __init__(self, log_sender: AsyncLogSender) -> None:
+        super().__init__()
+
+        self.log_sender = log_sender
+
+    def emit(self, record: logging.LogRecord) -> None:
+        log_entry = self.format(record)
+        task_run_external_id = ctx_task_run_external_id.get()
+        task_retry_count = ctx_task_retry_count.get()
+
+        if not task_run_external_id:
+            return
+
+        self.log_sender.publish(
+            LogRecord(
+                message=log_entry,
+                task_run_external_id=task_run_external_id,
+                level=LogLevel.from_levelname(record.levelname),
+                task_retry_count=task_retry_count or 0,
+            )
+        )
+
+
+def capture_logs(
+    logger: logging.Logger, log_sender: AsyncLogSender, func: Callable[P, Awaitable[T]]
+) -> Callable[P, Awaitable[T]]:
+    @functools.wraps(func)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        log_forwarder = LogForwardingHandler(log_sender)
+        log_forwarder.setLevel(logger.level)
+
+        if logger.handlers:
+            for handler in logger.handlers:
+                if handler.formatter:
+                    log_forwarder.setFormatter(handler.formatter)
+                    break
+
+            for handler in logger.handlers:
+                for filter_obj in handler.filters:
+                    log_forwarder.addFilter(filter_obj)
+
+        if not any(h for h in logger.handlers if isinstance(h, LogForwardingHandler)):
+            logger.addHandler(log_forwarder)
+
+        try:
+            result = await func(*args, **kwargs)
+        finally:
+            log_forwarder.flush()
+            logger.removeHandler(log_forwarder)
+
+        return result
+
+    return wrapper

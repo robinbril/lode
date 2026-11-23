@@ -1,0 +1,207 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createServer, request } from "node:http";
+import type { AddressInfo } from "node:net";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createApp } from "../src/api/app.ts";
+import { createServer as createApiServer } from "../src/api/server.ts";
+import { createDeployStore } from "../src/deploy/deploy-store.ts";
+import { createDeployService } from "../src/deploy/deploy-service.ts";
+import { createAclStore } from "../src/acl/acl-store.ts";
+import { createIdentityService } from "../src/identity/identity-service.ts";
+import { portalSession } from "../src/deploy/viewer-session.ts";
+import { deriveKey, seal } from "../plugins/portal/src/session.ts";
+import { scopeId } from "../src/types.ts";
+import { deployRef, encodeRef } from "../src/acl/resource-ref.ts";
+import type { FeatureFlagStore } from "../src/feature-flags.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testDatabaseUrl, testDeployBackings, testMap } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+import { createPgPool } from "../src/persistence/pg-pool.ts";
+import { onTenantLoad } from "../src/tenants/cache.ts";
+import { loadTenantSettings } from "../src/tenants/settings.ts";
+import { TEST_APP_HANDLE } from "./support/app-handle.ts";
+import { ownerUrl, TEST_TENANT } from "./support/test-tenant.ts";
+import { testTenant as tenant } from "./support/test-tenant.ts";
+
+const externalSharingOn = { enabled: async () => true } as unknown as FeatureFlagStore;
+
+const secret = "app-only-gateway-test-secret-long-enough";
+const guest = "guest@partner.test";
+const key = deriveKey(secret, "portal.session.v1");
+function token(appOnly: unknown = true) {
+  const now = Math.floor(Date.now() / 1000);
+  return seal({ k: "session", sub: guest, org: "acme", iat: now, exp: now + 3600, appOnly }, key);
+}
+test("gateway parser keeps app-only authority and rejects malformed signed markers", () => {
+  assert.deepEqual(portalSession(`portal_session=${token()}`, secret), { sub: guest, appOnly: true });
+  for (const marker of ["false", null, 0, {}])
+    assert.equal(portalSession(`portal_session=${token(marker)}`, secret), null);
+});
+
+test("app-only gateway checks exact current personal read grants without inherited or management authority", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "app-only-gateway-"));
+  let upstreamHits = 0;
+  const upstream = createServer((req, res) => {
+    upstreamHits++;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(req.headers));
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
+  const backings = testDeployBackings({ git: { repoRoot: join(dir, "repos") } });
+  const owner = createPgPool(ownerUrl(backings.databaseUrl).toString());
+  const appPool = createPgPool(backings.databaseUrl);
+  await owner.q(`UPDATE tenants SET settings = settings || jsonb_build_object('handle', $2::text) WHERE id = $1`, [
+    TEST_TENANT,
+    TEST_APP_HANDLE,
+  ]);
+  const stopLoad = onTenantLoad(() => loadTenantSettings(appPool));
+  const deploy = createDeployService({
+    ...singleProcessDeps(),
+    externalSharingAllowed: async () => true,
+    deployStore: createDeployStore(backings),
+    provider: {
+      profile: { managedScaleToZero: false },
+      apply: async () => ({ host: "127.0.0.1", port: (upstream.address() as AddressInfo).port }),
+      destroy: async () => {},
+    },
+    auditLog: { record() {}, events: async () => [], tail: async () => [] },
+    acl,
+    deployDir: join(dir, "deploy"),
+  });
+  const identity = createIdentityService(testMap(), { externalMembers: testMap() });
+  const app = createApp({
+    deploy,
+    acl,
+    directory: createPostgresDirectoryStore(testDatabaseUrl()),
+    sessions: createPostgresSessionStore(backings.databaseUrl),
+    identity,
+  } as unknown as Parameters<typeof createApp>[0]);
+  const ownerScopeId = scopeId("personal", "owner@example.test");
+  const shared = await app.deploy({
+    ownerScopeId,
+    createdBy: "owner@example.test",
+    entrypoint: "node app.js",
+    files: [],
+    name: "shared",
+  });
+  await app.deploy({
+    ownerScopeId: scopeId("org", "acme"),
+    createdBy: "owner@example.test",
+    entrypoint: "node app.js",
+    files: [],
+    name: "org-app",
+  });
+  app.canManageApp = async () => {
+    throw new Error("app-only must not consult management authority");
+  };
+  app.effectiveAppPermission = async () => {
+    throw new Error("app-only must not consult inherited permission");
+  };
+  const server = createApiServer(app, {
+    featureFlags: externalSharingOn,
+    identity,
+    signingSecret: secret,
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+    deployAppsDomain: "apps.example.test",
+    deployGateSecret: "gate",
+    deployAppsSessionSecret: secret,
+    deployAppsLoginUrl: "https://portal.example.test",
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const cookie = `portal_session=${token()}`;
+  const get = (name: string, path = "/", method = "GET") =>
+    new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = request(
+        {
+          host: "127.0.0.1",
+          port,
+          path,
+          method,
+          headers: {
+            host: `${TEST_APP_HANDLE}-${name}.apps.example.test`,
+            cookie,
+            "sec-fetch-dest": "document",
+            accept: "application/json",
+            "x-portal-identity": "forged",
+          },
+        },
+        (res) => {
+          let body = "";
+          res.on("data", (chunk) => {
+            body += chunk;
+          });
+          res.on("end", () => resolve({ status: res.statusCode!, body }));
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  try {
+    assert.equal((await get("shared")).status, 403);
+    assert.equal((await get("org-app")).status, 403, "org ownership is not an app-only entitlement");
+    for (const granteeScopeId of [scopeId("org", "acme"), scopeId("channel", "C1")]) {
+      await acl.grant(tenant, {
+        ownerScopeId,
+        ref: encodeRef(deployRef(shared.id)),
+        granteeScopeId,
+        permission: "read",
+        grantedBy: "owner@example.test",
+      });
+    }
+    assert.equal((await get("shared")).status, 403, "scope grants never admit app-only sessions");
+    await acl.grant(tenant, {
+      ownerScopeId,
+      ref: encodeRef(deployRef(shared.id)),
+      granteeScopeId: scopeId("personal", guest),
+      permission: "write",
+      grantedBy: "owner@example.test",
+    });
+    assert.equal((await get("shared")).status, 403, "a write grant cannot confer app-only management access");
+    assert.equal(upstreamHits, 0);
+    await app.shareApp(shared.id, scopeId("personal", guest), "read", { createdBy: "owner@example.test" });
+    const granted = await get("shared", "/api/data", "POST");
+    assert.equal(granted.status, 200, "read grants allow using the app, including its POST API");
+    assert.equal(JSON.parse(granted.body).cookie, undefined, "gateway cookie never reaches app");
+    assert.notEqual(JSON.parse(granted.body)["x-portal-identity"], "forged");
+    assert.equal((await get("shared", "/__claw__/version")).status, 200, "request goes to app, never management shell");
+    assert.equal((await get("org-app")).status, 403, "grant is for one app only");
+    await identity.deactivate(guest, "manual");
+    assert.equal((await get("shared")).status, 403, "manual deactivation overrides the current direct grant");
+    await identity.reactivate(guest);
+    await app.shareApp(shared.id, scopeId("personal", guest), null, { createdBy: "owner@example.test" });
+    assert.equal((await get("shared")).status, 403, "same session is refused immediately after revoke");
+    await app.shareApp(shared.id, scopeId("personal", guest), "read", { createdBy: "owner@example.test" });
+    await app.renameApp(shared.id, "renamed");
+    await app.deploy({
+      ownerScopeId,
+      createdBy: "owner@example.test",
+      entrypoint: "node app.js",
+      files: [],
+      name: "shared",
+    });
+    assert.equal((await get("shared")).status, 403, "reused name does not inherit old immutable-ID grant");
+    assert.equal((await get("renamed")).status, 200, "same immutable app retains its grant after rename");
+    await app.archiveApp(shared.id);
+    assert.equal((await get("renamed")).status, 404, "archived app cannot be reached even with its grant");
+    await app.setAppPublic("shared", true, { createdBy: "owner@example.test", personAtKeyboard: true });
+    const publicVisit = await get("shared");
+    assert.equal(publicVisit.status, 200);
+    assert.equal(JSON.parse(publicVisit.body)["x-portal-identity"], undefined, "public link access remains anonymous");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    stopLoad();
+    await owner.q(`UPDATE tenants SET settings = settings - 'handle' WHERE id = $1`, [TEST_TENANT]);
+    await owner.close();
+    await appPool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

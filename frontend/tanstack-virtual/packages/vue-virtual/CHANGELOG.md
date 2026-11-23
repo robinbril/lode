@@ -1,0 +1,379 @@
+# @tanstack/vue-virtual
+
+## 3.13.54
+
+### Patch Changes
+
+- Updated dependencies [[`df00c7f`](https://github.com/TanStack/virtual/commit/df00c7f30ddff82d322e58a51860172550dba51b), [`c8ec72d`](https://github.com/TanStack/virtual/commit/c8ec72d15cb0bf91dd61d27f4470896beeebf481)]:
+  - @tanstack/virtual-core@3.19.13
+
+## 3.13.53
+
+### Patch Changes
+
+- [#1383](https://github.com/TanStack/virtual/pull/1383) [`b883a1c`](https://github.com/TanStack/virtual/commit/b883a1cc6f45b62505a9490ed72b0f56c2ada6c9) - Seed a horizontal window virtualizer's default `initialOffset` from `window.scrollX` instead of `window.scrollY`, matching `observeWindowOffset` and the Marko adapter. A horizontal list mounted on a page that was scrolled down no longer renders the columns at the vertical scroll position until the first scroll event.
+
+- Updated dependencies [[`23026e2`](https://github.com/TanStack/virtual/commit/23026e2b93c076a0c5cd48985890c26be3520697), [`b0132f7`](https://github.com/TanStack/virtual/commit/b0132f7940a2eeac8622aa4d50b3147bcf85f1df), [`508bf45`](https://github.com/TanStack/virtual/commit/508bf45ec674cf83ed68678615e7e9f767a043ad), [`54a3f7d`](https://github.com/TanStack/virtual/commit/54a3f7d3cc32b373187b3802d81cb4b24ae08b0b)]:
+  - @tanstack/virtual-core@3.19.12
+
+## 3.13.52
+
+### Patch Changes
+
+- Updated dependencies [[`acaef5e`](https://github.com/TanStack/virtual/commit/acaef5ef7fc2ed86f10fad660b2e21c9285027b5), [`bd08fe5`](https://github.com/TanStack/virtual/commit/bd08fe5b4e798fb12f54ba1e28d31f15482e43a6)]:
+  - @tanstack/virtual-core@3.19.11
+
+## 3.13.51
+
+### Patch Changes
+
+- [#1353](https://github.com/TanStack/virtual/pull/1353) [`6936d2f`](https://github.com/TanStack/virtual/commit/6936d2f7503afc6f8aeb2788e6dcc0d20ec0ccdf) - Detach scroll observers when the scroll element becomes null.
+
+- Updated dependencies [[`9d7ff67`](https://github.com/TanStack/virtual/commit/9d7ff6781767f1b9ea30ef69f42d72d8524ab75d)]:
+  - @tanstack/virtual-core@3.19.10
+
+## 3.13.50
+
+### Patch Changes
+
+- Updated dependencies [[`35ad56d`](https://github.com/TanStack/virtual/commit/35ad56db40da52b9c43f226ca60c8267cf1d4c53), [`979c1b4`](https://github.com/TanStack/virtual/commit/979c1b46e0b32e3cdfbe634484b9a95b6b5a191e)]:
+  - @tanstack/virtual-core@3.19.9
+
+## 3.13.49
+
+### Patch Changes
+
+- Updated dependencies [[`2343004`](https://github.com/TanStack/virtual/commit/23430040447e24bcfdd9665bd6b6c67d8fefd0ea)]:
+  - @tanstack/virtual-core@3.19.8
+
+## 3.13.48
+
+### Patch Changes
+
+- Updated dependencies [[`887e971`](https://github.com/TanStack/virtual/commit/887e97172207c28d12bf9a0df8a842e261565a42), [`5d51f1d`](https://github.com/TanStack/virtual/commit/5d51f1d972c8c22b9cb0b767741a9c544bd89299)]:
+  - @tanstack/virtual-core@3.19.7
+
+## 3.13.47
+
+### Patch Changes
+
+- Updated dependencies [[`05bb4d3`](https://github.com/TanStack/virtual/commit/05bb4d3e75359442e7a650f1814bd496e382bc3d)]:
+  - @tanstack/virtual-core@3.19.6
+
+## 3.13.46
+
+### Patch Changes
+
+- Updated dependencies [[`56b2a63`](https://github.com/TanStack/virtual/commit/56b2a63d2336907659d87125b072fa11e4ac9046), [`d2c7911`](https://github.com/TanStack/virtual/commit/d2c7911d6b749aaa47e9aab1dc10125040363bd0), [`9c762fe`](https://github.com/TanStack/virtual/commit/9c762fe49021b602b1109e471ba38e3065cba5b5), [`6789f7a`](https://github.com/TanStack/virtual/commit/6789f7affc32c3fe77d8ed5b3b9d7c274d158be9), [`77cb05e`](https://github.com/TanStack/virtual/commit/77cb05eef131699bcef0f0a5877b60503e54a366), [`4a1a4fd`](https://github.com/TanStack/virtual/commit/4a1a4fdae1fa86cdda6603194876399f6651630d), [`3c61b6e`](https://github.com/TanStack/virtual/commit/3c61b6e30723e6af24d375ea1c5221d12a2e894d), [`9c762fe`](https://github.com/TanStack/virtual/commit/9c762fe49021b602b1109e471ba38e3065cba5b5)]:
+  - @tanstack/virtual-core@3.19.5
+
+## 3.13.45
+
+### Patch Changes
+
+- Updated dependencies [[`269e8ed`](https://github.com/TanStack/virtual/commit/269e8ed12db0b9ce55543da5b0bb1082a6296aac)]:
+  - @tanstack/virtual-core@3.19.4
+
+## 3.13.44
+
+### Patch Changes
+
+- Updated dependencies [[`f211d3a`](https://github.com/TanStack/virtual/commit/f211d3a64de6cbdd85469c9b97959db65df32eb6)]:
+  - @tanstack/virtual-core@3.19.3
+
+## 3.13.43
+
+### Patch Changes
+
+- Updated dependencies [[`3800fb3`](https://github.com/TanStack/virtual/commit/3800fb3e76aa7e86bc8a8eba7ddde84aef3066eb), [`cb510cb`](https://github.com/TanStack/virtual/commit/cb510cbb50a3e10eaaa7ff8c3c51f320d1224c79)]:
+  - @tanstack/virtual-core@3.19.2
+
+## 3.13.42
+
+### Patch Changes
+
+- Updated dependencies [[`7aa34f6`](https://github.com/TanStack/virtual/commit/7aa34f62587aab20938dbc84ba88a25e59552036), [`e7a0a92`](https://github.com/TanStack/virtual/commit/e7a0a92e4bec5ecd0a37659e951c8e8ff72e0207)]:
+  - @tanstack/virtual-core@3.19.1
+
+## 3.13.41
+
+### Patch Changes
+
+- Updated dependencies [[`28a2174`](https://github.com/TanStack/virtual/commit/28a21741bcc5055bbda9891655630989dc6b7517), [`92c697f`](https://github.com/TanStack/virtual/commit/92c697f7b9c5189137b14f0b0fb41a29eddedbc6)]:
+  - @tanstack/virtual-core@3.19.0
+
+## 3.13.40
+
+### Patch Changes
+
+- Updated dependencies [[`43675bc`](https://github.com/TanStack/virtual/commit/43675bc42e3043cb2cea4dba015df077d9813602), [`9df47a3`](https://github.com/TanStack/virtual/commit/9df47a3215f3fb3d182442316d058e2a96696e4f), [`c644f10`](https://github.com/TanStack/virtual/commit/c644f1096c9f4d8221d92862afdc9316b17df62a), [`2a631f4`](https://github.com/TanStack/virtual/commit/2a631f46f4366227533f45604af3db8e60deb70f)]:
+  - @tanstack/virtual-core@3.18.0
+
+## 3.13.39
+
+### Patch Changes
+
+- Updated dependencies [[`06d1b6b`](https://github.com/TanStack/virtual/commit/06d1b6bf8f61f203556a8fb21a6639600c9751a0), [`2c0a0ea`](https://github.com/TanStack/virtual/commit/2c0a0ea101c360ea15832c060008aa163cae2f7c)]:
+  - @tanstack/virtual-core@3.17.11
+
+## 3.13.38
+
+### Patch Changes
+
+- Updated dependencies [[`ab3278c`](https://github.com/TanStack/virtual/commit/ab3278cbe7b9a895ecdde263ad3c55c868b85d74)]:
+  - @tanstack/virtual-core@3.17.10
+
+## 3.13.37
+
+### Patch Changes
+
+- Updated dependencies [[`4a0adf3`](https://github.com/TanStack/virtual/commit/4a0adf3e3ba46968e0e6ba66471253e467babe55)]:
+  - @tanstack/virtual-core@3.17.9
+
+## 3.13.36
+
+### Patch Changes
+
+- Updated dependencies [[`a0a411e`](https://github.com/TanStack/virtual/commit/a0a411e06f7334a063422de35d59b12b264b3573), [`d2cf98b`](https://github.com/TanStack/virtual/commit/d2cf98beea1696c7187c06b57c9e724d1957963c)]:
+  - @tanstack/virtual-core@3.17.8
+
+## 3.13.35
+
+### Patch Changes
+
+- Updated dependencies [[`a5417b4`](https://github.com/TanStack/virtual/commit/a5417b4b0d3c82876747bb9635db7239c28d3e44)]:
+  - @tanstack/virtual-core@3.17.7
+
+## 3.13.34
+
+### Patch Changes
+
+- Updated dependencies [[`7ae32b5`](https://github.com/TanStack/virtual/commit/7ae32b55887fd044a48c788546cd940279b338e0)]:
+  - @tanstack/virtual-core@3.17.6
+
+## 3.13.33
+
+### Patch Changes
+
+- Updated dependencies [[`1e3b908`](https://github.com/TanStack/virtual/commit/1e3b908705e04e45be2615f2277580cb09f5cdef), [`7dcfc07`](https://github.com/TanStack/virtual/commit/7dcfc07b877479697124157d3124c09537b87a75)]:
+  - @tanstack/virtual-core@3.17.5
+
+## 3.13.32
+
+### Patch Changes
+
+- Updated dependencies [[`6cbecd8`](https://github.com/TanStack/virtual/commit/6cbecd887df56faaee3b6a81a1aae8049de0671e), [`d49cc52`](https://github.com/TanStack/virtual/commit/d49cc526fe248be7b5ad97ec6ac814db8271b0d0), [`cf7834d`](https://github.com/TanStack/virtual/commit/cf7834daade953fea5dfd2ab5685c15771ca300a)]:
+  - @tanstack/virtual-core@3.17.4
+
+## 3.13.31
+
+### Patch Changes
+
+- Updated dependencies [[`767ead4`](https://github.com/TanStack/virtual/commit/767ead46e4fab761fd6e15bcf281486042723152), [`bc8643b`](https://github.com/TanStack/virtual/commit/bc8643b7579e10e512654f58269de13d98b48781)]:
+  - @tanstack/virtual-core@3.17.3
+
+## 3.13.30
+
+### Patch Changes
+
+- Updated dependencies [[`b04f9ee`](https://github.com/TanStack/virtual/commit/b04f9ee48f0812e89156c1dac1fa58277cc32464), [`37be284`](https://github.com/TanStack/virtual/commit/37be28427ba52399ce8884e0006933e83f2645e9)]:
+  - @tanstack/virtual-core@3.17.2
+
+## 3.13.29
+
+### Patch Changes
+
+- Updated dependencies [[`ef69ea3`](https://github.com/TanStack/virtual/commit/ef69ea31738caa2819142e922efa03d3c408e25c)]:
+  - @tanstack/virtual-core@3.17.1
+
+## 3.13.28
+
+### Patch Changes
+
+- Updated dependencies [[`c0b84c8`](https://github.com/TanStack/virtual/commit/c0b84c83f03de1244649f9838a408faf75ed29c9), [`fbf3bdb`](https://github.com/TanStack/virtual/commit/fbf3bdbe38a2b1bf22c65a89752b7b9c07a77266)]:
+  - @tanstack/virtual-core@3.17.0
+
+## 3.13.27
+
+### Patch Changes
+
+- Updated dependencies [[`c746841`](https://github.com/TanStack/virtual/commit/c7468416354c203cd7cc952da5997073394224fb)]:
+  - @tanstack/virtual-core@3.16.1
+
+## 3.13.26
+
+### Patch Changes
+
+- Updated dependencies [[`fc992ab`](https://github.com/TanStack/virtual/commit/fc992ab00a15166311b79bd7580736cf01e8cc1a)]:
+  - @tanstack/virtual-core@3.16.0
+
+## 3.13.25
+
+### Patch Changes
+
+- Updated dependencies [[`99355ad`](https://github.com/TanStack/virtual/commit/99355ad1eceee6270efaa26e51f535d8d7c31ac2), [`99355ad`](https://github.com/TanStack/virtual/commit/99355ad1eceee6270efaa26e51f535d8d7c31ac2), [`99355ad`](https://github.com/TanStack/virtual/commit/99355ad1eceee6270efaa26e51f535d8d7c31ac2), [`99355ad`](https://github.com/TanStack/virtual/commit/99355ad1eceee6270efaa26e51f535d8d7c31ac2), [`99355ad`](https://github.com/TanStack/virtual/commit/99355ad1eceee6270efaa26e51f535d8d7c31ac2), [`99355ad`](https://github.com/TanStack/virtual/commit/99355ad1eceee6270efaa26e51f535d8d7c31ac2), [`99355ad`](https://github.com/TanStack/virtual/commit/99355ad1eceee6270efaa26e51f535d8d7c31ac2)]:
+  - @tanstack/virtual-core@3.15.0
+
+## 3.13.24
+
+### Patch Changes
+
+- Updated dependencies [[`97a204d`](https://github.com/TanStack/virtual/commit/97a204dc5526669114458685552b7569b60d2940)]:
+  - @tanstack/virtual-core@3.14.0
+
+## 3.13.23
+
+### Patch Changes
+
+- Updated dependencies [[`7ece2d5`](https://github.com/TanStack/virtual/commit/7ece2d5d4249b7e703c68ac497ae5545c54e7c67)]:
+  - @tanstack/virtual-core@3.13.23
+
+## 3.13.22
+
+### Patch Changes
+
+- Updated dependencies [[`54d771a`](https://github.com/TanStack/virtual/commit/54d771a7d4c74f6968e8132b5a85f3e04682376a), [`d3416c3`](https://github.com/TanStack/virtual/commit/d3416c386c6446957f413db2eef3211f5fdf3b5f)]:
+  - @tanstack/virtual-core@3.13.22
+
+## 3.13.21
+
+### Patch Changes
+
+- Updated dependencies [[`be89e29`](https://github.com/TanStack/virtual/commit/be89e293ea01654df6334dc6473b65eebed13e51)]:
+  - @tanstack/virtual-core@3.13.21
+
+## 3.13.20
+
+### Patch Changes
+
+- Updated dependencies [[`ff83e94`](https://github.com/TanStack/virtual/commit/ff83e949408ba8a714436fa10cafc3725a56274b)]:
+  - @tanstack/virtual-core@3.13.20
+
+## 3.13.19
+
+### Patch Changes
+
+- Updated dependencies [[`843109c`](https://github.com/TanStack/virtual/commit/843109c5bf780591a762f9767f3808fd15e3f94e)]:
+  - @tanstack/virtual-core@3.13.19
+
+## 3.13.18
+
+### Patch Changes
+
+- Updated dependencies [[`9067574`](https://github.com/TanStack/virtual/commit/9067574f1a0178d30e27bcac70853bdcbf437fec)]:
+  - @tanstack/virtual-core@3.13.18
+
+## 3.13.17
+
+### Patch Changes
+
+- Updated dependencies [[`21d9a46`](https://github.com/TanStack/virtual/commit/21d9a46eac034cb4299872891694965bceed526d)]:
+  - @tanstack/virtual-core@3.13.17
+
+## 3.13.16
+
+### Patch Changes
+
+- Updated dependencies [[`db6df21`](https://github.com/TanStack/virtual/commit/db6df212ed83dd7e4eb6450d1340c95475667b7b)]:
+  - @tanstack/virtual-core@3.13.16
+
+## 3.13.15
+
+### Patch Changes
+
+- Updated dependencies [[`5a273bf`](https://github.com/TanStack/virtual/commit/5a273bf0c0bc0255ca172929f021c3b6e50cb69d)]:
+  - @tanstack/virtual-core@3.13.15
+
+## 3.13.14
+
+### Patch Changes
+
+- Updated dependencies [[`6d9274c`](https://github.com/TanStack/virtual/commit/6d9274c3f0a9e64450b5829872079a65277bc654)]:
+  - @tanstack/virtual-core@3.13.14
+
+## 3.13.13
+
+### Patch Changes
+
+- Fix: Notify framework when count changes to update getTotalSize() ([#1085](https://github.com/TanStack/virtual/pull/1085))
+
+  Fixed an issue where `getTotalSize()` would return stale values when the `count` option changed (e.g., during filtering or search operations). The virtualizer now automatically notifies the framework when measurement-affecting options change, ensuring the UI updates correctly without requiring manual `useMemo` workarounds.
+
+  **Before**: When filtering items, the list container would maintain its previous height, causing excessive blank space (when count decreased) or inaccessible items (when count increased).
+
+  **After**: Height updates automatically when count changes, providing the correct user experience.
+
+  This fix applies to all framework adapters and has minimal performance impact (< 0.1ms per change).
+
+- Updated dependencies [[`2542c5a`](https://github.com/TanStack/virtual/commit/2542c5a3d6820cea956fa3b4f94c42e3526a8d68), [`96e32a6`](https://github.com/TanStack/virtual/commit/96e32a6ffc125743a0172ea4e0fe37ac29c4187b)]:
+  - @tanstack/virtual-core@3.13.13
+
+## 3.13.12
+
+### Patch Changes
+
+- Updated dependencies [[`d21ed98`](https://github.com/TanStack/virtual/commit/d21ed98da3470b9986c9a028ed70fdf0d6189ab4)]:
+  - @tanstack/virtual-core@3.13.12
+
+## 3.13.11
+
+### Patch Changes
+
+- Updated dependencies [[`73fa867`](https://github.com/TanStack/virtual/commit/73fa86752599a4bffba51ec8e4ff2f8cb8283010)]:
+  - @tanstack/virtual-core@3.13.11
+
+## 3.13.10
+
+### Patch Changes
+
+- Updated dependencies [[`b3b7e7d`](https://github.com/TanStack/virtual/commit/b3b7e7dc8b25daeebbd2da61b3b7ae3448babbdb)]:
+  - @tanstack/virtual-core@3.13.10
+
+## 3.13.9
+
+### Patch Changes
+
+- Updated dependencies [[`9e33cdb`](https://github.com/TanStack/virtual/commit/9e33cdb1c8780c2f455aafc11a0aeea58b71fc69)]:
+  - @tanstack/virtual-core@3.13.9
+
+## 3.13.8
+
+### Patch Changes
+
+- Updated dependencies [[`60719f6`](https://github.com/TanStack/virtual/commit/60719f61b589d6f9d886e4f7c093217f6d693faf)]:
+  - @tanstack/virtual-core@3.13.8
+
+## 3.13.7
+
+### Patch Changes
+
+- Updated dependencies [[`e2d93c2`](https://github.com/TanStack/virtual/commit/e2d93c2dcde9ccf60f658e56edccd8d05aefeee6)]:
+  - @tanstack/virtual-core@3.13.7
+
+## 3.13.6
+
+### Patch Changes
+
+- Updated dependencies [[`042616f`](https://github.com/TanStack/virtual/commit/042616f39ced842470db0b4b40fca77f22454b7f)]:
+  - @tanstack/virtual-core@3.13.6
+
+## 3.13.5
+
+### Patch Changes
+
+- Updated dependencies [[`51656d9`](https://github.com/TanStack/virtual/commit/51656d94a2469a065e631f25ffc8ec0288d9f5ec)]:
+  - @tanstack/virtual-core@3.13.5
+
+## 3.13.4
+
+### Patch Changes
+
+- Updated dependencies [[`514b62d`](https://github.com/TanStack/virtual/commit/514b62d04974c2fd59fc8a68ed40f4c1a1547dd2), [`f03d814`](https://github.com/TanStack/virtual/commit/f03d8142c03ea0f5816161a4dad38ca35469841c)]:
+  - @tanstack/virtual-core@3.13.4
+
+## 3.13.3
+
+### Patch Changes
+
+- Updated dependencies [[`02ef309`](https://github.com/TanStack/virtual/commit/02ef3097de4a14ed4077ace2ca901dc411bf81c1)]:
+  - @tanstack/virtual-core@3.13.3

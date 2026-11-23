@@ -1,0 +1,1497 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { JSDOM } from "jsdom";
+import { createTranscriptViewport, preserveTranscriptScroll } from "../src/transcript-viewport.ts";
+
+test("the scrollbar follows scrolling without requiring wheel input or pane focus", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture();
+  f.s.parentElement!.classList.add("split-canvas");
+  try {
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+    assert.notEqual(f.s.ownerDocument.activeElement, f.s);
+    f.scroll(500);
+    assert.equal(f.s.classList.contains("user-scrolling"), true);
+    t.mock.timers.tick(500);
+    f.scroll(400);
+    t.mock.timers.tick(500);
+    assert.equal(f.s.classList.contains("user-scrolling"), true);
+    f.viewport.follow(true);
+    f.flush();
+    f.scroll(800);
+    t.mock.timers.tick(500);
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+    f.scroll(300);
+    f.viewport.dispose();
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+    f.scroll(200);
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("the End key reveals the scrollbar for the user-requested jump", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture();
+  f.s.parentElement!.classList.add("split-canvas");
+  try {
+    f.scroll(300);
+    t.mock.timers.tick(1000);
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+    f.s.dispatchEvent(new f.s.ownerDocument.defaultView!.KeyboardEvent("keydown", { key: "End" }));
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+    assert.equal(f.s.classList.contains("user-scrolling"), true);
+    t.mock.timers.tick(1000);
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("scrollbar presentation follows transitions between single and split views", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture();
+  const canvas = f.s.parentElement!;
+  try {
+    f.scroll(500);
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+    canvas.className = "split-canvas single-pane";
+    f.scroll(400);
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+    canvas.classList.remove("single-pane");
+    f.scroll(300);
+    assert.equal(f.s.classList.contains("user-scrolling"), true);
+    canvas.classList.add("single-pane");
+    f.scroll(200);
+    assert.equal(f.s.classList.contains("user-scrolling"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("layout mutations preserve bottom following and an earlier reading anchor independently", () => {
+  const dom = new JSDOM(
+    '<main><section class="chat-scroll"><div class="message-stack"><article data-index="0"><qm-markdown><p>Reading here</p></qm-markdown></article></div></section><section class="chat-scroll"></section></main>',
+  );
+  const root = dom.window.document.querySelector("main")!;
+  const [reading, following] = [...root.querySelectorAll<HTMLElement>("section")];
+  const anchor = reading!.querySelector("p")!;
+  reading!.querySelector("article")!.getBoundingClientRect = () => anchor.getBoundingClientRect();
+  let height = 1000;
+  let anchorTop = 330;
+  for (const element of [reading!, following!]) {
+    Object.defineProperties(element, { clientHeight: { value: 200 }, scrollHeight: { get: () => height } });
+    element.getBoundingClientRect = () => ({ top: 20 }) as DOMRect;
+  }
+  anchor.getBoundingClientRect = () =>
+    ({ top: 20 + anchorTop - reading!.scrollTop, bottom: 100 + anchorTop - reading!.scrollTop }) as DOMRect;
+  reading!.scrollTop = 350;
+  following!.scrollTop = 800;
+  const restore = preserveTranscriptScroll(root);
+  reading!.scrollTop = following!.scrollTop = 0;
+  anchorTop += 120;
+  height += 300;
+  restore();
+  assert.equal(reading!.scrollTop, 470);
+  assert.equal(following!.scrollTop, 1300);
+  assert.equal(anchor.getBoundingClientRect().top, 0);
+});
+
+test("layout restoration ignores removed panes and falls back when an anchor was replaced", () => {
+  const dom = new JSDOM(
+    '<main><section class="chat-scroll"><div class="message-stack"><p>Reading</p></div></section><section class="chat-scroll"></section></main>',
+  );
+  const root = dom.window.document.querySelector("main")!;
+  const [reading, removed] = [...root.querySelectorAll<HTMLElement>("section")];
+  for (const element of [reading!, removed!]) {
+    Object.defineProperties(element, { clientHeight: { value: 200 }, scrollHeight: { value: 1000 } });
+    element.scrollTop = 350;
+  }
+  reading!.querySelector("p")!.getBoundingClientRect = () => ({ top: 10, bottom: 50 }) as DOMRect;
+  const restore = preserveTranscriptScroll(root);
+  reading!.replaceChildren();
+  removed!.remove();
+  reading!.scrollTop = removed!.scrollTop = 0;
+  restore();
+  assert.equal(reading!.scrollTop, 350);
+  assert.equal(removed!.scrollTop, 0);
+});
+
+function fixture(options: Parameters<typeof createTranscriptViewport>[0] = {}) {
+  const dom = new JSDOM(
+    '<section><div class="pinned-strip"></div><div class="message-stack"><article class="user-row"></article></div></section>',
+  );
+  const s = dom.window.document.querySelector("section")!;
+  const pins = s.querySelector<HTMLElement>(".pinned-strip")!;
+  const prompt = s.querySelector<HTMLElement>(".user-row")!;
+  let height = 1000;
+  let pinsHeight = 30;
+  let promptTop = 50;
+  Object.defineProperties(s, { scrollHeight: { get: () => height }, clientHeight: { value: 200 } });
+  s.scrollTop = 800;
+  s.getBoundingClientRect = () => ({ top: 20 }) as DOMRect;
+  pins.getBoundingClientRect = () => ({ height: pinsHeight }) as DOMRect;
+  prompt.getBoundingClientRect = () => ({ top: promptTop, height: 50 }) as DOMRect;
+  const writes: number[] = [];
+  let top = s.scrollTop;
+  Object.defineProperty(s, "scrollTop", {
+    get: () => top,
+    set: (value: number) => {
+      writes.push(value);
+      top = Math.min(value, height - 200);
+    },
+  });
+  const frames = new Map<number, FrameRequestCallback>();
+  let id = 0;
+  let resize = () => {};
+  const restore = ["requestAnimationFrame", "cancelAnimationFrame", "ResizeObserver", "getComputedStyle"].map(
+    (key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
+  );
+  Object.assign(globalThis, {
+    getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+    requestAnimationFrame: (cb: FrameRequestCallback) => {
+      frames.set(++id, cb);
+      return id;
+    },
+    cancelAnimationFrame: (n: number) => frames.delete(n),
+    ResizeObserver: class {
+      constructor(cb: () => void) {
+        resize = cb;
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  });
+  const viewport = createTranscriptViewport(options);
+  viewport.sync(s);
+  viewport.follow(true);
+  for (const cb of frames.values()) cb(0);
+  frames.clear();
+  writes.length = 0;
+  return {
+    s,
+    prompt,
+    viewport,
+    writes,
+    resize: (pinHeight: number, top: number) => {
+      pinsHeight = pinHeight;
+      promptTop = top;
+      resize();
+    },
+    fit: () => {
+      height = 200;
+      s.scrollTop = 0;
+      s.dispatchEvent(new dom.window.Event("scroll"));
+      writes.length = 0;
+    },
+    collapse: () => {
+      height = 400;
+      s.scrollTop = Math.min(s.scrollTop, 200);
+    },
+    grow: () => {
+      height += 100;
+    },
+    scroll: (top: number) => {
+      s.scrollTop = top;
+      s.dispatchEvent(new dom.window.Event("scroll"));
+    },
+    wheelUp: () => s.dispatchEvent(new dom.window.WheelEvent("wheel", { deltaY: -1 })),
+    flush: () => {
+      const pending = [...frames.values()];
+      frames.clear();
+      for (const cb of pending) cb(0);
+    },
+    close: () => {
+      viewport.dispose();
+      dom.window.close();
+      for (const [key, descriptor] of restore) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+    },
+  };
+}
+
+test("scrolling toward earlier messages loads before reaching the top and pauses following", () => {
+  const f = fixture();
+  try {
+    const button = f.s.ownerDocument.createElement("button");
+    button.className = "earlier-messages-btn";
+    f.s.querySelector(".message-stack")!.prepend(button);
+    let loads = 0;
+    button.onclick = () => {
+      loads++;
+      button.disabled = true;
+    };
+    f.viewport.sync(f.s);
+    assert.equal(loads, 0);
+    f.scroll(500);
+    assert.equal(loads, 0);
+    f.scroll(350);
+    assert.equal(loads, 1);
+    f.scroll(100);
+    f.wheelUp();
+    assert.equal(loads, 1);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 100);
+    button.disabled = false;
+    f.scroll(300);
+    assert.equal(loads, 1);
+    f.scroll(200);
+    assert.equal(loads, 2);
+  } finally {
+    f.close();
+  }
+});
+
+test("upward wheel loads history even when the transcript cannot scroll", () => {
+  const f = fixture();
+  try {
+    f.fit();
+    const button = f.s.ownerDocument.createElement("button");
+    button.className = "earlier-messages-btn";
+    f.s.querySelector(".message-stack")!.prepend(button);
+    let loads = 0;
+    button.onclick = () => {
+      loads++;
+    };
+    f.wheelUp();
+    assert.equal(loads, 1);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 0);
+    f.viewport.dispose();
+    f.wheelUp();
+    assert.equal(loads, 1);
+  } finally {
+    f.close();
+  }
+});
+
+test("a transcript too short to fill the viewport keeps loading earlier pages until it does", () => {
+  const f = fixture();
+  try {
+    f.fit();
+    const button = f.s.ownerDocument.createElement("button");
+    button.className = "earlier-messages-btn";
+    const stack = f.s.querySelector<HTMLElement>(".message-stack")!;
+    stack.prepend(button);
+    const page = () => stack.append(f.s.ownerDocument.createElement("article"));
+    let loads = 0;
+    button.onclick = () => {
+      loads++;
+      button.disabled = true;
+    };
+    f.viewport.sync(f.s);
+    assert.equal(loads, 1, "no scroll or wheel is needed when there is nothing to scroll");
+    f.viewport.sync(f.s);
+    assert.equal(loads, 1, "a page already loading is not requested twice");
+    page();
+    button.disabled = false;
+    f.resize(30, 50);
+    assert.equal(loads, 2, "still short after a page arrives, so the next page loads");
+    for (let i = 0; i < 6; i++) f.grow();
+    page();
+    button.disabled = false;
+    f.resize(30, 50);
+    f.viewport.sync(f.s);
+    assert.equal(loads, 2, "once the content overflows well past the top, loading waits for the reader");
+    button.remove();
+  } finally {
+    f.close();
+  }
+});
+
+test("a page that fails to load is not retried by auto-fill until the reader asks", () => {
+  const f = fixture();
+  try {
+    f.fit();
+    const button = f.s.ownerDocument.createElement("button");
+    button.className = "earlier-messages-btn";
+    f.s.querySelector(".message-stack")!.prepend(button);
+    let loads = 0;
+    button.onclick = () => loads++;
+    f.viewport.sync(f.s);
+    f.resize(30, 50);
+    f.viewport.sync(f.s);
+    assert.equal(loads, 1, "no growth since the last automatic load means no automatic retry");
+    f.wheelUp();
+    assert.equal(loads, 2, "the reader can still ask for it");
+  } finally {
+    f.close();
+  }
+});
+
+test("a hidden pane never pulls history just because it has no height", () => {
+  const dom = new JSDOM('<section class="chat-scroll"><div class="message-stack"></div></section>');
+  const s = dom.window.document.querySelector<HTMLElement>("section")!;
+  Object.defineProperties(s, { clientHeight: { value: 0 }, scrollHeight: { value: 0 } });
+  const button = dom.window.document.createElement("button");
+  button.className = "earlier-messages-btn";
+  s.querySelector(".message-stack")!.prepend(button);
+  let loads = 0;
+  button.onclick = () => loads++;
+  const viewport = createTranscriptViewport();
+  const saved = Object.getOwnPropertyDescriptor(globalThis, "getComputedStyle");
+  Object.assign(globalThis, { getComputedStyle: dom.window.getComputedStyle.bind(dom.window) });
+  try {
+    viewport.sync(s);
+    assert.equal(loads, 0);
+  } finally {
+    viewport.dispose();
+    if (saved) Object.defineProperty(globalThis, "getComputedStyle", saved);
+    else Reflect.deleteProperty(globalThis, "getComputedStyle");
+    dom.window.close();
+  }
+});
+
+test("a bottom-pinned stream follows growth instantly and coalesces frames", () => {
+  const f = fixture();
+  try {
+    f.grow();
+    f.viewport.follow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 900);
+    assert.deepEqual(f.writes, [1100]);
+  } finally {
+    f.close();
+  }
+});
+
+test("resizing a settled transcript updates the prompt expansion control", () => {
+  const f = fixture();
+  try {
+    f.prompt.innerHTML =
+      '<div class="user-bubble"><div class="pin-content"><markdown-block></markdown-block></div><button class="pin-toggle" hidden>Show more</button></div>';
+    const content = f.prompt.querySelector<HTMLElement>(".pin-content")!;
+    const toggle = f.prompt.querySelector<HTMLButtonElement>(".pin-toggle")!;
+    let availableHeight = 240;
+    Object.defineProperties(content, {
+      scrollHeight: { value: 240 },
+      clientHeight: { get: () => availableHeight },
+    });
+    f.viewport.sync(f.s);
+    f.resize(30, 50);
+    assert.equal(toggle.hidden, true);
+    availableHeight = 160;
+    f.resize(30, 50);
+    assert.equal(toggle.hidden, false);
+    availableHeight = 240;
+    f.resize(30, 50);
+    assert.equal(toggle.hidden, true);
+  } finally {
+    f.close();
+  }
+});
+
+test("leaving the bottom by more than a glance marks the transcript until the reader jumps back", () => {
+  const f = fixture();
+  try {
+    assert.equal(f.s.hasAttribute("data-away-from-bottom"), false);
+    f.scroll(700);
+    assert.equal(f.s.hasAttribute("data-away-from-bottom"), false);
+    f.scroll(500);
+    assert.equal(f.s.hasAttribute("data-away-from-bottom"), true);
+    f.viewport.follow(true);
+    assert.equal(f.s.hasAttribute("data-away-from-bottom"), false);
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+    f.scroll(300);
+    assert.equal(f.s.hasAttribute("data-away-from-bottom"), true);
+    f.viewport.dispose();
+    assert.equal(f.s.hasAttribute("data-away-from-bottom"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("even a small upward scroll stops following; returning to the bottom resumes it", () => {
+  const f = fixture();
+  try {
+    f.scroll(798);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 798);
+    assert.deepEqual(f.writes, [798]);
+    f.scroll(900);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 1000);
+  } finally {
+    f.close();
+  }
+});
+
+test("an upward wheel that cannot move a short transcript keeps following its growth", () => {
+  const f = fixture();
+  try {
+    f.fit();
+    f.wheelUp();
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 100);
+  } finally {
+    f.close();
+  }
+});
+
+test("an upward wheel cancels a queued follow before its scroll event arrives", () => {
+  const f = fixture();
+  try {
+    f.grow();
+    f.viewport.follow();
+    f.wheelUp();
+    f.flush();
+    assert.equal(f.writes.length, 0);
+  } finally {
+    f.close();
+  }
+});
+
+test("scrolling between scheduling and painting cannot be overwritten", () => {
+  const f = fixture();
+  try {
+    f.grow();
+    f.viewport.follow();
+    f.s.scrollTop -= 10;
+    f.flush();
+    assert.deepEqual(f.writes, [790]);
+  } finally {
+    f.close();
+  }
+});
+
+test("only reaching the sticky edge elevates the prompt; pin resizes update the edge", () => {
+  const f = fixture();
+  try {
+    f.resize(30, 200);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+    f.resize(30, 50);
+    assert.equal(f.prompt.classList.contains("stuck"), true);
+    f.resize(90, 110);
+    assert.equal(f.s.style.getPropertyValue("--chat-sticky-top"), "90px");
+    assert.equal(f.prompt.classList.contains("stuck"), true);
+    f.scroll(0);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("turning the pin preference off releases the latest prompt live, and turning it on pins it again", () => {
+  let pin = true;
+  const f = fixture({ pinPrompt: () => pin });
+  try {
+    f.resize(30, 50);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), true);
+    assert.equal(f.prompt.classList.contains("stuck"), true);
+    pin = false;
+    f.viewport.refresh();
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+    f.scroll(700);
+    f.resize(30, 50);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+    pin = true;
+    f.viewport.refresh();
+    assert.equal(f.prompt.classList.contains("latest-prompt"), true);
+    assert.equal(f.prompt.classList.contains("stuck"), true);
+  } finally {
+    f.close();
+  }
+});
+
+test("a prompt that starts unpinned is never made sticky", () => {
+  const f = fixture({ pinPrompt: () => false });
+  try {
+    f.resize(30, 50);
+    f.scroll(600);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("disposing cancels queued work and clears sticky presentation", () => {
+  const f = fixture();
+  try {
+    f.viewport.follow();
+    f.viewport.dispose();
+    f.flush();
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+    assert.equal(f.s.style.getPropertyValue("--chat-sticky-top"), "");
+  } finally {
+    f.close();
+  }
+});
+
+test("the viewport owns scroll anchoring in every state instead of the engine's native anchoring", () => {
+  const f = fixture();
+  try {
+    assert.equal(f.s.style.overflowAnchor, "none");
+    f.scroll(700);
+    assert.equal(f.s.style.overflowAnchor, "none");
+    f.viewport.dispose();
+    assert.equal(f.s.style.overflowAnchor, "");
+  } finally {
+    f.close();
+  }
+});
+
+test("replacing a scroller does not arm follow without an explicit fresh-session jump", () => {
+  const f = fixture();
+  try {
+    f.viewport.dispose();
+    f.viewport.sync(f.s);
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.writes.length, 0);
+    f.viewport.follow(true);
+    f.flush();
+    assert.equal(f.writes.length, 1);
+  } finally {
+    f.close();
+  }
+});
+
+test("redrawing unchanged nodes while reading performs no layout reads", () => {
+  const f = fixture();
+  try {
+    f.scroll(600);
+    f.s.getBoundingClientRect = () => {
+      throw new Error("unexpected layout read");
+    };
+    f.viewport.sync(f.s);
+    f.viewport.follow();
+    f.flush();
+    assert.deepEqual(f.writes, [600]);
+  } finally {
+    f.close();
+  }
+});
+
+test("a prompt stays in flow when pins leave too little room, and can stick again after resizing", () => {
+  const f = fixture();
+  try {
+    f.resize(160, 180);
+    assert.equal(f.prompt.classList.contains("sticky-disabled"), true);
+    assert.equal(f.prompt.classList.contains("stuck"), false);
+    f.resize(30, 50);
+    assert.equal(f.prompt.classList.contains("sticky-disabled"), false);
+    assert.equal(f.prompt.classList.contains("stuck"), true);
+  } finally {
+    f.close();
+  }
+});
+
+test("nested paste and attachment controls do not toggle the whole prompt", () => {
+  const f = fixture();
+  try {
+    f.prompt.innerHTML =
+      '<div class="user-bubble"><div class="pin-content"><code-block><button class="text-code-toggle">Show more</button><copy-button><button>Copy</button></copy-button></code-block><div class="message-files"><a class="file-chip" href="#file">notes.txt</a></div></div><button class="pin-toggle" hidden>Show more</button></div>';
+    const content = f.prompt.querySelector<HTMLElement>(".pin-content")!;
+    const toggle = f.prompt.querySelector<HTMLButtonElement>(".pin-toggle")!;
+    Object.defineProperties(content, {
+      scrollHeight: { value: 500 },
+      clientHeight: { value: 160 },
+    });
+    f.viewport.sync(f.s);
+    assert.equal(toggle.hidden, false);
+    for (const expanded of [false, true]) {
+      if (expanded) toggle.click();
+      for (const selector of [".text-code-toggle", "copy-button button", ".file-chip"]) {
+        f.prompt.querySelector<HTMLElement>(selector)!.click();
+        assert.equal(f.prompt.classList.contains("pin-expanded"), expanded);
+        assert.equal(toggle.getAttribute("aria-expanded"), String(expanded));
+      }
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("prompt clipping tolerates rounding but discloses any additional text line", () => {
+  const f = fixture();
+  try {
+    f.prompt.innerHTML =
+      '<div class="user-bubble"><div class="pin-content"></div><button class="pin-toggle" hidden>Show more</button></div>';
+    const content = f.prompt.querySelector<HTMLElement>(".pin-content")!;
+    const toggle = f.prompt.querySelector<HTMLButtonElement>(".pin-toggle")!;
+    let overflow = 5;
+    Object.defineProperties(content, {
+      scrollHeight: { get: () => 160 + overflow },
+      clientHeight: { value: 160 },
+    });
+    f.viewport.sync(f.s);
+    for (overflow of [0, 1, 2, 23, 100, 1]) {
+      f.resize(30, 50);
+      assert.equal(toggle.hidden, overflow <= 1);
+      f.resize(30, 50);
+      assert.equal(toggle.hidden, overflow <= 1, "stable on repeated measurements");
+    }
+    f.viewport.dispose();
+  } finally {
+    f.close();
+  }
+});
+
+test("returning to the bottom before a streamed render resumes follow before its scroll event", () => {
+  const f = fixture();
+  try {
+    f.scroll(700);
+    f.s.scrollTop = 800;
+    f.viewport.beforeRender();
+    f.grow();
+    f.s.dispatchEvent(new f.s.ownerDocument.defaultView!.Event("scroll"));
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 900);
+  } finally {
+    f.close();
+  }
+});
+
+test("a pre-render check leaves readers above the bottom alone", () => {
+  const f = fixture();
+  try {
+    f.scroll(600);
+    f.s.scrollTop = 798;
+    f.viewport.beforeRender();
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 798);
+  } finally {
+    f.close();
+  }
+});
+
+test("a pre-render check respects an upward wheel whose scroll has not arrived", () => {
+  const f = fixture();
+  try {
+    f.wheelUp();
+    f.viewport.beforeRender();
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+  } finally {
+    f.close();
+  }
+});
+
+test("a pre-render check handles an upward scroll before its event", () => {
+  const f = fixture();
+  try {
+    f.s.scrollTop = 790;
+    f.viewport.beforeRender();
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 790);
+  } finally {
+    f.close();
+  }
+});
+
+test("a downward scroll that reaches only the previous bottom does not resume following", () => {
+  const f = fixture();
+  try {
+    f.scroll(700);
+    f.grow();
+    f.scroll(800);
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+  } finally {
+    f.close();
+  }
+});
+
+test("a downward wheel gesture that lands short of the bottom is left alone", () => {
+  const f = fixture();
+  try {
+    f.scroll(700);
+    f.s.dispatchEvent(new f.s.ownerDocument.defaultView!.WheelEvent("wheel", { deltaY: 300 }));
+    f.grow();
+    f.resize(30, 50);
+    f.scroll(800);
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+  } finally {
+    f.close();
+  }
+});
+
+test("passing the previous bottom without reaching the new bottom does not resume follow", () => {
+  const f = fixture();
+  try {
+    f.scroll(700);
+    f.grow();
+    f.scroll(850);
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 850);
+  } finally {
+    f.close();
+  }
+});
+
+test("asynchronous growth leaves a reader in place", () => {
+  const f = fixture();
+  try {
+    f.scroll(600);
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 600);
+    f.scroll(800);
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+  } finally {
+    f.close();
+  }
+});
+
+test("opening a work log at the bottom grows below the clicked row instead of following", () => {
+  const f = fixture();
+  try {
+    const doc = f.s.ownerDocument;
+    const row = doc.createElement("details");
+    row.className = "work work-fold";
+    const summary = doc.createElement("summary");
+    row.append(summary);
+    f.s.querySelector(".message-stack")!.append(row);
+    summary.getBoundingClientRect = () => ({ top: 150 }) as DOMRect;
+    summary.dispatchEvent(new doc.defaultView!.MouseEvent("click", { bubbles: true }));
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+  } finally {
+    f.close();
+  }
+});
+
+test("reaching the real bottom by hand resumes following", () => {
+  const f = fixture();
+  try {
+    f.scroll(700);
+    f.grow();
+    f.scroll(900);
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 1000);
+  } finally {
+    f.close();
+  }
+});
+
+test("closing live work preserves following through delayed final markdown layout", () => {
+  const f = fixture();
+  try {
+    f.viewport.beforeRender();
+    f.viewport.follow();
+    f.collapse();
+    f.viewport.afterRender();
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 300);
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 400);
+  } finally {
+    f.close();
+  }
+});
+
+test("a reader who left the bottom is not pulled back when work closes", () => {
+  const f = fixture();
+  try {
+    f.scroll(100);
+    f.viewport.beforeRender();
+    f.collapse();
+    f.viewport.afterRender();
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 100);
+  } finally {
+    f.close();
+  }
+});
+
+test("a shrink that clamps a reader to the bottom does not resume following", () => {
+  const f = fixture();
+  try {
+    f.scroll(700);
+    f.viewport.beforeRender();
+    f.collapse();
+    f.s.dispatchEvent(new f.s.ownerDocument.defaultView!.Event("scroll"));
+    f.viewport.afterRender();
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 200);
+  } finally {
+    f.close();
+  }
+});
+
+test("a bottom-pinned reader keeps following when the browser clamps a shrink", () => {
+  const f = fixture();
+  try {
+    f.viewport.beforeRender();
+    f.collapse();
+    f.s.dispatchEvent(new f.s.ownerDocument.defaultView!.Event("scroll"));
+    f.viewport.afterRender();
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 300);
+  } finally {
+    f.close();
+  }
+});
+
+test("upward input after work closes still cancels the queued follow", () => {
+  const f = fixture();
+  try {
+    f.viewport.beforeRender();
+    f.collapse();
+    f.viewport.afterRender();
+    f.wheelUp();
+    f.scroll(190);
+    f.grow();
+    f.resize(30, 50);
+    f.flush();
+    assert.equal(f.s.scrollTop, 190);
+  } finally {
+    f.close();
+  }
+});
+
+test("an explicit new send re-arms following after reading older messages", () => {
+  const f = fixture();
+  try {
+    f.scroll(100);
+    f.viewport.follow(true);
+    f.grow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 900);
+    f.scroll(500);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 500);
+  } finally {
+    f.close();
+  }
+});
+
+for (const reading of [false, true]) {
+  test(`asynchronous Markdown replacement preserves ${reading ? "reader position" : "following"}`, async () => {
+    const f = fixture();
+    try {
+      if (reading) f.scroll(100);
+      f.viewport.beforeRender();
+      f.viewport.afterRender();
+      const completion = Promise.withResolvers<void>();
+      f.prompt.dispatchEvent(
+        new f.s.ownerDocument.defaultView!.CustomEvent("qm-content-updating", {
+          bubbles: true,
+          detail: completion.promise,
+        }),
+      );
+      f.collapse();
+      completion.resolve();
+      await completion.promise;
+      f.grow();
+      f.resize(30, 50);
+      f.flush();
+      assert.equal(f.s.scrollTop, reading ? 100 : 300);
+    } finally {
+      f.close();
+    }
+  });
+}
+
+test("an in-flight Markdown layout cannot be mistaken for reader scrolling", async () => {
+  const f = fixture();
+  try {
+    const completion = Promise.withResolvers<void>();
+    f.prompt.dispatchEvent(
+      new f.s.ownerDocument.defaultView!.CustomEvent("qm-content-updating", {
+        bubbles: true,
+        detail: completion.promise,
+      }),
+    );
+    f.s.scrollTop = 787;
+    f.viewport.beforeRender();
+    f.grow();
+    completion.resolve();
+    await completion.promise;
+    f.flush();
+    assert.equal(f.s.scrollTop, 900);
+  } finally {
+    f.close();
+  }
+});
+
+test("following waits for every overlapping render, including rejected updates", async () => {
+  const f = fixture();
+  try {
+    const first = Promise.withResolvers<void>();
+    const second = Promise.withResolvers<void>();
+    for (const completion of [first, second]) {
+      f.prompt.dispatchEvent(
+        new f.s.ownerDocument.defaultView!.CustomEvent("qm-content-updating", {
+          bubbles: true,
+          detail: completion.promise,
+        }),
+      );
+    }
+    f.grow();
+    first.reject(new Error("render failed"));
+    await first.promise.catch(() => {});
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+    second.resolve();
+    await second.promise;
+    f.flush();
+    assert.equal(f.s.scrollTop, 900);
+  } finally {
+    f.close();
+  }
+});
+
+test("a disposed render cannot release a new render on the same scroller", async () => {
+  const f = fixture();
+  try {
+    const start = () => {
+      const completion = Promise.withResolvers<void>();
+      f.prompt.dispatchEvent(
+        new f.s.ownerDocument.defaultView!.CustomEvent("qm-content-updating", {
+          bubbles: true,
+          detail: completion.promise,
+        }),
+      );
+      return completion;
+    };
+    const old = start();
+    f.viewport.dispose();
+    f.viewport.sync(f.s);
+    f.viewport.follow(true);
+    f.flush();
+    const current = start();
+    f.grow();
+    old.resolve();
+    await old.promise;
+    f.flush();
+    assert.equal(f.s.scrollTop, 800);
+    current.resolve();
+    await current.promise;
+    f.flush();
+    assert.equal(f.s.scrollTop, 900);
+  } finally {
+    f.close();
+  }
+});
+
+test("End on the transcript resumes following even when layout grows before scrolling", () => {
+  const f = fixture();
+  try {
+    f.scroll(200);
+    const event = new f.s.ownerDocument.defaultView!.KeyboardEvent("keydown", {
+      key: "End",
+      bubbles: true,
+      cancelable: true,
+    });
+    f.s.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, true);
+    f.grow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 900);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 1000);
+  } finally {
+    f.close();
+  }
+});
+
+test("End inside a nested control retains the control's native behavior", () => {
+  const f = fixture();
+  try {
+    f.scroll(200);
+    const input = f.s.ownerDocument.createElement("textarea");
+    f.s.append(input);
+    const event = new f.s.ownerDocument.defaultView!.KeyboardEvent("keydown", {
+      key: "End",
+      bubbles: true,
+      cancelable: true,
+    });
+    input.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, false);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 200);
+  } finally {
+    f.close();
+  }
+});
+
+test("revealing a message cancels pending and future bottom following", () => {
+  const f = fixture();
+  try {
+    f.viewport.follow(true);
+    f.viewport.cancelFollow();
+    f.s.scrollTop = 40;
+    f.flush();
+    assert.equal(f.s.scrollTop, 40);
+    f.grow();
+    f.viewport.follow();
+    f.flush();
+    assert.equal(f.s.scrollTop, 40);
+  } finally {
+    f.close();
+  }
+});
+
+test("the latest-prompt marker moves between rows and is restored after a template update", () => {
+  const f = fixture();
+  try {
+    assert.equal(f.prompt.classList.contains("latest-prompt"), true);
+    f.prompt.classList.remove("latest-prompt");
+    f.viewport.sync(f.s);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), true);
+    const next = f.prompt.cloneNode(true) as HTMLElement;
+    next.className = "user-row";
+    next.dataset.index = "2";
+    f.prompt.after(next);
+    f.viewport.sync(f.s);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(next.classList.contains("latest-prompt"), true);
+    f.viewport.dispose();
+    assert.equal(next.classList.contains("latest-prompt"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("an inline steer takes the sticky prompt marker from the original request", () => {
+  const f = fixture();
+  try {
+    const work = f.s.ownerDocument.createElement("article");
+    work.className = "assistant-row";
+    work.innerHTML = '<div class="inline-steer"><article class="user-row steered-row" data-index="1"></article></div>';
+    f.prompt.after(work);
+    f.viewport.sync(f.s);
+    assert.equal(f.prompt.classList.contains("latest-prompt"), false);
+    assert.equal(work.querySelector(".steered-row")!.classList.contains("latest-prompt"), true);
+  } finally {
+    f.close();
+  }
+});
+
+test("a steer rendered inside the running turn is the latest prompt and anchors to the block above it", () => {
+  const dom = new JSDOM(
+    '<section><div class="message-stack"><article class="user-row" data-index="0"></article>' +
+      '<article class="assistant-row" data-index="1"><div class="assistant-body"><details class="work"></details>' +
+      '<div class="inline-steer" style="display: contents"><article class="user-row steered-row" data-index="2"><div class="pin-content"></div></article></div>' +
+      '<div class="inline-steer" style="display: contents"><article class="user-row steered-row" data-index="3"><div class="pin-content"></div></article></div>' +
+      "</div></article></div></section>",
+  );
+  const s = dom.window.document.querySelector("section")!;
+  const [first, earlier, steer] = [...s.querySelectorAll<HTMLElement>(".user-row")];
+  const content = steer!.querySelector<HTMLElement>(".pin-content")!;
+  let scrollTop = 0;
+  Object.defineProperties(s, {
+    scrollHeight: { value: 1000 },
+    clientHeight: { value: 200 },
+    scrollTop: { get: () => scrollTop, set: (value: number) => (scrollTop = value) },
+  });
+  s.getBoundingClientRect = () => ({ top: 20 }) as DOMRect;
+  earlier!.getBoundingClientRect = () => ({ top: 100 - scrollTop, bottom: 140 - scrollTop, height: 40 }) as DOMRect;
+  steer!.getBoundingClientRect = () => ({ top: Math.max(20, 156 - scrollTop), height: 50 }) as DOMRect;
+  content.getBoundingClientRect = () => ({ height: 40 }) as DOMRect;
+  Object.defineProperty(content, "scrollHeight", { value: 40 });
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "getComputedStyle");
+  Object.assign(globalThis, { getComputedStyle: dom.window.getComputedStyle.bind(dom.window) });
+  const viewport = createTranscriptViewport();
+  try {
+    viewport.sync(s);
+    assert.equal(first!.classList.contains("latest-prompt"), false);
+    assert.equal(earlier!.classList.contains("latest-prompt"), false);
+    assert.equal(steer!.classList.contains("latest-prompt"), true);
+    s.scrollTop = 1;
+    s.dispatchEvent(new dom.window.Event("scroll"));
+    assert.equal(steer!.classList.contains("stuck"), false);
+    s.scrollTop = 150;
+    s.dispatchEvent(new dom.window.Event("scroll"));
+    assert.equal(steer!.classList.contains("stuck"), true);
+    assert.equal(steer!.style.getPropertyValue("--pin-content-max"), "26px");
+    assert.equal(steer!.classList.contains("pin-condensed"), false);
+  } finally {
+    viewport.dispose();
+    if (restore) Object.defineProperty(globalThis, "getComputedStyle", restore);
+  }
+});
+
+test("a redraw holds the transcript's height until the follow frame so a rebuilt reply cannot clamp the scroll", () => {
+  const f = fixture();
+  const stack = f.s.querySelector<HTMLElement>(".message-stack")!;
+  stack.getBoundingClientRect = () => ({ height: 1000 }) as DOMRect;
+  try {
+    f.viewport.beforeRender();
+    assert.equal(stack.style.minHeight, "1000px");
+    f.viewport.afterRender();
+    assert.equal(stack.style.minHeight, "1000px");
+    f.grow();
+    f.flush();
+    assert.equal(stack.style.minHeight, "");
+    assert.equal(f.s.scrollTop, 900);
+    assert.deepEqual(f.writes, [1100]);
+  } finally {
+    f.close();
+  }
+});
+
+test("a held height waits for in-flight content renders before it is released", async () => {
+  const f = fixture();
+  const stack = f.s.querySelector<HTMLElement>(".message-stack")!;
+  stack.getBoundingClientRect = () => ({ height: 1000 }) as DOMRect;
+  try {
+    const completion = Promise.withResolvers<void>();
+    f.viewport.beforeRender();
+    f.s.dispatchEvent(
+      new f.s.ownerDocument.defaultView!.CustomEvent("qm-content-updating", {
+        bubbles: true,
+        detail: completion.promise,
+      }),
+    );
+    f.viewport.afterRender();
+    f.flush();
+    assert.equal(stack.style.minHeight, "1000px");
+    completion.resolve();
+    await completion.promise;
+    await Promise.resolve();
+    f.grow();
+    f.flush();
+    assert.equal(stack.style.minHeight, "");
+    assert.equal(f.s.scrollTop, 900);
+  } finally {
+    f.close();
+  }
+});
+
+test("a reader keeps a rising height floor until following resumes, so no shrink can clamp them", () => {
+  const f = fixture();
+  const stack = f.s.querySelector<HTMLElement>(".message-stack")!;
+  let height = 1000;
+  stack.getBoundingClientRect = () => ({ height: Math.max(height, parseFloat(stack.style.minHeight) || 0) }) as DOMRect;
+  try {
+    f.scroll(600);
+    f.viewport.beforeRender();
+    assert.equal(stack.style.minHeight, "1000px");
+    f.viewport.afterRender();
+    f.flush();
+    assert.equal(stack.style.minHeight, "1000px");
+    height = 700;
+    f.viewport.beforeRender();
+    assert.equal(stack.style.minHeight, "1000px");
+    height = 1200;
+    f.viewport.beforeRender();
+    assert.equal(stack.style.minHeight, "1200px");
+    f.viewport.cancelFollow();
+    assert.equal(stack.style.minHeight, "1200px");
+    f.viewport.follow(true);
+    f.flush();
+    assert.equal(stack.style.minHeight, "");
+  } finally {
+    f.close();
+  }
+});
+
+function readingFixture(rows: number[]) {
+  const dom = new JSDOM('<section class="chat-scroll"><div class="message-stack"></div></section>');
+  const document = dom.window.document;
+  const s = document.querySelector("section")!;
+  const stack = s.querySelector<HTMLElement>(".message-stack")!;
+  const heights: number[] = [];
+  const texts: string[] = [];
+  const seqs = new Map<string, string>();
+  const draw = (): void => {
+    const nodes = [...stack.children] as HTMLElement[];
+    texts.forEach((text, index) => {
+      let row = nodes[index];
+      if (!row) {
+        row = document.createElement("article");
+        row.append(document.createElement("qm-markdown"));
+        row.firstElementChild!.append(document.createElement("p"));
+        stack.append(row);
+      }
+      row.dataset.index = String(index);
+      if (text && !seqs.has(text)) seqs.set(text, String(100 + seqs.size));
+      row.dataset.entrySeqs = text ? seqs.get(text)! : "";
+      row.querySelector("p")!.textContent = text || `Message ${index}`;
+    });
+    for (const extra of nodes.slice(texts.length)) extra.remove();
+  };
+  const above = (element: Element): number => {
+    const row = element.closest<HTMLElement>("[data-index]")!;
+    return heights.slice(0, [...stack.children].indexOf(row)).reduce((sum, h) => sum + h, 0);
+  };
+  let top = 0;
+  const total = (): number => heights.reduce((sum, h) => sum + h, 0);
+  Object.defineProperties(s, {
+    scrollHeight: { get: total },
+    clientHeight: { value: 200 },
+    scrollTop: { get: () => top, set: (value: number) => (top = Math.max(0, Math.min(value, total() - 200))) },
+  });
+  s.getBoundingClientRect = () => ({ top: 20 }) as DOMRect;
+  const rect = (element: Element): DOMRect => {
+    const row = element.closest<HTMLElement>("[data-index]")!;
+    const index = [...stack.children].indexOf(row);
+    const own = (element as HTMLElement).dataset;
+    const y = 20 + above(element) - top + Number(own.y ?? 0);
+    const height = own.h ? Number(own.h) : (heights[index] ?? 0);
+    return { top: y, bottom: y + height, height } as DOMRect;
+  };
+  const originalRect = dom.window.Element.prototype.getBoundingClientRect;
+  dom.window.HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+    if (this.closest("[data-index]")) return rect(this);
+    return originalRect.call(this);
+  };
+  stack.getBoundingClientRect = () => ({ top: 20 - top, height: total() }) as DOMRect;
+  const frames = new Map<number, FrameRequestCallback>();
+  let id = 0;
+  let resize: (entries?: unknown[]) => void = () => {};
+  const restore = ["requestAnimationFrame", "cancelAnimationFrame", "ResizeObserver", "getComputedStyle"].map(
+    (key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
+  );
+  Object.assign(globalThis, {
+    getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+    requestAnimationFrame: (cb: FrameRequestCallback) => {
+      frames.set(++id, cb);
+      return id;
+    },
+    cancelAnimationFrame: (n: number) => frames.delete(n),
+    ResizeObserver: class {
+      constructor(cb: (entries?: unknown[]) => void) {
+        resize = cb;
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  });
+  rows.forEach((height, index) => {
+    heights.push(height);
+    texts.push(`Paragraph ${index}`);
+  });
+  draw();
+  const viewport = createTranscriptViewport({ pinPrompt: () => false });
+  viewport.sync(s);
+  const flush = (): void => {
+    const pending = [...frames.values()];
+    frames.clear();
+    for (const cb of pending) cb(0);
+  };
+  const paragraph = (text: string): HTMLElement =>
+    [...stack.querySelectorAll<HTMLElement>("p")].find((node) => node.textContent === text)!;
+  return {
+    s,
+    stack,
+    viewport,
+    heights,
+    texts,
+    draw,
+    flush,
+    paragraph,
+    layout: () => resize([]),
+    scroll: (value: number) => {
+      s.scrollTop = value;
+      s.dispatchEvent(new dom.window.Event("scroll"));
+    },
+    top: (text: string) => paragraph(text).getBoundingClientRect().top,
+    close: () => {
+      viewport.dispose();
+      dom.window.close();
+      for (const [key, descriptor] of restore) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+    },
+  };
+}
+
+test("growth above a reader is absorbed so the line being read does not move", () => {
+  const f = readingFixture([300, 300, 300, 300]);
+  try {
+    f.scroll(650);
+    const before = f.top("Paragraph 2");
+    f.heights[1] = 480;
+    f.layout();
+    assert.equal(f.top("Paragraph 2"), before);
+    assert.equal(f.s.scrollTop, 830);
+  } finally {
+    f.close();
+  }
+});
+
+test("earlier messages prepended into reused rows keep the reader on the same text", () => {
+  const f = readingFixture([300, 300, 300]);
+  try {
+    f.scroll(350);
+    const before = f.top("Paragraph 1");
+    f.texts.unshift("Earlier A", "Earlier B");
+    f.heights.unshift(250, 250);
+    f.draw();
+    f.layout();
+    assert.equal(f.top("Paragraph 1"), before);
+    assert.equal(f.s.scrollTop, 850);
+  } finally {
+    f.close();
+  }
+});
+
+test("a reply rebuilt at settle is found again by its text even though its row key changed", () => {
+  const f = readingFixture([300, 300, 600]);
+  try {
+    f.texts[2] = "";
+    f.draw();
+    f.stack.children[2]!.setAttribute("data-entry-seqs", "150");
+    f.scroll(750);
+    const streaming = f.stack.children[2]!.querySelector("p")!;
+    streaming.textContent = "Reply so far";
+    f.scroll(749);
+    f.scroll(750);
+    const before = streaming.getBoundingClientRect().top;
+    f.viewport.beforeRender();
+    const settled = f.stack.ownerDocument.createElement("p");
+    settled.textContent = "Reply so far, now complete";
+    streaming.replaceWith(settled);
+    f.stack.children[2]!.setAttribute("data-entry-seqs", "200 201");
+    f.heights[1] = 340;
+    f.viewport.afterRender();
+    f.flush();
+    assert.equal(settled.getBoundingClientRect().top, before);
+  } finally {
+    f.close();
+  }
+});
+
+test("a scroll the reader made before a layout change is kept rather than undone", () => {
+  const f = readingFixture([300, 300, 300, 300]);
+  try {
+    f.scroll(650);
+    f.s.scrollTop = 500;
+    f.heights[0] = 400;
+    f.layout();
+    assert.equal(f.s.scrollTop, 500);
+  } finally {
+    f.close();
+  }
+});
+
+test("new content below a reader marks the jump control until the reader returns to the bottom", () => {
+  const f = readingFixture([300, 300, 300, 300]);
+  try {
+    f.scroll(300);
+    assert.equal(f.s.hasAttribute("data-new-below"), false);
+    f.heights[3] = 500;
+    f.layout();
+    assert.equal(f.s.scrollTop, 300);
+    assert.equal(f.s.hasAttribute("data-new-below"), true);
+    f.scroll(1200);
+    assert.equal(f.s.hasAttribute("data-new-below"), false);
+    f.scroll(300);
+    f.heights[0] = 200;
+    f.layout();
+    assert.equal(f.s.hasAttribute("data-new-below"), false);
+  } finally {
+    f.close();
+  }
+});
+
+test("following discards the old reading spot so a later pause does not jump back to it", () => {
+  const f = readingFixture([300, 300, 300, 300]);
+  try {
+    f.scroll(300);
+    f.viewport.follow(true);
+    f.flush();
+    assert.equal(f.s.scrollTop, 1000);
+    f.heights.push(300);
+    f.texts.push("Paragraph 4");
+    f.draw();
+    f.viewport.cancelFollow();
+    f.layout();
+    assert.equal(f.s.scrollTop, 1000);
+  } finally {
+    f.close();
+  }
+});
+
+test("work summaries above the reply never become the reading anchor, so reshaping them leaves the reply still", () => {
+  const f = readingFixture([300, 600, 300]);
+  try {
+    const row = f.stack.children[1]!;
+    const doc = f.stack.ownerDocument;
+    const summary = doc.createElement("summary");
+    summary.textContent = "Ran a command";
+    Object.assign(summary.dataset, { y: "0", h: "20" });
+    row.prepend(summary);
+    const reply = row.querySelector("p")!;
+    Object.assign(reply.dataset, { y: "40", h: "560" });
+    f.scroll(290);
+    const before = reply.getBoundingClientRect().top;
+    summary.dataset.y = "20";
+    reply.dataset.y = "80";
+    f.layout();
+    assert.equal(reply.getBoundingClientRect().top, before);
+  } finally {
+    f.close();
+  }
+});
+
+test("the scroll event echoing the viewport's own correction does not re-anchor the reader", () => {
+  const f = readingFixture([300, 300, 300, 300]);
+  try {
+    f.scroll(650);
+    const before = f.top("Paragraph 2");
+    f.heights[1] = 480;
+    f.layout();
+    f.heights[0] = 400;
+    f.s.dispatchEvent(new f.s.ownerDocument.defaultView!.Event("scroll"));
+    f.layout();
+    assert.equal(f.top("Paragraph 2"), before);
+  } finally {
+    f.close();
+  }
+});

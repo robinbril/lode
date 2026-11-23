@@ -1,0 +1,946 @@
+package v1
+
+import (
+	"context"
+	"math/rand/v2"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/rs/zerolog"
+
+	"github.com/hatchet-dev/hatchet/internal/enumerables"
+	"github.com/hatchet-dev/hatchet/internal/services/shared/timeout_lock"
+
+	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
+	"github.com/hatchet-dev/hatchet/pkg/repository/sqlcv1"
+)
+
+const (
+	// newWorkerWakeRate is how many idle queuers one new worker wakes per second. Each wake
+	// polls the database, so this is the poll rate that worker can start.
+	newWorkerWakeRate = 5000
+
+	// minNewWorkerWakeSpread is the shortest spread worth applying. Below it, the tenant has
+	// few enough queuers to wake together.
+	minNewWorkerWakeSpread = 100 * time.Millisecond
+
+	// maxNewWorkerWakeSpread caps how long an idle queuer waits to see a new worker.
+	maxNewWorkerWakeSpread = 5 * time.Second
+)
+
+type notifierMsg[T any] struct {
+	items []T
+
+	// isIncremental refers to whether the resource should be added to the current set, or
+	// should replace the current set
+	isIncremental bool
+}
+
+type notifierCh[T any] chan notifierMsg[T]
+
+// tenantManager manages the scheduler and queuers for a tenant and multiplexes
+// messages to the relevant queuer.
+type tenantManager struct {
+	cf       *sharedConfig
+	l        zerolog.Logger
+	tenantId uuid.UUID
+
+	scheduler *Scheduler
+	rl        *rateLimiter
+
+	queuers   []*Queuer
+	queuersMu sync.RWMutex
+
+	concurrencyStrategies []*ConcurrencyManager
+
+	// maintain a mapping of strategy ids to parent ids, because we'd like to signal all
+	// child strategy ids when a parent strategy id is updated
+	strategyIdsToParentIds *lru.Cache[int64, int64]
+	parentIdsToStrategyIds *lru.Cache[int64, []int64]
+
+	concurrencyMu                 sync.RWMutex
+	concurrencyAdvisoryLock       *timeout_lock.KeyedTimeoutLock[int64]
+	concurrencyParentAdvisoryLock *timeout_lock.KeyedTimeoutLock[int64]
+
+	leaseManager *LeaseManager
+
+	workersCh     notifierCh[*v1.ListActiveWorkersResult]
+	queuesCh      notifierCh[string]
+	concurrencyCh notifierCh[*sqlcv1.V1StepConcurrency]
+	batchesCh     notifierCh[*sqlcv1.ListDistinctBatchResourcesRow]
+
+	concurrencyResultsCh chan *ConcurrencyResults
+
+	resultsCh chan *QueueResults
+
+	batchSchedulers   map[uuid.UUID]*BatchScheduler
+	batchSchedulersMu sync.Mutex
+
+	// pendingBatchNotifies holds steps with an on-demand lease acquire in flight, so repeated
+	// flushes for the same step don't queue more of them. Guarded by batchSchedulersMu.
+	pendingBatchNotifies map[uuid.UUID]struct{}
+
+	ctx     context.Context
+	cleanup func()
+}
+
+func newTenantManager(cf *sharedConfig, tenantId uuid.UUID, resultsCh chan *QueueResults, concurrencyResultsCh chan *ConcurrencyResults, rateLimitPausesEndedCh chan<- uuid.UUID, exts *Extensions) *tenantManager {
+	tenantIdUUID := tenantId
+
+	rl := newRateLimiter(cf, tenantIdUUID, rateLimitPausesEndedCh)
+	s := newScheduler(cf, tenantIdUUID, rl, exts)
+	leaseManager, workersCh, queuesCh, concurrencyCh, batchesCh := newLeaseManager(cf, tenantIdUUID)
+
+	strategyIdsToParentIds, _ := lru.New[int64, int64](1000)
+	parentIdsToStrategyIds, _ := lru.New[int64, []int64](1000)
+
+	t := &tenantManager{
+		scheduler:                     s,
+		leaseManager:                  leaseManager,
+		cf:                            cf,
+		l:                             cf.l.With().Str("tenant_id", tenantIdUUID.String()).Logger(),
+		tenantId:                      tenantIdUUID,
+		workersCh:                     workersCh,
+		queuesCh:                      queuesCh,
+		concurrencyCh:                 concurrencyCh,
+		resultsCh:                     resultsCh,
+		rl:                            rl,
+		concurrencyResultsCh:          concurrencyResultsCh,
+		strategyIdsToParentIds:        strategyIdsToParentIds,
+		parentIdsToStrategyIds:        parentIdsToStrategyIds,
+		concurrencyAdvisoryLock:       timeout_lock.NewKeyedTimeoutLock[int64](cf.schedulerAdvisoryLockTimeout),
+		concurrencyParentAdvisoryLock: timeout_lock.NewKeyedTimeoutLock[int64](cf.schedulerAdvisoryLockTimeout),
+		batchSchedulers:               make(map[uuid.UUID]*BatchScheduler),
+		pendingBatchNotifies:          make(map[uuid.UUID]struct{}),
+		batchesCh:                     batchesCh,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.ctx = ctx
+	t.cleanup = cancel
+
+	s.onCapacityRestored = func(queues []string) {
+		t.notifyQueuers(ctx, queues)
+	}
+
+	go t.listenForWorkerLeases(ctx)
+	go t.listenForQueueLeases(ctx)
+	go t.listenForConcurrencyLeases(ctx)
+	go t.listenForBatchLeases(ctx)
+
+	leaseManager.start(ctx)
+	s.start(ctx)
+
+	return t
+}
+
+func (t *tenantManager) Cleanup() error {
+	// cancel the lifecycle context first so the listenFor*Leases goroutines exit before
+	// leaseManager.cleanup closes the lease channels underneath them
+	t.cleanup()
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := t.leaseManager.cleanup(cleanupCtx)
+
+	// clean up the other resources even if the lease manager fails to clean up
+	t.queuersMu.RLock()
+	defer t.queuersMu.RUnlock()
+
+	for _, q := range t.queuers {
+		q.Cleanup()
+	}
+
+	t.cleanupConcurrencyStrategies(cleanupCtx)
+
+	t.rl.cleanup()
+
+	t.batchSchedulersMu.Lock()
+
+	for stepId, scheduler := range t.batchSchedulers {
+		if err := scheduler.Cleanup(cleanupCtx); err != nil {
+			t.cf.l.Error().
+				Err(err).
+				Str("tenant_id", t.tenantId.String()).
+				Str("step_id", stepId.String()).
+				Msg("failed to cleanup batch scheduler during tenant cleanup")
+		}
+
+		delete(t.batchSchedulers, stepId)
+	}
+
+	t.batchSchedulersMu.Unlock()
+
+	return err
+}
+
+// cleanupConcurrencyStrategies stops every concurrency manager and then releases the outbox
+// topic leases they held. Stopping a manager leaves its lease valid for a full lease duration,
+// during which the scheduler that takes the tenant over cannot build its index for that
+// strategy. The release happens here rather than in each manager's cleanup because a manager
+// replaced in place shares its topic with its replacement, and releasing on the old manager's
+// behalf would revoke the lease the new one has just acquired.
+func (t *tenantManager) cleanupConcurrencyStrategies(ctx context.Context) {
+	t.concurrencyMu.Lock()
+
+	topics := make([]string, 0, len(t.concurrencyStrategies))
+
+	for _, c := range t.concurrencyStrategies {
+		c.cleanup()
+
+		if topic, ok := c.leasedOutboxTopic(); ok {
+			topics = append(topics, topic)
+		}
+	}
+
+	t.concurrencyStrategies = nil
+
+	t.concurrencyMu.Unlock()
+
+	if len(topics) == 0 {
+		return
+	}
+
+	// a failed release is not fatal: the leases lapse on their own after the lease duration
+	if err := t.cf.outbox.ReleaseTopics(ctx, topics); err != nil {
+		t.l.Error().Err(err).Int("topics", len(topics)).Msg("could not release concurrency outbox topic leases")
+	}
+}
+
+func (t *tenantManager) listenForWorkerLeases(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-t.workersCh:
+			if !ok {
+				return
+			}
+
+			if msg.isIncremental {
+				for _, worker := range msg.items {
+					t.scheduler.addWorker(worker)
+				}
+
+				t.replenish(ctx)
+
+				t.wakeQueuersForNewWorker(ctx)
+			} else {
+				t.scheduler.setWorkers(msg.items)
+			}
+		}
+	}
+}
+
+func (t *tenantManager) listenForQueueLeases(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-t.queuesCh:
+			if !ok {
+				return
+			}
+
+			if msg.isIncremental {
+				for _, queueName := range msg.items {
+					t.addQueuer(queueName)
+				}
+			} else {
+				t.setQueuers(msg.items)
+			}
+		}
+	}
+}
+
+func (t *tenantManager) listenForConcurrencyLeases(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-t.concurrencyCh:
+			if !ok {
+				return
+			}
+
+			if msg.isIncremental {
+				for _, strategy := range msg.items {
+					t.addConcurrencyStrategy(strategy)
+				}
+			} else {
+				t.setConcurrencyStrategies(msg.items)
+			}
+		}
+	}
+}
+
+func (t *tenantManager) listenForBatchLeases(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-t.batchesCh:
+			if !ok {
+				return
+			}
+			t.replenish(ctx)
+
+			if msg.isIncremental {
+				t.addBatchSchedulers(ctx, msg.items)
+			} else {
+				t.setBatchSchedulers(ctx, msg.items)
+			}
+		}
+	}
+}
+
+func (t *tenantManager) setQueuers(queueNames []string) {
+	t.queuersMu.Lock()
+	defer t.queuersMu.Unlock()
+
+	queueNamesSet := enumerables.ToSet(queueNames, func(queueName string) string { return queueName })
+
+	newQueueArr := make([]*Queuer, 0, len(queueNames))
+
+	for _, q := range t.queuers {
+		if _, ok := queueNamesSet[q.queueName]; ok {
+			newQueueArr = append(newQueueArr, q)
+
+			// delete from set
+			delete(queueNamesSet, q.queueName)
+		} else {
+			// if not in new set, cleanup
+			t.l.Debug().Msgf("cleaning up queuer for queue %s for tenant %s", q.queueName, t.tenantId)
+
+			go q.Cleanup()
+		}
+	}
+
+	for queueName := range queueNamesSet {
+		newQueueArr = append(newQueueArr, newQueuer(t.cf, t.tenantId, queueName, t.scheduler, t.resultsCh, t.notifyBatchedQueueItems))
+	}
+
+	t.queuers = newQueueArr
+}
+
+func (t *tenantManager) addQueuer(queueName string) {
+	t.queuersMu.Lock()
+
+	for _, q := range t.queuers {
+		if q.queueName == queueName {
+			t.queuersMu.Unlock()
+			return
+		}
+	}
+
+	q := newQueuer(t.cf, t.tenantId, queueName, t.scheduler, t.resultsCh, t.notifyBatchedQueueItems)
+
+	t.queuers = append(t.queuers, q)
+
+	t.queuersMu.Unlock()
+
+	t.queue(context.Background(), []string{queueName})
+}
+
+func (t *tenantManager) setConcurrencyStrategies(strategies []*sqlcv1.V1StepConcurrency) {
+	t.concurrencyMu.Lock()
+	defer t.concurrencyMu.Unlock()
+
+	strategiesSet := enumerables.KeyBy(strategies, func(strat *sqlcv1.V1StepConcurrency) int64 { return strat.ID })
+
+	newArr := make([]*ConcurrencyManager, 0, len(strategies))
+
+	for _, c := range t.concurrencyStrategies {
+		if strat, ok := strategiesSet[c.strategy.ID]; ok {
+			// If the definition changed (e.g. a shared strategy was re-registered with a
+			// different max_concurrency or expression), apply it to the running manager
+			// in place. Only structural changes (limit-strategy kind, parent linkage)
+			// still tear the manager down and rebuild: an async cleanup + init re-acquires
+			// the outbox topic and rehydrates every slot, and risks contending with the
+			// old manager's locks while it winds down.
+			if c.strategyDiffers(strat) && !c.UpdateStrategy(strat) {
+				go c.cleanup()
+
+				newArr = append(newArr, newConcurrencyManager(t.cf, t.tenantId, strat, t.concurrencyResultsCh, t.concurrencyAdvisoryLock, t.concurrencyParentAdvisoryLock))
+			} else {
+				newArr = append(newArr, c)
+			}
+
+			// delete from set
+			delete(strategiesSet, c.strategy.ID)
+		} else {
+			// if not in new set, cleanup
+			go c.cleanup()
+		}
+	}
+
+	for _, strategy := range strategiesSet {
+		c := newConcurrencyManager(t.cf, t.tenantId, strategy, t.concurrencyResultsCh, t.concurrencyAdvisoryLock, t.concurrencyParentAdvisoryLock)
+		newArr = append(newArr, c)
+	}
+
+	t.concurrencyStrategies = newArr
+}
+
+func (t *tenantManager) addConcurrencyStrategy(strategy *sqlcv1.V1StepConcurrency) {
+	t.concurrencyMu.Lock()
+	defer t.concurrencyMu.Unlock()
+
+	for _, c := range t.concurrencyStrategies {
+		if c.strategy.ID == strategy.ID {
+			return
+		}
+	}
+
+	c := newConcurrencyManager(t.cf, t.tenantId, strategy, t.concurrencyResultsCh, t.concurrencyAdvisoryLock, t.concurrencyParentAdvisoryLock)
+	t.concurrencyStrategies = append(t.concurrencyStrategies, c)
+}
+
+// setBatchSchedulers reconciles the set of running BatchSchedulers against the steps that
+// currently have pending batched queue items. One BatchScheduler runs per step_id -- matching
+// the granularity of the underlying BATCH lease -- and internally manages every batch_key for
+// that step.
+func (t *tenantManager) setBatchSchedulers(ctx context.Context, batches []*sqlcv1.ListDistinctBatchResourcesRow) {
+	desired := make(map[uuid.UUID]*sqlcv1.ListDistinctBatchResourcesRow, len(batches))
+
+	for _, row := range batches {
+		if row == nil {
+			continue
+		}
+
+		desired[row.StepID] = row
+	}
+
+	t.batchSchedulersMu.Lock()
+	defer t.batchSchedulersMu.Unlock()
+
+	for stepId, scheduler := range t.batchSchedulers {
+		// If the scheduler self-stopped due to idleness, remove it so it can be recreated
+		// if/when new batched queue items appear.
+		if scheduler != nil && scheduler.ctx != nil && scheduler.ctx.Err() != nil {
+			if err := scheduler.Cleanup(ctx); err != nil {
+				t.cf.l.Error().
+					Err(err).
+					Str("tenant_id", t.tenantId.String()).
+					Str("step_id", stepId.String()).
+					Msg("failed to cleanup stopped batch scheduler")
+			}
+
+			delete(t.batchSchedulers, stepId)
+			continue
+		}
+
+		if _, ok := desired[stepId]; ok {
+			continue
+		}
+
+		if err := scheduler.Cleanup(ctx); err != nil {
+			t.cf.l.Error().
+				Err(err).
+				Str("tenant_id", t.tenantId.String()).
+				Str("step_id", stepId.String()).
+				Msg("failed to cleanup batch scheduler")
+		}
+
+		delete(t.batchSchedulers, stepId)
+	}
+
+	for stepId, row := range desired {
+		if _, ok := t.batchSchedulers[stepId]; ok {
+			continue
+		}
+
+		t.startBatchSchedulerLocked(ctx, stepId, row)
+	}
+}
+
+// addBatchSchedulers starts schedulers for newly leased steps without touching the others,
+// replacing any that already stopped themselves for idleness.
+func (t *tenantManager) addBatchSchedulers(ctx context.Context, batches []*sqlcv1.ListDistinctBatchResourcesRow) {
+	t.batchSchedulersMu.Lock()
+	defer t.batchSchedulersMu.Unlock()
+
+	for _, row := range batches {
+		if row == nil {
+			continue
+		}
+
+		if existing, ok := t.batchSchedulers[row.StepID]; ok {
+			if existing == nil || existing.ctx == nil || existing.ctx.Err() == nil {
+				continue
+			}
+
+			if err := existing.Cleanup(ctx); err != nil {
+				t.cf.l.Error().
+					Err(err).
+					Str("tenant_id", t.tenantId.String()).
+					Str("step_id", row.StepID.String()).
+					Msg("failed to cleanup stopped batch scheduler")
+			}
+
+			delete(t.batchSchedulers, row.StepID)
+		}
+
+		t.startBatchSchedulerLocked(ctx, row.StepID, row)
+	}
+}
+
+// startBatchSchedulerLocked must be called with batchSchedulersMu held.
+func (t *tenantManager) startBatchSchedulerLocked(ctx context.Context, stepId uuid.UUID, row *sqlcv1.ListDistinctBatchResourcesRow) {
+	sched := newBatchScheduler(
+		t.cf,
+		t.tenantId,
+		row,
+		t.cf.repo.QueueFactory(),
+		t.scheduler,
+		func(res *QueueResults) {
+			if res == nil {
+				return
+			}
+
+			select {
+			case t.resultsCh <- res:
+			default:
+				// Ensure we don't block indefinitely; fall back to goroutine.
+				go func() {
+					t.resultsCh <- res
+				}()
+			}
+		},
+	)
+	if sched == nil {
+		return
+	}
+
+	sched.Start(ctx)
+
+	t.batchSchedulers[stepId] = sched
+}
+
+// notifyBatchedQueueItems is called once items are committed to the batched queue. It starts
+// schedulers for steps that have none, instead of leaving them for the 5s lease loop.
+func (t *tenantManager) notifyBatchedQueueItems(items []*sqlcv1.V1QueueItem) {
+	if len(items) == 0 {
+		return
+	}
+
+	stepIds := make([]uuid.UUID, 0, 1)
+
+	t.batchSchedulersMu.Lock()
+
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+
+		if sched, ok := t.batchSchedulers[item.StepID]; ok && sched != nil && sched.ctx != nil && sched.ctx.Err() == nil {
+			continue
+		}
+
+		// also dedupes steps within this call, since each one is marked pending as it's added
+		if _, ok := t.pendingBatchNotifies[item.StepID]; ok {
+			continue
+		}
+
+		stepIds = append(stepIds, item.StepID)
+		t.pendingBatchNotifies[item.StepID] = struct{}{}
+	}
+
+	t.batchSchedulersMu.Unlock()
+
+	if len(stepIds) == 0 {
+		return
+	}
+
+	go func() {
+		defer func() {
+			t.batchSchedulersMu.Lock()
+			for _, stepId := range stepIds {
+				delete(t.pendingBatchNotifies, stepId)
+			}
+			t.batchSchedulersMu.Unlock()
+		}()
+
+		if err := t.leaseManager.notifyNewBatchSteps(t.ctx, stepIds); err != nil {
+			t.l.Error().Err(err).Msg("error notifying new batch steps")
+		}
+	}()
+}
+
+// newWorkerWakeSpread is the window over which idle queuers are woken for a new worker.
+// Zero means they are woken together.
+func newWorkerWakeSpread(queuerCount int) time.Duration {
+	spread := time.Duration(queuerCount) * time.Second / newWorkerWakeRate
+
+	if spread < minNewWorkerWakeSpread {
+		return 0
+	}
+
+	return min(spread, maxNewWorkerWakeSpread)
+}
+
+// wakeQueuersForNewWorker wakes every queuer so it checks its queue against the new worker.
+// Queuers holding items they could not assign are woken now. The rest are spread at random
+// over newWorkerWakeSpread, because waking them together starts one database poll per queuer.
+func (t *tenantManager) wakeQueuersForNewWorker(ctx context.Context) {
+	t.queuersMu.RLock()
+	defer t.queuersMu.RUnlock()
+
+	spread := newWorkerWakeSpread(len(t.queuers))
+
+	for _, q := range t.queuers {
+		if spread == 0 || q.hasUnassigned() {
+			q.queue(ctx)
+			continue
+		}
+
+		q.queueAfter(ctx, rand.N(spread)) //nolint:gosec
+	}
+}
+
+// notifyQueuers wakes the queuers for the given queue names, so items that
+// missed capacity are retried as soon as the scheduler's pools have it rather
+// than on the queuers' next poll.
+func (t *tenantManager) notifyQueuers(ctx context.Context, queueNames []string) {
+	wanted := enumerables.ToSet(queueNames, func(queueName string) string { return queueName })
+
+	t.queuersMu.RLock()
+	defer t.queuersMu.RUnlock()
+
+	for _, q := range t.queuers {
+		if _, ok := wanted[q.queueName]; ok {
+			q.queue(ctx)
+		}
+	}
+}
+
+// wakes every queuer so runs held in memory are checked against the new limits right away
+func (t *tenantManager) notifyRateLimitsChanged(ctx context.Context) {
+	err := t.rl.refresh(ctx, time.Now().UTC())
+
+	if err != nil {
+		t.l.Error().Err(err).Msg("error refreshing rate limits")
+		return
+	}
+
+	t.queuersMu.RLock()
+	defer t.queuersMu.RUnlock()
+
+	for _, q := range t.queuers {
+		q.queue(ctx)
+	}
+}
+
+func (t *tenantManager) replenish(ctx context.Context) {
+	err := t.scheduler.replenish(ctx, false)
+
+	if err != nil {
+		t.l.Error().Err(err).Msg("error replenishing scheduler")
+	}
+}
+
+func (t *tenantManager) notifyConcurrency(ctx context.Context, strategyIds []int64) {
+	strategyIdsMap := make(map[int64]struct{}, len(strategyIds))
+	unmatchedIds := make(map[int64]struct{}, len(strategyIds))
+
+	for _, id := range strategyIds {
+		strategyIdsMap[id] = struct{}{}
+		unmatchedIds[id] = struct{}{}
+	}
+
+	t.concurrencyMu.RLock()
+
+	for _, c := range t.concurrencyStrategies {
+		if _, ok := strategyIdsMap[c.strategy.ID]; !ok {
+			continue
+		}
+
+		delete(unmatchedIds, c.strategy.ID)
+
+		c.notify(ctx)
+
+		childStrategyIds := make([]int64, 0)
+
+		// store the parent id for each strategy id
+		if c.strategy.ParentStrategyID.Valid {
+			parentId := c.strategy.ParentStrategyID.Int64
+
+			t.strategyIdsToParentIds.Add(c.strategy.ID, parentId)
+
+			var ok bool
+
+			childStrategyIds, ok = t.parentIdsToStrategyIds.Get(parentId)
+
+			// add the strategy id to the parent id
+			if ok {
+				// merge with existing map
+				found := false
+
+				for _, id := range childStrategyIds {
+					if id == c.strategy.ID {
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					childStrategyIds = append(childStrategyIds, c.strategy.ID)
+
+				}
+			} else {
+				childStrategyIds = []int64{c.strategy.ID}
+			}
+
+			t.parentIdsToStrategyIds.Add(parentId, childStrategyIds)
+		}
+
+		// notify the other child strategies
+		for _, childId := range childStrategyIds {
+			if childId != c.strategy.ID {
+				for _, c := range t.concurrencyStrategies {
+					if c.strategy.ID == childId {
+						c.notify(ctx)
+					}
+				}
+			}
+		}
+	}
+
+	t.concurrencyMu.RUnlock()
+
+	if len(unmatchedIds) > 0 {
+		leaseCtx := context.WithoutCancel(ctx)
+
+		for id := range unmatchedIds {
+			go t.notifyNewConcurrencyStrategy(leaseCtx, id)
+		}
+	}
+}
+
+func (t *tenantManager) notifyNewWorker(ctx context.Context, workerId uuid.UUID) {
+	err := t.leaseManager.notifyNewWorker(ctx, workerId)
+
+	if err != nil {
+		t.l.Error().Err(err).Msg("error notifying new worker")
+		return
+	}
+}
+
+func (t *tenantManager) removeWorker(ctx context.Context, workerId uuid.UUID) {
+	t.scheduler.removeWorker(workerId)
+	t.replenish(ctx)
+}
+
+func (t *tenantManager) notifyNewQueue(ctx context.Context, queueName string) {
+	t.l.Debug().Str("queue_name", queueName).Msg("notifying new queue")
+
+	err := t.leaseManager.notifyNewQueue(ctx, queueName)
+
+	if err != nil {
+		t.l.Error().Err(err).Msg("error notifying new queue")
+		return
+	}
+}
+
+func (t *tenantManager) notifyNewConcurrencyStrategy(ctx context.Context, strategyId int64) {
+	err := t.leaseManager.notifyNewConcurrencyStrategy(ctx, strategyId)
+
+	if err != nil {
+		t.l.Error().Err(err).Msg("error notifying new concurrency strategy")
+		return
+	}
+}
+
+func (t *tenantManager) queue(ctx context.Context, queueNames []string) {
+	t.queuersMu.RLock()
+	requested := enumerables.ToSet(queueNames, func(name string) string { return name })
+	for _, q := range t.queuers {
+		if _, ok := requested[q.queueName]; ok {
+			q.queue(ctx)
+			delete(requested, q.queueName)
+		}
+	}
+	t.queuersMu.RUnlock()
+
+	// this function sends to a channel that acquires the queuersMu, so needs to be outside lock.
+	for name := range requested {
+		t.notifyNewQueue(ctx, name)
+	}
+}
+
+func (t *tenantManager) runOptimisticScheduling(
+	ctx context.Context,
+	opts []*v1.WorkflowNameTriggerOpts,
+	localWorkerIds map[uuid.UUID]struct{},
+) (map[uuid.UUID][]*AssignedItemWithTask, []*v1.V1TaskWithPayload, []*v1.DAGWithData, []v1.IdempotencyCollision, error) {
+	// create a transaction
+	tx, err := t.cf.repo.Optimistic().StartTx(ctx, t.tenantId)
+
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	defer tx.Rollback()
+
+	// hook into the trigger transaction
+	qis, tasks, dags, collisions, err := t.cf.repo.Optimistic().TriggerFromNames(ctx, tx, t.tenantId, opts)
+
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	// read the queue items for the tasks we just created
+	// rewrite the queuer loop to not be asynchronous in batches, but instead run tryAssign
+	// and then immediately flush to the database
+
+	// split qis by their queue name
+	qisByQueueName := enumerables.GroupBy(qis, func(qi *sqlcv1.V1QueueItem) string { return qi.Queue })
+
+	var allLocalAssigned []*v1.AssignedItem
+	var allQueueResults []*QueueResults
+	var allBatched []*sqlcv1.V1QueueItem
+
+	for queueName, qis := range qisByQueueName {
+		t.queuersMu.RLock()
+
+		for _, q := range t.queuers {
+			if q.queueName == queueName {
+				localAssigned, queueResults, batched, err := q.runOptimisticQueue(ctx, tx, qis, localWorkerIds)
+
+				if err != nil {
+					t.queuersMu.RUnlock()
+					return nil, nil, nil, nil, err
+				}
+
+				allLocalAssigned = append(allLocalAssigned, localAssigned...)
+				allQueueResults = append(allQueueResults, queueResults...)
+				allBatched = append(allBatched, batched...)
+			}
+		}
+		t.queuersMu.RUnlock()
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	t.notifyBatchedQueueItems(allBatched)
+
+	for _, qr := range allQueueResults {
+		t.resultsCh <- qr
+	}
+
+	// map the tasks to the assigned items
+	taskUUIDToAssigned := enumerables.KeyBy(allLocalAssigned, func(ai *v1.AssignedItem) uuid.UUID { return ai.QueueItem.ExternalID })
+	taskUUIDToTask := enumerables.KeyBy(tasks, func(task *v1.V1TaskWithPayload) uuid.UUID { return task.ExternalID })
+
+	// return the assigned items with their tasks
+	res := make(map[uuid.UUID][]*AssignedItemWithTask)
+
+	for taskUUID, ai := range taskUUIDToAssigned {
+		task, ok := taskUUIDToTask[taskUUID]
+
+		if !ok {
+			continue
+		}
+
+		workerId := ai.WorkerId
+
+		res[workerId] = append(res[workerId], &AssignedItemWithTask{
+			AssignedItem: ai,
+			Task:         task,
+		})
+	}
+
+	return res, tasks, dags, collisions, nil
+}
+
+func (t *tenantManager) runOptimisticSchedulingFromEvents(
+	ctx context.Context,
+	opts []v1.EventTriggerOpts,
+	localWorkerIds map[uuid.UUID]struct{},
+) (map[uuid.UUID][]*AssignedItemWithTask, *v1.TriggerFromEventsResult, error) {
+	// create a transaction
+	tx, err := t.cf.repo.Optimistic().StartTx(ctx, t.tenantId)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer tx.Rollback()
+
+	// hook into the trigger transaction
+	qis, eventsRes, err := t.cf.repo.Optimistic().TriggerFromEvents(ctx, tx, t.tenantId, opts)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// read the queue items for the tasks we just created
+	// rewrite the queuer loop to not be asynchronous in batches, but instead run tryAssign
+	// and then immediately flush to the database
+
+	// split qis by their queue name
+	qisByQueueName := enumerables.GroupBy(qis, func(qi *sqlcv1.V1QueueItem) string { return qi.Queue })
+
+	var allLocalAssigned []*v1.AssignedItem
+	var allQueueResults []*QueueResults
+	var allBatched []*sqlcv1.V1QueueItem
+
+	for queueName, qis := range qisByQueueName {
+		t.queuersMu.RLock()
+
+		for _, q := range t.queuers {
+			if q.queueName == queueName {
+				localAssigned, queueResults, batched, err := q.runOptimisticQueue(ctx, tx, qis, localWorkerIds)
+
+				if err != nil {
+					t.queuersMu.RUnlock()
+					return nil, nil, err
+				}
+
+				allLocalAssigned = append(allLocalAssigned, localAssigned...)
+				allQueueResults = append(allQueueResults, queueResults...)
+				allBatched = append(allBatched, batched...)
+			}
+		}
+		t.queuersMu.RUnlock()
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	t.notifyBatchedQueueItems(allBatched)
+
+	for _, qr := range allQueueResults {
+		t.resultsCh <- qr
+	}
+
+	// map the tasks to the assigned items
+	taskUUIDToAssigned := enumerables.KeyBy(allLocalAssigned, func(ai *v1.AssignedItem) uuid.UUID { return ai.QueueItem.ExternalID })
+	taskUUIDToTask := enumerables.KeyBy(eventsRes.Tasks, func(task *v1.V1TaskWithPayload) uuid.UUID { return task.ExternalID })
+
+	// return the assigned items with their tasks
+	res := make(map[uuid.UUID][]*AssignedItemWithTask)
+
+	for taskUUID, ai := range taskUUIDToAssigned {
+		task, ok := taskUUIDToTask[taskUUID]
+
+		if !ok {
+			continue
+		}
+
+		workerId := ai.WorkerId
+
+		res[workerId] = append(res[workerId], &AssignedItemWithTask{
+			AssignedItem: ai,
+			Task:         task,
+		})
+	}
+
+	return res, eventsRes, nil
+}

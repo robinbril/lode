@@ -1,0 +1,167 @@
+import { samePerson } from "../directory/person.ts";
+import { loadsScopeContext } from "../resolution/context-filter.ts";
+import { conversationScope } from "../resolution/resolution-service.ts";
+import { createCoreSearch, type BackendSearchHit, type SearchBackend } from "../search/core-search.ts";
+import { createIntersectionBackend } from "../search/backends.ts";
+import { matchesSearchTerms, searchSnippet, searchTerms } from "../sessions/entry-search.ts";
+import type { Principal } from "../types.ts";
+import { conversationWebUrl } from "../util/conversation-links.ts";
+import { collectBytes } from "../util/bytes.ts";
+import { errMessage, swallowAs } from "../util/errors.ts";
+import type { App, AppDeps } from "./app-types.ts";
+import type { AppHelpers } from "./app-helpers.ts";
+import { ambientTenant } from "../tenants/context.ts";
+
+function conversationBackend(app: App, publicWebUrl: string | undefined): SearchBackend {
+  return createIntersectionBackend({
+    name: "conversations",
+    key: (hit) => hit.id,
+    searchForPrincipal: async (principal, { query, limit, botActor }) =>
+      (await app.searchSessions({ actorId: principal.id, botActor }, query, limit)).map((hit) => {
+        const url = conversationWebUrl(publicWebUrl, hit.sessionId);
+        return {
+          id: `${hit.sessionId}:${hit.seq}`,
+          type: "conversation" as const,
+          ...(hit.title ? { title: hit.title } : {}),
+          snippet: hit.snippet,
+          ...(url ? { url } : {}),
+          createdAt: hit.createdAt,
+          metadata: {
+            sessionId: hit.sessionId,
+            seq: hit.seq,
+            scopeId: hit.scopeId,
+            entryType: hit.entryType,
+            ...(hit.surface ? { surface: hit.surface } : {}),
+            ...(hit.channelName ? { channelName: hit.channelName } : {}),
+            ...(hit.author ? { author: hit.author } : {}),
+          },
+        };
+      }),
+  });
+}
+function searchableFile(mimetype: string, name: string): boolean {
+  return (
+    mimetype.startsWith("text/") ||
+    /(?:json|xml|yaml|csv|markdown)/i.test(mimetype) ||
+    /\.(?:txt|md|markdown|json|jsonl|csv|tsv|xml|ya?ml)$/i.test(name)
+  );
+}
+function fileBackend(deps: AppDeps, app: App, helpers: AppHelpers): SearchBackend {
+  return {
+    name: "files",
+    async search(request) {
+      const tenant = ambientTenant();
+      const libraries = await Promise.all(
+        request.principals.map(async (p) => {
+          const scopes = await helpers.currentResourceScopesForViewer(p.id, request.ownScopeBotWork === true);
+          const [owned, handles] = await Promise.all([
+            deps.files.listOwnedByScopes(scopes, { limit: 200 }),
+            deps.acl.handlesFor(tenant, scopes),
+          ]);
+          const shared = await deps.files.resolveByIds(
+            handles.map((h) => ({ ownerScopeId: h.ownerScopeId, id: h.fileId })),
+          );
+          return [
+            ...owned.files,
+            ...shared.filter((f) => !scopes.includes(f.ownerScopeId)).sort((a, b) => b.updatedAt - a.updatedAt),
+          ];
+        }),
+      );
+      const [first, ...rest] = libraries;
+      if (!first) return [];
+      const common = rest.map((files) => new Set(files.map((file) => file.id)));
+      const files = first.filter((file) => common.every((ids) => ids.has(file.id)));
+      const terms = searchTerms(request.query);
+      const hits: BackendSearchHit[] = [];
+      for (const file of files) {
+        let text = file.name;
+        if (searchableFile(file.mimetype, file.name)) {
+          const opened = await app.openFileForViewer(
+            tenant,
+            file.id,
+            request.principals[0]!.id,
+            request.ownScopeBotWork === true,
+          );
+          if (opened) {
+            const collected = await collectBytes(opened.stream, { maxBytes: 512 * 1024 }).catch(
+              swallowAs("app search: read file contents", null),
+            );
+            if (collected) text += `\n${collected.data.toString("utf8")}`;
+          }
+        }
+        if (!matchesSearchTerms(text, terms)) continue;
+        hits.push({
+          id: file.id,
+          type: "file",
+          title: file.name,
+          snippet: searchSnippet(text, terms),
+          createdAt: file.createdAt,
+          metadata: { ownerScopeId: file.ownerScopeId, sizeBytes: file.sizeBytes, direction: file.direction },
+        });
+        if (hits.length >= request.limit) break;
+      }
+      return hits;
+    },
+  };
+}
+function slackBackend(deps: AppDeps, app: App): SearchBackend | null {
+  if (!deps.surfaceCache) return null;
+  const canSee = async (principal: Principal, container: string, ownScopeBotWork: boolean): Promise<boolean> => {
+    const state = await deps.surfaceCache!.containerState(container);
+    if (!state) return false;
+    const home = conversationScope({ kind: state.kind ?? "channel", threadRef: container }, principal.id);
+    if (!loadsScopeContext(principal.id, home, ownScopeBotWork)) return false;
+    if (state.kind === "group") return deps.directory.groupMember(container, principal.id);
+    if (state.kind === "dm") {
+      const members = await deps.surfaceCache!.members(container);
+      return members.some((member) => samePerson(member, principal.id));
+    }
+    return app.channelVisibleTo(principal.id, container);
+  };
+  return {
+    name: "slack",
+    async search(request) {
+      const messages = await app.searchSurface(request.query, { limit: Math.min(100, request.limit * 4) });
+      const hits: BackendSearchHit[] = [];
+      for (const message of messages) {
+        const visible = await Promise.all(
+          request.principals.map((p) => canSee(p, message.container, request.ownScopeBotWork === true)),
+        );
+        if (!visible.every(Boolean)) continue;
+        hits.push({
+          id: `${message.container}:${message.ts}`,
+          type: "message",
+          snippet: message.text,
+          createdAt: message.createdAt,
+          metadata: {
+            container: message.container,
+            ts: message.ts,
+            ...(message.sub ? { threadTs: message.sub } : {}),
+            ...(message.authorId ? { authorId: message.authorId } : {}),
+            ...(message.authorName ? { authorName: message.authorName } : {}),
+          },
+        });
+        if (hits.length >= request.limit) break;
+      }
+      return hits;
+    },
+  };
+}
+export function createSearchMethods(
+  deps: AppDeps,
+  app: App,
+  helpers: AppHelpers,
+): Pick<App, "search" | "searchConversations"> {
+  const slack = slackBackend(deps, app);
+  const options = {
+    onBackendError: (backend: string, error: unknown) =>
+      console.error("%s", `[search] backend ${backend} failed:`, errMessage(error)),
+  };
+  const conversationsBackend = conversationBackend(app, deps.publicWebUrl);
+  const core = createCoreSearch(
+    [conversationsBackend, ...(slack ? [slack] : []), fileBackend(deps, app, helpers)],
+    options,
+  );
+  const conversations = createCoreSearch([conversationsBackend], options);
+  return { search: core.search, searchConversations: conversations.search };
+}

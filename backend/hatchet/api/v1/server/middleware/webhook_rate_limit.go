@@ -1,0 +1,74 @@
+package middleware
+
+import (
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/rs/zerolog"
+	"golang.org/x/time/rate"
+
+	"github.com/hatchet-dev/hatchet/api/v1/server/oas/apierrors"
+)
+
+// RetryAfter is the Retry-After value for a limiter refilling at limit tokens per second: whole
+// seconds until the next token, at least 1.
+func RetryAfter(limit rate.Limit) string {
+	if limit <= 0 {
+		return "1"
+	}
+
+	return strconv.Itoa(max(1, int(math.Ceil(1/float64(limit)))))
+}
+
+func WebhookRateLimitMiddleware(rateLimit rate.Limit, burst int, l *zerolog.Logger) echo.MiddlewareFunc {
+	config := middleware.RateLimiterConfig{
+		Skipper: func(c echo.Context) bool {
+			method := c.Request().Method
+
+			if method != http.MethodPost {
+				return true
+			}
+
+			tenantId := c.Param("tenant")
+			webhookName := c.Param("v1-webhook")
+
+			if tenantId == "" || webhookName == "" {
+				return true
+			}
+
+			return c.Request().URL.Path != fmt.Sprintf("/api/v1/stable/tenants/%s/webhooks/%s", tenantId, webhookName)
+		},
+
+		Store: middleware.NewRateLimiterMemoryStoreWithConfig(
+			middleware.RateLimiterMemoryStoreConfig{
+				Rate:      rateLimit,
+				Burst:     burst,
+				ExpiresIn: 10 * time.Minute,
+			},
+		),
+
+		IdentifierExtractor: func(c echo.Context) (string, error) {
+			tenantId := c.Param("tenant")
+			webhookName := c.Param("v1-webhook")
+
+			if tenantId == "" || webhookName == "" {
+				return c.RealIP(), nil
+			}
+
+			return fmt.Sprintf("%s-%s", tenantId, webhookName), nil
+		},
+
+		DenyHandler: func(c echo.Context, _ string, _ error) error {
+			c.Response().Header().Set(echo.HeaderRetryAfter, RetryAfter(rateLimit))
+
+			return c.JSON(http.StatusTooManyRequests, apierrors.NewAPIErrors("rate limit exceeded, retry shortly"))
+		},
+	}
+
+	return middleware.RateLimiterWithConfig(config)
+}

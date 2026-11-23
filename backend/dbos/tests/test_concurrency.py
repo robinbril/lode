@@ -1,0 +1,1184 @@
+import asyncio
+import threading
+import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Coroutine,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
+
+import pytest
+import sqlalchemy as sa
+from opentelemetry import trace
+from opentelemetry.trace.span import format_span_id
+
+# Public API
+from dbos import (
+    DBOS,
+    DBOSContextSetAuth,
+    PropagateOtelContext,
+    SetEnqueueOptions,
+    SetShardKey,
+    SetWorkflowAttributes,
+    SetWorkflowID,
+    SetWorkflowTimeout,
+    StepInfo,
+    WorkflowHandleAsync,
+)
+from dbos._context import OTEL_CARRIER_ATTRIBUTE
+from dbos._dbos_config import DBOSConfig
+from dbos._error import DBOSNonExistentWorkflowError, DBOSNotAuthorizedError
+from dbos._schemas.system_database import SystemSchema
+
+from .conftest import TestOtelType, set_workflow_status, using_sharding
+
+
+def test_concurrent_workflows(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def test_workflow() -> str:
+        time.sleep(1)
+        workflow_id = DBOS.workflow_id
+        assert workflow_id is not None
+        return workflow_id
+
+    def test_thread(id: str) -> str:
+        with SetWorkflowID(id):
+            return test_workflow()
+
+    num_threads = 10
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures: list[Tuple[str, Future[str]]] = []
+        for _ in range(num_threads):
+            id = str(uuid.uuid4())
+            futures.append((id, executor.submit(test_thread, id)))
+        for id, future in futures:
+            assert id == future.result()
+
+
+def test_concurrent_getevent(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def test_workflow(event_name: str, value: str) -> str:
+        DBOS.set_event(event_name, value)
+        return value
+
+    def test_thread(id: str, event_name: str) -> str:
+        return cast(str, DBOS.get_event(id, event_name, 5))
+
+    wfuuid = str(uuid.uuid4())
+    event_name = "test_event"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future1 = executor.submit(test_thread, wfuuid, event_name)
+        future2 = executor.submit(test_thread, wfuuid, event_name)
+
+        expected_message = "test message"
+        with SetWorkflowID(wfuuid):
+            test_workflow(event_name, expected_message)
+
+        # Both should return the same message (shared handle, NOT concurrent)
+        assert future1.result() == future2.result()
+        assert future1.result() == expected_message
+        # Make sure the event map is empty
+        assert not dbos._sys_db.workflow_events_map._dict
+
+
+# Async concurrency tests
+
+
+@dataclass(frozen=True)
+class Thing:
+    func: Callable[[], Coroutine[Any, Any, str]]
+    expected: str
+
+
+async def run_things_serial_or_conc(conc: bool, things: List[Thing]) -> None:
+    if conc:
+        # `asyncio.gather` without return_exceptions is harmful (like TS Promise.all or race)
+        #    return_exceptions, which will wait for all, capture exceptions as values, and is OK.
+        tasks: List[asyncio.Task[str]] = [asyncio.create_task(t.func()) for t in things]
+
+        results: List[Union[str, BaseException]] = await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
+        for i, (thing, result) in enumerate(zip(things, results)):
+            if isinstance(result, BaseException):
+                # Make failures loud
+                raise AssertionError(
+                    f"Thing[{i}] raised {type(result).__name__}: {result}"
+                ) from result
+            assert (
+                result == thing.expected
+            ), f"Thing[{i}] expected {thing.expected!r}, got {result!r}"
+
+    else:
+        for i, thing in enumerate(things):
+            result = await thing.func()
+            assert (
+                result == thing.expected
+            ), f"Thing[{i}] expected {thing.expected!r}, got {result!r}"
+
+
+def compare_wf_runs(
+    wfsteps_serial: List[StepInfo], wfsteps_concurrent: List[StepInfo]
+) -> None:
+    iconc = 0
+    i = 0
+    while i < len(wfsteps_serial):
+        s = wfsteps_serial[i]
+        c = wfsteps_concurrent[iconc]
+
+        print(
+            f"Output of {c['function_name']}@{c['function_id']}: {c['output']!r} "
+            f"vs. {s['function_name']}@{s['function_id']}: {s['output']!r}"
+        )
+
+        # Allow extra DBOS.sleep in concurrent run that may interleave
+        if c["function_id"] < s["function_id"] and c["function_name"] == "DBOS.sleep":
+            iconc += 1
+            continue
+
+        assert c["function_id"] == s["function_id"]
+        assert c["function_name"] == s["function_name"]
+        assert c["error"] == s["error"]
+
+        if c["function_name"] in {"DBOS.now", "DBOS.randomUUID", "DBOS.sleep"}:
+            # output may differ
+            pass
+        else:
+            assert c["output"] == s["output"]
+
+        i += 1
+        iconc += 1
+
+
+@pytest.mark.asyncio
+async def test_gather_manythings(dbos: DBOS, skip_with_sqlite: None) -> None:
+    # Register a database-backed queue up-front so the workflow can enqueue
+    # onto an already-existing queue.
+    db_queue_name = f"gather_db_queue_{uuid.uuid4()}"
+    await DBOS.register_queue_async(db_queue_name, polling_interval_sec=0.1)
+
+    @DBOS.workflow()
+    async def simple_wf() -> str:
+        return "WF Ran"
+
+    @DBOS.step()
+    async def simple_step() -> str:
+        return "Step Ran"
+
+    @DBOS.dbos_class()
+    class ConcurrTestClass:
+        cnt: ClassVar[int] = 0
+
+        @staticmethod
+        @DBOS.step()
+        async def test_read_write_function(id: int) -> int:
+            ConcurrTestClass.cnt += 1
+            return id
+
+        @staticmethod
+        @DBOS.step()
+        async def test_step(id: int) -> int:
+            ConcurrTestClass.cnt += 1
+            return id
+
+        @staticmethod
+        @DBOS.step()
+        async def test_step_str(id: str) -> str:
+            return id
+
+        @staticmethod
+        @DBOS.step(
+            retries_allowed=True, max_attempts=5, interval_seconds=0.01, backoff_rate=1
+        )
+        async def test_step_retry(id: str) -> str:
+            ss = DBOS.step_status
+            assert ss is not None
+            assert ss.current_attempt is not None
+            if ss.current_attempt <= 2:
+                raise Exception("Not yet")
+            return id
+
+        @staticmethod
+        @DBOS.workflow()
+        async def receive_workflow(topic: str, timeout: int) -> Any:
+            return await DBOS.recv_async(topic, timeout)
+
+    @DBOS.workflow()
+    async def run_a_lot_of_things_at_once(conc: bool) -> None:
+        async def t_sleep() -> str:
+            await DBOS.sleep_async(0.5)
+            return "slept"
+
+        async def t_run_step1() -> str:
+            return await DBOS.run_step_async({"name": "runStep1"}, lambda: "ranStep")
+
+        async def t_run_step2() -> str:
+            return await DBOS.run_step_async({"name": "runStep2"}, lambda: "ranStep")
+
+        async def t_run_step_retry() -> str:
+            def body() -> str:
+                ss = DBOS.step_status
+                assert ss is not None
+                assert ss.current_attempt is not None
+                if ss.current_attempt <= 2:
+                    raise Exception("Not yet")
+                return "ranStep"
+
+            return await DBOS.run_step_async(
+                {
+                    "name": "runStepRetry",
+                    "retries_allowed": True,
+                    "max_attempts": 5,
+                    "interval_seconds": 0.01,
+                    "backoff_rate": 1,
+                },
+                body,
+            )
+
+        async def t_function_calls_function() -> str:
+            return str(await ConcurrTestClass.test_read_write_function(2))
+
+        async def t_set_event() -> str:
+            await DBOS.set_event_async("eventkey", "eval")
+            return "set"
+
+        async def t_get_event() -> str:
+            wfid = DBOS.workflow_id
+            assert wfid is not None
+            v = await DBOS.get_event_async(wfid, "eventkey")
+            return v if v is not None else "Nope"
+
+        async def t_send_msg() -> str:
+            wfid = DBOS.workflow_id
+            assert wfid is not None
+            await DBOS.send_async(wfid, "msg", "topic")
+            return "sent"
+
+        async def t_step_str_3() -> str:
+            return await ConcurrTestClass.test_step_str("3")
+
+        async def t_recv_msg() -> str:
+            v = await DBOS.recv_async("topic")
+            return v if v is not None else "Nope"
+
+        async def t_get_workflow_status_nosuch() -> str:
+            st = await DBOS.get_workflow_status_async("nosuchwv")
+            return st.status if st is not None else "Nope"
+
+        async def t_retrieve_workflow_nosuch() -> str:
+            with pytest.raises(DBOSNonExistentWorkflowError):
+                await DBOS.retrieve_workflow_async("nosuchwv", existing_workflow=True)
+                return "Yep"
+            return "Nope"
+
+        async def t_liststeps() -> str:
+            steps = await DBOS.list_workflow_steps_async("nosuchwv")
+            return f"{len(steps)}"
+
+        async def t_listwfs() -> str:
+            wfs = await DBOS.list_workflows_async(workflow_id_prefix="aaaa")
+            return f"{len(wfs)}"
+
+        async def t_listqwfs() -> str:
+            wfs = await DBOS.list_queued_workflows_async(workflow_id_prefix="aaaa")
+            return f"{len(wfs)}"
+
+        async def t_step_retry_4() -> str:
+            return await ConcurrTestClass.test_step_retry("4")
+
+        async def t_start_child() -> str:
+            with SetWorkflowID(f"{DBOS.workflow_id}-cwf"):
+                await DBOS.start_workflow_async(simple_wf)
+            return "started"
+
+        async def t_get_child_result() -> str:
+            res = await DBOS.get_result_async(f"{DBOS.workflow_id}-cwf")
+            assert res is not None
+            return cast(str, res)
+
+        async def t_enqueue_child() -> str:
+            with SetWorkflowID(f"{DBOS.workflow_id}-eqcwf"):
+                await DBOS.enqueue_workflow_async(db_queue_name, simple_wf)
+            return "enqueued"
+
+        async def t_get_enqueued_child_result() -> str:
+            res = await DBOS.get_result_async(f"{DBOS.workflow_id}-eqcwf")
+            assert res is not None
+            return cast(str, res)
+
+        async def t_write_stream() -> str:
+            await DBOS.write_stream_async("stream", "val")
+            return "wrote"
+
+        async def t_read_stream() -> str:
+            wfid = DBOS.workflow_id
+            assert wfid is not None
+            ait = DBOS.read_stream_async(wfid, "stream")
+            item = await ait.__anext__()
+            return cast(str, item)
+
+        things: List[Thing] = [
+            Thing(func=t_sleep, expected="slept"),
+            Thing(func=t_run_step1, expected="ranStep"),
+            Thing(func=t_run_step2, expected="ranStep"),
+            Thing(func=t_listqwfs, expected="0"),
+            Thing(func=t_run_step_retry, expected="ranStep"),
+            Thing(func=t_function_calls_function, expected="2"),
+            Thing(func=t_set_event, expected="set"),
+            Thing(func=t_get_event, expected="eval"),
+            Thing(func=t_send_msg, expected="sent"),
+            Thing(func=t_step_str_3, expected="3"),
+            Thing(func=t_recv_msg, expected="msg"),
+            Thing(func=t_get_workflow_status_nosuch, expected="Nope"),
+            Thing(func=t_listwfs, expected="0"),
+            Thing(func=t_retrieve_workflow_nosuch, expected="Nope"),
+            Thing(func=t_step_retry_4, expected="4"),
+            Thing(func=simple_wf, expected="WF Ran"),
+            Thing(func=t_start_child, expected="started"),
+            Thing(func=t_get_child_result, expected="WF Ran"),
+            Thing(func=t_enqueue_child, expected="enqueued"),
+            Thing(func=t_get_enqueued_child_result, expected="WF Ran"),
+            Thing(func=simple_step, expected="Step Ran"),
+            Thing(func=t_write_stream, expected="wrote"),
+            Thing(func=t_read_stream, expected="val"),
+            Thing(func=t_liststeps, expected="0"),
+        ]
+
+        await run_things_serial_or_conc(conc, things)
+
+    wfid_serial = str(uuid.uuid4())
+    wfid_concurrent = str(uuid.uuid4())
+
+    with SetWorkflowID(wfid_serial):
+        await run_a_lot_of_things_at_once(conc=False)  # from earlier translation
+
+    with SetWorkflowID(wfid_concurrent):
+        await run_a_lot_of_things_at_once(conc=True)
+
+    wfsteps_serial = await DBOS.list_workflow_steps_async(wfid_serial)
+    wfsteps_concurrent = await DBOS.list_workflow_steps_async(wfid_concurrent)
+
+    assert wfsteps_serial is not None
+    assert wfsteps_concurrent is not None
+    compare_wf_runs(wfsteps_serial, wfsteps_concurrent)
+
+    await run_a_lot_of_things_at_once(conc=True)
+
+
+@pytest.mark.asyncio
+async def test_gather_manysteps(dbos: DBOS) -> None:
+    @DBOS.dbos_class()
+    class ConcurrTestClass:
+        @staticmethod
+        @DBOS.step()
+        async def test_step_str(id: str) -> str:
+            return id
+
+        @staticmethod
+        @DBOS.step(
+            retries_allowed=True, max_attempts=5, interval_seconds=0.01, backoff_rate=1
+        )
+        async def test_step_retry(id: str) -> str:
+            ss = DBOS.step_status
+            assert ss is not None
+            assert ss.current_attempt is not None
+            if ss.current_attempt <= 2:
+                raise Exception("Not yet")
+            return id
+
+    @DBOS.workflow()
+    async def run_a_lot_of_steps_at_once(conc: bool) -> None:
+        async def t_run_step1a() -> str:
+            return await DBOS.run_step_async({"name": "runStep1a"}, lambda: "ranStep")
+
+        async def _retry_body() -> str:
+            ss = DBOS.step_status
+            assert ss is not None
+            assert ss.current_attempt is not None
+            if ss.current_attempt <= 2:
+                raise Exception("Not yet")
+            return "ranStep"
+
+        async def t_run_step_retry1() -> str:
+            return await DBOS.run_step_async(
+                {
+                    "name": "runStepRetry1",
+                    "retries_allowed": True,
+                    "max_attempts": 5,
+                    "interval_seconds": 0.02,
+                    "backoff_rate": 1,
+                },
+                _retry_body,
+            )
+
+        async def t_run_step_retry2() -> str:
+            return await DBOS.run_step_async(
+                {
+                    "name": "runStepRetry2",
+                    "retries_allowed": True,
+                    "max_attempts": 5,
+                    "interval_seconds": 0.01,
+                    "backoff_rate": 1,
+                },
+                _retry_body,
+            )
+
+        async def t_run_step2() -> str:
+            return await DBOS.run_step_async({"name": "runStep2"}, lambda: "ranStep")
+
+        async def t_step_str_3() -> str:
+            return await ConcurrTestClass.test_step_str("3")
+
+        async def t_run_step_retry3() -> str:
+            return await DBOS.run_step_async(
+                {
+                    "name": "runStepRetry3",
+                    "retries_allowed": True,
+                    "max_attempts": 5,
+                    "interval_seconds": 0.03,
+                    "backoff_rate": 1,
+                },
+                _retry_body,
+            )
+
+        async def t_step_retry_4() -> str:
+            return await ConcurrTestClass.test_step_retry("4")
+
+        things: List[Thing] = [
+            Thing(func=t_run_step1a, expected="ranStep"),
+            Thing(func=t_run_step_retry1, expected="ranStep"),
+            Thing(func=t_run_step_retry2, expected="ranStep"),
+            Thing(func=t_run_step2, expected="ranStep"),
+            Thing(func=t_step_str_3, expected="3"),
+            Thing(func=t_run_step_retry3, expected="ranStep"),
+            Thing(func=t_step_retry_4, expected="4"),
+            # TODO: Add some sync steps?
+        ]
+
+        await run_things_serial_or_conc(conc, things)
+
+    wfid_serial = str(uuid.uuid4())
+    wfid_concurrent = str(uuid.uuid4())
+
+    with SetWorkflowID(wfid_serial):
+        await run_a_lot_of_steps_at_once(conc=False)
+
+    with SetWorkflowID(wfid_concurrent):
+        await run_a_lot_of_steps_at_once(conc=True)
+
+    wfsteps_serial = await DBOS.list_workflow_steps_async(wfid_serial)
+    wfsteps_concurrent = await DBOS.list_workflow_steps_async(wfid_concurrent)
+
+    assert wfsteps_serial is not None
+    assert wfsteps_concurrent is not None
+    compare_wf_runs(wfsteps_serial, wfsteps_concurrent)
+
+    fwf1 = await DBOS.fork_workflow_async(wfid_concurrent, 3)
+    await fwf1.get_result()
+
+    fwf2 = await DBOS.fork_workflow_async(wfid_concurrent, 5)
+    await fwf2.get_result()
+
+    fwf3 = await DBOS.fork_workflow_async(wfid_concurrent, 7)
+    await fwf3.get_result()
+
+
+@pytest.mark.asyncio
+async def test_gather_many_send_async(dbos: DBOS) -> None:
+    num_messages = 100
+
+    @DBOS.workflow()
+    async def run_many_sends(conc: bool) -> None:
+        things: List[Thing] = []
+
+        for i in range(num_messages):
+            topic = f"topic_{i}"
+            msg = f"msg_{i}"
+
+            async def t_send(t: str = topic, m: str = msg) -> str:
+                wfid = DBOS.workflow_id
+                assert wfid is not None
+                await DBOS.send_async(wfid, m, t)
+                return "sent"
+
+            things.append(Thing(func=t_send, expected="sent"))
+
+        await run_things_serial_or_conc(conc, things)
+
+        for i in range(num_messages):
+            v = await DBOS.recv_async(f"topic_{i}")
+            assert v == f"msg_{i}"
+
+    wfid_serial = str(uuid.uuid4())
+    wfid_concurrent = str(uuid.uuid4())
+
+    with SetWorkflowID(wfid_serial):
+        await run_many_sends(conc=False)
+
+    with SetWorkflowID(wfid_concurrent):
+        await run_many_sends(conc=True)
+
+    wfsteps_serial = await DBOS.list_workflow_steps_async(wfid_serial)
+    wfsteps_concurrent = await DBOS.list_workflow_steps_async(wfid_concurrent)
+
+    assert wfsteps_serial is not None
+    assert wfsteps_concurrent is not None
+    compare_wf_runs(wfsteps_serial, wfsteps_concurrent)
+
+
+@pytest.mark.asyncio
+async def test_gather_many_write_stream(dbos: DBOS) -> None:
+    num_writes = 100
+
+    @DBOS.workflow()
+    async def run_many_writes(conc: bool) -> None:
+        things: List[Thing] = []
+
+        for i in range(num_writes):
+            val = f"val_{i}"
+
+            async def t_write(v: str = val) -> str:
+                await DBOS.write_stream_async("stream", v)
+                return "wrote"
+
+            things.append(Thing(func=t_write, expected="wrote"))
+
+        await run_things_serial_or_conc(conc, things)
+
+    wfid_serial = str(uuid.uuid4())
+    wfid_concurrent = str(uuid.uuid4())
+
+    with SetWorkflowID(wfid_serial):
+        await run_many_writes(conc=False)
+
+    values_serial: List[str] = []
+    async for item in DBOS.read_stream_async(wfid_serial, "stream"):
+        values_serial.append(cast(str, item))
+    assert set(values_serial) == {f"val_{i}" for i in range(num_writes)}
+
+    with SetWorkflowID(wfid_concurrent):
+        await run_many_writes(conc=True)
+
+    values_concurrent: List[str] = []
+    async for item in DBOS.read_stream_async(wfid_concurrent, "stream"):
+        values_concurrent.append(cast(str, item))
+    assert set(values_concurrent) == {f"val_{i}" for i in range(num_writes)}
+
+    wfsteps_serial = await DBOS.list_workflow_steps_async(wfid_serial)
+    wfsteps_concurrent = await DBOS.list_workflow_steps_async(wfid_concurrent)
+
+    assert wfsteps_serial is not None
+    assert wfsteps_concurrent is not None
+    compare_wf_runs(wfsteps_serial, wfsteps_concurrent)
+
+
+@pytest.mark.asyncio
+async def test_gather_many_write_stream_from_step(dbos: DBOS) -> None:
+    num_writes = 100
+
+    @DBOS.step()
+    async def write_stream_step(val: str) -> str:
+        await DBOS.write_stream_async("stream", val)
+        return "wrote"
+
+    @DBOS.workflow()
+    async def run_many_writes(conc: bool) -> None:
+        things: List[Thing] = []
+
+        for i in range(num_writes):
+            val = f"val_{i}"
+
+            async def t_write(v: str = val) -> str:
+                return await write_stream_step(v)
+
+            things.append(Thing(func=t_write, expected="wrote"))
+
+        await run_things_serial_or_conc(conc, things)
+
+    wfid_serial = str(uuid.uuid4())
+    wfid_concurrent = str(uuid.uuid4())
+
+    with SetWorkflowID(wfid_serial):
+        await run_many_writes(conc=False)
+
+    values_serial: List[str] = []
+    async for item in DBOS.read_stream_async(wfid_serial, "stream"):
+        values_serial.append(cast(str, item))
+    assert set(values_serial) == {f"val_{i}" for i in range(num_writes)}
+
+    with SetWorkflowID(wfid_concurrent):
+        await run_many_writes(conc=True)
+
+    values_concurrent: List[str] = []
+    async for item in DBOS.read_stream_async(wfid_concurrent, "stream"):
+        values_concurrent.append(cast(str, item))
+    assert set(values_concurrent) == {f"val_{i}" for i in range(num_writes)}
+
+    wfsteps_serial = await DBOS.list_workflow_steps_async(wfid_serial)
+    wfsteps_concurrent = await DBOS.list_workflow_steps_async(wfid_concurrent)
+
+    assert wfsteps_serial is not None
+    assert wfsteps_concurrent is not None
+    compare_wf_runs(wfsteps_serial, wfsteps_concurrent)
+
+
+@pytest.mark.asyncio
+async def test_gather_many_set_event(dbos: DBOS) -> None:
+    num_events = 100
+
+    @DBOS.workflow()
+    async def run_many_set_events(conc: bool) -> None:
+        things: List[Thing] = []
+
+        for i in range(num_events):
+            key = f"event_{i}"
+            val = f"val_{i}"
+
+            async def t_set(k: str = key, v: str = val) -> str:
+                await DBOS.set_event_async(k, v)
+                return "set"
+
+            things.append(Thing(func=t_set, expected="set"))
+
+        await run_things_serial_or_conc(conc, things)
+
+    wfid_serial = str(uuid.uuid4())
+    wfid_concurrent = str(uuid.uuid4())
+
+    with SetWorkflowID(wfid_serial):
+        await run_many_set_events(conc=False)
+
+    for i in range(num_events):
+        v = await DBOS.get_event_async(wfid_serial, f"event_{i}")
+        assert v == f"val_{i}"
+
+    with SetWorkflowID(wfid_concurrent):
+        await run_many_set_events(conc=True)
+
+    for i in range(num_events):
+        v = await DBOS.get_event_async(wfid_concurrent, f"event_{i}")
+        assert v == f"val_{i}"
+
+    wfsteps_serial = await DBOS.list_workflow_steps_async(wfid_serial)
+    wfsteps_concurrent = await DBOS.list_workflow_steps_async(wfid_concurrent)
+
+    assert wfsteps_serial is not None
+    assert wfsteps_concurrent is not None
+    compare_wf_runs(wfsteps_serial, wfsteps_concurrent)
+
+
+@pytest.mark.asyncio
+async def test_high_async_concurrency(
+    dbos: DBOS, config: DBOSConfig, skip_with_sharding: None
+) -> None:
+    config["max_executor_threads"] = 32
+    DBOS.destroy(destroy_registry=True)
+    DBOS(config=config)
+    DBOS.launch()
+
+    peak_threads = 0
+
+    @DBOS.step()
+    async def sleep_step() -> None:
+        nonlocal peak_threads
+        peak_threads = max(peak_threads, threading.active_count())
+        await asyncio.sleep(5)
+
+    @DBOS.workflow()
+    async def sleep_workflow() -> None:
+        assert DBOS.workflow_id
+        nonlocal peak_threads
+        peak_threads = max(peak_threads, threading.active_count())
+        await DBOS.sleep_async(5)
+        message = await DBOS.recv_async(timeout_seconds=5)
+        assert message is None
+        value = await DBOS.get_event_async(DBOS.workflow_id, "key", timeout_seconds=5)
+        assert value is None
+
+    @DBOS.workflow()
+    async def concurrent_step_workflow() -> None:
+        await asyncio.gather(*[sleep_step() for _ in range(1000)])
+
+    @DBOS.workflow()
+    async def concurrent_wf_workflow() -> None:
+        handles = await asyncio.gather(
+            *[DBOS.start_workflow_async(sleep_workflow) for _ in range(1000)]
+        )
+        await asyncio.gather(*[h.get_result() for h in handles])
+
+    # Test concurrent steps
+    start_time = time.time()
+    await concurrent_step_workflow()
+    elapsed = time.time() - start_time
+    print(f"Steps elapsed: {elapsed}, peak threads: {peak_threads}")
+    assert (
+        config["max_executor_threads"]
+        and peak_threads < config["max_executor_threads"] + 10
+    )
+    assert elapsed < 30
+
+    # Test concurrent workflows
+    start_time = time.time()
+    await concurrent_wf_workflow()
+    elapsed = time.time() - start_time
+    print(f"Workflows elapsed: {elapsed}, peak threads: {peak_threads}")
+    assert (
+        config["max_executor_threads"]
+        and peak_threads < config["max_executor_threads"] + 10
+    )
+    # Floor is ~15s per workflow (sleep_async 5s + recv 5s + get_event 5s), run
+    # concurrently. 90s keeps the same 6x headroom as the steps assertion above,
+    # avoiding flakes from SQLite write contention under CI load.
+    assert elapsed < 90
+
+
+@pytest.mark.asyncio
+async def test_async_recovery_direct_child_no_thread_starvation(
+    dbos: DBOS, config: DBOSConfig, skip_with_sqlite: None
+) -> None:
+    # Recovering async parents that DIRECTLY invoke a child (not via
+    # start_workflow_async/enqueue) must not pin one thread-pool worker per
+    # waiting parent. Before the fix, each re-executing parent blocked a
+    # to_thread worker in the synchronous await_workflow_result while waiting for
+    # its already-recorded child; with more parents than pool threads this
+    # starved the shared executor so the children (also recovered) could never
+    # run, deadlocking recovery. The wait is now deferred onto the event loop.
+
+    # Bound the shared executor well below the parent count so per-parent
+    # blocking waits would exhaust it.
+    config["max_executor_threads"] = 4
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    async def child_wf(x: int) -> int:
+        # Depend on an executor slot so progress requires a free pool thread.
+        return await asyncio.to_thread(lambda: x * 2)
+
+    @DBOS.workflow()
+    async def parent_wf(x: int) -> int:
+        # Direct child invocation.
+        return await child_wf(x)
+
+    DBOS.launch()
+
+    num_parents = 12
+    parent_ids = [f"starve-parent-{i}" for i in range(num_parents)]
+    # Child ids are deterministic: "<parent_id>-1" (the parent's first call).
+    child_ids = [f"{pid}-1" for pid in parent_ids]
+
+    # Run each parent once so the parent->child relationship is recorded.
+    for i, pid in enumerate(parent_ids):
+        with SetWorkflowID(pid):
+            assert await parent_wf(i) == i * 2
+
+    # Reset both to PENDING, but reassign the children to a separate executor so
+    # recovery can run them in a SECOND pass. This forces every parent to be
+    # waiting on its (not-yet-running) child at once, which is exactly what
+    # exhausts the pool if each wait pins a thread.
+    for pid in parent_ids:
+        set_workflow_status(dbos._sys_db, pid, "PENDING")
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values(status="PENDING", executor_id="child-executor")
+            .where(SystemSchema.workflow_status.c.workflow_uuid.in_(child_ids))
+        )
+
+    # Pass 1: recover the parents. Each re-executes, finds its recorded child,
+    # and waits for it. With the old blocking wait, 12 parents pinning a pool of
+    # 4 threads deadlocks here (the recovery worker itself stalls dispatching);
+    # with the deferred wait they all park on the event loop and this returns.
+    # wait_for bounds a regression to a fast, localized failure instead of the
+    # opaque 120s global timeout.
+    await asyncio.wait_for(
+        asyncio.to_thread(DBOS._recover_pending_workflows, ["local"]), timeout=60
+    )
+
+    # Pass 2: recover the children (on their executor). They need pool threads to
+    # run — available only if the parents' waits did not pin them.
+    await asyncio.wait_for(
+        asyncio.to_thread(DBOS._recover_pending_workflows, ["child-executor"]),
+        timeout=60,
+    )
+
+    # Every parent must now finish. Bound each wait; the async polling handle
+    # waits on the loop, not a pool thread, so it cannot itself starve the pool.
+    async def parent_result(pid: str, expected: int) -> None:
+        handle: WorkflowHandleAsync[int] = await DBOS.retrieve_workflow_async(
+            pid, existing_workflow=False
+        )
+        assert await asyncio.wait_for(handle.get_result(), timeout=30) == expected
+
+    await asyncio.gather(
+        *[parent_result(pid, i * 2) for i, pid in enumerate(parent_ids)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_gather_distinct_steps_deterministic_order(dbos: DBOS) -> None:
+    # Regression test for https://github.com/dbos-inc/dbos-transact-py/issues/688
+    # asyncio.gather() of distinct @DBOS.step decorators must assign function IDs
+    # in the order the steps appear in the gather call, NOT in the order they
+    # happen to finish on the event loop. Otherwise a replay on another worker
+    # observes a different ordering and raises DBOSUnexpectedStepError.
+
+    @DBOS.step()
+    async def step_a(pn: str) -> str:
+        # Finishes last so completion order differs from gather order.
+        await asyncio.sleep(0.05)
+        return "a"
+
+    @DBOS.step()
+    async def step_b(pn: str) -> str:
+        # Finishes first.
+        await asyncio.sleep(0.001)
+        return "b"
+
+    @DBOS.step()
+    async def step_c(pn: str) -> str:
+        await asyncio.sleep(0.02)
+        return "c"
+
+    @DBOS.workflow()
+    async def my_workflow(pn: str) -> dict[str, str]:
+        a, b, c = await asyncio.gather(step_a(pn), step_b(pn), step_c(pn))
+        return {"a": a, "b": b, "c": c}
+
+    # Run many times: the function ID assigned to each step must be stable across
+    # executions even though the steps finish in a different (b, c, a) order.
+    for _ in range(25):
+        wfid = str(uuid.uuid4())
+        with SetWorkflowID(wfid):
+            assert await my_workflow("x") == {"a": "a", "b": "b", "c": "c"}
+
+        # Steps are returned ordered by function ID, so this asserts the IDs
+        # were assigned in gather order rather than completion order (b, c, a).
+        steps = await DBOS.list_workflow_steps_async(wfid)
+        names = [s["function_name"].rsplit(".", 1)[-1] for s in steps]
+        assert names == ["step_a", "step_b", "step_c"]
+
+
+# Sibling tasks of one workflow share its DBOSContext; their setter blocks must stay apart.
+
+
+@pytest.mark.asyncio
+async def test_enqueue_options_do_not_leak_across_tasks(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    async def child(i: int) -> int:
+        return i
+
+    @DBOS.workflow()
+    async def parent() -> str:
+        q = await DBOS.retrieve_queue_async("ctx_queue")
+        assert q is not None
+
+        async def one(i: int) -> None:
+            with SetEnqueueOptions(priority=i + 1):
+                await q.enqueue_async(child, i)
+                # Task 0 exits first, so exits run out of entry order.
+                await asyncio.sleep(0.05 * i)
+
+        await asyncio.gather(*(one(i) for i in range(3)))
+        return (await q.enqueue_async(child, 99)).workflow_id
+
+    await DBOS.register_queue_async("ctx_queue")
+    wfid = await (await DBOS.start_workflow_async(parent)).get_result()
+    status = await DBOS.get_workflow_status_async(wfid)
+    assert status is not None
+    assert not status.priority
+
+
+@pytest.mark.asyncio
+async def test_deduplication_id_does_not_leak_across_tasks(
+    dbos: DBOS, skip_with_sharding: None
+) -> None:
+    @DBOS.workflow()
+    async def child(i: int) -> int:
+        # Held until the parent reads its status: completion clears the dedup ID.
+        await DBOS.recv_async("release", 30)
+        return i
+
+    @DBOS.workflow()
+    async def parent() -> List[Optional[str]]:
+        q = await DBOS.retrieve_queue_async("ctx_queue")
+        assert q is not None
+
+        async def read_and_release(h: WorkflowHandleAsync[int]) -> Optional[str]:
+            status = await h.get_status()
+            await DBOS.send_async(h.workflow_id, None, "release")
+            return status.deduplication_id
+
+        async def one(i: int) -> Optional[str]:
+            with SetEnqueueOptions(deduplication_id=f"dedup-{i}"):
+                await asyncio.sleep(0.01 * (3 - i))
+                h = await q.enqueue_async(child, i)
+                await asyncio.sleep(0.05 * i)
+            return await read_and_release(h)
+
+        ids = list(await asyncio.gather(*(one(i) for i in range(3))))
+        last = await read_and_release(await q.enqueue_async(child, 99))
+        return ids + [last]
+
+    await DBOS.register_queue_async("ctx_queue")
+    ids = await (await DBOS.start_workflow_async(parent)).get_result()
+    assert ids == ["dedup-0", "dedup-1", "dedup-2", None]
+
+
+@pytest.mark.asyncio
+async def test_workflow_id_survives_await_inside_block(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    async def child(i: int) -> int:
+        return i
+
+    @DBOS.workflow()
+    async def parent() -> List[str]:
+        wfid = DBOS.workflow_id
+        assert wfid is not None
+
+        async def one(i: int) -> str:
+            with SetWorkflowID(f"{wfid}-wanted-{i}"):
+                # Every task's block is open before any of them starts its child.
+                await asyncio.sleep(0.01 * (3 - i))
+                return (await DBOS.start_workflow_async(child, i)).workflow_id
+
+        return list(await asyncio.gather(*(one(i) for i in range(3))))
+
+    handle = await DBOS.start_workflow_async(parent)
+    ids = await handle.get_result()
+    assert ids == [f"{handle.workflow_id}-wanted-{i}" for i in range(3)]
+
+
+@pytest.mark.asyncio
+async def test_unconsumed_workflow_id_does_not_leak(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    async def child() -> None:
+        pass
+
+    @DBOS.workflow()
+    async def parent() -> str:
+        with SetWorkflowID(f"unused-{uuid.uuid4()}"):
+            pass
+        return (await DBOS.start_workflow_async(child)).workflow_id
+
+    handle = await DBOS.start_workflow_async(parent)
+    child_id = await handle.get_result()
+    assert not child_id.startswith("unused-")
+
+
+@pytest.mark.asyncio
+async def test_timeout_and_attributes_do_not_leak_across_tasks(
+    dbos: DBOS, setup_in_memory_otlp_collector: TestOtelType
+) -> None:
+    tracer = trace.get_tracer_provider().get_tracer("dbos")
+    span_ids: Dict[int, str] = {}
+
+    @DBOS.workflow()
+    async def child(i: int) -> int:
+        return i
+
+    @DBOS.workflow()
+    async def parent() -> List[str]:
+        async def one(i: int) -> str:
+            # A span per task, so PropagateOtelContext has a carrier to leak.
+            with tracer.start_as_current_span(
+                f"task-{i}"
+            ) as span:  # pyright: ignore[reportAttributeAccessIssue]
+                span_ids[i] = format_span_id(span.get_span_context().span_id)
+                with (
+                    SetWorkflowTimeout(100 + i),
+                    SetWorkflowAttributes({"task": i}),
+                    PropagateOtelContext(),
+                ):
+                    h = await DBOS.start_workflow_async(child, i)
+                    await asyncio.sleep(0.05 * i)
+            return h.workflow_id
+
+        ids = list(await asyncio.gather(*(one(i) for i in range(3))))
+        return ids + [(await DBOS.start_workflow_async(child, 99)).workflow_id]
+
+    wfids = await (await DBOS.start_workflow_async(parent)).get_result()
+    for i, wfid in enumerate(wfids[:3]):
+        status = await DBOS.get_workflow_status_async(wfid)
+        assert status is not None
+        assert status.workflow_timeout_ms == (100 + i) * 1000
+        assert status.attributes is not None
+        assert status.attributes["task"] == i
+        assert span_ids[i] in status.attributes[OTEL_CARRIER_ATTRIBUTE]["traceparent"]
+    status = await DBOS.get_workflow_status_async(wfids[3])
+    assert status is not None
+    assert status.workflow_timeout_ms is None
+    assert status.workflow_deadline_epoch_ms is None
+    assert not status.attributes
+
+
+@pytest.mark.asyncio
+async def test_tasks_inherit_options_set_before_spawning(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    async def child(i: int) -> int:
+        return i
+
+    @DBOS.workflow()
+    async def parent() -> List[Any]:
+        q = await DBOS.retrieve_queue_async("ctx_queue")
+        assert q is not None
+
+        async def one(i: int) -> Any:
+            h = await q.enqueue_async(child, i)
+            return (await h.get_status()).priority
+
+        with SetEnqueueOptions(priority=7):
+            inner = list(await asyncio.gather(*(one(i) for i in range(3))))
+            with SetEnqueueOptions(priority=3):
+                nested = (
+                    await (await q.enqueue_async(child, 98)).get_status()
+                ).priority
+            outer = (await (await q.enqueue_async(child, 99)).get_status()).priority
+        return inner + [nested, outer]
+
+    await DBOS.register_queue_async("ctx_queue")
+    priorities = await (await DBOS.start_workflow_async(parent)).get_result()
+    assert priorities == [7, 7, 7, 3, 7]
+
+
+@pytest.mark.asyncio
+async def test_shard_key_does_not_leak_across_tasks(dbos: DBOS) -> None:
+    if not using_sharding():
+        pytest.skip("Shard keys need a sharded system database")
+
+    @DBOS.workflow()
+    async def child(i: int) -> int:
+        return i
+
+    @DBOS.workflow()
+    async def parent() -> List[Optional[str]]:
+        q = await DBOS.retrieve_queue_async("ctx_queue")
+        assert q is not None
+
+        # Only an enqueued child may run under a key other than its parent's.
+        async def one(i: int) -> Optional[str]:
+            with SetShardKey(f"task-{i}"):
+                await asyncio.sleep(0.01 * (3 - i))
+                h = await q.enqueue_async(child, i)
+                await asyncio.sleep(0.05 * i)
+            return (await h.get_status()).shard_key
+
+        keys = list(await asyncio.gather(*(one(i) for i in range(3))))
+        last = await (await q.enqueue_async(child, 99)).get_status()
+        return keys + [last.shard_key]
+
+    await DBOS.register_queue_async("ctx_queue")
+    handle = await DBOS.start_workflow_async(parent)
+    keys = await handle.get_result()
+    parent_status = await handle.get_status()
+    assert keys == ["task-0", "task-1", "task-2", parent_status.shard_key]
+
+
+@pytest.mark.asyncio
+async def test_dequeued_workflow_does_not_see_dequeue_options(dbos: DBOS) -> None:
+    # Async, so the body's task copies the queue thread's context and its dequeue blocks.
+    @DBOS.workflow()
+    async def child() -> None:
+        pass
+
+    @DBOS.workflow()
+    async def parent() -> str:
+        # A partition key leaking from the dequeue into the body would reject this start.
+        return (await DBOS.start_workflow_async(child)).workflow_id
+
+    q = await DBOS.register_queue_async("ctx_partitioned", partition_concurrency=1)
+    with SetEnqueueOptions(queue_partition_key="p"):
+        handle = await q.enqueue_async(parent)
+    child_id = await handle.get_result()
+    # A leaked SetWorkflowID would hand the child its parent's ID.
+    assert child_id != handle.workflow_id
+    child_status = await DBOS.get_workflow_status_async(child_id)
+    assert child_status is not None
+    assert child_status.queue_partition_key is None
+
+
+@pytest.mark.asyncio
+async def test_authentication_does_not_leak_across_tasks(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    async def child() -> Optional[str]:
+        return DBOS.authenticated_user
+
+    @DBOS.workflow()
+    async def parent() -> List[Optional[str]]:
+        async def one(user: str) -> Optional[str]:
+            with DBOSContextSetAuth(user, [user]):
+                r = await child()
+                # admin exits first, so exits run out of entry order.
+                await asyncio.sleep(0.01 if user == "admin" else 0.1)
+                return r
+
+        users = list(await asyncio.gather(one("admin"), one("guest")))
+        return users + [await child(), DBOS.authenticated_user]
+
+    users = await (await DBOS.start_workflow_async(parent)).get_result()
+    assert users == ["admin", "guest", None, None]
+
+
+@pytest.mark.asyncio
+async def test_roles_are_not_shared_across_tasks(dbos: DBOS) -> None:
+    @DBOS.required_roles(["admin"])
+    @DBOS.step()
+    async def admin_only() -> str:
+        return "ok"
+
+    @DBOS.workflow()
+    async def parent() -> str:
+        async def guest() -> str:
+            with DBOSContextSetAuth("guest", ["guest"]):
+                # The sibling's admin block opens before this call.
+                await asyncio.sleep(0.05)
+                try:
+                    return await admin_only()
+                except DBOSNotAuthorizedError:
+                    return "denied"
+
+        async def admin() -> None:
+            with DBOSContextSetAuth("admin", ["admin"]):
+                await asyncio.sleep(0.1)
+
+        result, _ = await asyncio.gather(guest(), admin())
+        return result
+
+    assert await (await DBOS.start_workflow_async(parent)).get_result() == "denied"
+
+
+@pytest.mark.asyncio
+async def test_set_authentication_applies_to_whole_workflow(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    async def parent() -> List[Optional[str]]:
+        reader_started = asyncio.Event()
+        identity_set = asyncio.Event()
+
+        async def setter() -> None:
+            await reader_started.wait()
+            DBOS.set_authentication("alice", ["admin"])
+            identity_set.set()
+
+        async def reader() -> Optional[str]:
+            # Already running when its sibling sets the identity.
+            reader_started.set()
+            await identity_set.wait()
+            return DBOS.authenticated_user
+
+        _, seen = await asyncio.gather(setter(), reader())
+        return [seen, DBOS.authenticated_user]
+
+    users = await (await DBOS.start_workflow_async(parent)).get_result()
+    assert users == ["alice", "alice"]

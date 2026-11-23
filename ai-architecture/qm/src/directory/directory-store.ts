@@ -1,0 +1,130 @@
+import type { Tenant } from "../tenants/context.ts";
+import type { PrincipalType } from "../types.ts";
+
+export interface DirectoryMember {
+  principalId: string;
+  displayName: string;
+  type: PrincipalType;
+  slackId?: string;
+  avatarUrl?: string;
+  isBot?: boolean;
+}
+
+export interface DirectoryChannel {
+  channelId: string;
+  name: string;
+  isPrivate?: boolean;
+  isExternal?: boolean;
+}
+
+export interface ScopeMembershipFacts {
+  member: boolean;
+  membership: boolean | undefined;
+}
+
+export interface ChannelMembershipFacts extends ScopeMembershipFacts {
+  isPrivate: boolean | undefined;
+}
+
+export interface ChannelMembership {
+  channelId: string;
+  principalId: string;
+}
+
+export interface GroupMembership {
+  groupId: string;
+  principalId: string;
+}
+
+export type GroupResolution = { kind: "one"; groupId: string } | { kind: "none" };
+
+export function groupParticipantsKey(participants: readonly string[]): string {
+  return [...new Set(participants.filter((p) => p))].sort().join(",");
+}
+
+interface SignInTenant {
+  id: string;
+  brandName?: string;
+  handle?: string;
+}
+
+export interface DirectoryMeta {
+  workspaceUrl: string | null;
+  appIconUrl: string | null;
+}
+
+export type RecipientResolution =
+  { kind: "one"; member: DirectoryMember } | { kind: "ambiguous"; candidates: DirectoryMember[] } | { kind: "none" };
+
+export type ChannelResolution =
+  { kind: "one"; channel: DirectoryChannel } | { kind: "ambiguous"; candidates: DirectoryChannel[] } | { kind: "none" };
+
+export interface DirectoryStore {
+  replace(members: DirectoryMember[], syncedAt?: number): Promise<boolean>;
+  replaceChannels(
+    channels: DirectoryChannel[],
+    channelMembers?: ChannelMembership[],
+    syncedAt?: number,
+    channelRosterIds?: string[],
+    revocations?: ChannelMembership[],
+    partial?: boolean,
+  ): Promise<boolean>;
+  list(): Promise<DirectoryMember[]>;
+  teammateName(tenant: Tenant, principalId: string): Promise<string | null>;
+  listChannels(): Promise<DirectoryChannel[]>;
+  getMany(principalIds: readonly string[]): Promise<Map<string, DirectoryMember>>;
+  get(principalId: string): Promise<DirectoryMember | null>;
+  getBySlackId(slackId: string): Promise<DirectoryMember | null>;
+  resolve(query: string): Promise<RecipientResolution>;
+  resolveChannel(query: string): Promise<ChannelResolution>;
+  channelMember(channelId: string, principalId: string): Promise<boolean>;
+  channelMembership(channelId: string, principalId: string): Promise<boolean | undefined>;
+  channelMemberships(channelIds: readonly string[], principalId: string): Promise<Map<string, ChannelMembershipFacts>>;
+  channelMemberIds(channelId: string): Promise<string[] | undefined>;
+  channelPrivacy(channelId: string): Promise<boolean | undefined>;
+  rosterCoversAudience(channelId: string): Promise<boolean | undefined>;
+  replaceGroups(
+    groupMembers: GroupMembership[],
+    syncedAt?: number,
+    groupIds?: string[],
+    groupRosterIds?: string[],
+  ): Promise<boolean>;
+  upsertGroup(groupId: string, principalIds: readonly string[], surface: string): Promise<void>;
+  resolveGroupByParticipants(participants: readonly string[], surface: string): Promise<GroupResolution>;
+  groupMember(groupId: string, principalId: string): Promise<boolean>;
+  groupMembership(groupId: string, principalId: string): Promise<boolean | undefined>;
+  groupMemberships(groupIds: readonly string[], principalId: string): Promise<Map<string, ScopeMembershipFacts>>;
+  listGroupsFor(principalId: string): Promise<string[]>;
+  conversationMembers(kind: "channel" | "group", id: string): Promise<DirectoryMember[] | undefined>;
+  groupRosters(groupIds: readonly string[]): Promise<Map<string, DirectoryMember[]>>;
+  listChannelsFor(principalId: string): Promise<DirectoryChannel[]>;
+  setWorkspace(meta: DirectoryMeta): Promise<void>;
+  meta(): Promise<DirectoryMeta>;
+  tenantsForEmail?(email: string): Promise<SignInTenant[]>;
+  tenantsForPrincipal?(principal: string): Promise<SignInTenant[]>;
+  setAppHandle?(handle: string): Promise<"ok" | "taken" | "app_taken">;
+  tenantForAppHost?(label: string): Promise<string | undefined>;
+}
+
+export const MAX_CANDIDATES = 10;
+export const normDirectoryQuery = (s: string): string => s.trim().toLowerCase().replace(/^[@#]/, "");
+
+export function pickMatch<T>(
+  items: T[],
+  query: string,
+  id: (t: T) => string,
+  label: (t: T) => string,
+): { kind: "one"; item: T } | { kind: "ambiguous"; items: T[] } | { kind: "none" } {
+  const q = normDirectoryQuery(query);
+  if (!q) return { kind: "none" };
+  const byId = items.find((t) => id(t).toLowerCase() === q);
+  if (byId) return { kind: "one", item: byId };
+  const exact = items.filter((t) => normDirectoryQuery(label(t)) === q);
+  if (exact.length === 1) return { kind: "one", item: exact[0]! };
+  if (exact.length > 1) return { kind: "ambiguous", items: exact.slice(0, MAX_CANDIDATES) };
+  const prefix = items.filter((t) => normDirectoryQuery(label(t)).startsWith(q));
+  const pool = prefix.length ? prefix : items.filter((t) => normDirectoryQuery(label(t)).includes(q));
+  if (pool.length === 0) return { kind: "none" };
+  if (pool.length === 1) return { kind: "one", item: pool[0]! };
+  return { kind: "ambiguous", items: pool.slice(0, MAX_CANDIDATES) };
+}

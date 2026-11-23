@@ -1,0 +1,50 @@
+import { readFileSync } from "node:fs";
+import { isExecutedAsMain } from "./lib/main.mjs";
+
+export const API_REFERENCE_INPUTS = [
+  "packages/react",
+  "packages/core",
+  "packages/store",
+  "packages/tap",
+  "packages/cloud",
+  "packages/assistant-stream",
+  "packages/generative-ui",
+  "packages/ai-sdk",
+  "packages/react-ai-sdk",
+  "packages/react-data-stream",
+  "packages/eve",
+  "packages/safe-content-frame",
+  "apps/docs/scripts",
+  "apps/docs/content/types-to-generate",
+  "apps/docs/content/docs/(reference)/api-reference",
+  "apps/docs/package.json",
+  "apps/docs/tsconfig.json",
+  "scripts/api-reference-inputs.mjs",
+  "scripts/lib/experimental-annotations.mjs",
+  ".github/workflows/autofix.yaml",
+  ".github/workflows/code-quality.yaml",
+];
+
+const touches = (file, input) => file === input || file.startsWith(`${input}/`);
+
+const isPackageTestSource = (file) =>
+  /^packages\/[^/]+\/.*\.tsx?$/.test(file) &&
+  (/\.(?:test|spec|bench)\.tsx?$/.test(file) ||
+    /\/(?:tests|__tests__)\//.test(file) ||
+    /\/testUtils\.tsx?$/.test(file));
+
+export function hasApiReferenceInputs(changedFiles) {
+  return changedFiles.some(
+    (file) =>
+      !/^packages\/[^/]+\/README\.md$/.test(file) &&
+      !isPackageTestSource(file) &&
+      API_REFERENCE_INPUTS.some((input) => touches(file, input)),
+  );
+}
+
+if (isExecutedAsMain(import.meta.url, process.argv[1])) {
+  const changedFiles = readFileSync(0, "utf8")
+    .split("\0")
+    .filter((file) => file !== "");
+  process.stdout.write(`${hasApiReferenceInputs(changedFiles)}\n`);
+}

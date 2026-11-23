@@ -1,0 +1,917 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CloudMessagePersistence } from "../CloudMessagePersistence";
+import type { AssistantCloud } from "../AssistantCloud";
+import { CloudAPIError } from "../AssistantCloudAPI";
+
+function createMockCloud() {
+  return {
+    threads: {
+      messages: {
+        create: vi.fn(),
+        list: vi.fn(),
+        update: vi.fn(),
+        delete: vi.fn().mockResolvedValue(undefined),
+      },
+    },
+  } as unknown as AssistantCloud;
+}
+
+function createCloudMessages(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `message-${index + 1}`,
+    parent_id: null,
+    height: index,
+    created_at: "2025-01-01T00:00:00Z" as unknown as Date,
+    updated_at: "2025-01-01T00:00:00Z" as unknown as Date,
+    format: "aui/v0",
+    content: {},
+  }));
+}
+
+describe("CloudMessagePersistence", () => {
+  let cloud: AssistantCloud;
+  let persistence: CloudMessagePersistence;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    cloud = createMockCloud();
+    persistence = new CloudMessagePersistence(cloud);
+  });
+
+  it("waits for a pending append before deleting its remote ID", async () => {
+    let resolveAppend!: (value: { message_id: string }) => void;
+    vi.mocked(cloud.threads.messages.create).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAppend = resolve;
+        }),
+    );
+    const append = persistence.append(
+      "thread-1",
+      "local-1",
+      null,
+      "aui/v0",
+      {},
+    );
+    const deletion = persistence.delete("thread-1", ["local-1"]);
+    expect(cloud.threads.messages.delete).not.toHaveBeenCalled();
+
+    resolveAppend({ message_id: "msg_1" });
+    await append;
+    await deletion;
+    expect(cloud.threads.messages.delete).toHaveBeenCalledWith("thread-1", [
+      "msg_1",
+    ]);
+    expect(persistence.isPersisted("local-1")).toBe(false);
+  });
+
+  it("skips unmapped IDs and failed appends without a delete request", async () => {
+    await persistence.delete("thread-1", ["missing"]);
+    let rejectAppend!: (error: Error) => void;
+    vi.mocked(cloud.threads.messages.create).mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectAppend = reject;
+        }),
+    );
+    const append = persistence.append(
+      "thread-1",
+      "local-1",
+      null,
+      "aui/v0",
+      {},
+    );
+    const rejected = expect(append).rejects.toThrow("append failed");
+    const deletion = persistence.delete("thread-1", ["local-1"]);
+    rejectAppend(new Error("append failed"));
+    await rejected;
+    await deletion;
+    expect(cloud.threads.messages.delete).not.toHaveBeenCalled();
+
+    vi.mocked(cloud.threads.messages.create).mockResolvedValueOnce({
+      message_id: "msg_child",
+    });
+    await persistence.append("thread-1", "child", "local-1", "aui/v0", {});
+    expect(cloud.threads.messages.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("creates a failed parent again before its child and grandchild", async () => {
+    vi.mocked(cloud.threads.messages.create)
+      .mockRejectedValueOnce(new Error("parent create failed"))
+      .mockResolvedValueOnce({ message_id: "msg_parent" })
+      .mockResolvedValueOnce({ message_id: "msg_child" })
+      .mockResolvedValueOnce({ message_id: "msg_grandchild" });
+
+    await expect(
+      persistence.append("thread-1", "parent", null, "aui/v0", { n: 0 }),
+    ).rejects.toThrow("parent create failed");
+    await persistence.append("thread-1", "child", "parent", "aui/v0", {
+      n: 1,
+    });
+    await persistence.append("thread-1", "grandchild", "child", "aui/v0", {
+      n: 2,
+    });
+
+    expect(
+      vi
+        .mocked(cloud.threads.messages.create)
+        .mock.calls.map(([, body]) => [body.parent_id, body.content]),
+    ).toEqual([
+      [null, { n: 0 }],
+      [null, { n: 0 }],
+      ["msg_parent", { n: 1 }],
+      ["msg_child", { n: 2 }],
+    ]);
+  });
+
+  it("creates a parent again when its create fails while the child waits", async () => {
+    let rejectParent!: (error: Error) => void;
+    vi.mocked(cloud.threads.messages.create)
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectParent = reject;
+          }),
+      )
+      .mockResolvedValueOnce({ message_id: "msg_parent" })
+      .mockResolvedValueOnce({ message_id: "msg_child" });
+
+    const parent = persistence.append("thread-1", "parent", null, "aui/v0", {});
+    const child = persistence.append(
+      "thread-1",
+      "child",
+      "parent",
+      "aui/v0",
+      {},
+    );
+    rejectParent(new Error("parent create failed"));
+
+    await expect(parent).rejects.toThrow("parent create failed");
+    await child;
+    expect(
+      vi.mocked(cloud.threads.messages.create).mock.calls[2]![1].parent_id,
+    ).toBe("msg_parent");
+  });
+
+  it("stores a child as a root when its parent still cannot be created", async () => {
+    vi.mocked(cloud.threads.messages.create)
+      .mockRejectedValueOnce(new Error("content too large"))
+      .mockRejectedValueOnce(new Error("content too large"))
+      .mockResolvedValueOnce({ message_id: "msg_child" })
+      .mockResolvedValueOnce({ message_id: "msg_grandchild" });
+
+    await expect(
+      persistence.append("thread-1", "parent", null, "aui/v0", {}),
+    ).rejects.toThrow("content too large");
+    await persistence.append("thread-1", "child", "parent", "aui/v0", {});
+    await persistence.append("thread-1", "grandchild", "child", "aui/v0", {});
+
+    expect(
+      vi
+        .mocked(cloud.threads.messages.create)
+        .mock.calls.map(([, body]) => body.parent_id),
+    ).toEqual([null, null, null, "msg_child"]);
+    expect(persistence.getResolvedRemoteId("grandchild")).toBe(
+      "msg_grandchild",
+    );
+  });
+
+  it("repeats a failed parent's create under the same external id", async () => {
+    vi.mocked(cloud.threads.messages.create)
+      .mockRejectedValueOnce(new Error("response lost"))
+      .mockResolvedValueOnce({ message_id: "msg_parent" })
+      .mockResolvedValueOnce({ message_id: "msg_child" });
+
+    await expect(
+      persistence.append("thread-1", "parent", null, "aui/v0", {}),
+    ).rejects.toThrow("response lost");
+    await persistence.append("thread-1", "child", "parent", "aui/v0", {});
+
+    expect(
+      vi
+        .mocked(cloud.threads.messages.create)
+        .mock.calls.map(([, body]) => body.external_id),
+    ).toEqual(["parent", "parent", "child"]);
+  });
+
+  it("omits an external id longer than the API accepts", async () => {
+    const longId = "m".repeat(256);
+    vi.mocked(cloud.threads.messages.create).mockResolvedValueOnce({
+      message_id: "msg_long",
+    });
+
+    await persistence.append("thread-1", longId, null, "aui/v0", {});
+
+    expect(
+      vi.mocked(cloud.threads.messages.create).mock.calls[0]![1],
+    ).not.toHaveProperty("external_id");
+    expect(persistence.getResolvedRemoteId(longId)).toBe("msg_long");
+  });
+
+  it("does not create a deleted failed parent again", async () => {
+    vi.mocked(cloud.threads.messages.create)
+      .mockRejectedValueOnce(new Error("parent create failed"))
+      .mockResolvedValueOnce({ message_id: "msg_child" });
+
+    await expect(
+      persistence.append("thread-1", "parent", null, "aui/v0", {}),
+    ).rejects.toThrow("parent create failed");
+    await persistence.delete("thread-1", ["parent"]);
+    await persistence.append("thread-1", "child", "parent", "aui/v0", {});
+
+    expect(cloud.threads.messages.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a replacement mapping made during deletion", async () => {
+    persistence.record("local-1", "msg_1");
+    let resolveDelete!: () => void;
+    vi.mocked(cloud.threads.messages.delete).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveDelete = resolve;
+        }),
+    );
+    const deletion = persistence.delete("thread-1", ["local-1"]);
+    await vi.waitFor(() =>
+      expect(cloud.threads.messages.delete).toHaveBeenCalledOnce(),
+    );
+    persistence.record("local-1", "msg_2");
+    resolveDelete();
+    await deletion;
+    expect(await persistence.getRemoteId("local-1")).toBe("msg_2");
+  });
+
+  it("treats a 404 as already deleted and clears the mapping", async () => {
+    persistence.record("local-1", "msg_1");
+    vi.mocked(cloud.threads.messages.delete).mockRejectedValueOnce(
+      new CloudAPIError("Messages not found", 404),
+    );
+    await persistence.delete("thread-1", ["local-1"]);
+    expect(persistence.isPersisted("local-1")).toBe(false);
+  });
+
+  it("propagates a server error and retains the mapping", async () => {
+    persistence.record("local-1", "msg_1");
+    const failure = new CloudAPIError("failed", 500);
+    vi.mocked(cloud.threads.messages.delete).mockRejectedValueOnce(failure);
+    await expect(persistence.delete("thread-1", ["local-1"])).rejects.toBe(
+      failure,
+    );
+    expect(persistence.isPersisted("local-1")).toBe(true);
+  });
+
+  it("appends a message and maps local ID to remote ID", async () => {
+    vi.mocked(cloud.threads.messages.create).mockResolvedValue({
+      message_id: "remote-1",
+    });
+
+    await persistence.append("thread-1", "local-1", null, "aui/v0", {
+      text: "hello",
+    });
+
+    expect(persistence.isPersisted("local-1")).toBe(true);
+    expect(await persistence.getRemoteId("local-1")).toBe("remote-1");
+    expect(persistence.getResolvedRemoteId("local-1")).toBe("remote-1");
+  });
+
+  it.each(["__proto__", "constructor", "toString"])(
+    "supports prototype-named local ID %s",
+    async (messageId) => {
+      vi.mocked(cloud.threads.messages.create).mockResolvedValue({
+        message_id: `remote-${messageId}`,
+      });
+
+      expect(persistence.isPersisted(messageId)).toBe(false);
+
+      await persistence.append("thread-1", messageId, null, "aui/v0", {
+        text: "hello",
+      });
+
+      expect(persistence.isPersisted(messageId)).toBe(true);
+      expect(await persistence.getRemoteId(messageId)).toBe(
+        `remote-${messageId}`,
+      );
+    },
+  );
+
+  it("uses the current client without losing ID mappings", async () => {
+    const firstCloud = createMockCloud();
+    const secondCloud = createMockCloud();
+    let currentCloud = firstCloud;
+    persistence = new CloudMessagePersistence(() => currentCloud);
+    vi.mocked(firstCloud.threads.messages.create).mockResolvedValue({
+      message_id: "remote-parent",
+    });
+    vi.mocked(secondCloud.threads.messages.create).mockResolvedValue({
+      message_id: "remote-child",
+    });
+
+    await persistence.append("thread-1", "parent", null, "aui/v0", {
+      text: "parent",
+    });
+    currentCloud = secondCloud;
+    await persistence.append("thread-1", "child", "parent", "aui/v0", {
+      text: "child",
+    });
+
+    expect(secondCloud.threads.messages.create).toHaveBeenCalledWith(
+      "thread-1",
+      expect.objectContaining({ parent_id: "remote-parent" }),
+    );
+    expect(await persistence.getRemoteId("child")).toBe("remote-child");
+  });
+
+  it("resolves parent ID from a concurrent append", async () => {
+    // Parent creation is delayed — the promise won't resolve immediately
+    let resolveParent!: (v: { message_id: string }) => void;
+    vi.mocked(cloud.threads.messages.create).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveParent = resolve;
+        }),
+    );
+    vi.mocked(cloud.threads.messages.create).mockResolvedValueOnce({
+      message_id: "remote-child",
+    });
+
+    // Start parent append (doesn't resolve yet)
+    const parentPromise = persistence.append(
+      "thread-1",
+      "parent",
+      null,
+      "aui/v0",
+      { text: "parent" },
+    );
+
+    // Start child append — it will await the parent's promise for its remote ID
+    const childPromise = persistence.append(
+      "thread-1",
+      "child",
+      "parent",
+      "aui/v0",
+      { text: "child" },
+    );
+
+    // Now resolve the parent
+    resolveParent({ message_id: "remote-parent" });
+    await parentPromise;
+    await childPromise;
+
+    // The child's create call should have used the parent's resolved remote ID
+    const childCreateCall = vi.mocked(cloud.threads.messages.create).mock
+      .calls[1]!;
+    expect(childCreateCall[1]).toMatchObject({
+      parent_id: "remote-parent",
+    });
+  });
+
+  it("deduplicates concurrent child appends while the parent is pending", async () => {
+    let resolveParent!: (value: { message_id: string }) => void;
+    vi.mocked(cloud.threads.messages.create)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveParent = resolve;
+          }),
+      )
+      .mockResolvedValue({ message_id: "remote-child" });
+
+    const parent = persistence.append("thread-1", "parent", null, "aui/v0", {
+      text: "parent",
+    });
+    const firstChild = persistence.append(
+      "thread-1",
+      "child",
+      "parent",
+      "aui/v0",
+      { text: "child" },
+    );
+    const secondChild = persistence.append(
+      "thread-1",
+      "child",
+      "parent",
+      "aui/v0",
+      { text: "child" },
+    );
+
+    expect(persistence.isPersisted("child")).toBe(true);
+    resolveParent({ message_id: "remote-parent" });
+    await Promise.all([parent, firstChild, secondChild]);
+
+    expect(cloud.threads.messages.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("resolves remote IDs throughout a concurrent message chain", async () => {
+    let resolveParent!: (value: { message_id: string }) => void;
+    vi.mocked(cloud.threads.messages.create)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveParent = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({ message_id: "remote-child" })
+      .mockResolvedValueOnce({ message_id: "remote-grandchild" });
+
+    const parent = persistence.append("thread-1", "parent", null, "aui/v0", {
+      text: "parent",
+    });
+    const child = persistence.append("thread-1", "child", "parent", "aui/v0", {
+      text: "child",
+    });
+    const grandchild = persistence.append(
+      "thread-1",
+      "grandchild",
+      "child",
+      "aui/v0",
+      { text: "grandchild" },
+    );
+
+    resolveParent({ message_id: "remote-parent" });
+    await Promise.all([parent, child, grandchild]);
+
+    expect(cloud.threads.messages.create).toHaveBeenCalledWith("thread-1", {
+      parent_id: "remote-parent",
+      external_id: "child",
+      format: "aui/v0",
+      content: { text: "child" },
+    });
+    expect(cloud.threads.messages.create).toHaveBeenCalledWith("thread-1", {
+      parent_id: "remote-child",
+      external_id: "grandchild",
+      format: "aui/v0",
+      content: { text: "grandchild" },
+    });
+  });
+
+  it("re-appends a message after its mapping has settled", async () => {
+    vi.mocked(cloud.threads.messages.create)
+      .mockResolvedValueOnce({ message_id: "remote-1" })
+      .mockResolvedValueOnce({ message_id: "remote-2" });
+
+    await persistence.append("thread-1", "local-1", null, "aui/v0", {
+      text: "first",
+    });
+    await persistence.append("thread-1", "local-1", null, "aui/v0", {
+      text: "second",
+    });
+
+    expect(cloud.threads.messages.create).toHaveBeenCalledTimes(2);
+    expect(await persistence.getRemoteId("local-1")).toBe("remote-2");
+  });
+
+  it("loaded messages are marked as persisted and not re-created", async () => {
+    vi.mocked(cloud.threads.messages.list).mockResolvedValue({
+      messages: [
+        {
+          id: "msg-1",
+          parent_id: null,
+          height: 0,
+          created_at: "2025-01-01T00:00:00Z" as unknown as Date,
+          updated_at: "2025-01-01T00:00:00Z" as unknown as Date,
+          format: "aui/v0",
+          content: { text: "loaded" },
+        },
+      ],
+    });
+
+    await persistence.load("thread-1");
+
+    expect(persistence.isPersisted("msg-1")).toBe(true);
+    expect(await persistence.getRemoteId("msg-1")).toBe("msg-1");
+  });
+
+  it("preserves a pending append mapping when load returns the same ID", async () => {
+    const messages = createCloudMessages(1);
+    let resolveLoad!: (value: { messages: typeof messages }) => void;
+    let resolveAppend!: (value: { message_id: string }) => void;
+    vi.mocked(cloud.threads.messages.list).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    vi.mocked(cloud.threads.messages.create).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAppend = resolve;
+        }),
+    );
+
+    const load = persistence.load("thread-1");
+    const append = persistence.append(
+      "thread-1",
+      "message-1",
+      null,
+      "aui/v0",
+      {},
+    );
+    resolveLoad({ messages });
+    await load;
+    resolveAppend({ message_id: "remote-2" });
+    await append;
+
+    expect(await persistence.getRemoteId("message-1")).toBe("remote-2");
+    await persistence.update("thread-1", "message-1", "aui/v0", {
+      text: "updated",
+    });
+    expect(cloud.threads.messages.update).toHaveBeenCalledWith(
+      "thread-1",
+      "remote-2",
+      { content: { text: "updated" } },
+    );
+  });
+
+  it("preserves a resolved append mapping when load returns the same ID", async () => {
+    const messages = createCloudMessages(1);
+    vi.mocked(cloud.threads.messages.create).mockResolvedValue({
+      message_id: "remote-1",
+    });
+    vi.mocked(cloud.threads.messages.list).mockResolvedValue({
+      messages,
+    });
+
+    await persistence.append("thread-1", "message-1", null, "aui/v0", {});
+    await persistence.load("thread-1");
+
+    expect(await persistence.getRemoteId("message-1")).toBe("remote-1");
+  });
+
+  it("keeps the loaded ID when a pending append for it fails", async () => {
+    const messages = createCloudMessages(1);
+    const failure = new Error("create failed");
+    let resolveLoad!: (value: { messages: typeof messages }) => void;
+    let rejectAppend!: (error: Error) => void;
+    vi.mocked(cloud.threads.messages.list).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    vi.mocked(cloud.threads.messages.create).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectAppend = reject;
+        }),
+    );
+
+    const load = persistence.load("thread-1");
+    const append = persistence.append(
+      "thread-1",
+      "message-1",
+      null,
+      "aui/v0",
+      {},
+    );
+    resolveLoad({ messages });
+    await load;
+    rejectAppend(failure);
+
+    await expect(append).rejects.toBe(failure);
+    expect(persistence.isPersisted("message-1")).toBe(true);
+    expect(await persistence.getRemoteId("message-1")).toBe("message-1");
+  });
+
+  it("does not restore a loaded ID after reset when its pending append fails", async () => {
+    const messages = createCloudMessages(1);
+    const failure = new Error("create failed");
+    let rejectAppend!: (error: Error) => void;
+    vi.mocked(cloud.threads.messages.list).mockResolvedValue({ messages });
+    vi.mocked(cloud.threads.messages.create).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectAppend = reject;
+        }),
+    );
+
+    const append = persistence.append(
+      "thread-1",
+      "message-1",
+      null,
+      "aui/v0",
+      {},
+    );
+    await persistence.load("thread-1");
+    persistence.reset();
+    rejectAppend(failure);
+
+    await expect(append).rejects.toBe(failure);
+    expect(persistence.isPersisted("message-1")).toBe(false);
+  });
+
+  it("does not restore IDs from a load that finishes after reset", async () => {
+    const oldMessages = createCloudMessages(1);
+    const newMessages = [{ ...oldMessages[0]!, id: "new-message" }];
+    let resolveOld!: (value: { messages: typeof oldMessages }) => void;
+    vi.mocked(cloud.threads.messages.list)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOld = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({ messages: newMessages });
+
+    const oldLoad = persistence.load("old-thread");
+    persistence.reset();
+    await persistence.load("new-thread");
+    resolveOld({ messages: oldMessages });
+
+    expect(await oldLoad).toEqual(oldMessages);
+    expect(persistence.isPersisted("message-1")).toBe(false);
+    expect(persistence.isPersisted("new-message")).toBe(true);
+  });
+
+  it("keeps a new append mapping when an old load returns the same ID", async () => {
+    const messages = createCloudMessages(1);
+    let resolveOld!: (value: { messages: typeof messages }) => void;
+    vi.mocked(cloud.threads.messages.list).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    );
+    vi.mocked(cloud.threads.messages.create).mockResolvedValue({
+      message_id: "new-remote-id",
+    });
+
+    const oldLoad = persistence.load("old-thread");
+    persistence.reset();
+    await persistence.append("new-thread", "message-1", null, "aui/v0", {});
+    resolveOld({ messages });
+    await oldLoad;
+
+    expect(await persistence.getRemoteId("message-1")).toBe("new-remote-id");
+  });
+
+  it("does not populate any old IDs when reset happens between history pages", async () => {
+    const messages = createCloudMessages(201);
+    let resolveLast!: (value: { messages: typeof messages }) => void;
+    vi.mocked(cloud.threads.messages.list)
+      .mockResolvedValueOnce({ messages: messages.slice(0, 200) })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveLast = resolve;
+          }),
+      );
+
+    const load = persistence.load("old-thread");
+    await vi.waitFor(() =>
+      expect(cloud.threads.messages.list).toHaveBeenCalledTimes(2),
+    );
+    persistence.reset();
+    resolveLast({ messages: messages.slice(200) });
+
+    expect(await load).toEqual(messages);
+    expect(
+      messages.some((message) => persistence.isPersisted(message.id)),
+    ).toBe(false);
+  });
+
+  it("propagates an old load failure without disturbing post-reset state", async () => {
+    let rejectOld!: (error: Error) => void;
+    vi.mocked(cloud.threads.messages.list).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectOld = reject;
+        }),
+    );
+    vi.mocked(cloud.threads.messages.create).mockResolvedValue({
+      message_id: "new-remote-id",
+    });
+    const failure = new Error("history failed");
+    const oldLoad = persistence.load("old-thread");
+    const rejected = expect(oldLoad).rejects.toBe(failure);
+    persistence.reset();
+    await persistence.append("new-thread", "new-message", null, "aui/v0", {});
+    rejectOld(failure);
+
+    await rejected;
+    expect(await persistence.getRemoteId("new-message")).toBe("new-remote-id");
+  });
+
+  it("maps prototype-named loaded messages", async () => {
+    vi.mocked(cloud.threads.messages.list).mockResolvedValue({
+      messages: [
+        {
+          id: "__proto__",
+          parent_id: null,
+          height: 0,
+          created_at: "2025-01-01T00:00:00Z" as unknown as Date,
+          updated_at: "2025-01-01T00:00:00Z" as unknown as Date,
+          format: "aui/v0",
+          content: { text: "loaded" },
+        },
+      ],
+    });
+
+    await persistence.load("thread-1");
+
+    expect(persistence.isPersisted("__proto__")).toBe(true);
+    expect(await persistence.getRemoteId("__proto__")).toBe("__proto__");
+  });
+
+  it("follows the message cursor across pages in server order", async () => {
+    const rows = createCloudMessages(450);
+    vi.mocked(cloud.threads.messages.list).mockImplementation(
+      async (_threadId, query) => {
+        const start = query?.after
+          ? rows.findIndex((row) => row.id === query.after) + 1
+          : 0;
+        return { messages: rows.slice(start, start + 200) };
+      },
+    );
+
+    const messages = await persistence.load("thread-1", "aui/v0");
+
+    expect(messages.map((message) => message.id)).toEqual(
+      rows.map((row) => row.id),
+    );
+    expect(cloud.threads.messages.list).toHaveBeenCalledTimes(3);
+    expect(cloud.threads.messages.list).toHaveBeenNthCalledWith(1, "thread-1", {
+      format: "aui/v0",
+      limit: 200,
+    });
+    expect(cloud.threads.messages.list).toHaveBeenNthCalledWith(3, "thread-1", {
+      format: "aui/v0",
+      limit: 200,
+      after: "message-400",
+    });
+  });
+
+  it("follows has_more past a page cut short by its size", async () => {
+    const rows = createCloudMessages(5);
+    vi.mocked(cloud.threads.messages.list).mockImplementation(
+      async (_threadId, query) => {
+        // Two messages a page, as a server cuts pages of large messages.
+        const start = query?.after
+          ? rows.findIndex((row) => row.id === query.after) + 1
+          : 0;
+        const page = rows.slice(start, start + 2);
+        const hasMore = start + 2 < rows.length;
+        return {
+          messages: page,
+          has_more: hasMore,
+          next_cursor: hasMore ? page.at(-1)!.id : null,
+        };
+      },
+    );
+
+    const messages = await persistence.load("thread-1");
+
+    expect(messages.map((message) => message.id)).toEqual(
+      rows.map((row) => row.id),
+    );
+    expect(cloud.threads.messages.list).toHaveBeenCalledTimes(3);
+  });
+
+  it("follows next_cursor past a page with no readable messages", async () => {
+    const rows = createCloudMessages(3);
+    vi.mocked(cloud.threads.messages.list)
+      .mockResolvedValueOnce({
+        messages: [],
+        has_more: true,
+        next_cursor: "message-0",
+      })
+      .mockResolvedValueOnce({ messages: rows, has_more: false });
+
+    const messages = await persistence.load("thread-1");
+
+    expect(messages).toHaveLength(3);
+    expect(cloud.threads.messages.list).toHaveBeenNthCalledWith(2, "thread-1", {
+      limit: 200,
+      after: "message-0",
+    });
+  });
+
+  it("stops at has_more false even on a full page", async () => {
+    vi.mocked(cloud.threads.messages.list).mockResolvedValue({
+      messages: createCloudMessages(200),
+      has_more: false,
+    });
+
+    await persistence.load("thread-1");
+
+    expect(cloud.threads.messages.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops without duplicates when a later cursor stops resolving", async () => {
+    const rows = createCloudMessages(450);
+    vi.mocked(cloud.threads.messages.list).mockImplementation(
+      async (_threadId, query) => {
+        // The third request replays page one, the way the endpoint answers a
+        // cursor whose message no longer resolves.
+        const start =
+          query?.after && query.after !== "message-400"
+            ? rows.findIndex((row) => row.id === query.after) + 1
+            : 0;
+        return { messages: rows.slice(start, start + 200) };
+      },
+    );
+
+    const messages = await persistence.load("thread-1", "aui/v0");
+
+    expect(messages.map((message) => message.id)).toEqual(
+      rows.slice(0, 400).map((row) => row.id),
+    );
+    expect(cloud.threads.messages.list).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops when a page does not advance the cursor", async () => {
+    vi.mocked(cloud.threads.messages.list).mockResolvedValue({
+      messages: createCloudMessages(200),
+    });
+
+    const messages = await persistence.load("thread-1", "aui/v0");
+
+    expect(messages).toHaveLength(200);
+    expect(cloud.threads.messages.list).toHaveBeenCalledTimes(2);
+  });
+
+  it("updates an already-persisted message", async () => {
+    vi.mocked(cloud.threads.messages.create).mockResolvedValue({
+      message_id: "remote-1",
+    });
+    vi.mocked(cloud.threads.messages.update).mockResolvedValue(undefined);
+
+    await persistence.append("thread-1", "local-1", null, "aui/v0", {
+      text: "original",
+    });
+    await persistence.update("thread-1", "local-1", "aui/v0", {
+      text: "updated",
+    });
+
+    expect(cloud.threads.messages.update).toHaveBeenCalledWith(
+      "thread-1",
+      "remote-1",
+      { content: { text: "updated" } },
+    );
+  });
+
+  it("warns and skips update when no remote id is mapped", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await persistence.update("thread-1", "unmapped-1", "aui/v0", {
+      text: "x",
+    });
+
+    expect(cloud.threads.messages.update).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "Skipping update for message unmapped-1: no remote id is mapped.",
+    );
+  });
+
+  it("cleans up ID mapping on append failure", async () => {
+    vi.mocked(cloud.threads.messages.create).mockRejectedValue(
+      new Error("network error"),
+    );
+
+    await expect(
+      persistence.append("thread-1", "local-1", null, "aui/v0", {
+        text: "fail",
+      }),
+    ).rejects.toThrow("network error");
+
+    expect(persistence.isPersisted("local-1")).toBe(false);
+  });
+
+  it("does not restore an append mapping after reset", async () => {
+    let resolveAppend!: (value: { message_id: string }) => void;
+    vi.mocked(cloud.threads.messages.create).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAppend = resolve;
+        }),
+    );
+
+    const append = persistence.append(
+      "thread-1",
+      "local-1",
+      null,
+      "aui/v0",
+      {},
+    );
+    persistence.reset();
+    resolveAppend({ message_id: "remote-1" });
+
+    await expect(append).resolves.toBeUndefined();
+    expect(persistence.isPersisted("local-1")).toBe(false);
+    expect(await persistence.getRemoteId("local-1")).toBeUndefined();
+  });
+
+  it("reset clears all ID mappings", async () => {
+    vi.mocked(cloud.threads.messages.create).mockResolvedValue({
+      message_id: "remote-1",
+    });
+
+    await persistence.append("thread-1", "local-1", null, "aui/v0", {
+      text: "hello",
+    });
+    expect(persistence.isPersisted("local-1")).toBe(true);
+
+    persistence.reset();
+
+    expect(persistence.isPersisted("local-1")).toBe(false);
+  });
+});

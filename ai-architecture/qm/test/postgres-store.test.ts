@@ -1,0 +1,2580 @@
+import "./run-availability.ts";
+import { test, before } from "node:test";
+import { randomUUID } from "node:crypto";
+import assert from "node:assert/strict";
+import { PARALLEL_EXCEPTION_QUERY } from "../src/deployment/postdeploy-smoke.ts";
+import { createPostgresUserStore } from "../src/identity/user-store.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { rowToSession } from "../src/sessions/session-rows.ts";
+import { createPostgresRunStore } from "../src/runs/postgres-run-store.ts";
+import { createPostgresRunSignalStore } from "../src/runs/postgres-run-signal-store.ts";
+import { scopeId, type Principal, type TurnRequest, type TurnResult } from "../src/types.ts";
+import type { OrchestratorInput } from "../src/core/orchestrator.ts";
+import { assertLateJoinerScopes, assertLeanListing } from "./support/participant-scopes.ts";
+import { assertParticipantSessionParity } from "./support/participant-session-parity.ts";
+import { assertSpendRollupParity } from "./support/spend-rollup-parity.ts";
+import { seedTestTenant } from "./support/test-tenant.ts";
+
+const URL = process.env.DATABASE_URL;
+const skip = URL ? false : "set DATABASE_URL (a Postgres) to run the Postgres store tests";
+
+before(async () => {
+  if (!URL) return;
+  const pg = (await import("pg")).default;
+  const p = new pg.Pool({ connectionString: URL });
+  await p.query("DROP SCHEMA public CASCADE");
+  await p.query("CREATE SCHEMA public");
+  await p.end();
+  await seedTestTenant(URL);
+});
+
+const actor: Principal = { id: "internal:U1", type: "internal" };
+const turn = (text: string): OrchestratorInput => ({
+  actor,
+  conversation: { kind: "dm", threadRef: "t", audience: [actor] },
+  origin: { kind: "direct" },
+  text,
+});
+
+test("sessions inherit the origin of their nearest automated ancestor ", { skip }, async () => {
+  {
+    const store = createPostgresSessionStore(URL!);
+    const run = randomUUID();
+    const scope = scopeId("channel", "C1");
+    const cron = await store.getOrCreateByThread(`agent:main:cron:${run}`, "channel", scope);
+    const child = await store.getOrCreateByThread(`subagent:${run}:1`, "channel", scope);
+    const grandchild = await store.getOrCreateByThread(`subagent:${run}:2`, "channel", scope);
+    const orphan = await store.getOrCreateByThread(`subagent:${run}:3`, "channel", scope);
+    await store.setParentSession(child.id, cron.id);
+    await store.setParentSession(grandchild.id, child.id);
+    await store.setParentSession(orphan.id, `missing-${run}`);
+    const origin = async (id: string) => store.inheritedOrigin((await store.get(id))!);
+    assert.equal(await origin(grandchild.id), "cron");
+    assert.equal(await origin(cron.id), "cron");
+    assert.equal(await origin(orphan.id), "conversation");
+  }
+});
+
+test("pg session row mapping ignores incomplete fork provenance", () => {
+  const session = rowToSession({
+    id: "fork",
+    type: "dm",
+    scope_id: "personal:U1",
+    thread_ref: "thread",
+    created_at: 1,
+    forked_from_session_id: "source",
+    fork_boundary_seq: null,
+  });
+  assert.equal(session.forkedFrom, undefined);
+  assert.equal(session.forkBoundarySeq, undefined);
+});
+
+test("pg session store: fork provenance survives a store restart", { skip }, async () => {
+  const first = createPostgresSessionStore(URL!);
+  const session = await first.getOrCreateByThread("fork-provenance", "dm", scopeId("personal", "U1"));
+  await first.updateForkProvenance(session.id, {
+    forkedFrom: { sessionId: "source-session", title: "Original" },
+    forkBoundarySeq: 4,
+  });
+  const restarted = createPostgresSessionStore(URL!);
+  const loaded = await restarted.get(session.id);
+  assert.deepEqual(loaded?.forkedFrom, { sessionId: "source-session", title: "Original" });
+  assert.equal(loaded?.forkBoundarySeq, 4);
+});
+
+test("pg session store: getForParticipant returns exactly the row listByParticipant returns", { skip }, async () => {
+  await assertParticipantSessionParity(createPostgresSessionStore(URL!), `pg-parity-${randomUUID()}`);
+});
+
+test("pg participant activity uses the latest user entry, including overheard entries", { skip }, async () => {
+  let at = 1_000;
+  const store = createPostgresSessionStore(URL!, { now: () => at });
+  const owner = `activity-${randomUUID()}`;
+  const scope = scopeId("personal", owner);
+  const session = await store.getOrCreateByThread(owner, "dm", scope);
+  await store.addParticipant(session.id, owner);
+  const writer = { sessionId: session.id };
+  at = 300_000;
+  await store.append(writer, { kind: "UserMessage", text: "overheard", body: { overheard: true } });
+  at = 500_000;
+  await store.append(writer, { kind: "AgentMessage", text: "later reply" });
+  at = 400_000;
+  const empty = await store.getOrCreateByThread(`${owner}-empty`, "dm", scope);
+  await store.addParticipant(empty.id, owner);
+  const listed = await store.listByParticipant(owner);
+  assert.equal(listed.find((row) => row.id === session.id)?.lastActivityAt, 300_000);
+  assert.equal(listed.find((row) => row.id === empty.id)?.lastActivityAt, 400_000);
+  assert.equal((await store.getForParticipant(session.id, owner))?.lastActivityAt, 300_000);
+  assert.deepEqual(
+    (await store.listByParticipant(owner, { limit: 1 })).map((row) => row.id),
+    [session.id],
+  );
+  assert.deepEqual(await store.listByParticipant(owner, { limit: 0 }), []);
+});
+
+test("pg session store: spendRollup matches the memory rollup row for row", { skip }, async () => {
+  await assertSpendRollupParity((now) => createPostgresSessionStore(URL!, { now }), `pg-spend-${randomUUID()}`);
+});
+
+test("pg saved spend refreshes changed days and preserves live attribution", { skip }, async () => {
+  const day = 86_400_000;
+  const base = Date.UTC(2024, 0, 1);
+  let at = base + 123;
+  const store = createPostgresSessionStore(URL!, { now: () => at });
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const scope = scopeId("personal", `saved-${randomUUID()}`);
+  const session = await store.getOrCreateByThread(scope, "dm", scope);
+  const range = { from: base, to: base + 2 * day };
+  const bill = () =>
+    store.recordLlmRequest(session.id, {
+      turnSeq: null,
+      step: 0,
+      model: "saved",
+      scopeLabel: scope,
+      usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 14, costUsd: 0.25 },
+    });
+  const read = async () => (await store.spendReport!(range)).rows;
+  const check = async () => assert.deepEqual(await read(), await store.spendRollup(range));
+  try {
+    const first = await bill();
+    await check();
+    await store.refreshSpendRollup!();
+    await check();
+    at += 1_000;
+    await bill();
+    assert.equal((await read())[0]!.calls, 1);
+    assert.equal((await store.spendReport!(range)).asOf, base + 123);
+    await store.refreshSpendRollup!();
+    await check();
+    assert.equal((await read())[0]!.calls, 2);
+    const restarted = createPostgresSessionStore(URL!, { now: () => at });
+    assert.deepEqual((await restarted.spendReport!(range)).rows, await read());
+
+    await raw.query("UPDATE session_llm_requests SET created_at = $2, model = 'moved', usage_json = $3 WHERE id = $1", [
+      first.id,
+      base + day + 1,
+      JSON.stringify({ input: 1, costUsd: 2 }),
+    ]);
+    await store.refreshSpendRollup!();
+    await check();
+    assert.equal((await read()).length, 2);
+    const parent = await store.getOrCreateByThread(`cron:${randomUUID()}`, "dm", scope);
+    await store.setParentSession(session.id, parent.id);
+    await store.refreshSpendRollup!();
+    await check();
+    assert.ok((await read()).every((r) => r.origin === "cron"));
+    await raw.query("UPDATE sessions SET scope_id = $2 WHERE id = $1", [session.id, "personal:saved-moved"]);
+    await store.refreshSpendRollup!();
+    await check();
+    assert.ok((await read()).every((r) => r.scopeId === "personal:saved-moved"));
+    await store.deleteSession(parent.id);
+    await store.refreshSpendRollup!();
+    await check();
+    assert.ok((await read()).every((r) => r.origin === "conversation"));
+    const partial = { from: base + 124, to: base + day };
+    assert.deepEqual((await store.spendReport!(partial)).rows, await store.spendRollup(partial));
+    await store.deleteSession(session.id);
+    await store.refreshSpendRollup!();
+    assert.deepEqual(await read(), []);
+    assert.equal(
+      (await raw.query("SELECT jsonb_array_length(rows) AS n FROM session_spend_days WHERE day = $1", [base / day]))
+        .rows[0].n,
+      0,
+    );
+  } finally {
+    await raw.end();
+  }
+});
+
+test("pg spend refresh keeps concurrent writes pending and failures preserve the last report", { skip }, async () => {
+  const base = Date.UTC(2025, 0, 1);
+  const range = { from: base, to: base + 86_400_000 };
+  const store = createPostgresSessionStore(URL!, { now: () => base + 123 });
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const scope = scopeId("personal", `race-${randomUUID()}`);
+  const session = await store.getOrCreateByThread(scope, "dm", scope);
+  const bill = () =>
+    store.recordLlmRequest(session.id, {
+      turnSeq: null,
+      step: 0,
+      model: "race",
+      scopeLabel: scope,
+      usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, costUsd: 1 },
+    });
+  const query = pg.Client.prototype.query;
+  const wallClock = Date.now;
+  let duringRollup: (() => Promise<unknown>) | undefined;
+  pg.Client.prototype.query = function (...args: any[]): any {
+    if (duringRollup && typeof args[0] === "string" && args[0].startsWith("WITH RECURSIVE ancestry")) {
+      const hook = duringRollup;
+      duringRollup = undefined;
+      return Promise.resolve(Reflect.apply(query, this, args)).then(async (result) => {
+        await hook();
+        return result;
+      });
+    }
+    return Reflect.apply(query, this, args);
+  };
+  try {
+    await bill();
+    await store.refreshSpendRollup!();
+    await bill();
+    duringRollup = bill;
+    await store.refreshSpendRollup!();
+    assert.equal((await store.spendReport!(range)).rows[0]!.calls, 2);
+    assert.equal((await store.spendRollup(range))[0]!.calls, 3);
+    assert.ok(
+      Number(
+        (await raw.query("SELECT count(*) AS n FROM session_spend_dirty WHERE day = $1", [base / 86_400_000])).rows[0]
+          .n,
+      ) > 0,
+    );
+    await store.refreshSpendRollup!();
+    assert.deepEqual((await store.spendReport!(range)).rows, await store.spendRollup(range));
+    const healthyId = randomUUID();
+    await raw.query(
+      "INSERT INTO session_llm_requests(id, session_id, step, model, scope_label, created_at, usage_json) VALUES ($1,$2,0,'healthy',$3,$4,$5)",
+      [healthyId, session.id, scope, base - 86_400_000, JSON.stringify({ costUsd: 1 })],
+    );
+    await store.refreshSpendRollup!();
+    await raw.query("UPDATE session_llm_requests SET usage_json = $2 WHERE id = $1", [
+      healthyId,
+      JSON.stringify({ costUsd: 2 }),
+    ]);
+    await bill();
+    duringRollup = async () => {
+      const elapsed = wallClock() + 5_001;
+      Date.now = () => elapsed;
+      throw new Error("injected slow spend refresh failure");
+    };
+    await store.refreshSpendRollup!();
+    Date.now = wallClock;
+    assert.equal((await store.spendReport!(range)).rows[0]!.calls, 3);
+    const healthy = await store.spendReport!({ from: base - 86_400_000, to: base });
+    assert.equal(healthy.rows[0]!.costUsd, 2);
+    await Promise.all([store.refreshSpendRollup!(), store.refreshSpendRollup!()]);
+    assert.equal((await store.spendReport!(range)).rows[0]!.calls, 4);
+    assert.equal(
+      Number(
+        (await raw.query("SELECT count(*) AS n FROM session_spend_dirty WHERE day = $1", [base / 86_400_000])).rows[0]
+          .n,
+      ),
+      0,
+    );
+  } finally {
+    pg.Client.prototype.query = query;
+    Date.now = wallClock;
+    await raw.end();
+  }
+});
+
+test(
+  "pg spend refresh takes the newest dirty day, then the stalest days, at least two per pass",
+  { skip },
+  async (t) => {
+    const pg = (await import("pg")).default;
+    const admin = new pg.Pool({ connectionString: URL });
+    const schema = `spend_order_${randomUUID().replaceAll("-", "")}`;
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const url = new globalThis.URL(URL!);
+    url.searchParams.set("options", `${url.searchParams.get("options") ?? ""} -c search_path=${schema}`.trim());
+    await seedTestTenant(url.toString());
+    const day = 86_400_000;
+    const base = Date.UTC(2025, 5, 1);
+    let clock = base + 3 * day;
+    let at = base;
+    let elapsed = 0;
+    let slow = false;
+    const store = createPostgresSessionStore(url.toString(), {
+      now: () => {
+        if (slow) elapsed += 10_000;
+        return at;
+      },
+    });
+    const raw = new pg.Pool({ connectionString: url.toString() });
+    const scope = scopeId("personal", "spend-order");
+    const session = await store.getOrCreateByThread("spend-order", "dm", scope);
+    const bill = async (offset: number) => {
+      at = base + offset * day;
+      await store.recordLlmRequest(session.id, {
+        turnSeq: null,
+        step: 0,
+        model: "order",
+        scopeLabel: scope,
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, costUsd: 1 },
+      });
+      at = clock;
+    };
+    const slowPass = async () => {
+      clock += 60_000;
+      at = clock;
+      slow = true;
+      await store.refreshSpendRollup!();
+      slow = false;
+    };
+    const pending = async () =>
+      (await raw.query("SELECT DISTINCT day FROM session_spend_dirty WHERE day IS NOT NULL ORDER BY day")).rows.map(
+        (r) => Number(r.day) - base / day,
+      );
+    try {
+      for (const offset of [0, 1, 2, 3]) {
+        await bill(offset);
+        at = base + offset * day;
+        await store.refreshSpendRollup!();
+      }
+      for (const offset of [0, 1, 2, 3]) await bill(offset);
+      t.mock.method(Date, "now", () => elapsed);
+      await slowPass();
+      assert.deepEqual(await pending(), [1, 2]);
+      await bill(2);
+      await bill(3);
+      await slowPass();
+      assert.deepEqual(await pending(), [2]);
+      await slowPass();
+      assert.deepEqual(await pending(), []);
+      clock = base + 10 * day;
+      for (const offset of [0, 1, 2]) await bill(offset);
+      await slowPass();
+      assert.deepEqual(await pending(), [1]);
+    } finally {
+      await raw.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  },
+);
+
+test(
+  "pg saved spend resolves session changes after commit and preserves non-finite legacy costs",
+  { skip },
+  async () => {
+    const base = Date.UTC(2025, 2, 1);
+    let at = base + 123;
+    const range = { from: base, to: base + 86_400_000 };
+    const store = createPostgresSessionStore(URL!, { now: () => at });
+    const pg = (await import("pg")).default;
+    const raw = new pg.Pool({ connectionString: URL });
+    const editor = await raw.connect();
+    const scope = scopeId("personal", `commit-${randomUUID()}`);
+    const session = await store.getOrCreateByThread(scope, "dm", scope);
+    try {
+      await store.refreshSpendRollup!();
+      await editor.query("BEGIN");
+      await editor.query("UPDATE sessions SET origin = 'cron' WHERE id = $1", [session.id]);
+      await store.recordLlmRequest(session.id, {
+        turnSeq: null,
+        step: 0,
+        model: "commit",
+        scopeLabel: scope,
+        usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, costUsd: 1 },
+      });
+      await store.refreshSpendRollup!();
+      assert.equal((await store.spendReport!(range)).rows[0]!.origin, "conversation");
+      await editor.query("COMMIT");
+      at += 1_000;
+      assert.ok((await store.spendReport!(range)).asOf! < at);
+      await store.refreshSpendRollup!();
+      assert.deepEqual((await store.spendReport!(range)).rows, await store.spendRollup(range));
+      assert.equal((await store.spendReport!(range)).rows[0]!.origin, "cron");
+      for (const cost of ["NaN", "Infinity", "-Infinity"]) {
+        await raw.query(
+          "INSERT INTO session_llm_requests(id, session_id, step, model, scope_label, created_at, usage_json) VALUES ($1,$2,0,$3,$4,$5,$6)",
+          [randomUUID(), session.id, cost, scope, base, JSON.stringify({ costUsd: cost })],
+        );
+      }
+      await store.refreshSpendRollup!();
+      assert.deepEqual((await store.spendReport!(range)).rows, await store.spendRollup(range));
+      assert.ok(Number.isNaN((await store.spendReport!(range)).rows.find((r) => r.model === "NaN")!.costUsd));
+    } finally {
+      await editor.query("ROLLBACK");
+      editor.release();
+      await store.deleteSession(session.id);
+      await raw.end();
+    }
+  },
+);
+
+test("pg spend rollup handles unusual usage rows and later writes", { skip }, async () => {
+  const at = Date.UTC(2022, 0, 1);
+  const store = createPostgresSessionStore(URL!, { now: () => at });
+  const session = await store.getOrCreateByThread("spend-index", "dm", scopeId("personal", "USPENDINDEX"));
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const usage = { input: 10, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 19, costUsd: 0.5 };
+  const wideModel = Array.from({ length: 100 }, () => randomUUID()).join("");
+  const wideUsage = { ...usage, legacyDetail: wideModel };
+  const deeplyNestedUsage =
+    JSON.stringify(usage).slice(0, -1) + ',"detail":' + "[".repeat(20_000) + "0" + "]".repeat(20_000) + "}";
+  const insert = async (id: string, model: string, json: string | null, when = at, sessionId = session.id) => {
+    await raw.query(
+      "INSERT INTO session_llm_requests(id, session_id, step, model, scope_label, created_at, usage_json) VALUES ($1,$2,0,$3,$4,$5,$6)",
+      [id, sessionId, model, session.scopeId, when, json],
+    );
+  };
+  const range = { from: at, to: at + 1 };
+  try {
+    await insert("spend-index-normal", "normal", JSON.stringify(usage));
+    await insert("spend-index-wide", wideModel, JSON.stringify(wideUsage));
+    await insert("spend-index-null", "null", null);
+    await insert("spend-index-empty", "empty", "{}");
+    await insert("spend-index-bad-history", "bad-history", "not json", at - 1);
+    await insert("spend-index-bad-orphan", "bad-orphan", "not json", at, "missing-spend-session");
+    await insert(
+      "spend-index-fraction-orphan",
+      "fraction-orphan",
+      JSON.stringify({ ...usage, input: 0.5 }),
+      at,
+      "missing-spend-session",
+    );
+    await insert("spend-index-unicode", "bad-unicode", JSON.stringify({ ...usage, detail: "\u0000" }), at - 1);
+    await insert("spend-index-fraction", "fraction", JSON.stringify({ ...usage, input: 0.5 }), at - 1);
+    await insert("spend-index-overflow", "overflow", JSON.stringify({ ...usage, input: 1e308 }), at - 1);
+    await insert("spend-index-deep-history", "deep-history", deeplyNestedUsage, at - 2);
+    const read = async () => (await store.spendRollup(range)).filter((r) => r.scopeId === session.scopeId);
+    const before = await read();
+    assert.equal(before.length, 3);
+    assert.equal(
+      before.reduce((sum, row) => sum + row.calls, 0),
+      3,
+    );
+    assert.equal(
+      before.reduce((sum, row) => sum + row.costUsd, 0),
+      1,
+    );
+    await store.recordLlmRequest(session.id, {
+      turnSeq: null,
+      step: 0,
+      model: wideModel,
+      scopeLabel: session.scopeId,
+      usage: wideUsage,
+    });
+    await store.recordLlmRequest(session.id, {
+      turnSeq: null,
+      step: 0,
+      model: "fraction-after-index",
+      scopeLabel: session.scopeId,
+      usage: { ...usage, input: 0.5 },
+    });
+    await raw.query("UPDATE session_llm_requests SET created_at = $1 WHERE model = 'fraction-after-index'", [at - 1]);
+    await insert("spend-index-bad-later", "bad-later", "not json", at - 1);
+    await insert("spend-index-deep-later", "deep-later", deeplyNestedUsage, at - 2);
+    await assert.rejects(store.spendRollup({ from: at - 2, to: at - 1 }), { code: "54001" });
+    await raw.query("UPDATE session_llm_requests SET usage_json = $1 WHERE id = 'spend-index-normal'", [
+      JSON.stringify({ ...usage, costUsd: 2 }),
+    ]);
+    assert.equal(
+      (await read()).reduce((sum, row) => sum + row.costUsd, 0),
+      3,
+    );
+    await raw.query("UPDATE sessions SET scope_id = 'personal:USPENDMOVED' WHERE id = $1", [session.id]);
+    const moved = (await store.spendRollup(range)).filter((r) => r.scopeId === "personal:USPENDMOVED");
+    assert.equal(
+      moved.reduce((sum, row) => sum + row.calls, 0),
+      4,
+    );
+    await raw.query("UPDATE session_llm_requests SET created_at = $1 WHERE id = 'spend-index-bad-later'", [at]);
+    await assert.rejects(store.spendRollup(range), /invalid input syntax for type json/);
+  } finally {
+    await raw.query("DELETE FROM session_llm_requests WHERE session_id IN ($1, 'missing-spend-session')", [session.id]);
+    await store.deleteSession(session.id);
+    await raw.end();
+  }
+});
+
+test("pg spend ancestry only visits sessions with usage inside the requested range", { skip }, async (t) => {
+  const at = Date.UTC(2023, 0, 1);
+  const store = createPostgresSessionStore(URL!, { now: () => at });
+  const scope = scopeId("personal", "USPENDANCESTRY");
+  const parent = await store.getOrCreateByThread("cron:spend-ancestry", "dm", scope);
+  const current = await store.getOrCreateByThread("spend-ancestry-current", "dm", scope);
+  const historical = await store.getOrCreateByThread("spend-ancestry-historical", "dm", scope);
+  await store.setParentSession(current.id, parent.id);
+  await store.setParentSession(historical.id, parent.id);
+  await store.recordLlmRequest(current.id, {
+    turnSeq: null,
+    step: 0,
+    model: "ancestry",
+    scopeLabel: scope,
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, costUsd: 1 },
+  });
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const execute = pg.Client.prototype.query;
+  let query = "";
+  t.mock.method(pg.Client.prototype, "query", function (this: InstanceType<typeof pg.Client>, ...args: unknown[]) {
+    const text = typeof args[0] === "string" ? args[0] : (args[0] as { text?: unknown } | null)?.text;
+    if (typeof text === "string" && text.startsWith("WITH RECURSIVE")) query = text;
+    return Reflect.apply(execute, this, args);
+  });
+  try {
+    assert.equal((await store.spendRollup({ from: at, to: at + 1 }))[0]!.origin, "cron");
+    assert.ok(query);
+    const explained = await raw.query(`EXPLAIN (ANALYZE, FORMAT JSON) ${query}`, [at, at + 1]);
+    type Plan = { Plans?: Plan[]; "Subplan Name"?: string; "Actual Rows"?: number };
+    const plans = (plan: Plan): Plan[] => [plan, ...(plan.Plans ?? []).flatMap(plans)];
+    const ancestry = plans(explained.rows[0]["QUERY PLAN"][0].Plan).find(
+      (plan) => plan["Subplan Name"] === "CTE ancestry",
+    );
+    assert.equal(ancestry?.["Actual Rows"], 2);
+  } finally {
+    for (const session of [current, historical, parent]) await store.deleteSession(session.id);
+    await raw.end();
+  }
+});
+
+test("pg session store: one-per-thread, monotonic log, membership visibility", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "U1");
+
+  const a = await s.getOrCreateByThread("t1", "dm", scope);
+  const b = await s.getOrCreateByThread("t1", "dm", scope);
+  assert.equal(a.id, b.id, "one session per thread");
+
+  await s.recordLlmRequest(a.id, {
+    turnSeq: 0,
+    step: 0,
+    model: "claude-x",
+    scopeLabel: scope,
+    promptEnvelope: { system: "sys" },
+  });
+  await s.recordLlmRequest(a.id, {
+    turnSeq: 0,
+    step: 1,
+    model: "claude-x",
+    scopeLabel: scope,
+    promptEnvelope: { system: "sys" },
+    truncated: true,
+    usage: { input: 30, output: 120, cacheRead: 5000, cacheWrite: 0, totalTokens: 5150, costUsd: 0.0123 },
+  });
+  const reqs = await s.listLlmRequests(a.id);
+  assert.equal(reqs[0]!.usage, null, "absent usage reads back null");
+  assert.deepEqual(
+    reqs[1]!.usage,
+    { input: 30, output: 120, cacheRead: 5000, cacheWrite: 0, totalTokens: 5150, costUsd: 0.0123 },
+    "usage round-trips",
+  );
+
+  const metaOnly = await s.listLlmRequests(a.id, { omitRequest: true });
+  assert.equal(metaOnly.length, 2, "every row still listed");
+  assert.ok(
+    metaOnly.every((r) => r.promptEnvelope === undefined),
+    "bodies omitted from the projection",
+  );
+  await s.recordLlmRequest(a.id, {
+    turnSeq: null,
+    step: 0,
+    model: "claude-x",
+    scopeLabel: scope,
+    promptEnvelope: { system: "sys" },
+  });
+  assert.deepEqual(
+    (await s.listLlmRequests(a.id, { orphans: true })).map((r) => r.turnSeq),
+    [null],
+    "orphans → null-turn rows only",
+  );
+  const union = await s.listLlmRequests(a.id, { turnSeqs: [0], orphans: true });
+  assert.equal(union.filter((r) => r.turnSeq === 0).length, 2, "turnSeqs + orphans keeps the turn rows");
+  assert.equal(union.filter((r) => r.turnSeq === null).length, 1, "…and unions in the orphan");
+
+  const writer = { sessionId: a.id };
+  const e0 = await s.append(writer, { kind: "UserMessage", text: "hi" });
+  const e1 = await s.append(writer, { kind: "AgentMessage", text: "yo" });
+  assert.deepEqual([e0.seq, e1.seq], [0, 1], "monotonic seq");
+  assert.deepEqual(
+    (await s.getItems(a.id)).map((e) => e.kind),
+    ["UserMessage", "AgentMessage"],
+  );
+  assert.equal((await s.getItems(a.id, { limit: 1 }))[0]!.seq, 1, "limit returns the most recent");
+  assert.equal((await s.getItem(a.id, 0))!.kind, "UserMessage", "point fetch returns exactly the requested seq");
+  assert.equal((await s.getItem(a.id, 1))!.seq, 1);
+  assert.equal(await s.getItem(a.id, 99), undefined, "a missing seq is undefined");
+  assert.equal(await s.getItem("nope", 0), undefined, "an unknown session is undefined");
+
+  assert.equal((await s.visibleItems(a.id, "U1")).length, 0, "a non-participant sees nothing");
+  await s.addParticipant(a.id, "U1");
+  assert.deepEqual(
+    (await s.visibleItems(a.id, "U1")).map((e) => e.text),
+    ["hi", "yo"],
+    "a late joiner sees the earlier history",
+  );
+  assert.equal((await s.listByParticipant("U1")).find((x) => x.id === a.id)?.hasEntries, true);
+  assert.equal(
+    (await s.listByScope(a.scopeId)).some((x) => x.id === a.id),
+    true,
+  );
+
+  assert.equal((await s.getByThread("t1"))?.id, a.id);
+  assert.equal(await s.getByThread("never-written"), null, "missing thread → null, no session created");
+
+  await s.removeParticipant(a.id, "U1");
+  assert.deepEqual(await s.visibleItems(a.id, "U1"), [], "a removed participant sees nothing");
+  assert.equal(
+    (await s.listByParticipant("U1")).some((x) => x.id === a.id),
+    false,
+    "a removed participant loses the sidebar entry",
+  );
+});
+
+test("pg latestItemSeq and participants round-trip", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "proj-reads");
+  const session = await s.getOrCreateByThread("pg-projection-reads", "dm", scope);
+  const writer = { sessionId: session.id };
+
+  assert.equal(await s.latestItemSeq(session.id), -1);
+  await s.append(writer, { kind: "UserMessage", text: "one" });
+  await s.append(writer, { kind: "AgentMessage", text: "two" });
+  assert.equal(await s.latestItemSeq(session.id), 1);
+
+  await s.addParticipant(session.id, "proj-reads");
+  await s.addParticipant(session.id, "late-joiner");
+  const listed = (await s.listParticipants()).filter((p) => p.sessionId === session.id);
+  assert.deepEqual(listed.map((p) => p.principalId).sort(), ["late-joiner", "proj-reads"]);
+  assert.deepEqual((await s.participantsOf(session.id)).sort(), ["late-joiner", "proj-reads"]);
+});
+
+test("pg deleteSession: hard-removes the session and its rows, leaves others", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "DEL1");
+  const a = await s.getOrCreateByThread("del-t1", "dm", scope);
+  const keep = await s.getOrCreateByThread("del-t2", "dm", scope);
+  await s.addParticipant(a.id, "DEL1");
+  await s.addParticipant(keep.id, "DEL1");
+  const writer = { sessionId: a.id };
+  await s.append(writer, { kind: "UserMessage", text: "hi" });
+  await s.recordLlmRequest(a.id, {
+    turnSeq: 0,
+    step: 0,
+    model: "claude-x",
+    scopeLabel: scope,
+    promptEnvelope: { system: "sys" },
+  });
+
+  await s.deleteSession(a.id);
+
+  assert.equal(await s.get(a.id), null, "session row gone");
+  assert.equal(await s.getByThread("del-t1"), null, "thread index gone");
+  assert.equal((await s.getItems(a.id)).length, 0, "entries gone");
+  assert.equal((await s.listLlmRequests(a.id)).length, 0, "llm requests gone");
+  assert.equal(
+    (await s.listByParticipant("DEL1")).some((x) => x.id === a.id),
+    false,
+    "dropped from the user's list",
+  );
+  const keptRow = (await s.listByParticipant("DEL1")).find((x) => x.id === keep.id);
+  assert.ok(keptRow, "other sessions untouched");
+  assert.equal(keptRow!.hasEntries, false, "an entry-less session reads back hasEntries=false");
+  await assert.rejects(
+    s.append({ sessionId: a.id }, { kind: "UserMessage", text: "late" }),
+    /foreign key/,
+    "no append lands on a deleted session",
+  );
+  const reborn = await s.getOrCreateByThread("del-t1", "dm", scope);
+  assert.notEqual(reborn.id, a.id, "the thread gets a fresh session");
+});
+
+test("pg scopeSessionSummaries: counts via aggregate, not per-transcript reads", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const team = scopeId("channel", "team-eng");
+  const other = scopeId("channel", "team-sales");
+
+  const a = await s.getOrCreateByThread("sumA", "channel", team);
+  const b = await s.getOrCreateByThread("sumB", "channel", team);
+  const c = await s.getOrCreateByThread("sumC", "channel", other);
+  const writer = { sessionId: a.id };
+  await s.append(writer, { kind: "UserMessage", text: "1" });
+  await s.append(writer, { kind: "AgentMessage", text: "ack" });
+  await s.append(writer, { kind: "UserMessage", text: "2" });
+
+  const cron = await s.getOrCreateByThread("agent:main:cron:c1", "channel", team);
+  const webhook = await s.getOrCreateByThread("agent:main:webhook:wh1", "channel", team);
+
+  const scoped = await s.scopeSessionSummaries(team, false, { limit: 500 });
+  assert.deepEqual(
+    scoped.map((r) => r.id).sort(),
+    [a.id, b.id, cron.id, webhook.id].sort(),
+    "scope filter excludes other scopes",
+  );
+  assert.equal(scoped.find((r) => r.id === a.id)!.origin, "conversation", "real conversation tagged conversation");
+  assert.equal(scoped.find((r) => r.id === cron.id)!.origin, "cron", "cron monologue thread tagged cron");
+  const ra = scoped.find((r) => r.id === a.id)!;
+  assert.equal(ra.turns, 2, "turns = user entries");
+  assert.equal(ra.messages, 3, "messages = all entries");
+  assert.equal(
+    ra.lastActivity,
+    a.createdAt,
+    "the debounce pins last activity to the session's creation for appends within 60s",
+  );
+  assert.equal(ra.firstMessage, "1", "first message = opening user turn (not the assistant reply)");
+  assert.equal(ra.lastMessage, "2", "last message = newest user turn");
+  const rb = scoped.find((r) => r.id === b.id)!;
+  assert.deepEqual([rb.turns, rb.messages], [0, 0], "entry-less session counts zero");
+  assert.equal(rb.lastActivity, rb.createdAt, "entry-less last activity falls back to created_at");
+  assert.deepEqual([rb.firstMessage, rb.lastMessage], ["", ""], "entry-less session has no message preview");
+
+  const all = await s.scopeSessionSummaries(team, true, { limit: 500 });
+  assert.equal(
+    all.some((r) => r.id === c.id),
+    true,
+    "orgWide includes every scope",
+  );
+
+  const conversations = await s.scopeSessionSummaries(team, false, { limit: 10, category: "conversation" });
+  assert.deepEqual(
+    conversations.map((r) => r.id).sort(),
+    [a.id, b.id].sort(),
+    "conversation page excludes cron monologues before pagination",
+  );
+  const background = await s.scopeSessionSummaries(team, false, { limit: 10, category: "background" });
+  assert.deepEqual(
+    background.map((r) => r.id).sort(),
+    [cron.id, webhook.id].sort(),
+    "background page contains trigger sessions",
+  );
+  const cronPage = await s.scopeSessionSummaries(team, false, {
+    limit: 1,
+    category: "background",
+    origin: "cron",
+  });
+  assert.deepEqual(
+    cronPage.map((r) => r.id),
+    [cron.id],
+    "origin page filters before pagination",
+  );
+  const otherPage = await s.scopeSessionSummaries(team, false, {
+    limit: 1,
+    category: "background",
+    origin: "other_background",
+  });
+  assert.deepEqual(
+    otherPage.map((r) => r.id),
+    [webhook.id],
+    "other background page filters before pagination",
+  );
+});
+
+test("pg scopeSessionSummaries: cronId page filters one cron's fires", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const team = scopeId("channel", "cron-groups");
+  const c1a = await s.getOrCreateByThread("cron:g1:slot1", "channel", team);
+  const c1b = await s.getOrCreateByThread("cron:g1:slot2", "channel", team);
+  await s.getOrCreateByThread("agent:main:cron:g2", "channel", team);
+  await s.getOrCreateByThread("agent:main:webhook:gwh", "channel", team);
+  const fresh = await s.getOrCreateByThread("cron:g1:slot3", "channel", team);
+
+  const fires = await s.scopeSessionSummaries(team, false, { limit: 10, cronId: "g1" });
+  assert.deepEqual(
+    fires.map((r) => r.id).sort(),
+    [c1a.id, c1b.id, fresh.id].sort(),
+    "cronId page returns only that cron's fires",
+  );
+  const page = await s.scopeSessionSummaries(team, false, {
+    limit: 1,
+    cronId: "g1",
+    before: { lastActivity: fires[0]!.lastActivity, id: fires[0]!.id },
+  });
+  assert.equal(page.length, 1, "cronId filter applies before pagination");
+});
+
+test("pg scopeActivity: one row per scope with conversation, cron and other background counts", { skip }, async () => {
+  const nowRef = { v: 40_000_000_000 };
+  const t0 = nowRef.v;
+  const s = createPostgresSessionStore(URL!, { now: () => nowRef.v });
+  const a = scopeId("channel", "activity-a");
+  const b = scopeId("channel", "activity-b");
+  await s.getOrCreateByThread("activity:t1", "channel", a);
+  await s.getOrCreateByThread("agent:main:webhook:activity-w1", "channel", a);
+  nowRef.v = t0 + 50_000;
+  await s.getOrCreateByThread("agent:main:monitor:activity-m1", "channel", b);
+  nowRef.v = t0 + 300_000;
+  await s.getOrCreateByThread("cron:activity-c1:fire:abc", "channel", a);
+  await s.getOrCreateByThread("activity:t2", "channel", a);
+
+  const rows = (await s.scopeActivity()).filter((r) => [a, b].includes(r.scopeId));
+  assert.deepEqual(
+    rows.sort((x, y) => x.scopeId.localeCompare(y.scopeId)),
+    [
+      { scopeId: a, conversations: 2, crons: 1, background: 1, lastActivity: t0 + 300_000 },
+      { scopeId: b, conversations: 0, crons: 0, background: 1, lastActivity: t0 + 50_000 },
+    ],
+  );
+});
+
+test("pg session origin columns are written at insert", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const team = scopeId("channel", "origin-columns");
+  const shapes: Record<string, { origin: string; cronId: string | null }> = {
+    "agent:main:cron:oc1": { origin: "cron", cronId: "oc1" },
+    "cron:oc2:slot": { origin: "cron", cronId: "oc2" },
+    "agent:main:webhook:ocw": { origin: "webhook", cronId: null },
+    "monitor:ocm:extra": { origin: "monitor", cronId: null },
+    "loop:ocl:fire:aaa": { origin: "loop", cronId: null },
+    "swarm:ocs:member": { origin: "swarm", cronId: null },
+    "ch:C1:oc-thread": { origin: "conversation", cronId: null },
+  };
+  const ids: string[] = [];
+  for (const threadRef of Object.keys(shapes)) ids.push((await s.getOrCreateByThread(threadRef, "channel", team)).id);
+
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const q = async (text: string, params?: unknown[]) =>
+    (await raw.query(text, params)).rows as Record<string, unknown>[];
+  const columns = async () =>
+    Object.fromEntries(
+      (await q("SELECT thread_ref, origin, origin_id FROM sessions WHERE id = ANY($1)", [ids])).map((r) => [
+        r.thread_ref,
+        { origin: r.origin, cronId: r.origin_id },
+      ]),
+    );
+  const classify = async () => ({
+    conversation: (await s.scopeSessionSummaries(team, false, { limit: 10, category: "conversation" })).map(
+      (r) => r.threadRef,
+    ),
+    cron: (await s.scopeSessionSummaries(team, false, { limit: 10, origin: "cron" })).map((r) => r.threadRef).sort(),
+    other: (await s.scopeSessionSummaries(team, false, { limit: 10, origin: "other_background" }))
+      .map((r) => r.threadRef)
+      .sort(),
+    oc2: (await s.scopeSessionSummaries(team, false, { limit: 10, cronId: "oc2" })).map((r) => r.threadRef),
+  });
+  try {
+    assert.deepEqual(await columns(), shapes, "insert derives origin and origin_id from the thread ref");
+    const stored = await classify();
+    assert.deepEqual(stored.other, [
+      "agent:main:webhook:ocw",
+      "loop:ocl:fire:aaa",
+      "monitor:ocm:extra",
+      "swarm:ocs:member",
+    ]);
+    assert.deepEqual(stored.conversation, ["ch:C1:oc-thread"]);
+    assert.deepEqual(stored.cron, ["agent:main:cron:oc1", "cron:oc2:slot"]);
+    assert.deepEqual(stored.oc2, ["cron:oc2:slot"]);
+
+    await q("UPDATE sessions SET origin = 'cron' WHERE id = ANY($1) AND thread_ref = 'ch:C1:oc-thread'", [ids]);
+    assert.deepEqual(
+      (await s.scopeSessionSummaries(team, false, { limit: 10, origin: "cron" }))
+        .filter((r) => r.threadRef === "ch:C1:oc-thread")
+        .map((r) => r.origin),
+      ["cron"],
+      "a listed session reports the stored origin its filter matched",
+    );
+  } finally {
+    await raw.end();
+  }
+});
+
+test("pg scopeSessionSummaries: keyset cursor pages stitch into the full listing", { skip }, async () => {
+  let clock = Date.now() + 1_000_000;
+  const s = createPostgresSessionStore(URL!, { now: () => ++clock });
+  const scope = scopeId("channel", "keyset");
+  for (let i = 0; i < 5; i++) {
+    const sess = await s.getOrCreateByThread(`keyset:${i}`, "channel", scope);
+    const writer = { sessionId: sess.id };
+    await s.append(writer, { kind: "UserMessage", text: `m${i}` });
+  }
+  const all = await s.scopeSessionSummaries(scope, false, { limit: 10 });
+  const page1 = await s.scopeSessionSummaries(scope, false, { limit: 2 });
+  const c1 = page1[page1.length - 1]!;
+  const page2 = await s.scopeSessionSummaries(scope, false, {
+    limit: 2,
+    before: { lastActivity: c1.lastActivity, id: c1.id },
+  });
+  const c2 = page2[page2.length - 1]!;
+  const page3 = await s.scopeSessionSummaries(scope, false, {
+    limit: 2,
+    before: { lastActivity: c2.lastActivity, id: c2.id },
+  });
+  assert.deepEqual(
+    [...page1, ...page2, ...page3].map((r) => r.id),
+    all.map((r) => r.id),
+    "cursor pages stitch into the full newest-first listing",
+  );
+  assert.equal(page3.length, 1, "final partial page");
+
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    await raw.query("UPDATE sessions SET messages = NULL, turns = NULL, last_activity = NULL WHERE id = $1", [
+      all[2]!.id,
+    ]);
+  } finally {
+    await raw.end();
+  }
+  const rerun = await s.scopeSessionSummaries(scope, false, { limit: 10 });
+  const p1 = await s.scopeSessionSummaries(scope, false, { limit: 2 });
+  const p2 = await s.scopeSessionSummaries(scope, false, {
+    limit: 2,
+    before: { lastActivity: p1[1]!.lastActivity, id: p1[1]!.id },
+  });
+  const p3 = await s.scopeSessionSummaries(scope, false, {
+    limit: 2,
+    before: { lastActivity: p2[1]!.lastActivity, id: p2[1]!.id },
+  });
+  assert.deepEqual(
+    [...p1, ...p2, ...p3].map((r) => r.id),
+    rerun.map((r) => r.id),
+    "a NULL-counter row still pages through on its created_at fallback",
+  );
+  assert.ok(
+    rerun.some((r) => r.id === all[2]!.id),
+    "the NULL-counter row is present in the listing",
+  );
+});
+
+test("pg scopeSessionSummaries: previews are stored on append and match the JS extraction", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "pvw");
+  const obj = await s.getOrCreateByThread("pvwA", "channel", scope);
+  const writer = { sessionId: obj.id };
+  await s.append(writer, { kind: "UserMessage", text: `[${"c".repeat(3000)}]\n\nthe real opener` });
+  await s.append(writer, { kind: "UserMessage", text: "x".repeat(300) });
+  const strp = await s.getOrCreateByThread("pvwB", "channel", scope);
+  const lease2 = { sessionId: strp.id };
+  await s.append(lease2, { kind: "UserMessage", text: "a bare string payload" });
+  await s.append(lease2, { kind: "UserMessage", text: "nul\u0000byte" });
+  const nontext = await s.getOrCreateByThread("pvwC", "channel", scope);
+  const lease3 = { sessionId: nontext.id };
+  await s.append(lease3, { kind: "UserMessage", body: { text: 42 } });
+
+  const rows = await s.scopeSessionSummaries(scope, false, { limit: 500 });
+  const ra = rows.find((r) => r.id === obj.id)!;
+  assert.equal(ra.firstMessage, "the real opener", "bracketed boilerplate stripped (even a >2KB block)");
+  assert.equal(ra.lastMessage, "x".repeat(99) + "…", "last-message preview truncated to 100 like before");
+  const rb = rows.find((r) => r.id === strp.id)!;
+  assert.equal(rb.firstMessage, "a bare string payload", "a plain message previews");
+  assert.equal(rb.lastMessage, "nulbyte", "a null byte never reaches the text column");
+  assert.equal(rows.find((r) => r.id === nontext.id)!.firstMessage, "", "a non-string text field has no preview");
+
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    const stored = await raw.query(
+      "SELECT id, first_user_preview, last_user_preview FROM sessions WHERE id = ANY($1) ORDER BY thread_ref",
+      [[obj.id, strp.id, nontext.id]],
+    );
+    assert.deepEqual(
+      stored.rows.map((r) => [r.first_user_preview, r.last_user_preview]),
+      [
+        ["the real opener", "x".repeat(99) + "…"],
+        ["a bare string payload", "nulbyte"],
+        ["", ""],
+      ],
+      "the append path persists bounded previews on the session row",
+    );
+  } finally {
+    await raw.end();
+  }
+});
+
+test("pg append returns the same sanitized text it stores for a lone surrogate", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "surrogate");
+  const session = await s.getOrCreateByThread("surrogateA", "channel", scope);
+  const writer = { sessionId: session.id };
+  const cut = "emoji 😀".slice(0, 7);
+  const appended = await s.append(writer, { kind: "UserMessage", text: `${cut}\u0000` });
+  const [stored] = await s.getItems(session.id);
+  assert.equal(appended.text, "emoji \uFFFD");
+  assert.deepEqual(stored, appended);
+});
+
+test("pg appendMany maintains first/last user previews across batches", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "pvw-batch");
+  const session = await s.getOrCreateByThread("pvwBatch", "channel", scope);
+  const preview = async () => {
+    const row = (await s.scopeSessionSummaries(scope, false, { limit: 10 })).find((r) => r.id === session.id)!;
+    return [row.firstMessage, row.lastMessage, row.turns];
+  };
+  assert.deepEqual(await preview(), ["", "", 0], "a fresh session has no preview");
+  const writer = { sessionId: session.id };
+  await s.appendMany(writer, [
+    { kind: "AgentMessage", text: "greeting" },
+    { kind: "UserMessage", text: "an overheard aside", body: { overheard: true } },
+    { kind: "UserMessage", text: "first ask" },
+    { kind: "UserMessage", text: "second ask" },
+  ]);
+  assert.deepEqual(await preview(), ["first ask", "second ask", 2], "one batch sets both ends, skipping overheard");
+  await s.appendMany(writer, [{ kind: "AgentMessage", text: "reply" }]);
+  assert.deepEqual(await preview(), ["first ask", "second ask", 2], "a batch without user turns keeps both");
+  await s.append(writer, { kind: "UserMessage", text: "third ask" });
+  assert.deepEqual(await preview(), ["first ask", "third ask", 3], "later user turns move only the last preview");
+  await s.append(writer, { kind: "UserMessage", text: "eavesdrop", body: { overheard: true } });
+  assert.deepEqual(await preview(), ["first ask", "third ask", 3], "an overheard turn is not the last message");
+});
+
+test(
+  "pg scopeSessionSummaries: rows without stored previews fall back to the title and never read items",
+  { skip },
+  async () => {
+    let clock = Date.now() + 5_000_000;
+    const s = createPostgresSessionStore(URL!, { now: () => (clock += 120_000) });
+    const scope = scopeId("channel", "pvw-legacy");
+    const titled = await s.getOrCreateByThread("pvwLegacyTitled", "channel", scope);
+    const bare = await s.getOrCreateByThread("pvwLegacyBare", "channel", scope);
+    for (const session of [titled, bare]) {
+      const writer = { sessionId: session.id };
+      await s.append(writer, { kind: "UserMessage", text: "open" });
+    }
+    const pg = (await import("pg")).default;
+    const raw = new pg.Pool({ connectionString: URL });
+    try {
+      await raw.query("UPDATE sessions SET first_user_preview = NULL, last_user_preview = NULL WHERE id = ANY($1)", [
+        [titled.id, bare.id],
+      ]);
+      await raw.query("UPDATE sessions SET title = 'Quarterly plan' WHERE id = $1", [titled.id]);
+      const rows = await s.scopeSessionSummaries(scope, false, { limit: 10 });
+      assert.deepEqual(
+        rows.map((r) => [r.id, r.firstMessage, r.lastMessage]),
+        [
+          [bare.id, "", ""],
+          [titled.id, "Quarterly plan", ""],
+        ],
+        "previews come only from stored session columns",
+      );
+    } finally {
+      await raw.end();
+    }
+  },
+);
+
+test("pg scopeSessionSummaries: keyset pages break last_activity ties by id without gaps", { skip }, async () => {
+  const at = Date.now() + 9_000_000;
+  const s = createPostgresSessionStore(URL!, { now: () => at });
+  const scope = scopeId("channel", `ties-${randomUUID()}`);
+  for (let i = 0; i < 7; i++) await s.getOrCreateByThread(`ties:${scope}:${i}`, "channel", scope);
+  const all = await s.scopeSessionSummaries(scope, false, { limit: 50 });
+  assert.equal(new Set(all.map((r) => r.lastActivity)).size, 1, "every row ties on last_activity");
+  assert.deepEqual(
+    all.map((r) => r.id),
+    all
+      .map((r) => r.id)
+      .sort()
+      .reverse(),
+    "ties order by id descending",
+  );
+  for (const orgWide of [false, true]) {
+    const walked: string[] = [];
+    let before = { lastActivity: at + 1, id: "" };
+    while (walked.length < all.length) {
+      const page = await s.scopeSessionSummaries(scope, orgWide, { limit: 3, before });
+      const mine = page.filter((r) => r.scopeId === scope);
+      walked.push(...mine.map((r) => r.id));
+      if (mine.length < 3) break;
+      before = { lastActivity: page[2]!.lastActivity, id: page[2]!.id };
+    }
+    assert.deepEqual(
+      walked,
+      all.map((r) => r.id),
+      `${orgWide ? "org-wide" : "scoped"} cursor walk visits each tie once`,
+    );
+  }
+});
+
+test("pg scopeSessionSummaries: a cancelled caller releases the listing query", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "listing-abort");
+  await s.getOrCreateByThread("listing-abort", "channel", scope);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    s.scopeSessionSummaries(scope, false, { limit: 10, signal: controller.signal }),
+    { name: "AbortError" },
+    "a disconnected admin request does not keep a pool connection busy",
+  );
+  assert.equal((await s.scopeSessionSummaries(scope, false, { limit: 10 })).length, 1);
+});
+
+test("pg scopeSessionSummaries: the listing plan is an index walk with no per-row subplans", { skip }, async (t) => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "plan-shape");
+  const session = await s.getOrCreateByThread("plan-shape", "channel", scope);
+  const writer = { sessionId: session.id };
+  await s.append(writer, { kind: "UserMessage", text: "hi" });
+  const pg = (await import("pg")).default;
+  const execute = pg.Client.prototype.query;
+  const captured: { text: string; values: unknown[] }[] = [];
+  t.mock.method(pg.Client.prototype, "query", function (this: InstanceType<typeof pg.Client>, ...args: unknown[]) {
+    const config = args[0] as { text?: string; values?: unknown[] } | string;
+    if (typeof config === "object" && config.text?.includes("AS last_activity, s.first_user_preview")) {
+      captured.push({ text: config.text, values: config.values ?? [] });
+    }
+    return Reflect.apply(execute, this, args);
+  });
+  const before = { lastActivity: Date.now() + 1e9, id: "~" };
+  await s.scopeSessionSummaries(scope, false, { limit: 50, before, category: "conversation" });
+  await s.scopeSessionSummaries(scope, true, { limit: 50, before, category: "conversation" });
+  await s.scopeSessionSummaries(scope, false, {
+    limit: 50,
+    before,
+    category: "background",
+    origin: "other_background",
+  });
+  t.mock.restoreAll();
+  assert.equal(captured.length, 3);
+  const raw = await new pg.Pool({ connectionString: URL }).connect();
+  try {
+    await raw.query("BEGIN");
+    await raw.query("SET LOCAL enable_seqscan = off");
+    await raw.query("SET LOCAL enable_bitmapscan = off");
+    await raw.query("SET LOCAL enable_sort = off");
+    const indexes = [
+      "sessions_conversations_by_scope_activity",
+      "sessions_by_activity",
+      "sessions_other_background_by_scope_activity",
+    ];
+    for (const [query, index] of captured.map((c, i) => [c, indexes[i]!] as const)) {
+      const explained = await raw.query(`EXPLAIN (FORMAT JSON) ${query.text}`, query.values);
+      const plan = JSON.stringify(explained.rows[0]["QUERY PLAN"]);
+      assert.doesNotMatch(plan, /SubPlan|"Relation Name":"items"/, "no correlated subquery over items");
+      assert.doesNotMatch(plan, /"Node Type":"Sort"/, "the index supplies the order; nothing is sorted");
+      assert.match(plan, new RegExp(`"Index Name":"${index}"`), `${index} serves the listing`);
+    }
+    await raw.query("ROLLBACK");
+  } finally {
+    raw.release();
+  }
+});
+
+test("pg sessions table indexes scoped activity pages", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  await s.countSessions();
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    const result = await raw.query("SELECT indexname, indexdef FROM pg_indexes WHERE indexname = ANY($1::text[])", [
+      ["sessions_by_scope", "sessions_by_scope_activity", "sessions_by_activity"],
+    ]);
+    const indexes = new Map(result.rows.map((row) => [row.indexname as string, row.indexdef as string]));
+    assert.match(indexes.get("sessions_by_scope") ?? "", /\(scope_id, created_at DESC\)/);
+    assert.match(
+      indexes.get("sessions_by_scope_activity") ?? "",
+      /scope_id, COALESCE\(last_activity, created_at\) DESC, id DESC/,
+    );
+    assert.match(
+      indexes.get("sessions_by_activity") ?? "",
+      /COALESCE\(last_activity, created_at\) DESC, id DESC/,
+      "the org-wide listing walks its own activity index",
+    );
+    const relopts = await raw.query("SELECT reloptions FROM pg_class WHERE relname = 'sessions'");
+    assert.ok(
+      ((relopts.rows[0]?.reloptions ?? []) as string[]).includes("fillfactor=70"),
+      "sessions leaves page room so counter-only appends can go HOT",
+    );
+  } finally {
+    await raw.end();
+  }
+});
+
+test("pg append debounces last_activity by 60s but keeps counters exact", { skip }, async () => {
+  const nowRef = { v: 20_000_000_000 };
+  const t0 = nowRef.v;
+  const s = createPostgresSessionStore(URL!, { now: () => nowRef.v });
+  const scope = scopeId("channel", "debounce");
+  const session = await s.getOrCreateByThread("debounceA", "channel", scope);
+  const writer = { sessionId: session.id };
+  const activityOf = async () =>
+    (await s.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === session.id)!;
+
+  nowRef.v = t0 + 30_000;
+  await s.append(writer, { kind: "UserMessage", text: "within the window" });
+  let row = await activityOf();
+  assert.equal(row.lastActivity, t0, "an append within 60s leaves last_activity alone");
+  assert.equal(row.messages, 1, "…while messages stays exact");
+  assert.equal(row.turns, 1, "…and turns stays exact");
+
+  nowRef.v = t0 + 90_000;
+  await s.append(writer, { kind: "UserMessage", text: "past the window" });
+  row = await activityOf();
+  assert.equal(row.lastActivity, t0 + 90_000, "an append past 60s advances last_activity");
+  assert.equal(row.messages, 2);
+  assert.equal(row.turns, 2);
+
+  nowRef.v = t0 + 120_000;
+  await s.append(writer, { kind: "AgentMessage", text: "still within" });
+  row = await activityOf();
+  assert.equal(row.lastActivity, t0 + 90_000, "the window measures from the stored value, not the last append");
+  assert.equal(row.messages, 3);
+});
+
+test("pg store startup never rewrites or waits on session rows", { skip }, async () => {
+  const nowRef = { v: Date.now() - 60_000 };
+  const s = createPostgresSessionStore(URL!, { now: () => nowRef.v });
+  const scope = scopeId("channel", "boot-no-lock");
+  const ids: string[] = [];
+  for (let i = 0; i < 4; i++) ids.push((await s.getOrCreateByThread(`bootNoLock${i}`, "channel", scope)).id);
+  nowRef.v += 10_000;
+  for (const id of ids) {
+    const writer = { sessionId: id };
+    await s.append(writer, { kind: "UserMessage", text: "hi" });
+  }
+  const [held, writing, ...idle] = ids as [string, string, ...string[]];
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const holder = await raw.connect();
+  let open = false;
+  const within = <T>(p: Promise<T>, what: string): Promise<T> =>
+    Promise.race([
+      p,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} blocked`)), 5_000).unref()),
+    ]);
+  try {
+    const rowVersions = async () =>
+      (await raw.query("SELECT id, xmin::text AS v FROM sessions WHERE id = ANY($1) ORDER BY id", [idle])).rows;
+    const before = await rowVersions();
+    await holder.query("BEGIN");
+    open = true;
+    await holder.query("SELECT 1 FROM sessions WHERE id = $1 FOR UPDATE", [held]);
+
+    const boots = [0, 1, 2].map(() => createPostgresSessionStore(URL!));
+    await within(Promise.all(boots.map((b) => b.get(held))), "concurrent fresh-store startup");
+    const writer = { sessionId: writing };
+    await within(
+      boots[0]!.append(writer, { kind: "AgentMessage", text: "beside a boot" }),
+      "append on a freshly booted store",
+    );
+    assert.deepEqual(await rowVersions(), before, "startup writes no session rows");
+    const row = (await boots[1]!.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === writing)!;
+    assert.equal(row.messages, 2, "normal appends keep exact counters");
+    assert.equal(row.turns, 1);
+  } finally {
+    if (open) await holder.query("ROLLBACK");
+    holder.release();
+    await raw.end();
+  }
+});
+
+test("pg scopeHasSessions + listByScope answer scope questions without a table scan", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "scoped-reads");
+  const other = scopeId("channel", "scoped-reads-other");
+  assert.equal(await s.scopeHasSessions(scope), false, "an unused scope reports no sessions");
+  const a = await s.getOrCreateByThread("scopedReadsA", "channel", scope);
+  const b = await s.getOrCreateByThread("scopedReadsB", "channel", scope);
+  await s.getOrCreateByThread("scopedReadsC", "channel", other);
+  assert.equal(await s.scopeHasSessions(scope), true);
+  const listed = await s.listByScope(scope);
+  assert.deepEqual(new Set(listed.map((x) => x.id)), new Set([a.id, b.id]), "only the asked-for scope comes back");
+});
+
+test("no plpgsql exception handler is marked parallel-safe anywhere in the schema", { skip }, async () => {
+  const seed = createPostgresSessionStore(URL!);
+  await seed.countSessions();
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    const offenders = await raw.query(PARALLEL_EXCEPTION_QUERY);
+    assert.deepEqual(offenders.rows, [], "plpgsql EXCEPTION handlers marked PARALLEL SAFE");
+  } finally {
+    await raw.end();
+  }
+});
+
+test(
+  "pg overheard catch-up entries are excluded from turns/preview/retention (jsonb payload filter)",
+  { skip },
+  async () => {
+    const s = createPostgresSessionStore(URL!);
+    const scope = scopeId("channel", "ov");
+    const a = await s.getOrCreateByThread("ovA", "channel", scope);
+    await s.addParticipant(a.id, "OV1");
+    const writer = { sessionId: a.id };
+    await s.append(writer, {
+      kind: "UserMessage",
+      externalId: "1",
+      text: "overheard chatter",
+      body: { overheard: true, name: "Alice" },
+    });
+    await s.append(writer, { kind: "UserMessage", text: "the real question" });
+    await s.append(writer, { kind: "AgentMessage", text: "answer" });
+    await s.append(writer, {
+      kind: "UserMessage",
+      externalId: "2",
+      text: "more chatter",
+      body: { overheard: true, name: "Bob" },
+    });
+
+    const row = (await s.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === a.id)!;
+    assert.equal(row.turns, 1, "summary turns excludes overheard");
+    assert.equal(row.messages, 4, "messages still counts every durable entry");
+    assert.equal(row.firstMessage, "the real question", "overheard is not the first message");
+    assert.equal(row.lastMessage, "the real question", "overheard is not the last message");
+  },
+);
+
+test("pg null-byte payloads: stripped on write and counted alongside raw items", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "nul");
+  const a = await s.getOrCreateByThread("nulA", "channel", scope);
+  await s.addParticipant(a.id, "NUL1");
+  const writer = { sessionId: a.id };
+  const e = await s.append(writer, { kind: "UserMessage", text: "a\u0000b", author: "NUL1" });
+  assert.equal(e.text, "ab", "append returns the sanitized text, matching what is stored");
+  assert.equal((await s.getItems(a.id))[0]!.text, "ab", "null byte stripped at write");
+
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    await raw.query(
+      "INSERT INTO items(tenant_id, session_id, seq, kind, author, body, created_at) VALUES (qm_bound_tenant(),$1,$2,'UserMessage','NUL1',$3,to_timestamp($4 / 1000.0))",
+      [a.id, 1, { text: "xy" }, Date.now()],
+    );
+    await raw.query("UPDATE sessions SET messages = NULL, turns = NULL, last_activity = NULL WHERE id = $1", [a.id]);
+  } finally {
+    await raw.end();
+  }
+  const activity = (await createPostgresUserStore(URL!).activity()).find((r) => r.principalId === "NUL1");
+  assert.equal(activity?.turns, 2, "both user turns counted");
+  const lease2 = { sessionId: a.id };
+  await s.append(lease2, { kind: "UserMessage", text: "z" });
+  const row = (await s.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === a.id)!;
+  assert.equal(row.turns, 3, "append recounts NULL turns");
+  assert.equal(row.messages, 3, "messages self-heal from the entry seq");
+});
+
+test(
+  "pg session counters: legacy and mismatched counters heal on the next append, not at startup",
+  { skip },
+  async () => {
+    const s = createPostgresSessionStore(URL!);
+    const scope = scopeId("channel", "counters");
+    const a = await s.getOrCreateByThread("countersA", "channel", scope);
+    const b = await s.getOrCreateByThread("countersB", "channel", scope);
+    const writer = { sessionId: a.id };
+    await s.append(writer, { kind: "UserMessage", text: "hi" });
+    await s.append(writer, { kind: "AgentMessage", text: "yo" });
+    await s.append(writer, { kind: "UserMessage", text: "heard", body: { overheard: true } });
+
+    const pg = (await import("pg")).default;
+    const raw = new pg.Pool({ connectionString: URL });
+    try {
+      await raw.query("UPDATE sessions SET messages = NULL, turns = NULL, last_activity = NULL WHERE id = ANY($1)", [
+        [a.id, b.id],
+      ]);
+      const s2 = createPostgresSessionStore(URL!);
+      const rows = await s2.scopeSessionSummaries(scope, false, { limit: 500 });
+      const ra = rows.find((r) => r.id === a.id)!;
+      assert.equal(ra.messages, 0, "startup no longer backfills: an idle legacy row reads as zero until it is written");
+      assert.equal(ra.lastActivity, ra.createdAt, "…and sorts by created_at");
+      assert.equal((await s2.getItems(a.id)).length, 3, "its stored messages are all still readable");
+      const rb = rows.find((r) => r.id === b.id)!;
+      assert.equal(rb.messages, 0, "entry-less legacy session reads as zero");
+      assert.equal(rb.lastActivity, rb.createdAt, "entry-less last-activity falls back to created_at");
+
+      const legacyWriter = { sessionId: a.id };
+      await s2.append(legacyWriter, { kind: "AgentMessage", text: "first write on new code" });
+      const entries = await s2.getItems(a.id);
+      const legacy = (await s2.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === a.id)!;
+      assert.equal(legacy.messages, 4, "append counts every entry of a legacy row");
+      assert.equal(legacy.turns, 1, "append recount excludes overheard user rows");
+      assert.equal(legacy.lastActivity, entries[entries.length - 1]!.createdAt, "last-activity = newest entry");
+
+      await raw.query(
+        "INSERT INTO items(tenant_id, session_id, seq, kind, author, body, created_at) VALUES (qm_bound_tenant(),$1,$2,'UserMessage','NUL1',$3,to_timestamp($4 / 1000.0))",
+        [a.id, 4, { text: "from the old instance" }, Date.now()],
+      );
+      const lease2 = { sessionId: a.id };
+      await s2.append(lease2, { kind: "UserMessage", text: "back on new code" });
+      const healed = (await s2.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === a.id)!;
+      assert.equal(healed.messages, 6, "messages self-heal from the entry seq");
+      assert.equal(healed.turns, 3, "seq/messages mismatch triggers a full turns recount");
+
+      await raw.query(
+        "INSERT INTO items(tenant_id, session_id, seq, kind, body, created_at) VALUES (qm_bound_tenant(),$1,0,'UserMessage',$2,to_timestamp($3 / 1000.0)), (qm_bound_tenant(),$1,1,'AgentMessage',$4,to_timestamp($5 / 1000.0))",
+        [b.id, { text: "drained turn" }, Date.now(), { text: "reply" }, Date.now() + 1],
+      );
+      await raw.query("UPDATE sessions SET messages = 0, turns = 0 WHERE id = $1", [b.id]);
+      const s3 = createPostgresSessionStore(URL!);
+      const stale = (await s3.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === b.id)!;
+      assert.equal(stale.messages, 0, "a fresh store leaves stale non-NULL counters alone");
+      await s3.append({ sessionId: b.id }, { kind: "AgentMessage", text: "next" });
+      const rb2 = (await s3.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === b.id)!;
+      assert.equal(rb2.messages, 3, "the next append repairs stale non-NULL counters");
+      assert.equal(rb2.turns, 1, "…and restores turns the old writer never counted");
+
+      const future = Date.now() + 5_000_000;
+      await raw.query("UPDATE sessions SET last_activity = $2 WHERE id = $1", [a.id, future]);
+      const lease3 = { sessionId: a.id };
+      await s3.append(lease3, { kind: "AgentMessage", text: "late clock" });
+      const ra2 = (await s3.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === a.id)!;
+      assert.equal(ra2.lastActivity, future, "an older-clocked append never moves last_activity backwards");
+      const ra3 = (await createPostgresSessionStore(URL!).scopeSessionSummaries(scope, false, { limit: 500 })).find(
+        (r) => r.id === a.id,
+      )!;
+      assert.equal(ra3.lastActivity, future, "a fresh store never moves last_activity either");
+
+      await raw.query("UPDATE sessions SET turns = 7 WHERE id = $1", [b.id]);
+    } finally {
+      await raw.end();
+    }
+    assert.equal(
+      (await s.scopeSessionSummaries(scope, false, { limit: 500 })).find((r) => r.id === b.id)!.turns,
+      7,
+      "listings read the stored turns counter, never the entries",
+    );
+  },
+);
+
+test("pg run store: Unicode stays jsonb-safe through enqueue, edit and both steering paths", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  const signals = createPostgresRunSignalStore(URL!);
+  const thread = `unicode-${randomUUID()}`;
+  const unsafe = "nul\u0000 lone\ud800 low\udfff emoji😀 literal\\u0000";
+  const safe = "nul lone� low� emoji😀 literal\\u0000";
+  const inbound: TurnRequest = {
+    surface: "web",
+    actor: { externalId: "U1" },
+    conversation: { kind: "dm", threadRef: thread },
+    text: unsafe,
+  };
+  const request = {
+    ...turn(unsafe),
+    attachments: [{ name: unsafe, mimetype: "text/plain", sizeBytes: 5, blobId: "notes-blob" }],
+  };
+  try {
+    const first = (await runs.enqueue({ sessionId: thread, request })).run;
+    assert.equal(first.request.text, safe);
+    assert.equal(first.request.attachments?.[0]?.name, safe);
+    assert.equal(request.text, unsafe);
+    const privateRun = (
+      await runs.enqueue({ sessionId: thread, request: { ...turn(unsafe), privateSessionMessage: true } })
+    ).run;
+    assert.equal(await runs.editPendingText(first.id, `edit ${unsafe}`, unsafe), true);
+    assert.equal(await runs.editPendingText(first.id, "stale", unsafe), false);
+    assert.equal((await runs.get(first.id))?.request.displayText, `edit ${safe}`);
+    assert.equal(
+      await runs.steerQueued(
+        first.id,
+        privateRun.id,
+        {
+          kind: "steer",
+          text: `edit ${unsafe}`,
+          request: { ...inbound, text: `edit ${unsafe}` },
+          dedupeKey: `${thread}-queued`,
+        },
+        signals,
+      ),
+      true,
+    );
+    assert.equal(await runs.get(first.id), null);
+    const queued = await signals.takePending(privateRun.id);
+    assert.equal(queued[0]?.text, `edit ${safe}`);
+    assert.equal(queued[0]?.request?.text, `edit ${safe}`);
+    assert.equal(
+      await signals.send(privateRun.id, {
+        kind: "steer",
+        text: unsafe,
+        request: inbound,
+      }),
+      true,
+    );
+    const direct = await signals.takePending(privateRun.id);
+    assert.equal(direct[0]?.text, safe);
+    assert.equal(direct[0]?.request?.text, safe);
+  } finally {
+    for (const run of await runs.inFlightForThread(thread)) await runs.withdraw(run.id);
+    await signals.close?.();
+    await close();
+  }
+});
+
+test("pg run store: terminalFinished lists finished runs by (finishedAt, id) up to the bound", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  const tag = randomUUID();
+  try {
+    const ids: string[] = [];
+    for (const ref of ["a", "b", "c"]) {
+      const thread = `${tag}-${ref}`;
+      const run = (await runs.enqueue({ sessionId: thread, request: turn(ref) })).run;
+      const claimed = await runs.claimById(run.id, "w", 5_000);
+      await runs.complete(run.id, claimed?.leaseToken ?? "", { status: "ok", reply: ref });
+      ids.push(run.id);
+    }
+    const open = (await runs.enqueue({ sessionId: `${tag}-open`, request: turn("open") })).run;
+    await runs.claimById(open.id, "w", 5_000);
+    const far = Date.now() + 60_000;
+    const started = (await runs.get(ids[0]!))!.startedAt! - 1;
+    const listed = await runs.terminalFinished({ finishedAt: started, id: "" }, far, 10_000);
+    const mine = listed.filter((run) => run.sessionId.startsWith(tag));
+    assert.deepEqual(new Set(mine.map((run) => run.id)), new Set(ids));
+    assert.ok(!listed.some((run) => run.id === open.id));
+    for (let i = 1; i < listed.length; i++) {
+      const prev = listed[i - 1]!;
+      const next = listed[i]!;
+      assert.ok(prev.finishedAt! < next.finishedAt! || (prev.finishedAt === next.finishedAt && prev.id < next.id));
+    }
+    const first = mine[0]!;
+    const after = await runs.terminalFinished({ finishedAt: first.finishedAt!, id: first.id }, far, 10_000);
+    assert.ok(!after.some((run) => run.id === first.id), "the cursor row itself is excluded");
+    assert.deepEqual(await runs.terminalFinished({ finishedAt: started, id: "" }, first.finishedAt! - 1, 10_000), []);
+  } finally {
+    await close();
+  }
+});
+
+test("pg run store: the turn boundary is recorded once and survives a re-claim", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  try {
+    const session = `sSeq-${randomUUID()}`;
+    const run = (await runs.enqueue({ sessionId: session, request: turn("where is that running?") })).run;
+    assert.equal(run.turnUserSeq, null, "a fresh run has no recorded turn");
+    assert.equal(await runs.noteTurnUserSeq(run.id, 0), true, "seq 0 is a real seq, not an absent marker");
+    assert.equal((await runs.get(run.id))?.turnUserSeq, 0);
+    assert.equal(await runs.noteTurnUserSeq(run.id, 41), false, "a later attempt cannot move the boundary");
+    const claimed = await runs.claimById(run.id, "w1", 5_000);
+    assert.equal(claimed?.turnUserSeq, 0, "the re-claimed run still carries the boundary the dead attempt recorded");
+    assert.equal(await runs.noteTurnUserSeq(randomUUID(), 7), false, "an unknown run records nothing");
+  } finally {
+    await close();
+  }
+});
+
+test("pg run store: enqueue dedup, atomic one-per-session claim, fencing, reaper", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  try {
+    const r1 = (await runs.enqueue({ sessionId: "sA", request: turn("1") })).run;
+    await runs.enqueue({ sessionId: "sA", request: turn("2") });
+    const rB = (await runs.enqueue({ sessionId: "sB", request: turn("b") })).run;
+    const first = (await runs.claim("w1", 5_000))[0] ?? null;
+    assert.equal(first?.id, r1.id, "oldest pending claimed first");
+    const second = (await runs.claim("w2", 5_000))[0] ?? null;
+    assert.equal(second?.id, rB.id, "sA already running → skip its 2nd, take sB");
+    assert.equal((await runs.claim("w3", 5_000))[0] ?? null, null, "nothing else eligible");
+
+    assert.equal(
+      await runs.complete(first!.id, "wrong", { status: "ok" } as TurnResult),
+      false,
+      "fenced token can't complete",
+    );
+    assert.equal((await runs.get(first!.id))?.status, "running");
+    assert.equal(await runs.complete(first!.id, first!.leaseToken!, { status: "ok", reply: "done" }), true);
+    assert.equal((await runs.get(first!.id))?.status, "done");
+
+    const a = await runs.enqueue({ sessionId: "s1", request: turn("hi"), dedupKey: "k1" });
+    const b = await runs.enqueue({ sessionId: "s1", request: turn("again"), dedupKey: "k1" });
+    assert.equal(b.deduped, true);
+    assert.equal(b.run.id, a.run.id);
+
+    const N = 8;
+    const raced = await Promise.all(
+      Array.from({ length: N }, (_, i) => runs.enqueue({ sessionId: "s2", request: turn(`c${i}`), dedupKey: "kc" })),
+    );
+    const racedIds = new Set(raced.map((r) => r.run.id));
+    assert.equal(racedIds.size, 1, "all concurrent same-key enqueues return the same run");
+    assert.equal(raced.filter((r) => r.deduped === false).length, 1, "exactly one inserter");
+    assert.equal(raced.filter((r) => r.deduped === true).length, N - 1, "the rest are dedup hits");
+
+    const r = (await runs.enqueue({ sessionId: "sR", request: turn("x"), maxAttempts: 3 })).run;
+    await runs.claim("dead", 1);
+    await new Promise((res) => setTimeout(res, 20));
+    const swept = await runs.reapExpired();
+    assert.ok(swept.requeued >= 1);
+    assert.equal((await runs.get(r.id))?.status, "pending");
+  } finally {
+    await close();
+  }
+});
+
+test("pg run store: duplicate enqueue never updates a protected run owner", { skip }, async () => {
+  const first = createPostgresRunStore(URL!);
+  const sibling = createPostgresRunStore(URL!);
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const key = `protected-${randomUUID()}`;
+  let runId: string | undefined;
+  try {
+    const original = await first.runs.enqueue({ sessionId: key, request: turn("original"), dedupKey: key });
+    runId = original.run.id;
+    await raw.query(`CREATE FUNCTION reject_run_owner_update() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'turn dedup owner still has active routes' USING ERRCODE='23503';
+      END
+    $$`);
+    await raw.query(`CREATE TRIGGER reject_run_owner_update BEFORE UPDATE OF id ON runs
+      FOR EACH ROW EXECUTE FUNCTION reject_run_owner_update()`);
+    for (const status of ["pending", "running", "done"]) {
+      if (status === "running") await first.runs.claimById(runId, "protected-worker", 60_000);
+      if (status === "done") {
+        const claimed = await first.runs.get(runId);
+        await first.runs.complete(runId, claimed!.leaseToken!, { status: "ok", reply: "finished" });
+      }
+      const before = await first.runs.get(runId);
+      const duplicates = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          sibling.runs.enqueue({
+            sessionId: "different-session",
+            request: turn("duplicate"),
+            dedupKey: key,
+            maxAttempts: 9,
+          }),
+        ),
+      );
+      for (const duplicate of duplicates) {
+        assert.equal(duplicate.deduped, true);
+        assert.deepEqual(duplicate.run, before);
+        assert.equal(duplicate.run.status, status);
+      }
+      assert.deepEqual(await first.runs.get(runId), before);
+    }
+  } finally {
+    await raw.query("DROP TRIGGER IF EXISTS reject_run_owner_update ON runs");
+    await raw.query("DROP FUNCTION IF EXISTS reject_run_owner_update()");
+    if (runId) await raw.query("DELETE FROM runs WHERE id=$1", [runId]);
+    await raw.end();
+    await first.close();
+    await sibling.close();
+  }
+});
+
+test("pg run store: enqueue retries when a conflicting key is released before lookup", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const key = `released-${randomUUID()}`;
+  try {
+    const original = await runs.enqueue({ sessionId: key, request: turn("original"), dedupKey: key });
+    await raw.query(`CREATE FUNCTION release_conflicting_run_key() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        UPDATE runs SET idempotency_key=NULL WHERE id='${original.run.id}';
+        RETURN NULL;
+      END
+    $$`);
+    await raw.query(`CREATE TRIGGER release_conflicting_run_key AFTER INSERT ON runs
+      FOR EACH STATEMENT EXECUTE FUNCTION release_conflicting_run_key()`);
+    const retried = await runs.enqueue({ sessionId: key, request: turn("retry"), dedupKey: key });
+    assert.equal(retried.deduped, false);
+    assert.notEqual(retried.run.id, original.run.id);
+    assert.equal(retried.run.request.text, "retry");
+    assert.equal((await runs.get(original.run.id))?.dedupKey, null);
+    assert.equal((await runs.getByDedupKey(key))?.id, retried.run.id);
+  } finally {
+    await raw.query("DROP TRIGGER IF EXISTS release_conflicting_run_key ON runs");
+    await raw.query("DROP FUNCTION IF EXISTS release_conflicting_run_key()");
+    await raw.query("DELETE FROM runs WHERE session_id=$1", [key]);
+    await raw.end();
+    await close();
+  }
+});
+
+test(
+  "pg run store: releaseLease (deploy drain) hands the run back as a retry without spending budget; stale token is a no-op",
+  { skip },
+  async () => {
+    const { runs, close } = createPostgresRunStore(URL!);
+    try {
+      const r = (await runs.enqueue({ sessionId: "sDrain", request: turn("long turn") })).run;
+      const claimed = await runs.claimById(r.id, "w1", 60_000);
+      assert.equal(claimed?.id, r.id);
+      const token = claimed!.leaseToken!;
+      const claimCount = claimed!.attempts;
+
+      assert.equal(await runs.releaseLease(r.id, "wrong-token"), false);
+      assert.equal((await runs.get(r.id))?.status, "running");
+
+      assert.equal(await runs.releaseLease(r.id, token), true);
+      const released = await runs.get(r.id);
+      assert.equal(released?.status, "pending", "released immediately, not after TTL");
+      assert.equal(released?.leaseToken, null);
+      assert.equal(released?.leaseExpiresAt, null);
+      assert.equal(released?.workerId, null);
+      assert.equal(released?.attempts, claimCount, "claim count untouched");
+      assert.equal(released?.errorAttempts, 0, "a drain is not an error");
+
+      const reclaimed = await runs.claimById(r.id, "w2", 60_000);
+      assert.equal(reclaimed?.id, r.id);
+      assert.equal(reclaimed?.attempts, claimCount + 1, "reclaim treated as a retry");
+      assert.equal(reclaimed?.errorAttempts, 0);
+
+      assert.equal(await runs.complete(r.id, reclaimed!.leaseToken!, { status: "ok", reply: "done" }), true);
+      assert.equal(await runs.releaseLease(r.id, reclaimed!.leaseToken!), false);
+      assert.equal((await runs.get(r.id))?.status, "done");
+    } finally {
+      await close();
+    }
+  },
+);
+
+test("pg run store: delivery state round-trips; onTerminal fires once with it", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  try {
+    const r = (await runs.enqueue({ sessionId: "sDeliver", request: turn("x") })).run;
+    assert.equal(r.deliveryState, null);
+    assert.equal(await runs.setDeliveryState("missing", null, { editRef: "1.2" }), false);
+    assert.equal(await runs.setDeliveryState(r.id, null, { editRef: "171.002" }), true);
+    assert.equal((await runs.get(r.id))?.deliveryState?.editRef, "171.002");
+
+    const seen: string[] = [];
+    runs.onTerminal((run) => seen.push(`${run.id}:${run.status}:${run.deliveryState?.editRef ?? ""}`));
+    const claimed = await runs.claimById(r.id, "w1", 5_000);
+    assert.equal(await runs.setDeliveryState(r.id, "wrong-token", { replying: true }), false);
+    assert.equal((await runs.get(r.id))?.deliveryState?.replying, undefined);
+    await Promise.all([
+      runs.setDeliveryState(r.id, claimed!.leaseToken!, { replying: true }),
+      runs.setDeliveryState(r.id, null, { editRef: "171.002" }),
+    ]);
+    assert.deepEqual((await runs.get(r.id))?.deliveryState, { editRef: "171.002", replying: true });
+    await runs.complete(r.id, claimed!.leaseToken!, { status: "ok", reply: "done" });
+    assert.deepEqual(seen, [`${r.id}:done:171.002`], "terminal listener sees the checkpointed state");
+
+    const parked = (await runs.enqueue({ sessionId: "sPark", request: turn("y"), maxAttempts: 1 })).run;
+    const c = await runs.claimById(parked.id, "w2", 5_000);
+    await runs.fail(parked.id, c!.leaseToken!, "boom", { retry: true });
+    assert.equal(seen.length, 2, "exhausted attempts park the run and fire");
+    assert.equal(seen[1], `${parked.id}:failed:`);
+
+    const limited = (await runs.enqueue({ sessionId: "sLimited", request: turn("z"), maxAttempts: 1 })).run;
+    const l = await runs.claimById(limited.id, "w3", 5_000);
+    await runs.fail(limited.id, l!.leaseToken!, "slow down", {
+      retry: true,
+      stop: { kind: "error", code: "rate_limit", status: 429 },
+    });
+    assert.equal((await runs.get(limited.id))?.result?.errorCode, "rate_limit");
+  } finally {
+    await close();
+  }
+});
+
+test("pg run store: reaper cannot clobber a run that completed or renewed its lease mid-sweep", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  try {
+    const completed = (await runs.enqueue({ sessionId: "sweepDone", request: turn("x") })).run;
+    const claimedDone = await runs.claimById(completed.id, "w1", 1);
+    assert.ok(claimedDone?.leaseToken);
+    await new Promise((res) => setTimeout(res, 20));
+    assert.equal(await runs.complete(completed.id, claimedDone!.leaseToken!, { status: "ok", reply: "won" }), true);
+    await runs.reapExpired();
+    const done = await runs.get(completed.id);
+    assert.equal(done?.status, "done", "completed run is not flipped back to pending");
+    assert.equal(done?.result?.reply, "won");
+
+    const renewed = (await runs.enqueue({ sessionId: "sweepAlive", request: turn("y") })).run;
+    const claimedAlive = await runs.claimById(renewed.id, "w2", 1);
+    assert.ok(claimedAlive?.leaseToken);
+    await new Promise((res) => setTimeout(res, 20));
+    assert.equal(await runs.heartbeat(renewed.id, claimedAlive!.leaseToken!, 60_000), true);
+    await runs.reapExpired();
+    assert.equal((await runs.get(renewed.id))?.status, "running", "renewed lease survives the sweep");
+  } finally {
+    await close();
+  }
+});
+
+test("pg run store: reaper parks over-age runs, requeues young ones, and audits every reap", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  try {
+    type ReapEvent = import("../src/runs/run-store.ts").ReapEvent;
+
+    const old = (await runs.enqueue({ sessionId: "ageOld", request: turn("poison") })).run;
+    assert.ok((await runs.claimById(old.id, "wOld", 1))?.leaseToken);
+    await new Promise((res) => setTimeout(res, 20));
+    const oldEvents: ReapEvent[] = [];
+    const sweptOld = await runs.reapExpired({ maxAgeMs: 5, onReap: (e) => oldEvents.push(e) });
+    assert.equal(sweptOld.parked, 1, "an over-age run parks");
+    assert.equal(sweptOld.requeued, 0);
+    const parked = await runs.get(old.id);
+    assert.equal(parked?.status, "failed", "park is a loud terminal failure");
+    assert.match(parked?.result?.reason ?? "", /max age/);
+    assert.equal(parked?.errorAttempts, 0, "age-cap park does not spend the error budget");
+    const oldEv = oldEvents.find((e) => e.runId === old.id);
+    assert.equal(oldEv?.outcome, "parked");
+    assert.equal(oldEv?.sessionId, "ageOld");
+    assert.equal(oldEv?.workerId, "wOld");
+    assert.equal(oldEv?.attempts, 1);
+    assert.equal(oldEv?.errorAttempts, 0);
+
+    const young = (await runs.enqueue({ sessionId: "ageYoung", request: turn("normal") })).run;
+    assert.ok((await runs.claimById(young.id, "wYoung", 1))?.leaseToken);
+    await new Promise((res) => setTimeout(res, 20));
+    const youngEvents: ReapEvent[] = [];
+    const sweptYoung = await runs.reapExpired({ maxAgeMs: 600_000, onReap: (e) => youngEvents.push(e) });
+    assert.equal(sweptYoung.requeued, 1, "a young expired run requeues");
+    assert.equal(sweptYoung.parked, 0);
+    assert.equal((await runs.get(young.id))?.status, "pending");
+    const youngEv = youngEvents.find((e) => e.runId === young.id);
+    assert.equal(youngEv?.outcome, "requeued");
+    assert.equal(youngEv?.workerId, "wYoung");
+    assert.equal(youngEv?.errorAttempts, 0);
+  } finally {
+    await close();
+  }
+});
+
+test("pg run store: one-running-per-session holds under concurrent claims (unique index)", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    const r1 = (await runs.enqueue({ sessionId: "sRace", request: turn("a") })).run;
+    const r2 = (await runs.enqueue({ sessionId: "sRace", request: turn("b") })).run;
+    assert.ok(await runs.claimById(r1.id, "w1", 60_000));
+
+    await assert.rejects(
+      raw.query("UPDATE runs SET status='running' WHERE id=$1", [r2.id]),
+      /idx_runs_one_running_per_session/,
+      "partial unique index blocks a second running row for the session",
+    );
+    assert.equal(await runs.claimById(r2.id, "w2", 60_000), null, "claimById refuses while a sibling runs");
+
+    const claims = await Promise.all(Array.from({ length: 8 }, (_, i) => runs.claim(`race-${i}`, 60_000, 8)));
+    const raceClaims = claims.flat().filter((run) => run.sessionId === "sRace");
+    assert.equal(raceClaims.length, 0, "concurrent claims never double-run a session");
+    assert.equal((await runs.get(r2.id))?.status, "pending", "the queued sibling stays queued");
+  } finally {
+    await raw.end();
+    await close();
+  }
+});
+
+test(
+  "pg run store: same-instant submissions keep send order, and the claim takes the displayed head",
+  { skip },
+  async () => {
+    const { runs, close } = createPostgresRunStore(URL!);
+    try {
+      const created = [];
+      for (let i = 0; i < 6; i++) created.push((await runs.enqueue({ sessionId: "sSeq", request: turn(`m${i}`) })).run);
+      const expected = created.map((r) => r.id);
+      assert.deepEqual(
+        (await runs.inFlightForThread("sSeq")).map((r) => r.id),
+        expected,
+        "the queue reads back in send order even when created_at ties",
+      );
+      const claimed = (await runs.claim("wSeq", 60_000))[0] ?? null;
+      assert.equal(claimed?.id, expected[0], "the worker claims exactly the head the queue displays");
+
+      const pg = (await import("pg")).default;
+      const raw = new pg.Pool({ connectionString: URL });
+      try {
+        const early = (await runs.enqueue({ sessionId: "sBackfill", request: turn("early") })).run;
+        await new Promise((r) => setTimeout(r, 5));
+        const late = (await runs.enqueue({ sessionId: "sBackfill", request: turn("late") })).run;
+        await raw.query("UPDATE runs SET seq = 999999999 WHERE id = $1", [early.id]);
+        assert.deepEqual(
+          (await runs.inFlightForThread("sBackfill")).map((r) => r.id),
+          [early.id, late.id],
+          "created_at outranks a scrambled seq",
+        );
+      } finally {
+        await raw.end();
+      }
+    } finally {
+      await close();
+    }
+  },
+);
+
+test("pg run store: withdraw and claim cannot both win the same queued run", { skip }, async () => {
+  const { runs, close } = createPostgresRunStore(URL!);
+  try {
+    const live = (await runs.enqueue({ sessionId: "sWd", request: turn("live") })).run;
+    assert.ok(await runs.claimById(live.id, "w1", 60_000));
+    const queued = (await runs.enqueue({ sessionId: "sWd", request: turn("queued") })).run;
+    const results = await Promise.all(Array.from({ length: 8 }, () => runs.withdraw(queued.id)));
+    assert.equal(results.filter(Boolean).length, 1, "exactly one withdrawal wins");
+    assert.equal(await runs.get(queued.id), null);
+
+    const contested = (await runs.enqueue({ sessionId: "sWd2", request: turn("contested") })).run;
+    const [withdrawn, claimed] = await Promise.all([
+      runs.withdraw(contested.id),
+      runs.claimById(contested.id, "w2", 60_000),
+    ]);
+    assert.notEqual(withdrawn, Boolean(claimed), "the run is either withdrawn or running, never both");
+  } finally {
+    await close();
+  }
+});
+
+test("pg run store indexes newest active run by session", { skip }, async () => {
+  const { close } = createPostgresRunStore(URL!);
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  try {
+    const result = await raw.query(
+      "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_runs_session_active_created'",
+    );
+    assert.match(
+      result.rows[0]?.indexdef ?? "",
+      /\(session_id, created_at DESC\).*WHERE \(status = ANY \(ARRAY.*pending.*running/,
+    );
+  } finally {
+    await raw.end();
+    await close();
+  }
+});
+
+test(
+  "pg sessionsByThreadRefs, distinctScopes, countSessions, distinctParticipants: bulk projections match a full scan",
+  { skip },
+  async () => {
+    const s = createPostgresSessionStore(URL!);
+    const eng = scopeId("channel", "CENG");
+    const uma = scopeId("personal", "UMA");
+    const a = await s.getOrCreateByThread("btr-a", "channel", eng, "eng");
+    await s.getOrCreateByThread("btr-b", "channel", eng);
+    await s.getOrCreateByThread("btr-c", "dm", uma);
+    await s.updateTitle(a.id, "board deck");
+
+    const all = (await Promise.all((await s.distinctScopes()).map((d) => s.listByScope(d.scopeId)))).flat();
+    const byRefExpected = new Map(all.map((x) => [x.threadRef, x]));
+    const refs = await s.sessionsByThreadRefs(["btr-a", "btr-c", "btr-missing"]);
+    assert.deepEqual(refs.map((r) => r.threadRef).sort(), ["btr-a", "btr-c"], "only existing refs returned");
+    const ra = refs.find((r) => r.threadRef === "btr-a")!;
+    assert.equal(ra.scopeId, byRefExpected.get("btr-a")!.scopeId);
+    assert.equal(ra.type, byRefExpected.get("btr-a")!.type);
+    assert.equal(ra.title, "board deck", "title projected");
+    assert.equal(refs.find((r) => r.threadRef === "btr-c")!.type, "dm");
+    assert.deepEqual(await s.sessionsByThreadRefs([]), [], "empty input short-circuits");
+
+    const distinct = new Map((await s.distinctScopes()).map((d) => [d.scopeId, d.channelName]));
+    const scopesFromAll = new Set(all.map((x) => x.scopeId));
+    assert.deepEqual(
+      [...distinct.keys()].sort(),
+      [...scopesFromAll].sort(),
+      "same distinct scope set as the per-scope listings",
+    );
+    assert.equal(distinct.get(eng), "eng", "a non-null channel name wins for the scope");
+    assert.equal(distinct.get(uma), undefined, "no channel name for a personal scope");
+
+    assert.equal(await s.countSessions(), all.length, "same total as the per-scope listings");
+    await s.addParticipant(a.id, "UMA");
+    await s.addParticipant(a.id, "UBOB");
+    await s.removeParticipant(a.id, "UBOB");
+    const principalsFromAll = new Set((await s.listParticipants()).map((w) => w.principalId));
+    assert.deepEqual(
+      (await s.distinctParticipants()).sort(),
+      [...principalsFromAll].sort(),
+      "same principal set as listParticipants",
+    );
+  },
+);
+
+test("pg participant view: pin/color are per-participant and clear", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("channel", "CPIN");
+  const sess = await s.getOrCreateByThread("pv-pin", "channel", scope);
+  await s.addParticipant(sess.id, "U1");
+  await s.addParticipant(sess.id, "U2");
+
+  await s.updateParticipantView(sess.id, "U1", { title: "Mine", pinned: true, color: "#3b82f6" });
+  const u1 = (await s.listByParticipant("U1")).find((x) => x.id === sess.id)!;
+  assert.equal(u1.pinned, true);
+  assert.equal(u1.color, "#3b82f6");
+  const u2 = (await s.listByParticipant("U2")).find((x) => x.id === sess.id)!;
+  assert.ok(!u2.pinned, "one participant's pin never pins the thread for another");
+  assert.equal(u2.color ?? null, null);
+
+  await s.updateParticipantView(sess.id, "U1", { pinned: false, color: null });
+  const cleared = (await s.listByParticipant("U1")).find((x) => x.id === sess.id)!;
+  assert.ok(!cleared.pinned);
+  assert.equal(cleared.color ?? null, null, "null clears the color");
+});
+
+test("pg conversation pins: add, list, remove, and delete with the session", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "UPINS");
+  const sess = await s.getOrCreateByThread("pins-1", "dm", scope);
+
+  const a = (await s.addPin(sess.id, { text: "launch: Sept 4", addedBy: "UPINS" }))!;
+  const b = (await s.addPin(sess.id, { entrySeq: 0, addedBy: "UPINS" }))!;
+  assert.ok(a && b, "pins insert for a live session");
+  assert.equal(await s.addPin(sess.id, { text: "over cap", addedBy: "UPINS" }, 2), null, "the cap refuses the insert");
+  assert.equal(
+    await s.addPin("no-such-session", { text: "orphan", addedBy: "UPINS" }),
+    null,
+    "no orphan rows for a missing session",
+  );
+  const listed = await s.listPins(sess.id);
+  assert.deepEqual(
+    listed.map((x) => x.id),
+    [a.id, b.id],
+    "pins list in creation order",
+  );
+  assert.equal(listed[0]!.text, "launch: Sept 4");
+  assert.equal(listed[1]!.entrySeq, 0);
+  assert.equal(listed[1]!.text, undefined);
+
+  assert.equal(await s.removePin(sess.id, a.id), true);
+  assert.equal(await s.removePin(sess.id, a.id), false, "removing twice reports missing");
+  assert.equal((await s.listPins(sess.id)).length, 1);
+
+  await s.deleteSession(sess.id);
+  assert.equal((await s.listPins(sess.id)).length, 0, "pins go with the session");
+});
+
+test("pg search: full-text over entries with prefix match, membership ACL, and type filter", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "USRCH");
+  const sess = await s.getOrCreateByThread("srch-1", "dm", scope);
+  await s.addParticipant(sess.id, "USRCH");
+
+  const writer = { sessionId: sess.id };
+  await s.append(writer, { kind: "UserMessage", text: "can you refresh the memo board data?", body: { name: "josh" } });
+  await s.append(writer, { kind: "AgentMessage", text: "Done — pushed the memo board refresh." });
+  await s.append(writer, {
+    kind: "ToolCall",
+    tool: "execute",
+    callId: "noise",
+    body: { text: "memo board tool noise" },
+  });
+  await s.addParticipant(sess.id, "ULATE");
+  await s.append(writer, { kind: "UserMessage", text: "memo board postscript" });
+
+  const hits = await s.searchEntries("USRCH", "memo boar");
+  assert.equal(hits.length, 3, "prefix terms match user and assistant text; tool calls are ignored");
+  assert.equal(hits[0]!.text, "memo board postscript", "newest first");
+  assert.equal(hits[2]!.author, "josh", "user hits carry the author");
+
+  assert.equal((await s.searchEntries("ULATE", "memo")).length, 3, "a latecomer searches the whole conversation");
+
+  assert.deepEqual(await s.searchEntries("UNONE", "memo"), [], "a non-participant sees nothing");
+  assert.deepEqual(await s.searchEntries("USRCH", "  !!  "), [], "an unusable query is empty, not an error");
+  assert.deepEqual(await s.searchEntries("USRCH", "memo missing"), [], "every term must match");
+});
+
+test("pg search: own chats and side chats only, no subagents or automations", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "UOWN");
+  const write = async (threadRef: string, text: string, surface?: string): Promise<string> => {
+    const sess = await s.getOrCreateByThread(threadRef, "dm", scope, undefined, surface);
+    await s.addParticipant(sess.id, "UOWN");
+    const writer = { sessionId: sess.id };
+    await s.append(writer, { kind: "UserMessage", text });
+    await s.updateTitle(sess.id, "Ownchat harbor");
+    return sess.id;
+  };
+  const chat = await write("own-chat", "ownchat harbor plans");
+  const child = await write("own-child", "ownchat harbor from a subagent");
+  await s.setParentSession(child, chat);
+  await write("own-cron", "ownchat harbor from a cron", "cron");
+  const side = await write("own-side", "ownchat harbor in a side chat");
+  await s.updateForkProvenance(side, {
+    forkedFrom: { sessionId: chat },
+    forkBoundarySeq: 1,
+    sideChat: { entrySeq: 1, quote: "plans", occurrence: 0, expanded: false },
+  });
+
+  assert.deepEqual(
+    (await s.searchEntries("UOWN", "ownchat harbor")).map((h) => h.sessionId).sort(),
+    [chat, side].sort(),
+  );
+  assert.deepEqual(
+    (await s.searchSessionTitles("UOWN", "ownchat harbor")).map((row) => row.id).sort(),
+    [chat, side].sort(),
+  );
+});
+
+test("pg search: membership filters global matches before the result limit", { skip }, async () => {
+  let at = Date.now();
+  const s = createPostgresSessionStore(URL!, { now: () => at });
+  const scope = scopeId("personal", "SEARCH-MEMBER");
+  const session = await s.getOrCreateByThread("search-member-limit", "dm", scope);
+  const writer = { sessionId: session.id };
+  at += 1;
+  const visible = await s.append(writer, { kind: "UserMessage", text: "limitmember visible" });
+  await s.addParticipant(session.id, "SEARCH-MEMBER");
+
+  const hidden = await s.getOrCreateByThread("search-hidden-limit", "dm", scope);
+  at += 1;
+  await s.append({ sessionId: hidden.id }, { kind: "UserMessage", text: "limitmember inaccessible session" });
+
+  for (const limit of [1, 200]) {
+    const hits = await s.searchEntries("SEARCH-MEMBER", "limitmember", limit);
+    assert.deepEqual(
+      hits.map((hit) => [hit.sessionId, hit.seq]),
+      [[session.id, visible.seq]],
+    );
+  }
+  await s.removeParticipant(session.id, "SEARCH-MEMBER");
+  assert.deepEqual(await s.searchEntries("SEARCH-MEMBER", "limitmember", 1), []);
+});
+
+test("pg search: message writes populate the index and tool results stay unfindable", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "UIDX");
+  const sess = await s.getOrCreateByThread("srch-idx-1", "dm", scope);
+  await s.addParticipant(sess.id, "UIDX");
+  const writer = { sessionId: sess.id };
+  await s.append(writer, { kind: "UserMessage", text: "please rotate the deploy key", body: { name: "alex" } });
+  await s.append(writer, {
+    kind: "ToolResult",
+    tool: "execute",
+    callId: "c1",
+    isError: false,
+    text: "secret broker value QQ17",
+  });
+  await s.append(writer, { kind: "AgentMessage", text: "Rotated the deploy key." });
+
+  const before = await s.searchEntries("UIDX", "deploy key");
+  assert.equal(before.length, 2, "message writes are searchable immediately");
+  assert.equal(before.find((hit) => hit.type === "user")?.author, "alex");
+
+  await s.append(writer, { kind: "UserMessage", text: "also rotate the staging deploy key" });
+  assert.equal((await s.searchEntries("UIDX", "deploy key")).length, 3, "a new message is indexed immediately");
+
+  assert.deepEqual(await s.searchEntries("UIDX", "secret broker"), [], "tool results are unfindable");
+
+  await s.addParticipant(sess.id, "ULATE2");
+  await s.append(writer, { kind: "UserMessage", text: "deploy key postscript" });
+  assert.equal(
+    (await s.searchEntries("ULATE2", "deploy key")).length,
+    4,
+    "a latecomer searches the whole conversation",
+  );
+
+  await s.append(writer, { kind: "UserMessage", text: "nul\u0000riddled deploy key", body: { name: "e\u0000ve" } });
+  const nulHits = await s.searchEntries("UIDX", "nulriddled");
+  assert.equal(nulHits.length, 1, "a NUL byte in the text never wedges the index write");
+  assert.equal(nulHits[0]!.author, "eve");
+});
+
+test("pg deleteSession: racing an append never orphans entries", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "UHARD");
+  const ids: string[] = [];
+  for (let i = 0; i < 15; i++) {
+    const sess = await s.getOrCreateByThread(`web:UHARD:${i}`, "dm", scope);
+    ids.push(sess.id);
+    await Promise.allSettled([
+      s.append({ sessionId: sess.id }, { kind: "UserMessage", text: "racing" }),
+      s.deleteSession(sess.id),
+    ]);
+    assert.equal(await s.get(sess.id), null, "the session is gone either way");
+  }
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const leftovers = await raw.query("SELECT COUNT(*) AS n FROM items WHERE session_id = ANY($1)", [ids]);
+  await raw.end();
+  assert.equal(Number(leftovers.rows[0].n), 0, "no entry survives its session");
+});
+
+test("pg deleteSessionIfEmpty: racing an append either discards the session or keeps the entry", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "URACE");
+  for (let i = 0; i < 15; i++) {
+    const sess = await s.getOrCreateByThread(`web:URACE:${i}`, "dm", scope);
+    const [appended, discarded] = await Promise.allSettled([
+      s.append({ sessionId: sess.id }, { kind: "UserMessage", text: "racing" }),
+      s.deleteSessionIfEmpty(sess.id),
+    ]);
+    assert.equal(discarded.status, "fulfilled");
+    if (discarded.value) {
+      assert.equal(appended.status, "rejected", "a discarded session takes no append");
+      assert.equal(await s.get(sess.id), null);
+    } else {
+      assert.equal(appended.status, "fulfilled", "when the discard is refused the append landed");
+      assert.equal((await s.getItems(sess.id)).length, 1, "the session survives with its entry");
+    }
+  }
+});
+
+test("pg deleteSessionIfEmpty: landed entries refuse the discard atomically", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "UDISC");
+  const sess = await s.getOrCreateByThread("web:UDISC:seed", "dm", scope);
+  await s.append({ sessionId: sess.id }, { kind: "UserMessage", text: "seed" });
+  assert.equal(await s.deleteSessionIfEmpty(sess.id), false, "entries block the discard");
+  assert.ok(await s.get(sess.id), "the refused discard leaves the session intact");
+
+  const empty = await s.getOrCreateByThread("web:UDISC:seed2", "dm", scope);
+  assert.equal(await s.deleteSessionIfEmpty(empty.id), true, "an empty session is discarded");
+  assert.equal(await s.get(empty.id), null);
+
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const orphans = await raw.query("SELECT COUNT(*) AS e FROM items WHERE session_id = $1", [empty.id]);
+  await raw.end();
+  assert.equal(Number(orphans.rows[0].e), 0, "no orphaned entries survive the discard");
+});
+
+test("pg search: globally limits indexed hits across sessions", { skip }, async () => {
+  const store = createPostgresSessionStore(URL!, { now: () => 5000 });
+  const scope = scopeId("personal", "ULIMITSEARCH");
+  const expected: Array<{ sessionId: string; seq: number }> = [];
+  for (let i = 0; i < 3; i++) {
+    const session = await store.getOrCreateByThread(`search-global-limit-${i}`, "dm", scope);
+    await store.addParticipant(session.id, "ULIMITSEARCH");
+    const writer = { sessionId: session.id };
+    for (let j = 0; j < 4; j++) {
+      const entry = await store.append(writer, { kind: "UserMessage", text: "document limit" });
+      expected.push({ sessionId: session.id, seq: entry.seq });
+    }
+  }
+  expected.sort((a, b) => a.sessionId.localeCompare(b.sessionId) || b.seq - a.seq);
+  for (const limit of [1, 5, 12, 20]) {
+    const hits = await store.searchEntries("ULIMITSEARCH", "doc lim", limit);
+    assert.deepEqual(
+      hits.map(({ sessionId, seq }) => ({ sessionId, seq })),
+      expected.slice(0, limit),
+    );
+  }
+});
+
+test(
+  "pg search: reads items directly, items are append-only, and deleting the session removes its hits",
+  { skip },
+  async () => {
+    const store = createPostgresSessionStore(URL!);
+    const session = await store.getOrCreateByThread("search-atomic", "dm", scopeId("personal", "UATOMIC"));
+    await store.addParticipant(session.id, "UATOMIC");
+    const pg = (await import("pg")).default;
+    const pool = new pg.Pool({ connectionString: URL });
+    const writer = { sessionId: session.id };
+    try {
+      const entry = await store.append(writer, { kind: "UserMessage", text: "original document" });
+      await assert.rejects(
+        pool.query("UPDATE items SET body=$3 WHERE session_id=$1 AND seq=$2", [
+          session.id,
+          entry.seq,
+          { text: "edited document", name: "Editor" },
+        ]),
+        /UPDATE on items is forbidden/,
+      );
+      assert.equal((await store.searchEntries("UATOMIC", "original")).length, 1);
+      await assert.rejects(
+        pool.query("DELETE FROM items WHERE session_id=$1", [session.id]),
+        /only allowed through its session/,
+      );
+    } finally {
+      await store.deleteSession(session.id);
+      await pool.end();
+    }
+    assert.deepEqual(await store.searchEntries("UATOMIC", "original"), []);
+  },
+);
+
+test("pg session store: bounded participant listing is recent and optional", { skip }, async () => {
+  let at = 1000;
+  const store = createPostgresSessionStore(URL!, { now: () => at });
+  const ids: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    at += 1000;
+    const session = await store.getOrCreateByThread(`bounded:${i}`, "dm", scopeId("personal", "bounded-user"));
+    ids.push(session.id);
+    await store.addParticipant(session.id, "bounded-user");
+  }
+  assert.equal((await store.listByParticipant("bounded-user")).length, 5);
+  assert.deepEqual(
+    (await store.listByParticipant("bounded-user", { limit: 2 })).map((s) => s.id),
+    ids.slice(-2).reverse(),
+  );
+  assert.deepEqual(await store.listByParticipant("bounded-user", { limit: 0 }), []);
+});
+
+test("pg transcript write failure rolls back the entry and its counters", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const scope = scopeId("personal", "canonical-failure");
+  const session = await s.getOrCreateByThread("pg-canonical-failure", "dm", scope);
+  const writer = { sessionId: session.id };
+  const pg = (await import("pg")).default;
+  const client = new pg.Client({ connectionString: URL! });
+  await client.connect();
+  await client.query(
+    `CREATE FUNCTION reject_transcript_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'transcript unavailable'; END $$`,
+  );
+  await client.query(
+    `CREATE TRIGGER reject_transcript_test BEFORE INSERT ON items FOR EACH ROW WHEN (NEW.session_id = '${session.id}') EXECUTE FUNCTION reject_transcript_test()`,
+  );
+  try {
+    await assert.rejects(s.append(writer, { kind: "UserMessage", text: "must rollback" }), /transcript unavailable/);
+    assert.deepEqual(await s.getItems(session.id), []);
+    assert.equal(await s.latestItemSeq(session.id), -1);
+    const counters = (await client.query("SELECT messages FROM sessions WHERE id=$1", [session.id])).rows[0];
+    assert.equal(counters.messages, 0);
+  } finally {
+    await client.query("DROP TRIGGER reject_transcript_test ON items");
+    await client.query("DROP FUNCTION reject_transcript_test()");
+    await client.end();
+  }
+});
+
+test("pg terminal returns survive reopening the run store", { skip }, async () => {
+  const first = createPostgresRunStore(URL!);
+  const { run } = await first.runs.enqueue({
+    sessionId: `agent:main:subagent:${randomUUID()}`,
+    request: turn("return result"),
+  });
+  const claimed = await first.runs.claimById(run.id, "return-worker", 30_000);
+  await first.runs.complete(run.id, claimed!.leaseToken!, { status: "ok", reply: "done" });
+  await first.close();
+  const second = createPostgresRunStore(URL!);
+  assert.ok((await second.runs.pendingReturns(1000)).some((pending) => pending.id === run.id));
+  assert.ok(!(await second.runs.pendingReturns(1000, run.id)).some((pending) => pending.id === run.id));
+  await second.runs.markReturned(run.id);
+  assert.ok(!(await second.runs.pendingReturns(1000)).some((pending) => pending.id === run.id));
+  await second.close();
+});
+
+test("pg child parentage and spawn metadata survive reopening", { skip }, async () => {
+  const first = createPostgresSessionStore(URL!);
+  const ownerScope = scopeId("personal", `parentage-${randomUUID()}`);
+  const parent = await first.getOrCreateByThread(`parent-${randomUUID()}`, "dm", ownerScope);
+  const child = await first.getOrCreateByThread(`agent:main:subagent:${randomUUID()}`, "dm", ownerScope);
+  const meta = {
+    surface: "web",
+    actor: { id: "tester", type: "internal" as const },
+    conversation: {
+      kind: "dm" as const,
+      threadRef: parent.threadRef,
+      audience: [{ id: "tester", type: "internal" as const }],
+    },
+    readOnly: true,
+  };
+  await first.setParentSession(child.id, parent.id);
+  await first.setSpawnMeta(child.id, meta);
+  const reopened = createPostgresSessionStore(URL!);
+  assert.equal((await reopened.get(child.id))?.parentSessionId, parent.id);
+  assert.deepEqual((await reopened.get(child.id))?.spawnMeta, meta);
+  assert.deepEqual(
+    (await reopened.childrenOf(parent.id)).map((session) => session.id),
+    [child.id],
+  );
+  await reopened.setParentSession(child.id, null);
+  assert.equal((await reopened.get(child.id))?.parentSessionId, undefined);
+});
+
+test("pg spawn metadata that jsonb can't hold still saves", { skip }, async () => {
+  const store = createPostgresSessionStore(URL!);
+  const session = await store.getOrCreateByThread(`nul-${randomUUID()}`, "dm", scopeId("personal", randomUUID()));
+  const actor = { id: "tester\u0000\ud800", type: "internal" as const };
+  const meta = {
+    surface: "web",
+    botActor: true,
+    actor,
+    conversation: { kind: "dm" as const, threadRef: "t", audience: [actor] },
+  };
+  await store.setSpawnMeta(session.id, meta);
+  assert.deepEqual((await store.get(session.id))?.spawnMeta, meta);
+});
+
+test(
+  "pg legacy completion wakeups remain discoverable after return and restart until withdrawn",
+  { skip },
+  async () => {
+    const first = createPostgresRunStore(URL!);
+    const { run } = await first.runs.enqueue({
+      sessionId: `agent:main:subagent:${randomUUID()}`,
+      request: turn("child"),
+    });
+    const claimed = await first.runs.claimById(run.id, "child", 30_000);
+    await first.runs.complete(run.id, claimed!.leaseToken!, { status: "ok", reply: "done" });
+    const { run: wake } = await first.runs.enqueue({
+      sessionId: `parent-${randomUUID()}`,
+      dedupKey: `subagent-return:${run.id}`,
+      request: turn("completion"),
+    });
+    await first.runs.markReturned(run.id);
+    await first.close();
+    const second = createPostgresRunStore(URL!);
+    try {
+      assert.ok((await second.runs.pendingReturns(1000)).some((pending) => pending.id === run.id));
+      assert.ok(!(await second.runs.pendingReturns(1000, run.id)).some((pending) => pending.id === run.id));
+      assert.equal(await second.runs.withdraw(wake.id), true);
+      assert.ok(!(await second.runs.pendingReturns(1000)).some((pending) => pending.id === run.id));
+    } finally {
+      await second.close();
+    }
+  },
+);
+
+test("pg unstarted withdrawal preserves claimed and released turns atomically", { skip }, async () => {
+  const store = createPostgresRunStore(URL!);
+  try {
+    const { run } = await store.runs.enqueue({ sessionId: `wake-retry-${randomUUID()}`, request: turn("completion") });
+    const claimed = await store.runs.claimById(run.id, "worker", 30_000);
+    assert.equal(await store.runs.withdraw(run.id, { unstartedOnly: true }), false);
+    await store.runs.releaseLease(run.id, claimed!.leaseToken!);
+    assert.equal(await store.runs.withdraw(run.id, { unstartedOnly: true }), false);
+    assert.equal((await store.runs.get(run.id))!.status, "pending");
+    const { run: fresh } = await store.runs.enqueue({
+      sessionId: `wake-fresh-${randomUUID()}`,
+      request: turn("completion"),
+    });
+    assert.equal(await store.runs.withdraw(fresh.id, { unstartedOnly: true }), true);
+    assert.equal(await store.runs.get(fresh.id), null);
+  } finally {
+    await store.close();
+  }
+});
+
+test(
+  "pg spend_usage_json returns NULL for invalid or unusual usage text instead of raising (Postgres 18 inlines SQL functions)",
+  { skip },
+  async () => {
+    const store = createPostgresSessionStore(URL!);
+    await store.countSessions();
+    const pg = (await import("pg")).default;
+    const raw = new pg.Pool({ connectionString: URL });
+    try {
+      const { rows } = await raw.query(
+        `SELECT spend_usage_json(t) AS j FROM (VALUES ('not json'), ('{"costUsd":"abc"}'), ('{"costUsd":0.5,"input":1}'), (NULL)) v(t)`,
+      );
+      assert.deepEqual(
+        rows.map((row) => row.j),
+        [null, null, { costUsd: 0.5, input: 1 }, null],
+      );
+    } finally {
+      await raw.end();
+    }
+  },
+);
+
+test("desktop tool definitions survive a store restart without changing on later turns", { skip }, async () => {
+  const { desktopComputerTool } = await import("../plugins/chassis/src/desktop-computer.ts");
+  const first = createPostgresSessionStore(URL!);
+  const session = await first.getOrCreateByThread(
+    `desktop-${randomUUID()}`,
+    "dm",
+    scopeId("personal", "U1"),
+    undefined,
+    "web",
+    [desktopComputerTool],
+  );
+  const restarted = createPostgresSessionStore(URL!);
+  const loaded = await restarted.getOrCreateByThread(session.threadRef, "dm", session.scopeId, undefined, "web");
+  assert.deepEqual(loaded.clientTools, [desktopComputerTool]);
+  const changed = await restarted.getOrCreateByThread(session.threadRef, "dm", session.scopeId, undefined, "web", [
+    { ...desktopComputerTool, description: "new version" },
+  ]);
+  assert.deepEqual(changed.clientTools, [desktopComputerTool]);
+});
+
+test("pg session lists leave out spawn metadata and group scopes per participant", { skip }, async () => {
+  await assertLeanListing(createPostgresSessionStore(URL!), "pg-lean");
+});
+
+test("pg participantScopes counts sessions whose content predates the participant", { skip }, async () => {
+  await assertLateJoinerScopes(createPostgresSessionStore(URL!), "pg-late");
+});
+
+test("pg LLM capture retention drops old prompt envelopes and keeps request rows", { skip }, async () => {
+  const day = 86_400_000;
+  let at = Date.UTC(2025, 0, 1);
+  const store = createPostgresSessionStore(URL!, { now: () => at });
+  const pg = (await import("pg")).default;
+  const raw = new pg.Pool({ connectionString: URL });
+  const tag = randomUUID();
+  const scope = scopeId("personal", `retention-${tag}`);
+  const session = await store.getOrCreateByThread(`retention-${tag}`, "dm", scope);
+  const record = (text: string) =>
+    store.recordLlmRequest(session.id, {
+      turnSeq: 1,
+      step: 0,
+      model: "retention",
+      scopeLabel: scope,
+      promptEnvelope: { messages: [{ role: "user", content: `${tag} ${text}` }] },
+      usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10, costUsd: 0.5 },
+    });
+  try {
+    const old = await record("old");
+    const reused = await record("reused");
+    for (let i = 0; i < 250; i++) await record(`bulk ${i}`);
+    at += 40 * day;
+    const kept = await record("recent");
+    await record("reused");
+    const range = { from: Date.UTC(2025, 0, 1), to: Date.UTC(2025, 0, 1) + 41 * day };
+    await store.refreshSpendRollup!();
+    const spendBefore = (await store.spendReport!(range)).rows;
+    const dirtyBefore = Number((await raw.query("SELECT count(*) AS n FROM session_spend_dirty")).rows[0].n);
+
+    assert.equal(await store.purgeLlmCaptures!(at - 30 * day, { stop: () => true }), 0);
+    assert.equal(await store.purgeLlmCaptures!(at - 30 * day), 251);
+    assert.equal(await store.purgeLlmCaptures!(at - 30 * day), 0);
+
+    const rows = new Map((await store.listLlmRequests(session.id)).map((r) => [r.id, r]));
+    assert.equal(rows.size, 254);
+    assert.equal(rows.get(old.id)!.promptEnvelope, undefined);
+    assert.ok(rows.get(old.id)!.usage, "usage survives the purge");
+    assert.ok(rows.get(reused.id)!.promptEnvelope, "an envelope reused within retention survives");
+    assert.ok(rows.get(kept.id)!.promptEnvelope);
+    assert.equal(
+      Number((await raw.query("SELECT count(*) AS n FROM session_spend_dirty")).rows[0].n),
+      dirtyBefore,
+      "purging prompts does not dirty spend days",
+    );
+    assert.deepEqual((await store.spendReport!(range)).rows, spendBefore);
+    assert.deepEqual(await store.spendRollup(range), spendBefore);
+    assert.equal(
+      (
+        await raw.query(
+          "SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'session_llm_requests' AND column_name = 'request'",
+        )
+      ).rows[0].n,
+      "0",
+    );
+  } finally {
+    await raw.end();
+  }
+});
+
+test("pg session pages sort by the person's last message, which appends keep", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const me = `paging-${randomUUID()}`;
+  const personal = scopeId("personal", me);
+  const ids: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const session = await s.getOrCreateByThread(`web:${me}:${i}`, "dm", personal, undefined, "web");
+    await s.addParticipant(session.id, me, `Chat ${i}`);
+    ids.push(session.id);
+  }
+  const say = async (sessionId: string, kind: "UserMessage" | "AgentMessage") => {
+    const writer = { sessionId: sessionId };
+    await s.append(writer, { kind, text: kind });
+  };
+  await say(ids[0]!, "UserMessage");
+  await say(ids[2]!, "AgentMessage");
+  const order = async () => {
+    const first = await s.listParticipantPage(me, { limit: 2 });
+    const rest = first.next ? await s.listParticipantPage(me, { limit: 2, before: first.next }) : null;
+    assert.equal(rest?.next, null);
+    return [...first.sessions, ...(rest?.sessions ?? [])].map((row) => row.id);
+  };
+  assert.deepEqual(await order(), [ids[0], ids[2], ids[1]], "a reply doesn't move a chat; the person's message does");
+
+  const child = await s.getOrCreateByThread(`subagent:${me}:1`, "dm", personal, undefined, "web");
+  await s.setParentSession(child.id, ids[0]!);
+  const grandchild = await s.getOrCreateByThread(`subagent:${me}:2`, "dm", personal, undefined, "web");
+  await s.setParentSession(grandchild.id, child.id);
+  assert.deepEqual(
+    (await s.descendantsOf([ids[0]!])).map((d) => [d.id, d.rootId]).sort(),
+    [
+      [child.id, ids[0]],
+      [grandchild.id, ids[0]],
+    ].sort(),
+  );
+});
+
+test("pg session pages apply every filter whether or not a scope narrows them", { skip }, async () => {
+  const s = createPostgresSessionStore(URL!);
+  const me = `filters-${randomUUID()}`;
+  const personal = scopeId("personal", me);
+  const channel = scopeId("channel", `C-${me}`);
+  const chat = async (ref: string, scope: typeof personal, surface: string, title: string) => {
+    const session = await s.getOrCreateByThread(`${ref}:${me}`, "dm", scope, undefined, surface);
+    await s.addParticipant(session.id, me, title);
+    return session.id;
+  };
+  const alpha = await chat("web:a", personal, "web", "Alpha");
+  const beta = await chat("slack:b", channel, "slack", "Beta");
+  const gamma = await chat("web:g", personal, "web", "Gamma");
+  const child = await chat("subagent:c", personal, "web", "Child");
+  await s.setParentSession(child, alpha);
+  await chat("cron:d", personal, "cron", "Nightly");
+  const theirs = await s.getOrCreateByThread(`web:theirs:${me}`, "dm", personal, undefined, "web");
+  await s.addParticipant(theirs.id, `${me}-other`, "Theirs");
+  await s.updateParticipantView(beta, me, { archived: true });
+  await s.updateParticipantView(gamma, me, { pinned: true });
+
+  const ids = async (query: Omit<Parameters<typeof s.listParticipantPage>[1], "limit">) =>
+    (await s.listParticipantPage(me, { limit: 10, ...query })).sessions.map((row) => row.id).sort();
+  assert.deepEqual(await ids({ archived: false, pinned: false }), [alpha]);
+  assert.deepEqual(await ids({ archived: false, pinned: true }), [gamma]);
+  assert.deepEqual(await ids({ archived: true }), [beta]);
+  assert.deepEqual(await ids({ archived: false }), [alpha, gamma].sort());
+  assert.deepEqual(await ids({ archived: false, scopeId: personal }), [alpha, gamma].sort());
+  assert.deepEqual(await ids({ archived: true, scopeId: channel }), [beta]);
+  assert.deepEqual(await ids({ archived: false, scopeId: channel }), []);
+  assert.deepEqual(await ids({ archived: false, sessionIds: [gamma, theirs.id, child] }), [gamma]);
+  assert.deepEqual(await ids({ archived: false, surface: "web", titleQuery: "alp" }), [alpha]);
+  assert.deepEqual(await ids({ archived: false, scopeId: personal, titleQuery: "gam" }), [gamma]);
+});

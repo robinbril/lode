@@ -1,0 +1,273 @@
+# `qm`
+
+The standalone deployment CLI for QM. The normative directory schema,
+security guarantees, target behavior, and lifecycle are in
+[`docs/deploy-directory.md`](../docs/deploy-directory.md). `qm init` materializes
+the agent-consumable package runbook into the deployment repository.
+
+```bash
+npm exec --yes --package=@yc-software/qm@latest -- \
+  qm init . --org acme --target aws
+npm install
+npm exec qm -- check
+npm exec qm -- infra render
+npm exec qm -- doctor
+npm exec qm -- infra build-image
+npm exec qm -- plan
+npm exec qm -- up --yes
+npm exec qm -- check --live
+```
+
+This package is published to npm as `@yc-software/qm`, with npm provenance attesting the
+building workflow. A release is one dispatch of `.github/workflows/release.yml` from
+`main`: it signs and pushes the first-party images, publishes the package pinning their
+digests, and then tags `v<version>` and creates the GitHub release with the resolved
+digests attached. Each release picks its own version: a patch bump past the latest released version, or
+`cli/package.json`'s version when a PR raised it higher (for a minor or major bump); a
+tag that already exists stops the release rather than moving. The checked-in image manifest is a sentinel that
+a deployment overrides with real digests. The packed-artifact test exercises the consumer
+path locally.
+
+The CLI deploys long-running QM services; it is not the runtime. Docker runs
+them locally, Fly runs them as Fly apps with Fly Machines for agent computers, and AWS
+runs digest-pinned tasks on ECS Fargate (amd64 by default for first-party services) with Lambda MicroVM agent computers.
+
+When upgrading an AWS source deployment that previously relied on the ARM64 default,
+set each existing workload's `architecture: "arm64"` explicitly until rebuilding
+its image for another platform. Secret rotation refuses a task-platform change
+before uploading secrets. New release candidates record their workload architectures;
+legacy source-built first-party candidates without that record require an explicit
+architecture matching the image, or regeneration with the current CLI. Candidate
+deployment and migration reject platform mismatches before accessing AWS.
+
+## Docker
+
+`init --target docker` scaffolds a local test drive. Core serves the web UI and
+sign-in at `http://localhost:8082` and its API at `http://localhost:8080`, with
+the built-in sign-in broker. Put the first administrator in `ADMIN_GRANTS`
+(`qm setup` asks for it and derives `AUTH_ALLOWED_EMAILS`), run `qm up`, then
+`qm admin-login` for a sign-in link; no email transport is needed. Sign-in
+accepts plain HTTP only when `publicUrl` is a loopback address.
+
+To upgrade a deployment that ran separate `web-ui`, `portal` or `auth`
+containers, once:
+
+1. In `qm.config.jsonc`, remove `"web-ui"` and `"portal"` from `services`, set
+   `publicUrl` to `http://localhost:8082` (base port + 2), keep or add
+   `"auth"`, set `env.auth.AUTH_EMAIL_TRANSPORT` to `"resend"` or `"smtp"`, and
+   add `"secretEnv": { "core": { "ADMIN_GRANTS": "ADMIN_GRANTS" } }`.
+2. Run `qm setup`. It asks for `ADMIN_GRANTS` and generates the sign-in secrets.
+3. Run `qm down`. It removes every container of the deployment, including the
+   old ones, and keeps the database and data volumes.
+4. Run `qm up`, then `qm admin-login`.
+
+## Render
+
+```bash
+npm exec qm -- init . --org acme --target render \
+  --repo https://github.com/acme/qm --branch main
+npm install
+npm exec qm -- setup
+npm exec qm -- check
+npm exec qm -- plan
+npm exec qm -- up
+npm exec qm -- check --live
+```
+
+Render initialization requires `--repo` and `--branch` for a source checkout that
+contains Render support. Set `render.workspaceId` and the email access gate before setup. Render builds
+every service from Git and creates one project for the QM services, Postgres,
+and bundled MinIO; no AWS account or external object store is needed. Normal
+`qm up` runs keep the selected MinIO source commit. Use
+`qm up --upgrade-minio` to upgrade MinIO to the selected source commit.
+The [Render runbook](templates/deployment/references/render.md) covers updates,
+rollback, custom domains, archive and restore, and permanent cleanup.
+
+## Deployment directory
+
+```text
+qm.config.jsonc
+package.json
+package-lock.json
+deployment.md
+.codex/skills/deploy-qm/
+.env.example
+.env
+slack-app-manifest.yml
+slack-sso-manifest.yml
+sandbox/
+  tools/<id>/tool.json
+  tools/<id>/<binary>
+  skills/<id>/SKILL.md
+  Dockerfile
+plugins/<name>/Dockerfile
+infra/
+```
+
+`qm.config.jsonc` is committed and contains no secret values. `.env` is ignored.
+`package.json` pins the CLI package at the exact version that scaffolded the
+directory — `contract: 1` is only the compatibility floor — so every checkout
+resolves the same interpreter; upgrade the pin deliberately.
+`cd` into it and the DEPLOY commands act on it; `--config` / `--env-file` / `--sandbox-dir` relocate
+a piece (e.g. several deployments sharing one `sandbox/`). `check` validates the config,
+computed secret names, tools, skills, and plugins without network access; `up`, `plan`, and
+`sandbox build` run the same checks first. `doctor` verifies external prerequisites read-only.
+`plan` renders the deployment; AWS mutation requires `up --yes`.
+
+For a single-host Docker deployment, `sandbox.backend: "local"` runs each agent
+computer in its own container. `qm up` builds the local runtime from the CLI's
+pinned sandbox base, mounts the host Docker socket into trusted core, and connects
+core to each sandbox's private network. An explicit `sandbox.image` uses that
+runnable local image instead.
+
+On AWS, `up` verifies under the deploy lease that RDS point-in-time recovery
+is current (its `LatestRestorableTime` must lag by at most
+`QM_AWS_DB_MAX_RESTORE_LAG_MS`, default 10 minutes) and records the pre-deploy
+timestamp in the deployment manifest it precedes. `rollback` restores code and
+configuration only, so it prints that timestamp as the matching data restore
+point (`aws rds restore-db-instance-to-point-in-time`);
+`aws.predeployDbSnapshot: false` opts out.
+
+On AWS, `up` waits for every rolling service to reach `COMPLETED` with a single
+deployment, polling until `QM_AWS_ROLLOUT_DEADLINE_MS` (default 20 minutes); a
+timeout rolls the changed services back. ECS stops the old tasks once they exit
+or their `stopTimeout` elapses (core drains for `SHUTDOWN_DRAIN_MS`, 30 s by
+default, and its `stopTimeout` defaults to that drain plus 30 s so core can hand
+turns back before ECS kills it), and a turn cut off there resumes on the new tasks. Core images older
+than this release protect their task while a turn runs, so the first `qm up`
+that replaces them cannot finish before their longest in-flight turn ends
+(protection expires after 60 minutes at most); run that one deploy with a
+longer deadline or when no long turn is in flight. The candidate migration task
+and the private live-session canary also wait up to `QM_AWS_ROLLOUT_DEADLINE_MS`
+(default 30 minutes for them); a task still running then is left to finish, and a
+migration that outlasts it fails `up` before any service changes.
+
+AWS deployments can opt into deployment identities with
+`aws.backgroundWorkControl: true`. The CLI allocates a unique
+`BACKGROUND_DEPLOYMENT_ID` for each replacement core deployment and records it in
+the deployment manifest. A no-op deployment and automatic ECS task replacement keep
+that identity; an explicit core restart allocates a new one.
+
+Every core process with background work enabled heartbeats under its deployment
+identity (its build hash when it has none). A deployment counts as started when its
+first process started, remembered while any of its processes heartbeats and for an
+hour after, so a replaced task does not make its deployment newer. When a deployment with another identity started more
+recently and is still heartbeating, the older one stops claiming runs, stops its
+cron scheduler and closes its Slack connections within ten seconds, and finishes
+admitted work under its leases. It resumes within ten seconds after the newer
+deployment's processes shut down cleanly, or about forty seconds after their last
+heartbeat if they die. Background work therefore follows the most recently started
+deployment that has `BACKGROUND_WORK_ENABLED` on: to hand it to another stack, start
+that stack with background work enabled; to hand it back, stop that stack's core
+tasks (`qm down`) or turn its background work off. Turning background work on for a
+stack whose flag is already on replaces no tasks, so rolling back to a stack that
+never turned its flag off means turning the newer stack's background work off.
+
+The exported `awsBackgroundWorkBootState` reads the exact manifest core task to
+return its recorded boot flag and optional deployment identity. It returns
+`undefined` only without a recorded core task, and rejects missing or ambiguous
+boot flags or identities. The exported
+`awsSetBackgroundWork(config, configDir, enabled, candidatePath?)` turns a stack's
+background work on or off by replacing its core tasks with the flag changed.
+On a stack with `aws.backgroundWorkControl`, turning it on also records a new
+deployment identity, so the stack ranks as the newest deployment even if it ran
+background work earlier.
+
+Control requests require both `CORE_SIGNING_SECRET` and a distinct
+`DEPLOYMENT_CONTROL_SECRET` of at least 32 characters, restricted to core. Live
+checks of a controlled stack that runs background work use its authenticated
+canary endpoint to verify a real model reply, session persistence, generated
+title, error records, session cleanup, and database catalog health. The endpoint
+refuses while a newer deployment supersedes the stack, and the CLI requires a
+final success bound to the request and deployment identity; heartbeats alone do
+not count. An uncertain result never triggers an automatic replay or fallback.
+Other deployments, including a controlled stack with background work off, use the
+Fargate canary.
+
+Core secret uploads defer activation to a subsequent staged `up --restart core`.
+The generic upload path refuses changes to either control credential while a
+controlled deployment is recorded, because replacing credentials before every
+running process has them would break the live session check.
+
+Batch operators can set `QM_DEPLOY_PROGRESS_FILE` to a new absolute file path and
+`QM_DEPLOY_PROGRESS_TOKEN` to a unique attempt identifier for candidate `up --yes`.
+After all forward service updates have been submitted, the CLI atomically creates
+a private JSON receipt with `phase: "monitoring"`, `token`, `orgId`, and `targets`
+(the selected workload-to-task-definition mapping). It then continues health
+checks, manifest recording, and rollback under the deployment lease. This receipt
+only permits the batch runner to release a submission slot; the CLI exit status
+still determines success. Use a fresh path and token for every attempt. Missing
+receipts must keep the submission slot occupied until the CLI exits.
+
+`sandbox build` is a local validation build of the sandbox layer image. At runtime
+sandboxes boot their platform's stock image; tools and skills arrive through the
+deployment-layer sync, which every ordinary `up` performs.
+
+Content screening is off by default. Set `securityScreen: { "mode": "observe" }`
+to record classifier verdicts without acting on them, or `"enforce"` to quarantine
+flagged content. The classifier is the built-in model unless `"classifier": "proxy"`
+names an external screener with a provider label and HTTPS endpoint; route its token
+through `secretEnv.core.SECURITY_SCREEN_PROXY_TOKEN`.
+
+## Commands
+
+```text
+init [dir] [--org id] [--target docker|fly|aws|render] [--model-provider anthropic|openai|openrouter] [--repo url --branch name]
+check [--json] [--live]
+doctor
+infra render|build-image|delete-image|delete-task-definitions
+conformance [dir] [--static]
+plan
+up [--yes] [--build-from[=repo]] [--image-label label]
+slack render
+outputs [--json]
+admin-login [--email admin@example.com]
+proof scope-key <scope-id>
+secrets push [--from file]
+status
+logs [service] [-f] [--tail n]
+down [--purge]
+rollback [--to revision-or-sha]
+sandbox build [--from image] [--tag tag] [--dry-run]
+```
+
+## Administrator login without email
+
+After deployment, run `qm admin-login` to print a single-use login URL valid for
+five minutes. Open it and confirm the displayed administrator email. The command
+uses the deployment's existing `PORTAL_SESSION_SECRET` and the email in
+`ADMIN_GRANTS`; if several admins are configured, select one with `--email`.
+QM checks that the selected account still has `org_admin` access when the link
+is redeemed. The command creates no account or role grant.
+
+Run it from the deployment directory with its `.env`, or use `--config` and
+`--env-file`. Inside a running deployment without a config file, supply
+`PUBLIC_WEB_URL`, `PORTAL_SESSION_SECRET`, and `ADMIN_GRANTS` through its
+environment. The CLI prints only the URL, which is a temporary login credential;
+do not publish it or put it in shared logs.
+
+`qm setup` offers email setup separately. Skip it to use administrator login
+without Resend or SMTP. For ordinary users before email is ready, the broker can
+accept passwords: hash one with `node plugins/auth/src/hash-password.ts
+user@example.com` and store the output with `qm secrets set AUTH_PASSWORD_USERS`.
+This is meant for onboarding; switch to email links or an identity provider
+afterwards. To enable ordinary email login later, rerun `qm setup`
+and configure the selected transport's complete credential set and sender,
+then push secrets and redeploy. Missing email credentials disable email sign-in;
+QM and `qm admin-login` remain available, even if a sender is still configured.
+
+Deployment commands accept `--config`, `--env-file`, and `--sandbox-dir`;
+`admin-login` uses only `--config` and `--env-file`. `dev` remains
+the contributor worktree loop and is separate from the portable deployment contract.
+
+## Package contract
+
+The `@yc-software/qm/contract` export is the supported programmatic surface for
+conformance tests. It exposes the contract version, parsing/rendering
+functions, and provider ids without registering arbitrary runtime plugins.
+Incompatible directory
+changes increment the contract major; optional fields may be added within a
+major.
+
+Its one runtime dependency is Nodemailer, which `qm check` uses to verify SMTP credentials. It shells out to Docker with Buildx, Flyctl,
+the AWS CLI, and Git. Terraform is operator-run against the module generated by `init`.

@@ -1,0 +1,510 @@
+import { Readable } from "node:stream";
+import { createAttachStaging } from "../src/core/orchestrator/attach-tool.ts";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  collectNamedOutbound,
+  parseOutboundFiles,
+  MAX_ATTACHMENT_BYTES,
+  type ArtifactRegistration,
+} from "../src/core/attachments.ts";
+import { createSurfaceToolDeps, type SurfaceToolsContext } from "../src/surfaces/surface-tools.ts";
+import { turnPostKeys } from "../src/core/orchestrator/turn-helpers.ts";
+import { createMemoryBlobTransferStore } from "../src/persistence/blob-transfer.ts";
+import { createMemoryDurableByteStore } from "../src/files/durable-byte-store.ts";
+import { scopeId } from "../src/types.ts";
+import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
+import { createPostgresChannelPolicyStore } from "../src/surface-cache/channel-policy-store.ts";
+import { createPostgresFileArtifactStore } from "../src/files/postgres-file-artifact-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { testSurfaces } from "./support/single-process.ts";
+import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
+import { createSurfaceRegistry } from "../src/surfaces/registry.ts";
+import { createGenericChatSurface } from "../src/surfaces/generic-chat/adapter.ts";
+
+function fakeSandbox(files: Record<string, Uint8Array>): Sandbox {
+  return {
+    async readFileBytes(_handle: SandboxHandle, p: string) {
+      return files[p] ?? null;
+    },
+  } as unknown as Sandbox;
+}
+
+const handle = { rootDir: "/root/workspace" } as SandboxHandle;
+const bytes = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+test("collectNamedOutbound: resolves workspace-relative paths into blob-backed attachments", async () => {
+  const transfer = createMemoryBlobTransferStore();
+  const sandbox = fakeSandbox({ "reports/cover.png": bytes("PNGDATA"), "report.pdf": bytes("PDF") });
+  const r = await collectNamedOutbound(sandbox, handle, ["reports/cover.png", "report.pdf"], transfer);
+  assert.equal(r.attachments.length, 2, "both named files became attachments");
+  assert.deepEqual(r.attachments.map((a) => a.name).sort(), ["cover.png", "report.pdf"]);
+  assert.ok(
+    r.attachments.every((a) => a.blobId && a.sizeBytes > 0),
+    "each attachment is blob-backed",
+  );
+});
+
+test("collectNamedOutbound: rejects parent traversal before reading outside the workspace", async () => {
+  const transfer = createMemoryBlobTransferStore();
+  const reads: string[] = [];
+  const invalid = ["../.ssh/id_ed25519", "work/../../.ssh/id_ed25519"];
+  const paths = ["report.pdf", ...invalid];
+  const sandbox = {
+    async readFileBytes(_handle: SandboxHandle, p: string) {
+      reads.push(p);
+      return bytes("secret");
+    },
+  } as unknown as Sandbox;
+  await assert.rejects(collectNamedOutbound(sandbox, handle, paths, transfer), /no \.\. path segments/);
+  assert.deepEqual(reads, []);
+  assert.equal(await transfer.sweep(0), 0);
+});
+
+test("collectNamedOutbound: preserves POSIX filenames containing backslashes", async () => {
+  const path = String.raw`reports\..\final.txt`;
+  const r = await collectNamedOutbound(
+    fakeSandbox({ [path]: bytes("report") }),
+    handle,
+    [path],
+    createMemoryBlobTransferStore(),
+  );
+  assert.equal(r.attachments.length, 1);
+  assert.equal(r.attachments[0]?.name, "final.txt");
+  assert.deepEqual(r.missing, []);
+});
+
+test("surface post rejects traversal before provisioning or staging any attachment", async () => {
+  const calls = { provision: 0, read: 0, put: 0, grant: 0 };
+  const tools = createSurfaceToolDeps({
+    deps: {
+      surfaces: testSurfaces(),
+      deliveries: {},
+      sandbox: {
+        async readFileBytes() {
+          calls.read += 1;
+          return bytes("file");
+        },
+      },
+    },
+    input: { surfaceTools: true },
+    defaultDestination: {},
+    strictReadOnly: false,
+    provision: async () => {
+      calls.provision += 1;
+      return handle;
+    },
+    blobTransfer: {
+      async put() {
+        calls.put += 1;
+        return { blobId: "blob" };
+      },
+    },
+    fileRegistration: {
+      async onRegistered() {
+        calls.grant += 1;
+      },
+    },
+    postKeys: turnPostKeys("run-test"),
+    spine: { surfaceOutboundCount: 0, crossConversationPosts: 0 },
+  } as unknown as SurfaceToolsContext);
+  const r = await tools!.post("hello", undefined, ["report.pdf", "../.ssh/id_ed25519"]);
+  assert.equal(r.ok, false);
+  assert.deepEqual(calls, { provision: 0, read: 0, put: 0, grant: 0 });
+});
+
+test("surface standing orders preserve and reset the stored ambient reply policy", async () => {
+  const channelPolicy = createPostgresChannelPolicyStore(testDatabaseUrl());
+  const tools = createSurfaceToolDeps({
+    deps: { surfaces: testSurfaces(), deliveries: {}, channelPolicy, auditLog: { record() {} } },
+    input: { surfaceTools: true },
+    actor: { id: "U1" },
+    conversation: { kind: "channel", channelRef: "C1" },
+    session: { id: "S1" },
+    scopeId: "channel:C1",
+    defaultDestination: {},
+    strictReadOnly: false,
+    blobTransfer: {},
+    fileRegistration: {},
+    provision: async () => handle,
+    postProvenance() {
+      return {};
+    },
+    postKeys: turnPostKeys("run-test"),
+    spine: { surfaceOutboundCount: 0, crossConversationPosts: 0 },
+  } as unknown as SurfaceToolsContext)!;
+
+  await tools.setStandingOrder("watch", undefined, true);
+  assert.equal((await channelPolicy.get("C1"))?.ambientEnabled, true);
+  const enabledOrder = await tools.getStandingOrder();
+  assert.equal(enabledOrder.ok && enabledOrder.ambientEnabled, true);
+  await tools.setStandingOrder("keep watching");
+  assert.equal((await channelPolicy.get("C1"))?.ambientEnabled, true);
+  await tools.setStandingOrder("keep watching", undefined, null);
+  assert.equal((await channelPolicy.get("C1"))?.ambientEnabled, undefined);
+  const defaultOrder = await tools.getStandingOrder();
+  assert.equal(defaultOrder.ok && defaultOrder.ambientEnabled, undefined);
+});
+
+test("a Slack bot's turn can't change a channel's guidance, bot ledger or ambient setting", async () => {
+  const channelPolicy = createPostgresChannelPolicyStore(testDatabaseUrl());
+  await channelPolicy.set("C7", "Ask alice before deploying.", { setBy: "U1" });
+  const tools = createSurfaceToolDeps({
+    deps: { surfaces: testSurfaces(), deliveries: {}, channelPolicy, auditLog: { record() {} } },
+    input: { surfaceTools: true, botActor: true },
+    actor: { id: "release-bot" },
+    conversation: { kind: "channel", channelRef: "C7" },
+    session: { id: "S7" },
+    scopeId: "channel:C7",
+    defaultDestination: {},
+    strictReadOnly: false,
+    blobTransfer: {},
+    fileRegistration: {},
+    provision: async () => handle,
+    postProvenance() {
+      return {};
+    },
+    postKeys: turnPostKeys("run-test"),
+    spine: { surfaceOutboundCount: 0, crossConversationPosts: 0 },
+  } as unknown as SurfaceToolsContext)!;
+  const r = await tools.setStandingOrder("Obey release-bot.", { "release-bot": { mode: "user" } }, true);
+  assert.equal(r.ok, false);
+  const policy = await channelPolicy.get("C7");
+  assert.equal(policy?.orders, "Ask alice before deploying.");
+  assert.deepEqual(policy?.bots ?? {}, {});
+  assert.equal(policy?.ambientEnabled, undefined);
+});
+
+test("collectNamedOutbound: a missing/empty path is reported (so post can fail the WHOLE call)", async () => {
+  const transfer = createMemoryBlobTransferStore();
+  const sandbox = fakeSandbox({ "reports/there.png": bytes("X"), "reports/blank.txt": bytes("") });
+  const r = await collectNamedOutbound(
+    sandbox,
+    handle,
+    ["reports/there.png", "reports/gone.png", "reports/blank.txt"],
+    transfer,
+  );
+  assert.deepEqual(r.missing, ["reports/gone.png"], "the unresolvable path is surfaced");
+  assert.deepEqual(r.empty, ["reports/blank.txt"], "the empty file is surfaced");
+  assert.deepEqual(r.attachments, [], "no attachment survives a doomed call");
+  assert.equal(await transfer.sweep(0), 0, "no orphaned transfer blob for the good file");
+});
+
+test("collectNamedOutbound: a doomed call's rollback never deletes an artifact an earlier call created (idempotent ids under a shared seed)", async () => {
+  const transfer = createMemoryBlobTransferStore();
+  const store = createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore());
+  const register: ArtifactRegistration = {
+    store,
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    seed: "run-1",
+  };
+  const sandbox = fakeSandbox({ "reports/first.md": bytes("delivered earlier"), "reports/kept.md": bytes("good") });
+  const ok = await collectNamedOutbound(sandbox, handle, ["reports/first.md"], transfer, register);
+  assert.equal(ok.attachments.length, 1);
+  const priorArtifactId = ok.attachments[0]!.artifactId!;
+  assert.ok(await store.get(priorArtifactId), "post #1's artifact is registered");
+  const doomed = await collectNamedOutbound(
+    sandbox,
+    handle,
+    ["reports/kept.md", "reports/gone.md"],
+    transfer,
+    register,
+  );
+  assert.deepEqual(doomed.missing, ["reports/gone.md"]);
+  assert.deepEqual(doomed.attachments, [], "the doomed call stages nothing");
+  assert.ok(await store.get(priorArtifactId), "post #1's artifact survives post #2's rollback");
+});
+
+test("surface post returns the sent attachments' metadata (so surfaces can render them)", async () => {
+  const enqueued: unknown[] = [];
+  const tools = createSurfaceToolDeps({
+    deps: {
+      surfaces: testSurfaces(),
+      deliveries: {
+        async enqueue(input: unknown) {
+          enqueued.push(input);
+          return { id: "d1" };
+        },
+      },
+      sandbox: fakeSandbox({ "qm-brand/cover.png": bytes("PNGDATA") }),
+    },
+    input: { surfaceTools: true },
+    actor: { id: "U1" },
+    conversation: { kind: "group" },
+    session: { id: "S1" },
+    scopeId: scopeId("personal", "U1"),
+    defaultDestination: { type: "web", target: "web:thread" },
+    strictReadOnly: false,
+    provision: async () => handle,
+    blobTransfer: createMemoryBlobTransferStore(),
+    fileRegistration: {
+      store: createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore()),
+      ownerScopeId: scopeId("personal", "U1"),
+      createdBy: "U1",
+      seed: "run-post",
+    },
+    postProvenance() {
+      return {};
+    },
+    postKeys: turnPostKeys("run-test"),
+    spine: { surfaceOutboundCount: 0, crossConversationPosts: 0 },
+  } as unknown as SurfaceToolsContext)!;
+  const r = await tools.post("Here they are", undefined, ["qm-brand/cover.png"]);
+  assert.equal(r.ok, true);
+  assert.equal(enqueued.length, 1, "the delivery was enqueued");
+  assert.equal(r.attachments?.length, 1, "the post result names what it sent");
+  const a = r.attachments![0]!;
+  assert.equal(a.name, "cover.png");
+  assert.equal(a.mimetype, "image/png");
+  assert.ok(a.sizeBytes > 0);
+  assert.ok(a.artifactId, "artifact id present so the web surface can serve the bytes");
+  assert.ok(!("blobId" in a), "internal blob handle is not leaked to surfaces");
+});
+
+test("stored files retain metadata and need no sandbox, including replacement and failed batches", async () => {
+  const store = createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore());
+  const transfer = createMemoryBlobTransferStore();
+  await store.put({
+    id: "saved",
+    ownerScopeId: "personal:U1",
+    createdBy: "U1",
+    name: "report.custom",
+    path: "report.custom",
+    mimetype: "text/custom",
+    data: bytes("saved data"),
+    direction: "out",
+  });
+  const staging = createAttachStaging({
+    sandbox: undefined as unknown as Sandbox,
+    provision: async () => {
+      throw new Error("no default sandbox");
+    },
+    blobTransfer: transfer,
+    fileRegistration: { store, ownerScopeId: "personal:U1", createdBy: "U1", seed: "new" },
+    openStored: async (id) => {
+      const opened = await store.open(id);
+      return opened ? { ...opened.artifact, stream: opened.stream } : null;
+    },
+  });
+  assert.equal((await staging.attach([{ file_id: "saved" }])).ok, true);
+  const first = staging.staged()[0]!;
+  assert.equal(first.artifactId, "saved");
+  assert.equal(first.mimetype, "text/custom");
+  assert.equal(first.name, "report.custom");
+  assert.equal((await staging.attach([{ file_id: "saved" }])).ok, true);
+  assert.equal(await transfer.open(first.blobId), null);
+  assert.equal(staging.staged().length, 1);
+  assert.equal((await staging.attach([{ file_id: "saved" }, { file_id: "denied" }])).ok, false);
+  assert.equal(staging.staged().length, 1);
+  assert.ok(await store.get("saved"), "rollback never deletes the source artifact");
+});
+
+test("workspace staging selects the requested sandbox and never falls back on rejected IDs", async () => {
+  const selected: Array<string | undefined> = [];
+  const transfer = createMemoryBlobTransferStore();
+  const staging = createAttachStaging({
+    sandbox: {
+      async readFileBytes(box: SandboxHandle) {
+        return bytes(box.id);
+      },
+    } as unknown as Sandbox,
+    provision: async (id) => {
+      selected.push(id);
+      if (id === "denied") throw new Error("unauthorized");
+      return { ...handle, id: id ?? "default" };
+    },
+    blobTransfer: transfer,
+    fileRegistration: {
+      store: createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore()),
+      ownerScopeId: "personal:U1",
+      createdBy: "U1",
+      seed: "selector",
+    },
+  });
+  await staging.attach(["report.txt"], "one");
+  await staging.attach(["report.txt"], "two");
+  assert.equal(staging.staged().length, 2, "the same path on different computers is not a replacement");
+  await assert.rejects(staging.attach(["report.txt"], "denied"), /unauthorized/);
+  assert.deepEqual(selected, ["one", "two", "denied"]);
+});
+
+test("stored file validation rejects malformed inputs, excessive counts and oversized streams", async () => {
+  for (const input of [
+    [{}],
+    [{ file_id: "" }],
+    [{ file_id: "id", path: "ambiguous" }],
+    [12],
+    Array(21).fill({ file_id: "id" }),
+  ])
+    assert.equal(parseOutboundFiles(input).ok, false);
+  let opened = 0;
+  const transfer = createMemoryBlobTransferStore();
+  const result = await collectNamedOutbound(
+    undefined,
+    async () => {
+      throw new Error("sandbox not needed");
+    },
+    [{ file_id: "large" }],
+    transfer,
+    undefined,
+    [],
+    async () => {
+      opened++;
+      return {
+        name: "large.zip",
+        mimetype: "application/zip",
+        sizeBytes: MAX_ATTACHMENT_BYTES + 1,
+        stream: Readable.from(["not read"]),
+      };
+    },
+  );
+  assert.equal(opened, 1);
+  assert.deepEqual(result.oversized, ["large"]);
+  assert.deepEqual(result.attachments, []);
+  assert.equal(await transfer.sweep(0), 0);
+});
+
+test("a stored stream failure rolls back earlier workspace staging", async () => {
+  const store = createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore());
+  const transfer = createMemoryBlobTransferStore();
+  await assert.rejects(
+    collectNamedOutbound(
+      fakeSandbox({ "report.txt": bytes("hello") }),
+      handle,
+      ["report.txt", { file_id: "broken" }],
+      transfer,
+      { store, ownerScopeId: "personal:U1", createdBy: "U1", seed: "rollback" },
+      [],
+      async () => ({
+        name: "broken.txt",
+        mimetype: "text/plain",
+        sizeBytes: 1,
+        stream: Readable.from(
+          (async function* () {
+            yield "partial";
+            throw new Error("read failed");
+          })(),
+        ),
+      }),
+    ),
+    /read failed/,
+  );
+  assert.equal(await transfer.sweep(0), 0);
+  assert.equal((await store.listOwnedByScopes(["personal:U1"])).files.length, 0);
+});
+
+test("replacing a path preserves its artifact when staged again by ID", async () => {
+  const store = createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore());
+  const staging = createAttachStaging({
+    sandbox: fakeSandbox({ "report.txt": bytes("report") }),
+    provision: async () => handle,
+    blobTransfer: createMemoryBlobTransferStore(),
+    fileRegistration: { store, ownerScopeId: "personal:U1", createdBy: "U1", seed: "reference" },
+    openStored: async (id) => {
+      const opened = await store.open(id);
+      return opened ? { ...opened.artifact, stream: opened.stream } : null;
+    },
+  });
+  await staging.attach(["report.txt"]);
+  const id = staging.staged()[0]!.artifactId!;
+  await staging.attach([{ file_id: id }]);
+  await staging.attach(["report.txt"]);
+  assert.equal(staging.staged().length, 2);
+  assert.ok(await store.open(id), "the staged file ID remains readable");
+});
+
+test("surface edit rewrites a Slack message in place and refuses outside Slack instead of posting", async () => {
+  const edit = async (destination: Record<string, unknown>) => {
+    const queued: Array<{ destination: Record<string, unknown>; text: string }> = [];
+    const tools = createSurfaceToolDeps({
+      deps: {
+        surfaces: testSurfaces(),
+        deliveries: {
+          enqueue: async (d: { destination: Record<string, unknown>; text: string }) => {
+            queued.push(d);
+            return { id: `D${queued.length}` };
+          },
+        },
+      },
+      input: { surfaceTools: true },
+      defaultDestination: destination,
+      strictReadOnly: false,
+      postProvenance: () => ({}),
+      postKeys: turnPostKeys("run-test"),
+      spine: { surfaceOutboundCount: 0, crossConversationPosts: 0 },
+    } as unknown as SurfaceToolsContext)!;
+    return { result: await tools.edit({ ref: "1723497600.123456", text: "fixed" }), queued };
+  };
+  const slack = await edit({ type: "slack", target: "C1:1723497600.000001" });
+  assert.equal(slack.result.ok, true);
+  assert.deepEqual(slack.queued[0]?.destination.edit, { messageTs: "1723497600.123456" });
+  assert.equal(slack.queued[0]?.text, "fixed");
+  const web = await edit({ type: "web", target: "web:U1:S1" });
+  assert.equal(web.result.ok, false);
+  assert.deepEqual(web.queued, []);
+});
+
+test("a text-only surface refuses reactions, deletes, file posts and attachments instead of queueing them", async () => {
+  const deliveries = createDeliveryStore();
+  const tools = createSurfaceToolDeps({
+    deps: {
+      surfaces: createSurfaceRegistry({
+        surfaces: [createGenericChatSurface({ deliveries, surfaceCache: { readMessages: async () => [] } })],
+      }),
+      deliveries,
+    },
+    input: { surfaceTools: true },
+    defaultDestination: { type: "partner-chat", target: "partner-chat:7001:group:88:1002" },
+    strictReadOnly: false,
+    postProvenance: () => ({}),
+    postKeys: turnPostKeys("run-test"),
+    spine: { surfaceOutboundCount: 0, crossConversationPosts: 0 },
+  } as unknown as SurfaceToolsContext)!;
+  assert.equal((await tools.react({ ts: "1793649600.00000000000000001002", emoji: "eyes" })).ok, false);
+  assert.equal((await tools.delete({ ref: "1793649600.00000000000000001002" })).ok, false);
+  assert.equal((await tools.post("see attached", undefined, ["a.txt"])).ok, false);
+  assert.equal((await createAttachStaging({ textOnly: true } as never).attach(["a.txt"])).ok, false);
+  assert.deepEqual(await deliveries.pending("partner-chat"), []);
+});
+
+test("a post the agent sends to another channel keeps the conversation's persona", async () => {
+  const enqueued: Array<Record<string, unknown>> = [];
+  const persona = { id: "p-ada", name: "Ada" };
+  const tools = createSurfaceToolDeps({
+    deps: {
+      surfaces: testSurfaces(),
+      deliveries: {
+        async enqueue(d: Record<string, unknown>) {
+          enqueued.push(d);
+          return { id: `d${enqueued.length}` };
+        },
+      },
+      directory: {
+        async resolveChannel() {
+          return { kind: "one", channel: { channelId: "C_OTHER", name: "other", isPrivate: false } };
+        },
+        async channelMember() {
+          return true;
+        },
+      },
+    },
+    input: { surfaceTools: true },
+    actor: { id: "U1" },
+    conversation: { kind: "channel", channelRef: "C1" },
+    session: { id: "S1" },
+    defaultDestination: { type: "slack", target: "C1:1.0", audienceScopeId: "channel:C1", persona },
+    strictReadOnly: false,
+    postProvenance() {
+      return {};
+    },
+    postKeys: turnPostKeys("run-test"),
+    spine: { surfaceOutboundCount: 0, crossConversationPosts: 0 },
+  } as unknown as SurfaceToolsContext)!;
+  const r = await tools.reach("Hello from Ada", { channel: "other" });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(
+    enqueued.map((d) => (d.destination as { target: string; persona?: unknown }).persona),
+    [persona],
+  );
+});

@@ -1,0 +1,223 @@
+import { html, nothing, type TemplateResult } from "lit";
+import { getRuntimeConfig, type RuntimeConfig } from "./runtime-config-cache.ts";
+import { loadRuntimeConfig, saveRuntimeConfig, subscribeRuntimeConfig } from "./runtime-config-store";
+import { defaultEffortForModel, runtimeModelOptions, type EffortLevel, type ModelOption } from "./model-options";
+import { createModelPicker } from "./model-picker";
+import {
+  loadoutActions,
+  loadLoadout,
+  saveLoadout,
+  reconcileLoadout,
+  upsertLoadout,
+  effortLevelsForModel,
+  type LoadoutEntry,
+} from "./composer-loadout";
+import { modelSupportsFastMode } from "./pi-models";
+import { errMessage } from "../../chassis/src/errors";
+
+const INHERIT = "";
+
+export const contextModelState = {
+  scope: null as string | null,
+  loading: false,
+  saving: false,
+  pending: null as string | null,
+  pendingEffort: null as string | null,
+  pendingFast: null as boolean | null,
+  get config(): RuntimeConfig | null {
+    return getRuntimeConfig(contextModelState.scope);
+  },
+  notice: "",
+  noticeKind: "" as "" | "error",
+};
+
+let picker: ReturnType<typeof createModelPicker<void>> | undefined;
+let pickerState = { openMenu: null as string | null, menuQuery: "", effortLevel: "auto" as EffortLevel };
+let loadSeq = 0;
+let unsubscribeRuntime: (() => void) | undefined;
+let redraw: () => void = () => {};
+
+export function resetContextModel(): void {
+  picker?.dispose();
+  picker = undefined;
+  pickerState = { openMenu: null, menuQuery: "", effortLevel: "auto" };
+  loadSeq += 1;
+  unsubscribeRuntime?.();
+  unsubscribeRuntime = undefined;
+  contextModelState.scope = null;
+  contextModelState.loading = false;
+  contextModelState.saving = false;
+  contextModelState.pending = null;
+  contextModelState.pendingEffort = null;
+  contextModelState.pendingFast = null;
+  contextModelState.notice = "";
+  contextModelState.noticeKind = "";
+}
+
+export async function loadContextModel(scopeId: string, onChange: () => void): Promise<void> {
+  redraw = onChange;
+  if (contextModelState.scope === scopeId) return;
+  resetContextModel();
+  const seq = ++loadSeq;
+  contextModelState.scope = scopeId;
+  contextModelState.loading = true;
+  unsubscribeRuntime = subscribeRuntimeConfig(scopeId, () => {
+    contextModelState.loading = false;
+    redraw();
+  });
+  const config = await loadRuntimeConfig(scopeId);
+  if (seq !== loadSeq) return;
+  contextModelState.loading = false;
+  if (!config) {
+    contextModelState.notice = "Couldn't load this project's model.";
+    contextModelState.noticeKind = "error";
+  }
+  redraw();
+}
+
+function optionsFor(config: RuntimeConfig): ModelOption[] {
+  return runtimeModelOptions(config.models, config.modelCatalog);
+}
+
+function labelForRuntime(config: RuntimeConfig, runtime: { modelId: string }): string {
+  return optionsFor(config).find((o) => o.value === runtime.modelId)?.label ?? runtime.modelId;
+}
+
+function selectedValue(config: RuntimeConfig): string {
+  return config.scopeOverride ? config.scopeOverride.modelId : INHERIT;
+}
+
+function selectedEffort(config: RuntimeConfig): string {
+  return (
+    config.effective.effortLevel ??
+    defaultEffortForModel(optionsFor(config).find((option) => option.value === config.effective.modelId)?.model)
+  );
+}
+
+async function choose(scope: string, value: string, effort?: string, fast = false): Promise<void> {
+  if (contextModelState.saving) return;
+  const seq = loadSeq;
+  const restoreFocus = document.activeElement?.closest(".context-model .loadout-control") !== null;
+  contextModelState.saving = true;
+  contextModelState.pending = value;
+  contextModelState.pendingEffort = effort ?? null;
+  contextModelState.pendingFast = fast;
+  picker?.resetSection();
+  contextModelState.notice = "";
+  contextModelState.noticeKind = "";
+  redraw();
+  try {
+    const model = contextModelState.config
+      ? optionsFor(contextModelState.config).find((option) => option.value === value)?.model
+      : undefined;
+    await saveRuntimeConfig(
+      scope,
+      value === INHERIT
+        ? { inherit: true }
+        : {
+            modelId: value,
+            fastMode: fast && modelSupportsFastMode(scope, value),
+            ...(effort && effortLevelsForModel(model).some((o) => o.value === effort) ? { effortLevel: effort } : {}),
+          },
+    );
+    if (seq !== loadSeq) return;
+  } catch (e) {
+    if (seq !== loadSeq) return;
+    contextModelState.notice = errMessage(e, "Couldn't change the model. Try again.");
+    contextModelState.noticeKind = "error";
+  } finally {
+    if (seq === loadSeq) {
+      contextModelState.saving = false;
+      contextModelState.pending = null;
+      contextModelState.pendingEffort = null;
+      contextModelState.pendingFast = null;
+      redraw();
+      if (restoreFocus)
+        requestAnimationFrame(() => {
+          if (seq === loadSeq && document.activeElement === document.body)
+            document.querySelector<HTMLButtonElement>(".context-model .loadout-button")?.focus();
+        });
+    }
+  }
+}
+
+function activeEntry(config: RuntimeConfig): LoadoutEntry {
+  return {
+    value: contextModelState.pending || config.effective.modelId,
+    effort: (contextModelState.pendingEffort ?? selectedEffort(config)) as EffortLevel,
+    fast: contextModelState.pendingFast ?? config.effective.fastMode === true,
+  };
+}
+
+function contextPicker(scopeId: string) {
+  const current = () => activeEntry(contextModelState.config!);
+  const options = () => optionsFor(contextModelState.config!);
+  const actions = loadoutActions(
+    options,
+    current,
+    (_, entry) => {
+      if (!contextModelState.saving) void choose(scopeId, entry.value, entry.effort, entry.fast);
+    },
+    (modelId) => modelSupportsFastMode(scopeId, modelId),
+  );
+  return createModelPicker<void>({
+    host: () => document.querySelector<HTMLElement>(".context-model"),
+    redraw: () => redraw(),
+    scopeKey: () => scopeId,
+    state: pickerState,
+    presets: {
+      entries: () => reconcileLoadout(loadLoadout(), options(), current()),
+      save: saveLoadout,
+      add: (option) => {
+        const entry = { value: option.value, effort: defaultEffortForModel(option.model), fast: false };
+        saveLoadout(upsertLoadout(reconcileLoadout(loadLoadout(), options(), current()), entry));
+        pickerState.menuQuery = "";
+        actions.apply(entry);
+      },
+    },
+    activeEntry: current,
+    ...actions,
+    effectiveFastMode: () => current().fast,
+    changeDefault: () => choose(scopeId, INHERIT),
+    showDefaultAction: false,
+  });
+}
+
+export function contextModelSection(scopeId: string): TemplateResult | typeof nothing {
+  if (contextModelState.scope !== scopeId) return nothing;
+  if (contextModelState.loading)
+    return html`<section class="context-panel context-model" aria-labelledby="context-model-title">
+      <h2 class="context-panel-title" id="context-model-title">Model</h2>
+      <div class="context-panel-loading">Loading…</div>
+    </section>`;
+  const config = contextModelState.config;
+  if (!config)
+    return html`<section class="context-panel context-model" aria-labelledby="context-model-title">
+      <h2 class="context-panel-title" id="context-model-title">Model</h2>
+      <span class="context-model-status error" aria-live="polite">${contextModelState.notice}</span>
+    </section>`;
+  const options = optionsFor(config);
+  const active = activeEntry(config);
+  const option = options.find((option) => option.value === active.value);
+  const stalePin = config.scopeOverride && !options.some((option) => option.value === selectedValue(config));
+  pickerState.effortLevel = active.effort;
+  picker ??= contextPicker(scopeId);
+  picker.place();
+  return html`
+    <section class="context-panel context-model" aria-labelledby="context-model-title">
+      <h2 class="context-panel-title" id="context-model-title">Model</h2>
+      ${stalePin ? html`<span class="context-model-status">${labelForRuntime(config, config.scopeOverride!)} (no longer offered)</span>` : nothing}
+      ${!option && !stalePin ? html`<span class="context-model-status">${labelForRuntime(config, config.effective)} (no longer offered)</span>` : nothing}
+      ${picker.render(undefined, option, contextModelState.saving)}
+      ${
+        contextModelState.notice
+          ? html`<span
+              class=${`context-model-status ${contextModelState.noticeKind === "error" ? "error" : ""}`}
+              aria-live="polite"
+              >${contextModelState.notice}</span
+            >`
+          : nothing
+      }
+    </section>
+  `;
+}

@@ -1,0 +1,55 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 582b9c66e0791980685c8b80bb11e6a3df1a06ef
+    hooks:
+      - id: end-of-file-fixer
+        exclude: "(^.yarn/)|(.svg$)|(-openapi.json)|(java/lib/src/test/resources/__files/)|(kotlin/lib/src/test/resources/__files/)|(server/svix-server/migrations/202[234])"
+      - id: trailing-whitespace
+        exclude: "(^.yarn/)|(.svg$)|(-openapi.json)|(java/lib/src/test/resources/__files/)|(kotlin/lib/src/test/resources/__files/)|(svix-cli/wix/main.wxs)|(server/svix-server/migrations/202[234])"
+      - id: check-case-conflict
+      - id: check-illegal-windows-names
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+      - id: check-json
+        exclude: "(kotlin/lib/src/test/resources/__files/ExpectedMsgCreateBodyWithHeaders.json)|(tsconfig.json)"
+
+  - repo: https://github.com/google/yamlfmt
+    rev: v0.17.2
+    hooks:
+      - id: yamlfmt
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.48.0
+    hooks:
+      - id: typos
+
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.13.1-1
+    hooks:
+      - id: shfmt
+        exclude: gradlew
+        args: ["--write", "-i", "4", "-ci"]
+
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.11.0
+    hooks:
+      - id: shellcheck
+        exclude: gradlew
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: f805888065fdb6162e1f800e50bb9460cbd223d6 # v0.37.2
+    hooks:
+      - id: check-dependabot
+
+  - repo: https://github.com/kjanat/actionlint
+    rev: 220b76cfa568e00ed8b3c476898f849a722b88e2 # frozen: v1.17.1
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/zendern/pre-commit-hooks
+    rev: cb3feef6aa5b1864d521e8bc84acc35391146974 # frozen: v1.3.0
+    hooks:
+      - id: gh-actions-lock-verify-local
+      - id: gh-actions-lock-verify # manual stage: run in CI with GH_TOKEN

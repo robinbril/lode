@@ -1,0 +1,319 @@
+import { errMessage, swallow } from "../util/errors.ts";
+import { GENERIC_FAILURE_CLAUSE } from "../../plugins/chassis/src/failure-copy.ts";
+import { conversationScope } from "../resolution/resolution-service.ts";
+import { NonRetryableTurnError } from "../core/turn-error.ts";
+import type { TurnRuntimePurpose } from "../resolution/config-store.ts";
+import { resolveRuntimeChoice } from "../agent/runtime-choice.ts";
+import { resolveIndividualAuthRouting } from "../core/individual-auth-routing.ts";
+import { gatewayModelCatalog } from "../model/gateway-models.ts";
+import type { AppDeps } from "./app-types.ts";
+import type { ScopeId, TurnRequest } from "../types.ts";
+import { orgScope } from "../config.ts";
+import {
+  defaultModel,
+  modelSupported,
+  serviceableModelIds,
+  ALL_PROVIDERS_AVAILABLE,
+  fastModeModelIds,
+  modelCatalogFor,
+  modelOfferedInWebui,
+  modelUnavailableReason,
+  thinkingLevelsFor,
+  codexProviderModelId,
+  codexSubscriptionModelId,
+  companyModelId,
+  THINKING_LEVELS,
+  modelServiceable,
+  resolveModel,
+  type ModelProviderAvailability,
+} from "../model/pi-models.ts";
+import { builtInModelCatalog, selectableCatalog, selectableModelCatalog } from "../model/model-catalog.ts";
+import type { RuntimeChoice } from "../agent/agent.ts";
+import { modelBilling } from "../model/model-route.ts";
+
+export type RuntimeDeps = Partial<
+  Pick<
+    AppDeps,
+    "config" | "providerKeys" | "modelCredentials" | "modelCredentialFetch" | "refreshModels" | "userModelCredentials"
+  >
+> & { baseModelDefault?: string };
+
+export function runtimeFallback(ctx: { deps: RuntimeDeps }): RuntimeChoice {
+  const gatewayIds = gatewayModelCatalog(true).map((model) => model.id);
+  const providers =
+    gatewayIds.length && ctx.deps.providerKeys
+      ? { ...ctx.deps.providerKeys, modelIds: new Set(gatewayIds) }
+      : undefined;
+  return { modelId: ctx.deps.baseModelDefault ?? defaultModel(undefined, providers) };
+}
+
+export const APP_EDIT_DEFAULT_RUNTIME: RuntimeChoice = { modelId: "gpt-6.1-sol-ultrafast" };
+const reportedAppEditFallbacks = new Set<string>();
+
+export async function withAppEditRuntime<T extends { models: string[] }>(
+  ctx: { deps: RuntimeDeps },
+  body: T,
+): Promise<T & { appEditRuntime?: RuntimeChoice }> {
+  const configured = (await ctx.deps.config?.getPurposeRuntimeDurable("appEdit")) ?? APP_EDIT_DEFAULT_RUNTIME;
+  if (body.models.includes(configured.modelId)) return { ...body, appEditRuntime: storedChoice(configured) };
+  const reason =
+    modelUnavailableReason(configured.modelId) ??
+    (modelSupported(configured.modelId) ? "not offered to this person on this deployment" : "unknown model");
+  const key = `${orgScope()}:${configured.modelId}:${reason}`;
+  if (!reportedAppEditFallbacks.has(key)) {
+    reportedAppEditFallbacks.add(key);
+    console.warn("[runtime] app edit runtime unavailable; app edit chats use the conversation runtime", {
+      modelId: configured.modelId,
+      reason,
+    });
+  }
+  return body;
+}
+
+export async function userRuntimeConfigBody(ctx: { deps: RuntimeDeps }, scope: ScopeId, actorId: string) {
+  const account = await ctx.deps.config?.getModelAccountDurable(actorId);
+  const store = ctx.deps.userModelCredentials;
+  if (!store || !account || account === "company") return runtimeConfigBody(ctx, scope);
+  const [anthropic, openai] = await Promise.all([
+    account === "openai" ? null : store.get(actorId, "anthropic"),
+    account === "anthropic" ? null : store.get(actorId, "openai"),
+  ]);
+  const snapshot = await runtimeConfigBody(ctx, scope, async (choice) => {
+    const route = resolveIndividualAuthRouting(anthropic, openai, choice.modelId);
+    return route?.model === choice.modelId ? null : "account_runtime_unavailable";
+  });
+  const route = resolveIndividualAuthRouting(anthropic, openai, snapshot.effective.modelId);
+  if (!route?.model || !snapshot.models.includes(route.model)) return snapshot;
+  const { unavailableReason: _, ...available } = snapshot;
+  return {
+    ...available,
+    effective: {
+      ...snapshot.effective,
+      modelId: route.model,
+      effortLevel: thinkingLevelsFor(route.model).includes(snapshot.effective.effortLevel ?? "auto")
+        ? snapshot.effective.effortLevel
+        : "auto",
+      fastMode: snapshot.effective.fastMode === true && fastModeModelIds().includes(route.model),
+    },
+  };
+}
+
+function storedChoice(stored: RuntimeChoice): RuntimeChoice {
+  return {
+    modelId: stored.modelId,
+    ...(stored.effortLevel ? { effortLevel: stored.effortLevel } : {}),
+    ...(typeof stored.fastMode === "boolean" ? { fastMode: stored.fastMode } : {}),
+  };
+}
+
+export async function runtimeConfigBody(
+  ctx: { deps: RuntimeDeps },
+  scope: ScopeId,
+  authorizeChoice?: (choice: RuntimeChoice) => Promise<string | null>,
+  purpose?: TurnRuntimePurpose,
+  requested?: Partial<RuntimeChoice>,
+) {
+  if (authorizeChoice)
+    ctx = { deps: { ...ctx.deps, providerKeys: ALL_PROVIDERS_AVAILABLE, modelCredentials: undefined } };
+  const config = ctx.deps.config!;
+  const configuredKeys = ctx.deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
+  const managedKeys = ctx.deps.modelCredentials ? await ctx.deps.modelCredentials.availability() : configuredKeys;
+  const fallback = runtimeFallback(ctx);
+  const org = orgScope();
+  const orgStored = await config.getRuntimeSelectionDurable(org);
+  const orgLegacyModel = orgStored ? null : await config.getBaseModelOwnDurable(org);
+  let orgDefault: RuntimeChoice & { revision: number } = { ...fallback, revision: orgStored?.revision ?? 0 };
+  if (orgStored) orgDefault = { ...storedChoice(orgStored), revision: orgStored.revision ?? 0 };
+  else if (orgLegacyModel) orgDefault = { modelId: orgLegacyModel, revision: 0 };
+  const stored = scope === org ? orgStored : await config.getRuntimeSelectionDurable(scope);
+  const legacyModel = scope === org ? null : await config.getBaseModelOwnDurable(scope);
+  let scopeOverride: (RuntimeChoice & { orgRevision?: number }) | null = null;
+  if (stored) scopeOverride = { ...storedChoice(stored), orgRevision: stored.orgRevision };
+  else if (legacyModel) scopeOverride = { modelId: legacyModel, orgRevision: 0 };
+  const effective = purpose
+    ? await resolveRuntimeChoice(config, org, scope, fallback, requested, undefined, purpose)
+    : (scopeOverride ?? orgDefault);
+  const purposeDefault = purpose ? await config.getPurposeRuntimeDurable(purpose) : undefined;
+  const selected = [orgDefault, scopeOverride, effective, purposeDefault].filter((choice) => choice != null);
+  const allowlist = await config.getWebuiModelsDurable(org);
+  const offered =
+    allowlist != null
+      ? allowlist.filter((id) => modelSupported(id))
+      : selectableCatalog(
+          ctx.deps.modelCredentials && managedKeys.openrouter
+            ? await selectableModelCatalog(ctx.deps.modelCredentialFetch)
+            : builtInModelCatalog(),
+        )
+          .filter((model) => modelOfferedInWebui(model.id))
+          .map((model) => model.id);
+  for (const choice of selected) {
+    if (
+      allowlist?.length !== 0 &&
+      (!allowlist ||
+        choice.modelId === orgDefault.modelId ||
+        choice.modelId === purposeDefault?.modelId ||
+        allowlist.includes(codexProviderModelId(choice.modelId))) &&
+      modelSupported(choice.modelId) &&
+      !offered.includes(choice.modelId)
+    )
+      offered.push(choice.modelId);
+  }
+  let models = serviceableModelIds(offered, managedKeys);
+  if (authorizeChoice) {
+    for (const id of models.slice()) {
+      const subscriptionId = codexSubscriptionModelId(id);
+      if (modelSupported(subscriptionId) && !models.includes(subscriptionId)) models.push(subscriptionId);
+    }
+    const allowed = await Promise.all(
+      models.map((modelId) => authorizeChoice({ modelId, effortLevel: "auto", fastMode: false })),
+    );
+    models = models.filter((_, index) => !allowed[index]);
+  }
+  const billing = (id: string) =>
+    modelBilling(!!managedKeys.modelIds?.has(companyModelId(id, managedKeys)), !!authorizeChoice);
+  const modelCatalog = Object.fromEntries(
+    Object.entries(modelCatalogFor(new Set(models))).map(([id, meta]) => [id, { ...meta, billing: billing(id) }]),
+  );
+  return {
+    scopeId: scope,
+    ...(purpose ? { executionPurpose: purpose } : {}),
+    models,
+    modelCatalog,
+    orgDefault,
+    scopeOverride,
+    effective: storedChoice(effective),
+    ...(!models.includes(effective.modelId)
+      ? {
+          unavailableReason:
+            modelUnavailableReason(effective.modelId) ?? "Selected model is unavailable; choose another model",
+        }
+      : {}),
+    upgradeAvailable: Boolean(scopeOverride && scopeOverride.orgRevision !== orgDefault.revision),
+    fastModeModelIds: fastModeModelIds(),
+    interactiveFastMode: await config.getInteractiveFastModeDurable(),
+  };
+}
+
+export function validateRuntimeChoice(choice: RuntimeChoice): string | null {
+  if (!modelSupported(choice.modelId)) return "model_not_supported";
+  if (choice.effortLevel !== undefined && !thinkingLevelsFor(choice.modelId).includes(choice.effortLevel))
+    return "effort_not_supported";
+  if (choice.fastMode !== undefined && typeof choice.fastMode !== "boolean") return "fast_mode_invalid";
+  if (choice.fastMode && !fastModeModelIds().includes(choice.modelId)) return "fast_mode_not_supported";
+  return null;
+}
+
+export async function availableRuntimeError(
+  ctx: { deps: RuntimeDeps },
+  scope: ScopeId,
+  choice: RuntimeChoice,
+  purpose?: TurnRuntimePurpose,
+): Promise<string | null> {
+  await ctx.deps.refreshModels?.();
+  let reason: string;
+  try {
+    const choices = await runtimeConfigBody(ctx, scope, undefined, purpose, choice);
+    if (choices.models.includes(choice.modelId))
+      return validateRuntimeChoice({
+        ...choice,
+        effortLevel:
+          choice.effortLevel === "adaptive" || choice.effortLevel === "default" ? choice.effortLevel : undefined,
+      });
+    reason = "runtime is no longer available or enabled on this deployment";
+  } catch (error) {
+    if (!(error instanceof NonRetryableTurnError)) throw error;
+    reason = `${error.message}; it may be an unknown model ID`;
+  }
+  const head = `${choice.modelId} can't run here (${reason}). Pick from this list rather than guessing another model: the default`;
+  try {
+    const { effective, models } = await runtimeConfigBody(ctx, scope, undefined, purpose);
+    return `${head}, ${effective.modelId}${models.length ? `, or one of: ${models.join(", ")}` : ""}.`;
+  } catch (listError) {
+    return `${head} (listing usable models failed: ${errMessage(listError)}).`;
+  }
+}
+
+export async function requestedRuntimeError(
+  ctx: { deps: RuntimeDeps },
+  scope: ScopeId,
+  requested: Partial<RuntimeChoice>,
+  purpose?: TurnRuntimePurpose,
+): Promise<string | null> {
+  const { effective } = await runtimeConfigBody(ctx, scope, undefined, purpose, requested).catch((error: unknown) => {
+    if (!(error instanceof NonRetryableTurnError)) throw error;
+    return runtimeConfigBody(ctx, scope, undefined, purpose);
+  });
+  return availableRuntimeError(
+    ctx,
+    scope,
+    {
+      ...requested,
+      modelId: requested.modelId ?? effective.modelId,
+    },
+    purpose,
+  );
+}
+
+export function validateWebTurnModelOptions(
+  input: { model?: string; thinkingLevel?: string },
+  enabledModels: readonly string[],
+  providers: ModelProviderAvailability = ALL_PROVIDERS_AVAILABLE,
+): string | null {
+  const allowedModels = serviceableModelIds(enabledModels, providers);
+  if (input.model && !allowedModels.includes(input.model)) {
+    return resolveModel(input.model) && !modelServiceable(input.model, providers)
+      ? "that model isn't available on this deployment (its provider isn't configured)"
+      : "that model is not enabled for the web UI";
+  }
+  if (input.thinkingLevel && !(THINKING_LEVELS as readonly string[]).includes(input.thinkingLevel))
+    return "unsupported thinking level";
+  return null;
+}
+
+export async function turnModelRefusal(
+  deps: AppDeps,
+  req: TurnRequest,
+  actorId: string,
+  individualAuth: boolean,
+  purpose: TurnRuntimePurpose | undefined,
+): Promise<string | null> {
+  const org = orgScope();
+  const scope = conversationScope(req.conversation, actorId);
+  const requested: Partial<RuntimeChoice> = {
+    ...(req.model ? { modelId: req.model } : {}),
+    ...(req.thinkingLevel ? { effortLevel: req.thinkingLevel } : {}),
+    ...(typeof req.fastMode === "boolean" ? { fastMode: req.fastMode } : {}),
+  };
+  if (req.origin?.kind === "automation" && req.model) {
+    const error = await requestedRuntimeError({ deps }, scope, requested, purpose);
+    if (error) return error;
+  }
+  if (req.surface !== "web") return null;
+  if (individualAuth) {
+    if (!req.model) return null;
+    const available = await userRuntimeConfigBody({ deps }, scope, actorId);
+    if (!available.models.includes(req.model)) return "Your connected AI account cannot serve this model.";
+    return validateWebTurnModelOptions(req, available.models);
+  }
+  const fallback = deps.runtimeFallback ?? { modelId: defaultModel() };
+  const providers = deps.modelCredentials
+    ? await deps.modelCredentials.availability()
+    : (deps.providerKeys ?? deps.modelProviders);
+  const hydrate = async () =>
+    deps.modelCredentials && providers?.openrouter ? selectableModelCatalog(deps.modelCredentialFetch) : undefined;
+  const modelCredentials = deps.modelCredentials && { ...deps.modelCredentials, availability: async () => providers! };
+  let runtime: RuntimeChoice;
+  let pickerModels: string[];
+  try {
+    [runtime, { models: pickerModels }] = await Promise.all([
+      resolveRuntimeChoice(deps.config, org, scope, fallback, requested, hydrate, purpose),
+      runtimeConfigBody({ deps: { ...deps, modelCredentials } }, scope),
+    ]);
+  } catch (error) {
+    swallow("turn: runtime resolution", error);
+    return `I couldn't set up that runtime choice — ${GENERIC_FAILURE_CLAUSE}`;
+  }
+  if (providers && !modelServiceable(runtime.modelId, providers))
+    return "that model isn't available on this deployment (its provider isn't configured)";
+  return validateWebTurnModelOptions(req, pickerModels, providers);
+}

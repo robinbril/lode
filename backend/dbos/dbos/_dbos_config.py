@@ -1,0 +1,581 @@
+import math
+import os
+import re
+from typing import Any, Dict, List, Literal, Optional, TypedDict, cast
+
+import sqlalchemy as sa
+import yaml
+from sqlalchemy import make_url
+
+from dbos._serialization import Serializer
+
+from ._error import DBOSInitializationError
+from ._external_storage import ExternalStore
+from ._workflow_archive import WorkflowArchive
+
+DBOS_CONFIG_PATH = "dbos-config.yaml"
+
+
+class DBOSConfig(TypedDict, total=False):
+    """
+    Data structure containing the DBOS library configuration.
+
+    Attributes:
+        name (str): Application name
+        system_database_url (str): Connection string for the DBOS system database. Defaults to sqlite:///{name} if not provided.
+        sys_db_pool_size (int): System database pool size
+        sys_db_polling_concurrency (int): Maximum number of DB-backed polling reads (from wait operations such as get_result, recv, get_event, and read_stream) that may run concurrently against the system database pool. This keeps high-fan-out polling from checking out every pool connection and starving control-plane operations such as enqueue/dequeue, status writes, recovery, and cancellation. Defaults to half the system database pool size (minimum 1). Set to a non-positive value to disable the limiter.
+        db_engine_kwargs (Dict[str, Any]): SQLAlchemy engine kwargs for the system database engine (See https://docs.sqlalchemy.org/en/20/core/engines.html#sqlalchemy.create_engine)
+        sys_db_idle_transaction_timeout_sec (float): Postgres idle_in_transaction_session_timeout, in seconds, for system database connections DBOS creates. Postgres ends a session left idle inside an open transaction for longer than this, releasing its locks. Defaults to 60.0. Set to a non-positive value to leave the server's setting in place. Not applied to a custom system_database_engine or when db_engine_kwargs already sets the parameter.
+        log_level (str): Log level
+        otlp_log_level: Optional[str]: log level specficially for OTLP logging (if enabled); must be no less severe than log_level
+        console_log_level: Optional[str]: log level specficially for console logging; must be no less severe than log_level
+        otlp_traces_endpoints: List[str]: OTLP traces endpoints
+        otlp_logs_endpoints: List[str]: OTLP logs endpoints
+        otlp_attributes (dict[str, str]): A set of custom attributes to apply OTLP-exported logs and traces
+        application_version (str): Application version
+        executor_id (str): Executor ID, used to identify the application instance in distributed environments
+        dbos_system_schema (str): Schema name for DBOS system tables. Defaults to "dbos".
+        enable_otlp (bool): If True, enable built-in DBOS OTLP tracing and logging.
+        system_database_engine (sa.Engine): A custom system database engine. If provided, DBOS will not create an engine but use this instead.
+        conductor_key (str): An API key for DBOS Conductor. Pass this in to connect your process to Conductor.
+        conductor_url (str): The websockets URL for your DBOS Conductor service. Only set if you're self-hosting Conductor.
+        conductor_executor_metadata (Dict[str, Any]): Metadata associated with this executor that may be used to identify an executor on the Conductor dashboard. Must be JSON-serializable.
+        conductor_metadata_only_mode (bool): If True, only send workflow metadata to Conductor, never workflow data (inputs, outputs, errors, step outputs, events, notifications, streams, or schedule context). Defaults to False.
+        transact_enterprise_key (str): The key that entitles this application to Transact Enterprise features.
+        auto_upgrade (bool): If True, workflows registered by this application are auto-upgraded to the latest application version. Defaults to False.
+        auto_upgrade_interval_sec (float): Seconds between two auto-upgrade passes. Defaults to 30.0.
+        auto_upgrade_grace_sec (float): Seconds the latest application version must have been the latest before auto-upgrade re-enqueues PENDING workflows left on older versions, giving executors on those versions time to drain. ENQUEUED and DELAYED workflows are upgraded without waiting. Defaults to 0.0.
+        enable_patching (bool): Deprecated. Pins the application version to "PATCHING_ENABLED" so every deployment shares one version.
+        serializer (Serializer): A custom serializer and deserializer DBOS uses when storing program data in the system database
+        external_stores (List[ExternalStore]): The object stores for values passed to DBOS.store_external_object. If there are multiple, store_external_object must specify one with store_id, and each needs a unique store_id. Requires Transact Enterprise.
+        workflow_archive (WorkflowArchive): Where workflows are archived once they reach a terminal status, such as dbos_enterprise.archive.ParquetArchive. Retention then only deletes workflows already archived. Not supported on a sharded system database or CockroachDB. Requires Transact Enterprise.
+        use_listen_notify (bool): Whether to use LISTEN/NOTIFY or polling to listen for notifications and events.  Defaults to True. As this affects migrations, may not be changed after the system database is first created.
+        run_migrations (bool): Whether to create and migrate the system database on launch. Defaults to True. Set to False for a process that must not alter the schema, such as one whose database role cannot run DDL, or a deployment that migrates out of band with `dbos migrate`. Launch then verifies the schema instead: a system database that is missing, or behind the version this build requires, fails launch rather than being created or migrated.
+        notification_listener_polling_interval_sec (float): Polling interval in seconds for the notification listener background process. Defaults to 1.0. Minimum value is 0.001. Lower values can speed up test execution.
+        notification_coalesce_sec (float): Interval in seconds for coalescing LISTEN/NOTIFY notifications (streams and events) pushed off the write path. Bounds read latency and caps the rate of notifying commits independent of write throughput. Defaults to 0.01. Minimum value is 0.001.
+        observability_query_timeout_sec (float): Statement timeout, in seconds, for read-only observability queries against the system database. Defaults to 30.0.
+        scheduler_polling_interval_sec (float): Polling interval in seconds for the scheduler thread to detect new workflow schedules. Defaults to 30.0.
+        kafka_queue_polling_interval_sec (float): Polling interval in seconds for the internal queues on which Kafka consumer workflows run (_dbos_kafka_queue and _dbos_kafka_ordered_queue). Defaults to 1.0. Minimum value is 0.001.
+        otel_attribute_format (Literal["legacy", "semconv"]): How span attribute names are emitted to OTLP.
+            "legacy" (default) keeps DBOS's original names (e.g. operationUUID, applicationID) for backward
+            compatibility with existing dashboards and the TypeScript Transact SDK. "semconv" emits the
+            OpenTelemetry-style equivalents under the dbos.* namespace (e.g. dbos.operation.workflow_id,
+            dbos.application.id), per https://opentelemetry.io/docs/specs/semconv/general/attribute-naming/.
+    """
+
+    name: str
+    system_database_url: Optional[str]
+    sys_db_pool_size: Optional[int]
+    sys_db_polling_concurrency: Optional[int]
+    db_engine_kwargs: Optional[Dict[str, Any]]
+    sys_db_idle_transaction_timeout_sec: Optional[float]
+    log_level: Optional[str]
+    otlp_log_level: Optional[str]
+    console_log_level: Optional[str]
+    otlp_traces_endpoints: Optional[List[str]]
+    otlp_logs_endpoints: Optional[List[str]]
+    otlp_attributes: Optional[dict[str, str]]
+    application_version: Optional[str]
+    executor_id: Optional[str]
+    dbos_system_schema: Optional[str]
+    enable_otlp: Optional[bool]
+    system_database_engine: Optional[sa.Engine]
+    conductor_key: Optional[str]
+    conductor_url: Optional[str]
+    conductor_executor_metadata: Optional[Dict[str, Any]]
+    conductor_metadata_only_mode: Optional[bool]
+    transact_enterprise_key: Optional[str]
+    auto_upgrade: Optional[bool]
+    auto_upgrade_interval_sec: Optional[float]
+    auto_upgrade_grace_sec: Optional[float]
+    serializer: Optional[Serializer]
+    external_stores: Optional[List[ExternalStore]]
+    workflow_archive: Optional[WorkflowArchive]
+    enable_patching: Optional[bool]
+    use_listen_notify: Optional[bool]
+    # Use a sharded system database from dbos-enterprise; every workflow then lives under an explicit shard key.
+    sharding: Optional[bool]
+    # Suspend mode from dbos-enterprise: recv(suspend=True) and sleep(suspend=True) park the
+    # workflow in the database. Any send, with or without suspend mode, wakes a parked recv.
+    suspend_mode: Optional[bool]
+    run_migrations: Optional[bool]
+    max_executor_threads: Optional[int]
+    notification_listener_polling_interval_sec: Optional[float]
+    notification_coalesce_sec: Optional[float]
+    observability_query_timeout_sec: Optional[float]
+    scheduler_polling_interval_sec: Optional[float]
+    kafka_queue_polling_interval_sec: Optional[float]
+    otel_attribute_format: Optional[Literal["legacy", "semconv"]]
+
+
+class RuntimeConfig(TypedDict, total=False):
+    start: List[str]
+    setup: Optional[List[str]]
+    max_executor_threads: Optional[int]
+    notification_listener_polling_interval_sec: Optional[float]
+    notification_coalesce_sec: Optional[float]
+    observability_query_timeout_sec: Optional[float]
+    scheduler_polling_interval_sec: Optional[float]
+    kafka_queue_polling_interval_sec: Optional[float]
+    auto_upgrade_interval_sec: Optional[float]
+    auto_upgrade_grace_sec: Optional[float]
+
+
+class DatabaseConfig(TypedDict, total=False):
+    sys_db_pool_size: Optional[int]
+    sys_db_polling_concurrency: Optional[int]
+    db_engine_kwargs: Optional[Dict[str, Any]]
+    sys_db_engine_kwargs: Optional[Dict[str, Any]]
+    sys_db_idle_transaction_timeout_sec: Optional[float]
+    migrate: Optional[List[str]]
+
+
+class OTLPExporterConfig(TypedDict, total=False):
+    logsEndpoint: Optional[List[str]]
+    tracesEndpoint: Optional[List[str]]
+
+
+class LoggerConfig(TypedDict, total=False):
+    logLevel: Optional[str]
+    consoleLogLevel: Optional[str]
+    otlpLogLevel: Optional[str]
+
+
+class TelemetryConfig(TypedDict, total=False):
+    logs: Optional[LoggerConfig]
+    OTLPExporter: Optional[OTLPExporterConfig]
+    otlp_attributes: Optional[dict[str, str]]
+    disable_otlp: bool
+    otel_attribute_format: Optional[Literal["legacy", "semconv"]]
+
+
+class ConfigFile(TypedDict, total=False):
+    """
+    Data structure containing the DBOS Configuration.
+    The DBOSConfig object is parsed into this.
+    """
+
+    name: str
+    runtimeConfig: RuntimeConfig
+    database: DatabaseConfig
+    system_database_url: Optional[str]
+    telemetry: Optional[TelemetryConfig]
+    system_database_engine: Optional[sa.Engine]
+    dbos_system_schema: Optional[str]
+    use_listen_notify: bool
+    run_migrations: bool
+    sharding: bool
+    suspend_mode: bool
+
+
+def _validate_idle_transaction_timeout_sec(value: Optional[float]) -> None:
+    # Reject NaN/inf: the timeout becomes an integer number of milliseconds.
+    if value is not None and not math.isfinite(value):
+        raise DBOSInitializationError(
+            f"sys_db_idle_transaction_timeout_sec must be a finite number, got {value}"
+        )
+
+
+def _validate_observability_query_timeout_sec(value: Optional[float]) -> None:
+    # Reject NaN/inf: the timeout becomes an integer number of milliseconds.
+    if value is not None and not math.isfinite(value):
+        raise DBOSInitializationError(
+            f"observability_query_timeout_sec must be a finite number, got {value}"
+        )
+
+
+# Removed in DBOS 3.0 along with the application database.
+REMOVED_DATABASE_URL_KEYS = ("database_url", "application_database_url")
+
+
+def _reject_removed_database_url_keys(config: DBOSConfig) -> None:
+    for key in REMOVED_DATABASE_URL_KEYS:
+        if not config.get(key):
+            continue
+        raise DBOSInitializationError(
+            f"DBOSConfig sets {key}, which was removed in DBOS 3.0 along with the "
+            "application database. Use system_database_url instead."
+        )
+
+
+def translate_dbos_config_to_config_file(config: DBOSConfig) -> ConfigFile:
+    if "name" not in config:
+        raise DBOSInitializationError(f"Configuration must specify an application name")
+    _reject_removed_database_url_keys(config)
+
+    translated_config: ConfigFile = {
+        "name": config["name"],
+    }
+
+    # Database config
+    db_config: DatabaseConfig = {}
+    if "sys_db_pool_size" in config:
+        db_config["sys_db_pool_size"] = config.get("sys_db_pool_size")
+    if "sys_db_polling_concurrency" in config:
+        db_config["sys_db_polling_concurrency"] = config.get(
+            "sys_db_polling_concurrency"
+        )
+    if "db_engine_kwargs" in config:
+        db_config["db_engine_kwargs"] = config.get("db_engine_kwargs")
+    if "sys_db_idle_transaction_timeout_sec" in config:
+        idle_timeout = config["sys_db_idle_transaction_timeout_sec"]
+        _validate_idle_transaction_timeout_sec(idle_timeout)
+        db_config["sys_db_idle_transaction_timeout_sec"] = idle_timeout
+    if db_config:
+        translated_config["database"] = db_config
+
+    if "system_database_url" in config:
+        translated_config["system_database_url"] = config.get("system_database_url")
+
+    if "dbos_system_schema" in config:
+        translated_config["dbos_system_schema"] = config.get("dbos_system_schema")
+
+    # Runtime config
+    translated_config["runtimeConfig"] = {}
+    if "max_executor_threads" in config:
+        translated_config["runtimeConfig"]["max_executor_threads"] = config[
+            "max_executor_threads"
+        ]
+    if "notification_listener_polling_interval_sec" in config:
+        interval = config["notification_listener_polling_interval_sec"]
+        # Reject NaN/inf too (they slip past a bare < 0.001) so the listener's time.sleep can't crash.
+        if interval is not None and (not math.isfinite(interval) or interval < 0.001):
+            raise DBOSInitializationError(
+                f"notification_listener_polling_interval_sec must be a finite number at least 0.001 seconds, got {interval}"
+            )
+        translated_config["runtimeConfig"][
+            "notification_listener_polling_interval_sec"
+        ] = interval
+    if "notification_coalesce_sec" in config:
+        coalesce = config["notification_coalesce_sec"]
+        # Reject NaN/inf too (they slip past a bare < 0.001) so run_notifier's time.sleep can't crash.
+        if coalesce is not None and (not math.isfinite(coalesce) or coalesce < 0.001):
+            raise DBOSInitializationError(
+                f"notification_coalesce_sec must be a finite number at least 0.001 seconds, got {coalesce}"
+            )
+        translated_config["runtimeConfig"]["notification_coalesce_sec"] = coalesce
+    if "observability_query_timeout_sec" in config:
+        query_timeout = config["observability_query_timeout_sec"]
+        _validate_observability_query_timeout_sec(query_timeout)
+        translated_config["runtimeConfig"][
+            "observability_query_timeout_sec"
+        ] = query_timeout
+    if "scheduler_polling_interval_sec" in config:
+        translated_config["runtimeConfig"]["scheduler_polling_interval_sec"] = config[
+            "scheduler_polling_interval_sec"
+        ]
+    if "kafka_queue_polling_interval_sec" in config:
+        kafka_interval = config["kafka_queue_polling_interval_sec"]
+        # Reject NaN/inf too (they slip past a bare < 0.001) so the queue worker's wait can't crash.
+        if kafka_interval is not None and (
+            not math.isfinite(kafka_interval) or kafka_interval < 0.001
+        ):
+            raise DBOSInitializationError(
+                f"kafka_queue_polling_interval_sec must be a finite number at least 0.001 seconds, got {kafka_interval}"
+            )
+        translated_config["runtimeConfig"][
+            "kafka_queue_polling_interval_sec"
+        ] = kafka_interval
+    if "auto_upgrade_interval_sec" in config:
+        upgrade_interval = config["auto_upgrade_interval_sec"]
+        # Reject NaN/inf too (they slip past a bare <= 0) so the poller's wait can't crash.
+        if upgrade_interval is not None and (
+            not math.isfinite(upgrade_interval) or upgrade_interval <= 0
+        ):
+            raise DBOSInitializationError(
+                f"auto_upgrade_interval_sec must be a finite positive number of seconds, got {upgrade_interval}"
+            )
+        translated_config["runtimeConfig"][
+            "auto_upgrade_interval_sec"
+        ] = upgrade_interval
+    if "auto_upgrade_grace_sec" in config:
+        upgrade_grace = config["auto_upgrade_grace_sec"]
+        # Zero means no grace; NaN/inf are rejected so the pass's comparison stays meaningful.
+        if upgrade_grace is not None and (
+            not math.isfinite(upgrade_grace) or upgrade_grace < 0
+        ):
+            raise DBOSInitializationError(
+                f"auto_upgrade_grace_sec must be a finite non-negative number of seconds, got {upgrade_grace}"
+            )
+        translated_config["runtimeConfig"]["auto_upgrade_grace_sec"] = upgrade_grace
+
+    # Telemetry config
+    enable_otlp = config.get("enable_otlp", None)
+    disable_otlp = True if enable_otlp is None else not enable_otlp
+    telemetry: TelemetryConfig = {
+        "OTLPExporter": {"tracesEndpoint": [], "logsEndpoint": []},
+        "otlp_attributes": config.get("otlp_attributes", {}),
+        "disable_otlp": disable_otlp,
+        "otel_attribute_format": config.get("otel_attribute_format", "legacy"),
+    }
+    # For mypy
+    assert telemetry["OTLPExporter"] is not None
+
+    # Add OTLPExporter if traces endpoints exist
+    otlp_trace_endpoints = config.get("otlp_traces_endpoints")
+    if isinstance(otlp_trace_endpoints, list) and len(otlp_trace_endpoints) > 0:
+        telemetry["OTLPExporter"]["tracesEndpoint"] = otlp_trace_endpoints
+    # Same for the logs
+    otlp_logs_endpoints = config.get("otlp_logs_endpoints")
+    if isinstance(otlp_logs_endpoints, list) and len(otlp_logs_endpoints) > 0:
+        telemetry["OTLPExporter"]["logsEndpoint"] = otlp_logs_endpoints
+
+    # Default to INFO -- the logging seems to default to WARN otherwise.
+    log_level = config.get("log_level", "INFO")
+    otlp_log_level = config.get("otlp_log_level", log_level)
+    console_log_level = config.get("console_log_level", log_level)
+    if log_level:
+        telemetry["logs"] = LoggerConfig(
+            logLevel=log_level,
+            consoleLogLevel=cast(str, console_log_level),
+            otlpLogLevel=cast(str, otlp_log_level),
+        )
+    if telemetry:
+        translated_config["telemetry"] = telemetry
+
+    translated_config["system_database_engine"] = config.get("system_database_engine")
+    use_listen_notify = config.get("use_listen_notify", None)
+    translated_config["use_listen_notify"] = (
+        use_listen_notify if use_listen_notify is not None else True
+    )
+    run_migrations = config.get("run_migrations", None)
+    translated_config["run_migrations"] = (
+        run_migrations if run_migrations is not None else True
+    )
+    translated_config["sharding"] = bool(config.get("sharding"))
+    translated_config["suspend_mode"] = bool(config.get("suspend_mode"))
+
+    return translated_config
+
+
+def _substitute_env_vars(content: str) -> str:
+    # Regex to match ${VAR_NAME} style placeholders for environment variables
+    env_regex = r"\$\{([^}]+)\}"
+
+    def replace_env_func(match: re.Match[str]) -> str:
+        # If the env variable is not set, return an empty string
+        return os.environ.get(match.group(1), "")
+
+    return re.sub(env_regex, replace_env_func, content)
+
+
+def load_config(
+    config_file_path: str = DBOS_CONFIG_PATH,
+) -> ConfigFile:
+    """
+    Load the DBOS `ConfigFile` from the specified path (typically `dbos-config.yaml`).
+
+    Args:
+        config_file_path (str): The path to the yaml configuration file.
+
+    Returns:
+        ConfigFile: The loaded configuration
+
+    """
+
+    with open(config_file_path, "r") as file:
+        content = file.read()
+        substituted_content = _substitute_env_vars(content)
+        data = yaml.safe_load(substituted_content)
+
+    if not isinstance(data, dict):
+        raise DBOSInitializationError(
+            f"dbos-config.yaml must contain a dictionary, not {type(data)}"
+        )
+    return cast(ConfigFile, data)
+
+
+def process_config(
+    *,
+    data: ConfigFile,
+) -> ConfigFile:
+    """
+    If a system_database_url is provided, pass it as is in the config.
+
+    Else, default to SQLite.
+
+    Also build SQL Alchemy "kwargs" base on user input + defaults.
+    """
+
+    if "name" not in data:
+        raise DBOSInitializationError(f"Configuration must specify an application name")
+
+    if not _is_valid_app_name(data["name"]):
+        raise DBOSInitializationError(
+            f'Invalid app name {data["name"]}.  App names must be between 3 and 256 characters long and contain only lowercase letters, numbers, dashes, and underscores.'
+        )
+
+    if data.get("telemetry") is None:
+        data["telemetry"] = {}
+    telemetry = cast(TelemetryConfig, data["telemetry"])
+    if telemetry.get("logs") is None:
+        telemetry["logs"] = {}
+    logs = cast(LoggerConfig, telemetry["logs"])
+    if logs.get("logLevel") is None:
+        logs["logLevel"] = "INFO"
+
+    # Ensure database dict exists
+    data.setdefault("database", {})
+    connect_timeout = None
+
+    if data.get("system_database_engine") and not data.get("system_database_url"):
+        engine = data.get("system_database_engine")
+        assert engine is not None
+        if "sqlite" in engine.dialect.name:
+            data["system_database_url"] = (
+                "sqlite:///custom_system_database_engine.sqlite"
+            )
+        else:
+            data["system_database_url"] = "postgresql://custom:system@database/engine"
+
+    # Process the system database URL, if provided
+    if data.get("system_database_url"):
+        # Parse the db string and check required fields
+        assert data["system_database_url"]
+        assert is_valid_database_url(data["system_database_url"])
+
+        url = make_url(data["system_database_url"])
+
+        # Gather connect_timeout from the URL if provided. It should be used in engine kwargs if not provided there (instead of our default)
+        connect_timeout_str = url.query.get("connect_timeout")
+        if connect_timeout_str is not None:
+            assert isinstance(
+                connect_timeout_str, str
+            ), "connect_timeout must be a string and defined once in the URL"
+            if connect_timeout_str.isdigit():
+                connect_timeout = int(connect_timeout_str)
+
+    # If no URL is provided, use a default SQLite system database URL.
+    if not data.get("system_database_url"):
+        _sys_db_name = _app_name_to_db_name(data["name"])
+        data["system_database_url"] = f"sqlite:///{_sys_db_name}.sqlite"
+
+    configure_db_engine_parameters(data["database"], connect_timeout=connect_timeout)
+
+    # Return data as ConfigFile type
+    return data
+
+
+def configure_db_engine_parameters(
+    data: DatabaseConfig, connect_timeout: Optional[int] = None
+) -> None:
+    """
+    Configure SQLAlchemy engine parameters for the system database.
+
+    If provided, sys_db_pool_size will take precedence over user_kwargs for the system db engine.
+
+    Args:
+        data: Configuration dictionary containing database settings
+    """
+
+    engine_kwargs: dict[str, Any] = {
+        "connect_args": {"application_name": "dbos_transact"},
+        "pool_timeout": 30,
+        "max_overflow": 0,
+        "pool_size": 20,
+        "pool_pre_ping": True,
+    }
+    # If user-provided kwargs are present, use them instead
+    custom_engine_kwargs = data.get("db_engine_kwargs")
+    if custom_engine_kwargs is not None:
+        engine_kwargs.update(custom_engine_kwargs)
+
+    # If user-provided kwargs do not contain connect_timeout, check if their URL did (this function connect_timeout parameter).
+    # Else default to 10
+    if "connect_args" not in engine_kwargs:
+        engine_kwargs["connect_args"] = {}
+    if "connect_timeout" not in engine_kwargs["connect_args"]:
+        engine_kwargs["connect_args"]["connect_timeout"] = (
+            connect_timeout if connect_timeout else 10
+        )
+
+    # If NullPool is specified, remove pool parameters
+    if custom_engine_kwargs and custom_engine_kwargs.get("poolclass") == sa.NullPool:
+        del engine_kwargs["pool_timeout"]
+        del engine_kwargs["max_overflow"]
+        del engine_kwargs["pool_size"]
+        del engine_kwargs["pool_pre_ping"]
+
+    # User-provided sys_db_pool_size takes precedence
+    if data.get("sys_db_pool_size") is not None:
+        engine_kwargs["pool_size"] = data["sys_db_pool_size"]
+
+    data["sys_db_engine_kwargs"] = engine_kwargs
+
+
+def is_valid_database_url(database_url: str) -> bool:
+    if database_url.startswith("sqlite"):
+        return True
+    url = make_url(database_url)
+    required_fields = [
+        ("database", "Database name must be specified in the connection URL"),
+    ]
+    for field_name, error_message in required_fields:
+        field_value = getattr(url, field_name, None)
+        if not field_value:
+            raise DBOSInitializationError(error_message)
+    return True
+
+
+def _is_valid_app_name(name: str) -> bool:
+    name_len = len(name)
+    if name_len < 3 or name_len > 256:
+        return False
+    match = re.match("^[a-z0-9-_]+$", name)
+    return True if match != None else False
+
+
+def _app_name_to_db_name(app_name: str) -> str:
+    name = app_name.replace("-", "_").replace(" ", "_").lower()
+    return name if not name[0].isdigit() else f"_{name}"
+
+
+def overwrite_config(provided_config: ConfigFile) -> ConfigFile:
+    # In DBOS Cloud, force the settings the platform exports as environment variables:
+    # 1. The application name from DBOS_APP_NAME, so it matches the name registered in the cloud
+    # 2. The system database url provided by DBOS_SYSTEM_DATABASE_URL
+    # 3. OTLP endpoints from DBOS__OTLP_TRACES_ENDPOINT and DBOS__OTLP_LOGS_ENDPOINT, added to any provided in code
+
+    app_name = os.environ.get("DBOS_APP_NAME")
+    if app_name is None:
+        raise DBOSInitializationError(
+            "DBOS_APP_NAME environment variable is not set. This is required to identify the application in DBOS Cloud."
+        )
+    provided_config["name"] = app_name
+
+    # Use the DBOS Cloud system database URL
+    system_db_url = os.environ.get("DBOS_SYSTEM_DATABASE_URL")
+    if system_db_url is None:
+        raise DBOSInitializationError(
+            "DBOS_SYSTEM_DATABASE_URL environment variable is not set. This is required to connect to the database."
+        )
+    provided_config["system_database_url"] = system_db_url
+    # Always use the "dbos" schema when deploying to DBOS Cloud
+    provided_config["dbos_system_schema"] = "dbos"
+
+    # Telemetry config
+    if "telemetry" not in provided_config or provided_config["telemetry"] is None:
+        provided_config["telemetry"] = {
+            "OTLPExporter": {"tracesEndpoint": [], "logsEndpoint": []},
+            "disable_otlp": False,
+        }
+    else:
+        provided_config["telemetry"]["disable_otlp"] = False
+        if "OTLPExporter" not in provided_config["telemetry"]:
+            provided_config["telemetry"]["OTLPExporter"] = {
+                "tracesEndpoint": [],
+                "logsEndpoint": [],
+            }
+
+    # Cast because mypy doesn't track that telemetry and OTLPExporter were resolved above
+    telemetry = cast(Dict[str, Any], provided_config["telemetry"])
+    otlp_exporter = cast(Dict[str, Any], telemetry["OTLPExporter"])
+    traces_endpoint = os.environ.get("DBOS__OTLP_TRACES_ENDPOINT")
+    if traces_endpoint:
+        otlp_exporter["tracesEndpoint"].append(traces_endpoint)
+    logs_endpoint = os.environ.get("DBOS__OTLP_LOGS_ENDPOINT")
+    if logs_endpoint:
+        otlp_exporter["logsEndpoint"].append(logs_endpoint)
+
+    return provided_config

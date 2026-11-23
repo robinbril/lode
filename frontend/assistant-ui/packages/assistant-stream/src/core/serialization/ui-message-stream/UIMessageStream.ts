@@ -1,0 +1,392 @@
+import sjson from "secure-json-parse";
+import type { AssistantStreamChunk } from "../../AssistantStreamChunk";
+import { AssistantTransformStream } from "../../utils/stream/AssistantTransformStream";
+import { PipeableTransformStream } from "../../utils/stream/PipeableTransformStream";
+import { createSSEJsonDecoder } from "../../utils/stream/SSEJson";
+import type {
+  UIMessageStreamChunk,
+  UIMessageStreamDataChunk,
+} from "./chunk-types";
+import { generateId } from "../../utils/generateId";
+import { createToolCallPartRegistry } from "../tool-call-part-registry";
+import { createChunkNormalizer } from "./chunk-normalizer";
+import type { AssistantStreamController } from "../../modules/assistant-stream";
+import type { TextStreamController } from "../../modules/text";
+import type { ToolCallApproval } from "../../utils/types";
+
+export type { UIMessageStreamChunk, UIMessageStreamDataChunk };
+
+export type UIMessageStreamDecoderOptions = {
+  onData?: (data: {
+    type: string;
+    name: string;
+    id?: string;
+    data: unknown;
+    transient?: boolean;
+  }) => void;
+  /** Maximum UTF-16 code units accepted in one SSE line. */
+  maxLineLength?: number | undefined;
+  /** Maximum UTF-16 code units retained across one SSE event. */
+  maxEventLength?: number | undefined;
+};
+
+const isDataChunk = (
+  chunk: UIMessageStreamChunk,
+): chunk is UIMessageStreamDataChunk => chunk.type.startsWith("data-");
+
+/**
+ * Decodes AI SDK v6 UI Message Stream format into AssistantStreamChunks.
+ */
+export class UIMessageStreamDecoder extends PipeableTransformStream<
+  Uint8Array<ArrayBuffer>,
+  AssistantStreamChunk
+> {
+  constructor(options: UIMessageStreamDecoderOptions = {}) {
+    super((readable) => {
+      const toolCallPartRegistry = createToolCallPartRegistry();
+      const normalizer = createChunkNormalizer();
+      const textParts = {
+        text: new Map<string, TextStreamController>(),
+        reasoning: new Map<string, TextStreamController>(),
+      };
+      const activeTextIds: Partial<Record<keyof typeof textParts, string>> = {};
+      const closeTextParts = () => {
+        for (const kind of ["text", "reasoning"] as const) {
+          for (const part of textParts[kind].values()) part.close();
+          textParts[kind].clear();
+          delete activeTextIds[kind];
+        }
+      };
+      let activeToolCallId: string | undefined;
+      let currentMessageId: string | undefined;
+      // `start` opens the first step, and AI SDK streams follow it with a
+      // `start-step` for that same step.
+      let stepOpenedByStart = false;
+      const approvalsByToolCallId = new Map<string, ToolCallApproval>();
+
+      const transformer = {
+        transform(
+          chunk: UIMessageStreamChunk,
+          controller: AssistantStreamController,
+        ) {
+          const type = chunk.type;
+
+          if (isDataChunk(chunk)) {
+            const name = chunk.type.slice(5);
+
+            if (options.onData) {
+              options.onData({
+                type: chunk.type,
+                name,
+                data: chunk.data,
+                ...(typeof chunk.id === "string" && { id: chunk.id }),
+                ...(chunk.transient !== undefined && {
+                  transient: chunk.transient,
+                }),
+              });
+            }
+
+            if (!chunk.transient) {
+              controller.enqueue({
+                type: "data",
+                path: [],
+                data: [{ name, data: chunk.data }],
+              });
+            }
+            return;
+          }
+
+          switch (type) {
+            case "start":
+              currentMessageId = chunk.messageId;
+              stepOpenedByStart = true;
+              controller.enqueue({
+                type: "step-start",
+                path: [],
+                messageId: chunk.messageId,
+              });
+              break;
+
+            case "text-start":
+            case "reasoning-start": {
+              const kind = type === "text-start" ? "text" : "reasoning";
+              textParts[kind].get(chunk.id)?.close();
+              textParts[kind].set(
+                chunk.id,
+                kind === "text"
+                  ? controller.addTextPart(
+                      chunk.providerMetadata != null
+                        ? { providerMetadata: chunk.providerMetadata }
+                        : undefined,
+                    )
+                  : controller.addReasoningPart(
+                      chunk.providerMetadata != null
+                        ? { providerMetadata: chunk.providerMetadata }
+                        : undefined,
+                    ),
+              );
+              activeTextIds[kind] = chunk.id;
+              break;
+            }
+
+            case "text-delta":
+            case "reasoning-delta": {
+              const kind = type === "text-delta" ? "text" : "reasoning";
+              const id = chunk.id ?? activeTextIds[kind];
+              const part =
+                id === undefined ? undefined : textParts[kind].get(id);
+              const delta =
+                type === "text-delta" ? chunk.textDelta : chunk.delta;
+              if (part) part.append(delta, chunk.providerMetadata);
+              else if (kind === "text") controller.appendText(delta);
+              else controller.appendReasoning(delta);
+              break;
+            }
+
+            case "text-end":
+            case "reasoning-end": {
+              const kind = type === "text-end" ? "text" : "reasoning";
+              const id = chunk.id ?? activeTextIds[kind];
+              if (id === undefined) break;
+              textParts[kind].get(id)?.close(chunk.providerMetadata);
+              textParts[kind].delete(id);
+              if (activeTextIds[kind] === id) delete activeTextIds[kind];
+              break;
+            }
+
+            case "source":
+              controller.appendSource({
+                type: "source",
+                sourceType: chunk.source.sourceType,
+                id: chunk.source.id,
+                url: chunk.source.url,
+                ...(chunk.source.title && { title: chunk.source.title }),
+              });
+              break;
+
+            case "source-document":
+              controller.appendSource({
+                type: "source",
+                sourceType: "document",
+                id: chunk.sourceId,
+                title: chunk.title,
+                mediaType: chunk.mediaType,
+                ...(chunk.filename && { filename: chunk.filename }),
+              });
+              break;
+
+            case "file":
+              controller.appendFile({
+                type: "file",
+                mimeType: chunk.file.mimeType,
+                data: chunk.file.data,
+              });
+              break;
+
+            case "tool-call-start": {
+              if (activeToolCallId !== undefined) {
+                toolCallPartRegistry.closeArgsText(
+                  toolCallPartRegistry.get(activeToolCallId),
+                );
+                activeToolCallId = undefined;
+              }
+
+              toolCallPartRegistry.start(chunk.toolCallId, () =>
+                controller.addToolCallPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  ...(chunk.providerExecuted && { providerExecuted: true }),
+                }),
+              );
+              activeToolCallId = chunk.toolCallId;
+              break;
+            }
+
+            case "tool-call-delta":
+              if (activeToolCallId !== undefined) {
+                toolCallPartRegistry.appendArgsText(
+                  toolCallPartRegistry.get(activeToolCallId),
+                  chunk.argsText,
+                );
+              }
+              break;
+
+            case "tool-call-end":
+              if (activeToolCallId !== undefined) {
+                toolCallPartRegistry.closeArgsText(
+                  toolCallPartRegistry.get(activeToolCallId),
+                );
+                activeToolCallId = undefined;
+              }
+              break;
+
+            case "tool-result": {
+              if (chunk.toolCallId === activeToolCallId) {
+                activeToolCallId = undefined;
+              }
+              const toolCallController = toolCallPartRegistry.tryGet(
+                chunk.toolCallId,
+              );
+              if (!toolCallController) {
+                throw new Error(
+                  `Encountered tool result with unknown id: ${chunk.toolCallId}`,
+                );
+              }
+              toolCallPartRegistry.setResponse(toolCallController, {
+                result: chunk.result,
+                isError: chunk.isError ?? false,
+                ...(chunk.isPreliminary ? { isPreliminary: true } : {}),
+                ...(chunk.messages !== undefined
+                  ? { messages: chunk.messages }
+                  : {}),
+              });
+              break;
+            }
+
+            // A call opened by an earlier response is not in the registry; its
+            // approval chunks belong to that response's message and are dropped.
+            case "tool-approval-request": {
+              const toolCallController = toolCallPartRegistry.tryGet(
+                chunk.toolCallId,
+              );
+              if (!toolCallController) break;
+              approvalsByToolCallId.set(chunk.toolCallId, chunk.approval);
+              toolCallController.setApproval(chunk.approval);
+              break;
+            }
+
+            case "tool-approval-response": {
+              let entry: [string, ToolCallApproval] | undefined;
+              for (const candidate of approvalsByToolCallId) {
+                if (candidate[1].id !== chunk.approvalId) continue;
+                entry = candidate;
+                break;
+              }
+              if (!entry) break;
+              const [toolCallId, approval] = entry;
+              const decided = {
+                ...approval,
+                approved: chunk.approved,
+                ...(chunk.reason !== undefined && { reason: chunk.reason }),
+              };
+              approvalsByToolCallId.set(toolCallId, decided);
+              toolCallPartRegistry.tryGet(toolCallId)?.setApproval(decided);
+              break;
+            }
+
+            case "tool-output-denied": {
+              const toolCallController = toolCallPartRegistry.tryGet(
+                chunk.toolCallId,
+              );
+              if (!toolCallController) break;
+              const reason = approvalsByToolCallId.get(
+                chunk.toolCallId,
+              )?.reason;
+              toolCallPartRegistry.setResponse(toolCallController, {
+                result: { error: reason || "Tool approval denied" },
+                isError: true,
+              });
+              break;
+            }
+
+            case "start-step": {
+              const messageId =
+                chunk.messageId ?? currentMessageId ?? generateId();
+              const isOpenStep =
+                stepOpenedByStart && messageId === currentMessageId;
+              stepOpenedByStart = false;
+              if (isOpenStep) break;
+              controller.enqueue({ type: "step-start", path: [], messageId });
+              break;
+            }
+
+            case "finish-step":
+              stepOpenedByStart = false;
+              closeTextParts();
+              controller.enqueue({
+                type: "step-finish",
+                path: [],
+                finishReason: chunk.finishReason,
+                usage: chunk.usage,
+                isContinued: chunk.isContinued,
+              });
+              break;
+
+            case "finish":
+              closeTextParts();
+              controller.enqueue({
+                type: "message-finish",
+                path: [],
+                finishReason: chunk.finishReason,
+                usage: chunk.usage,
+              });
+              break;
+
+            case "error":
+              controller.enqueue({
+                type: "error",
+                path: [],
+                error: chunk.errorText,
+              });
+              break;
+
+            default:
+              // ignore unknown types for forward compatibility
+              break;
+          }
+        },
+        flush(controller: AssistantStreamController) {
+          normalizer.flush({
+            enqueue(chunk) {
+              transformer.transform(chunk, controller);
+            },
+          });
+          closeTextParts();
+          if (activeToolCallId !== undefined) {
+            toolCallPartRegistry.closeArgsText(
+              toolCallPartRegistry.get(activeToolCallId),
+            );
+          }
+          toolCallPartRegistry.closeAll();
+        },
+      };
+      const transform = new AssistantTransformStream<UIMessageStreamChunk>(
+        transformer,
+      );
+
+      return createSSEJsonDecoder<UIMessageStreamChunk>({
+        strict: true,
+        maxLineLength: options.maxLineLength,
+        maxEventLength: options.maxEventLength,
+        parse(data, controller) {
+          let chunk;
+          try {
+            chunk = sjson.parse(data);
+          } catch {
+            chunk = undefined;
+          }
+          if (
+            typeof chunk !== "object" ||
+            chunk === null ||
+            Array.isArray(chunk) ||
+            typeof chunk.type !== "string"
+          ) {
+            console.warn(
+              `Dropped invalid UIMessageStream chunk: ${data.slice(0, 200)}`,
+            );
+            return;
+          }
+          normalizer.normalize(chunk, controller);
+        },
+        done: {
+          marker: "[DONE]",
+          onMissing() {
+            throw new Error(
+              "Stream ended abruptly without receiving [DONE] marker",
+            );
+          },
+        },
+      })(readable).pipeThrough(transform);
+    });
+  }
+}

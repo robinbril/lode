@@ -1,0 +1,248 @@
+import Link from "next/link";
+import type { FC, ReactNode } from "react";
+import {
+  Definition,
+  DefinitionAnnotation,
+  DefinitionDetails,
+  DefinitionList,
+  DefinitionName,
+  DefinitionTerm,
+} from "@/components/ui/definition-list";
+import {
+  COMMON_PARAMS,
+  DESCRIPTION_LINK_CLASSNAME,
+  DeprecatedNotice,
+  getParameterAnnotations,
+} from "./parameter-annotations";
+
+type ParameterDef = {
+  name: string;
+  type?: string;
+  description: string | ReactNode;
+  required?: boolean;
+  default?: string;
+  deprecated?: string;
+  experimental?: boolean;
+  children?: Array<ParametersTableProps>;
+};
+
+const MARKDOWN_LINK_REGEX = /\[([^\]]+)\]\(([^)\s]+)\)/g;
+
+function renderLinkLabel(label: string): ReactNode {
+  if (label.startsWith("`") && label.endsWith("`")) {
+    return <code>{label.slice(1, -1)}</code>;
+  }
+  return label;
+}
+
+export function renderDescription(description: string | ReactNode): ReactNode {
+  if (typeof description !== "string") return description;
+
+  const parts: ReactNode[] = [];
+  let lastIndex = 0;
+  for (const match of description.matchAll(MARKDOWN_LINK_REGEX)) {
+    const fullMatch = match[0]!;
+    const label = match[1]!;
+    const linkHref = match[2]!;
+    const index = match.index ?? 0;
+    if (index > lastIndex) {
+      parts.push(description.slice(lastIndex, index));
+    }
+
+    const children = renderLinkLabel(label);
+    parts.push(
+      linkHref.startsWith("/") ? (
+        <Link
+          key={`${linkHref}-${index}`}
+          className={DESCRIPTION_LINK_CLASSNAME}
+          href={linkHref}
+        >
+          {children}
+        </Link>
+      ) : (
+        <a
+          key={`${linkHref}-${index}`}
+          className={DESCRIPTION_LINK_CLASSNAME}
+          href={linkHref}
+        >
+          {children}
+        </a>
+      ),
+    );
+    lastIndex = index + fullMatch.length;
+  }
+
+  if (lastIndex === 0) return description;
+  if (lastIndex < description.length) parts.push(description.slice(lastIndex));
+  return parts;
+}
+
+const Parameter: FC<{ parameter: ParameterDef }> = ({
+  parameter: partialParameter,
+}) => {
+  const parameter = {
+    ...COMMON_PARAMS.parameters[partialParameter.name],
+    ...partialParameter,
+  };
+
+  const isOptional = !parameter.required && !parameter.default;
+
+  return (
+    <Definition>
+      <DefinitionTerm>
+        <DefinitionName>
+          {parameter.name}
+          {isOptional && "?"}
+        </DefinitionName>
+        {parameter.type && (
+          <DefinitionAnnotation>{parameter.type}</DefinitionAnnotation>
+        )}
+        {parameter.default && (
+          <DefinitionAnnotation>= {parameter.default}</DefinitionAnnotation>
+        )}
+        {getParameterAnnotations(parameter, "term")}
+      </DefinitionTerm>
+      <DefinitionDetails>
+        <p className="whitespace-pre-line">
+          {renderDescription(parameter.description)}
+        </p>
+
+        <DeprecatedNotice deprecated={parameter.deprecated} />
+
+        {parameter.children?.map((child, i) => (
+          <ParametersGroup key={child.type ?? i} {...child} />
+        ))}
+      </DefinitionDetails>
+    </Definition>
+  );
+};
+
+const ParametersGroup: FC<ParametersTableProps> = ({ type, parameters }) => {
+  return (
+    <div className="border-foreground/10 mt-3 border-s ps-4">
+      {type && (
+        <div className="text-muted-foreground mb-2 font-mono text-xs font-medium [overflow-wrap:anywhere]">
+          {type}
+        </div>
+      )}
+      <DefinitionList className="border-t-0 [&>div:last-child]:border-b-0 [&>div:last-child]:pb-0">
+        {parameters.map((parameter) => (
+          <Parameter key={parameter.name} parameter={parameter} />
+        ))}
+      </DefinitionList>
+    </div>
+  );
+};
+
+export type ParametersTableProps = {
+  type?: string | undefined;
+  parameters: Array<ParameterDef>;
+};
+
+export const ParametersTable: FC<ParametersTableProps> = ({
+  type,
+  parameters,
+}) => {
+  return (
+    <div className="not-prose my-6">
+      {type && (
+        <div className="text-muted-foreground mb-2 font-mono text-xs font-medium [overflow-wrap:anywhere]">
+          {type}
+        </div>
+      )}
+      <DefinitionList>
+        {parameters.map((parameter) => (
+          <Parameter key={parameter.name} parameter={parameter} />
+        ))}
+      </DefinitionList>
+    </div>
+  );
+};
+
+// Shared bullet-list renderer for both ParametersTable and PrimitivesTypeTable
+// in LLM/markdown output. `normalizeType` is the only behavioral difference
+// between the two: PrimitivesTypeTable strips a trailing `| undefined`.
+export type DefLLM = {
+  name: string;
+  type?: string;
+  description?: string | ReactNode;
+  required?: boolean;
+  default?: string;
+  deprecated?: string;
+  experimental?: boolean;
+  children?: Array<{ parameters: DefLLM[] }>;
+};
+
+type DefListLLMProps = {
+  defs: DefLLM[];
+  commonParams?: Record<string, Partial<DefLLM>> | undefined;
+  normalizeType?: ((type: string) => string) | undefined;
+};
+
+export const DefListLLM: FC<DefListLLMProps> = ({
+  defs,
+  commonParams,
+  normalizeType,
+}) => {
+  return (
+    <ul>
+      {defs.map((def) => (
+        <DefItemLLM
+          key={def.name}
+          def={def}
+          commonParams={commonParams}
+          normalizeType={normalizeType}
+        />
+      ))}
+    </ul>
+  );
+};
+
+const DefItemLLM: FC<
+  { def: DefLLM } & Pick<DefListLLMProps, "commonParams" | "normalizeType">
+> = ({ def: rawDef, commonParams, normalizeType }) => {
+  const def = { ...commonParams?.[rawDef.name], ...rawDef };
+  const isOptional = !def.required && !def.default;
+  const type = def.type && normalizeType ? normalizeType(def.type) : def.type;
+
+  return (
+    <li>
+      <code>
+        {def.name}
+        {isOptional ? "?" : ""}
+      </code>
+      {type ? (
+        <>
+          {": "}
+          <code>{type}</code>
+        </>
+      ) : null}
+      {def.default ? (
+        <>
+          {" (default "}
+          <code>{def.default}</code>
+          {")"}
+        </>
+      ) : null}
+      {def.deprecated ? <> (deprecated: {def.deprecated})</> : null}
+      {def.experimental ? <> (experimental)</> : null}
+      {def.description ? <> — {renderDescription(def.description)}</> : null}
+      {def.children?.map((child, i) => (
+        <DefListLLM
+          key={i}
+          defs={child.parameters}
+          commonParams={commonParams}
+          normalizeType={normalizeType}
+        />
+      ))}
+    </li>
+  );
+};
+
+export const ParametersTableLLM: FC<ParametersTableProps> = ({
+  parameters,
+}) => {
+  return (
+    <DefListLLM defs={parameters} commonParams={COMMON_PARAMS.parameters} />
+  );
+};

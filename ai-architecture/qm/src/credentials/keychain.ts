@@ -1,0 +1,1895 @@
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
+import { orgId as configOrgId } from "../config.ts";
+import { randomBytes } from "node:crypto";
+import { scopeId as toScopeId, parseScopeId, type Destination, type ScopeId } from "../types.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
+import type { SurfaceUser } from "../surfaces/contract.ts";
+import { encryptSecret, decryptSecret, type SecretKey } from "../connectors/connector-client-store.ts";
+import { errMessage } from "../util/errors.ts";
+import { canonicalPerson, personIds, personKey, samePerson } from "../directory/person.ts";
+import { cronIdOf } from "../sessions/session-store.ts";
+import { hashId } from "../util/crypto.ts";
+import { mergeCredentialFiles, type CredentialFileMerge } from "./file-merge.ts";
+import { shq } from "../util/shell.ts";
+import { homeRelativePath } from "./paths.ts";
+import { envKey } from "./connector-token.ts";
+import { connectorHostLabel } from "../connectors/oauth.ts";
+import { credentialInjectionError, type CredentialInjection } from "./credential-injection.ts";
+import { claimThenBind } from "../tenants/claim.ts";
+import { currentTenant } from "../tenants/context.ts";
+
+export const COMPOSIO_ENV_KEY = "COMPOSIO_API_KEY";
+
+export function isBackendCredential(c: { envKey?: string; fields?: ReadonlyArray<{ envKey: string }> }): boolean {
+  return c.envKey === COMPOSIO_ENV_KEY || c.fields?.some((f) => f.envKey === COMPOSIO_ENV_KEY) === true;
+}
+
+export function isUsableComposioKey(c: PublicServiceCredential): boolean {
+  return c.enabled && c.hasSecret && c.delivery === "env" && c.envKey === COMPOSIO_ENV_KEY;
+}
+
+export function isComposioHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/\.$/, "");
+  return normalized === "composio.dev" || normalized.endsWith(".composio.dev");
+}
+
+type CredentialKind = "env" | "file" | "broker";
+
+interface BrokerDelivery {
+  name: string;
+  delivery?: "broker" | "env";
+  envKey?: string;
+  injection?: CredentialInjection;
+  allowedMethods?: string[];
+  allowedPathPrefixes?: string[];
+  deployments?: boolean;
+  enabled: boolean;
+  updatedBy?: string;
+}
+
+interface CredentialRefresh {
+  refreshTokenEnc?: string;
+  idTokenEnc?: string;
+  accountId?: string;
+  accountType?: string;
+  clientRef?: string;
+  grantedScopes?: string[];
+  refreshFailedAt?: number;
+  refreshError?: string;
+  orgId?: string;
+}
+
+export interface CredentialFile {
+  path: string;
+  contentBase64: string;
+  mode?: number;
+}
+
+export function restoredFileMode(mode?: number): number {
+  return ((mode ?? 0o600) & 0o700) | 0o600;
+}
+
+interface CredentialFieldMeta {
+  envKey: string;
+  secret: boolean;
+}
+
+export interface CredentialFieldInput {
+  envKey: string;
+  value: string;
+  secret?: boolean;
+}
+
+export interface KeychainCredential {
+  id: string;
+  ownerId: string;
+  orgId?: string;
+  service: string;
+  kind: CredentialKind;
+  envKey?: string;
+  target?: string;
+  targets?: string[];
+  host?: string;
+  accountLabel?: string;
+  fields?: CredentialFieldMeta[];
+  broker?: BrokerDelivery;
+  refresh?: CredentialRefresh;
+  managed?: "connector";
+  secretEnc: string;
+  fingerprint: string;
+  origin?: string;
+  expiresAt?: number;
+  writer?: { holder: string; until: number };
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type KeychainCredentialMeta = Omit<KeychainCredential, "secretEnc"> & { credentialHandle?: string };
+
+export type GrantMode = "once" | "standing";
+
+export interface KeychainGrant {
+  id: string;
+  credentialId: string;
+  ownerId: string;
+  orgId?: string;
+  audienceScopeId: ScopeId;
+  mode: GrantMode;
+  purpose: string;
+  status: "active" | "revoked" | "used";
+  createdAt: number;
+  expiresAt?: number;
+  revokedAt?: number;
+  usedAt?: number;
+  usedBy?: string;
+  askId?: string;
+  botActor?: true;
+}
+
+type AskStatus = "pending" | "approved" | "declined" | "expired";
+
+export interface KeychainAsk {
+  id: string;
+  credentialId: string;
+  ownerId: string;
+  requesterId: string;
+  orgId?: string;
+  requesterScopeId: ScopeId;
+  requesterDestination?: Destination;
+  requesterThreadRef?: string;
+  requesterSeq?: number;
+  requesterMessageTs?: string;
+  ownerSurfaceUser?: Pick<SurfaceUser, "surface" | "account" | "id">;
+  purpose: string;
+  requestedMode?: GrantMode;
+  botActor?: boolean;
+  status: AskStatus;
+  createdAt: number;
+  expiresAt: number;
+  resolvedAt?: number;
+  grantId?: string;
+  note?: string;
+  notifiedAt?: number;
+}
+
+export const ASK_TTL_MS = 24 * 60 * 60_000;
+export const ASK_PRUNE_AFTER_MS = 14 * 24 * 60 * 60_000;
+
+export interface ServiceCredentialInput {
+  slug: string;
+  name: string;
+  secret?: string;
+  delivery?: "broker" | "env";
+  envKey?: string;
+  host: string;
+  injection?: CredentialInjection;
+  allowedMethods?: string[];
+  allowedPathPrefixes?: string[];
+  deployments?: boolean;
+  enabled?: boolean;
+  updatedBy?: string;
+}
+
+export interface PublicServiceCredential {
+  slug: string;
+  name: string;
+  delivery: "broker" | "env";
+  envKey?: string;
+  host: string;
+  injection?: CredentialInjection;
+  allowedMethods?: string[];
+  allowedPathPrefixes?: string[];
+  deployments: boolean;
+  enabled: boolean;
+  hasSecret: boolean;
+  maxRequestsPerDay?: number;
+  source?: "deployment";
+  updatedBy?: string;
+  updatedAt: number;
+}
+
+export interface DecryptedServiceCredential {
+  slug: string;
+  name: string;
+  secret: string;
+  delivery: "broker" | "env";
+  envKey?: string;
+  host: string;
+  injection?: CredentialInjection;
+  allowedMethods?: string[];
+  allowedPathPrefixes?: string[];
+  deployments: boolean;
+  enabled: boolean;
+  maxRequestsPerDay?: number;
+  source?: "deployment";
+}
+
+export function isValidCredentialSlug(slug: string): boolean {
+  return /^[a-z0-9][a-z0-9-]{0,62}$/.test(slug);
+}
+
+export function isValidServiceCredentialEnvKey(envKey: string): boolean {
+  return /^[A-Z][A-Z0-9_]*$/.test(envKey) && !envKey.startsWith("AGENT_");
+}
+
+export function isValidBrokerHost(host: string): boolean {
+  return Boolean(host) && host === host.toLowerCase() && !/[/:\s]/.test(host);
+}
+
+export function isValidBrokerMethod(method: string): boolean {
+  return /^[A-Z]+$/.test(method);
+}
+
+export function isValidBrokerPathPrefix(path: string): boolean {
+  return path.startsWith("/") && !/[\r\n]/.test(path);
+}
+
+export interface ServiceCredentialReader {
+  getServiceCredentialSecret(orgScopeId: ScopeId, slug: string): Promise<DecryptedServiceCredential | null>;
+}
+
+export interface ServiceCredentialStore extends ServiceCredentialReader {
+  setServiceCredential(orgScopeId: ScopeId, input: ServiceCredentialInput): Promise<void>;
+  setServiceCredentialIfAbsent(orgScopeId: ScopeId, input: ServiceCredentialInput): Promise<number | null>;
+  setServiceCredentialIfCurrent(
+    orgScopeId: ScopeId,
+    input: ServiceCredentialInput,
+    expectedUpdatedAt: number,
+  ): Promise<number | null>;
+  listServiceCredentials(orgScopeId: ScopeId): Promise<PublicServiceCredential[]>;
+  deleteServiceCredential(orgScopeId: ScopeId, slug: string): Promise<void>;
+  deleteServiceCredentialIfCurrent(orgScopeId: ScopeId, slug: string, expectedUpdatedAt: number): Promise<boolean>;
+}
+
+export interface OAuthToken {
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  grantedScopes?: string[];
+  clientRef?: string;
+  accountType?: string;
+  orgId?: string;
+  idToken?: string;
+  accountId?: string;
+}
+
+export interface DerivedOAuthAuth {
+  accessToken: string;
+  idToken?: string;
+  accountId?: string;
+  expiresAt?: number;
+}
+
+export interface OAuthTokenStatus {
+  connected: boolean;
+  expiresAt?: number;
+  hasRefreshToken?: boolean;
+  needsReconnect?: boolean;
+  refreshFailedAt?: number;
+  refreshError?: string;
+  accountType?: string;
+  grantedScopes?: string[];
+}
+
+export type OAuthRefresh = (
+  host: string,
+  token: OAuthToken,
+  ctx?: { accountType?: string; clientRef?: string },
+) => Promise<OAuthToken>;
+
+interface ConnectorMeta {
+  credentialId: string;
+  ownerId: string;
+  host: string;
+  accountType?: string;
+  expiresAt?: number;
+  connected: boolean;
+  needsReconnect?: boolean;
+  refreshError?: string;
+}
+
+export interface ConnectorTokenStore {
+  operatorFallbackHosts?: readonly string[];
+  listConnectorsByOwners?(ownerIds: string[]): Promise<Map<string, ConnectorMeta[]>>;
+  setConnectorToken(host: string, principalId: string, token: OAuthToken, accountType?: string): Promise<void>;
+  deleteConnectorToken(host: string, principalId: string, accountType?: string): Promise<void>;
+  connectorTokenStatus(host: string, principalId: string, accountType?: string): Promise<OAuthTokenStatus>;
+  connectorAccessToken(host: string, principalId: string, accountType?: string): Promise<string | null>;
+  connectorDerivedAuth(host: string, principalId: string, accountType?: string): Promise<DerivedOAuthAuth | null>;
+}
+
+interface SaveCredentialInput {
+  ownerId: string;
+  service: string;
+  secret?: string;
+  envKey?: string;
+  fields?: CredentialFieldInput[];
+  target?: string;
+  files?: CredentialFile[];
+  host?: string;
+  accountLabel?: string;
+  origin?: string;
+  expiresAt?: number;
+}
+
+interface CreateGrantInput {
+  credentialId: string;
+  ownerId: string;
+  audienceScopeId: ScopeId;
+  mode: GrantMode;
+  purpose: string;
+  expiresAt?: number;
+  askId?: string;
+  botActor?: boolean;
+}
+
+interface CreateAskInput {
+  triggered?: boolean;
+  credentialId: string;
+  requesterId: string;
+  requesterScopeId: ScopeId;
+  requesterDestination?: Destination;
+  requesterThreadRef?: string;
+  requesterSeq?: number;
+  requesterMessageTs?: string;
+  ownerSurfaceUser?: Pick<SurfaceUser, "surface" | "account" | "id">;
+  purpose: string;
+  requestedMode?: GrantMode;
+  botActor?: boolean;
+  expiresAt?: number;
+}
+
+interface ApproveAskInput {
+  askId: string;
+  ownerId: string;
+  mode: GrantMode;
+  purpose: string;
+  expiresAt?: number;
+}
+
+interface AskListFilter {
+  requesterId?: string;
+  ownerId?: string;
+  requesterScopeId?: ScopeId;
+}
+
+interface MaterializedEnvCred {
+  credentialId: string;
+  ownerId: string;
+  service: string;
+  env: Array<{ key: string; value: string; secret?: boolean }>;
+  grantId?: string;
+  purpose?: string;
+}
+
+interface MaterializedFileCred {
+  credentialId: string;
+  ownerId: string;
+  service: string;
+  files: CredentialFile[];
+  origin?: string;
+  grantId?: string;
+  purpose?: string;
+  writeback?: boolean;
+  live?: boolean;
+  baseline?: Record<string, string>;
+}
+
+export type MaterializedCred = ({ kind: "env" } & MaterializedEnvCred) | ({ kind: "file" } & MaterializedFileCred);
+
+export class KeychainError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "KeychainError";
+    this.status = status;
+  }
+}
+
+interface GrantListFilter {
+  ownerId?: string;
+  audienceScopeId?: ScopeId;
+}
+
+export interface Keychain extends ServiceCredentialStore, ConnectorTokenStore {
+  save(input: SaveCredentialInput): Promise<KeychainCredentialMeta>;
+  create(input: SaveCredentialInput): Promise<KeychainCredentialMeta | null>;
+  withLoginTicket<T>(ticketId: string, fn: () => Promise<T>): Promise<T>;
+  claimWriter(ownerId: string, id: string, writer: { holder: string; until: number }): Promise<boolean | null>;
+  releaseWriter(ownerId: string, id: string, holder: string): Promise<boolean | null>;
+  updateFiles(
+    materialized: Extract<MaterializedCred, { kind: "file" }>,
+    files: CredentialFile[],
+  ): Promise<CredentialFileSave>;
+  writebackBaseline(
+    source: FileCredentialSource,
+    fileHashes: Record<string, string>,
+  ): Promise<Extract<MaterializedCred, { kind: "file" }>>;
+  listAllMetadata(): Promise<KeychainCredentialMeta[]>;
+  listByOwner(ownerId: string): Promise<KeychainCredentialMeta[]>;
+  listByOwners(ownerIds: string[]): Promise<Map<string, KeychainCredentialMeta[]>>;
+  listConnectorsByOwners(ownerIds: string[]): Promise<Map<string, ConnectorMeta[]>>;
+  getCredential(id: string): Promise<KeychainCredentialMeta | null>;
+  readOwnSecret(ownerId: string, credentialId: string): Promise<string | null>;
+  remove(ownerId: string, id: string): Promise<boolean>;
+
+  createGrant(input: CreateGrantInput): Promise<KeychainGrant>;
+  grantConnectorToScope(input: {
+    host: string;
+    principalId: string;
+    accountType?: string;
+    audienceScopeId: ScopeId;
+    purpose: string;
+  }): Promise<KeychainGrant | null>;
+  getGrant(id: string): Promise<KeychainGrant | null>;
+  listGrants(filter: GrantListFilter): Promise<KeychainGrant[]>;
+  revokeGrant(ownerId: string, grantId: string): Promise<boolean>;
+  grantsForScope(
+    scopeId: ScopeId,
+    opts?: { includePersonGrants?: boolean },
+  ): Promise<Array<{ grant: KeychainGrant; credential: KeychainCredentialMeta }>>;
+
+  createAsk(input: CreateAskInput): Promise<{ ask: KeychainAsk; existing: boolean }>;
+  getAsk(id: string): Promise<KeychainAsk | null>;
+  listAsks(filter: AskListFilter): Promise<KeychainAsk[]>;
+  approveAsk(input: ApproveAskInput): Promise<{ ask: KeychainAsk; grant: KeychainGrant }>;
+  declineAsk(input: { askId: string; ownerId: string; note?: string }): Promise<KeychainAsk>;
+  unnotifiedResolvedAsks(now: number): Promise<Array<KeychainAsk & { tenantId: string }>>;
+  markAskNotified(id: string, status: KeychainAsk["status"]): Promise<void>;
+
+  composioKey(ownerId: string, credentialId: string): Promise<string | null>;
+  prepareMaterialize(
+    grantId: string,
+    scopeId: ScopeId,
+    usedBy: string,
+  ): Promise<{
+    materialized: MaterializedCred;
+    singleUse: boolean;
+    commit(): Promise<void>;
+  }>;
+  materializeOwnById(ownerId: string, credentialId: string, scopeId: ScopeId): Promise<MaterializedCred>;
+  materializeOwn(ownerId: string): Promise<MaterializedEnvCred[]>;
+  materializeOwnFiles(ownerId: string): Promise<MaterializedFileCred[]>;
+
+  materializeStanding(scopeId: ScopeId): Promise<MaterializedEnvCred[]>;
+}
+
+function fingerprintOf(secret: string): string {
+  return hashId([secret]);
+}
+
+export function credentialHandle(credential: Pick<KeychainCredential, "id" | "service">): string {
+  return `${encodeURIComponent(credential.service)}:${credential.id}`;
+}
+
+export interface FileCredentialSource {
+  credentialId: string;
+  ownerId: string;
+  service: string;
+  grantId?: string;
+  writeback?: boolean;
+  live?: boolean;
+}
+
+export type CredentialFileSave = Pick<CredentialFileMerge, "overruled" | "withheld">;
+
+function credentialFilesFingerprint(files: CredentialFile[]): string {
+  return fileCredentialFingerprint(
+    files
+      .map((file) => ({ ...file, mode: restoredFileMode(file.mode) }))
+      .sort((a, b) => homeRelativePath(a.path).localeCompare(homeRelativePath(b.path))),
+  );
+}
+
+function fileCredentialFingerprint(files: CredentialFile[]): string {
+  return fingerprintOf(JSON.stringify(files.map((f) => ({ ...f, path: homeRelativePath(f.path) }))));
+}
+
+export function credentialFileHashes(files: CredentialFile[]): Record<string, string> {
+  return Object.fromEntries(files.map((file) => [file.path, credentialFilesFingerprint([file])]));
+}
+
+function keychainFilePath(path: string): string {
+  if (/[\n\r]/.test(path))
+    throw new KeychainError(400, `file path may not contain line breaks: ${JSON.stringify(path)}`);
+  try {
+    return homeRelativePath(path);
+  } catch {
+    throw new KeychainError(400, `file path must be home-relative: ${path}`);
+  }
+}
+
+export function keychainService(service: string): string {
+  return service.trim().toLowerCase();
+}
+
+function credId(ownerId: string, service: string, slot: string): string {
+  return hashId([ownerId, service, slot]);
+}
+
+function defaultEnvKey(service: string): string {
+  return `${service.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_TOKEN`;
+}
+
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function isPersonalCredentialEnvKey(envKey: string): boolean {
+  return ENV_KEY_RE.test(envKey) && !envKey.startsWith("AGENT_");
+}
+
+function legacyUsernameEnvKey(passwordEnvKey: string): string {
+  const base = passwordEnvKey.replace(/_(PASSWORD|PASS|TOKEN|SECRET|API_KEY|KEY)$/i, "");
+  return `${base || passwordEnvKey}_USERNAME`;
+}
+
+function consumedGrant(grant: KeychainGrant): boolean {
+  return grant.status === "used" || (grant.mode === "once" && grant.usedAt !== undefined);
+}
+
+function askTask(a: {
+  credentialId: string;
+  requesterScopeId: string;
+  requesterThreadRef?: string;
+  botActor?: boolean;
+}): string {
+  return JSON.stringify([
+    a.credentialId,
+    a.requesterScopeId,
+    cronIdOf(a.requesterThreadRef) ?? a.requesterThreadRef,
+    a.botActor === true,
+  ]);
+}
+
+function expired(rec: { expiresAt?: number }, now: number): boolean {
+  return typeof rec.expiresAt === "number" && rec.expiresAt < now;
+}
+
+function credExpired(rec: { kind: CredentialKind; expiresAt?: number }, now: number): boolean {
+  return rec.kind !== "file" && expired(rec, now);
+}
+
+function toMeta(rec: Omit<KeychainCredential, "secretEnc"> & { secretEnc?: string }): KeychainCredentialMeta {
+  const { secretEnc: _, writer: __, ...meta } = rec;
+  return {
+    ...meta,
+    ...((rec.kind === "env" || rec.kind === "file") && !isBackendCredential(rec)
+      ? { credentialHandle: credentialHandle(rec) }
+      : {}),
+  };
+}
+
+function byOwners(ownerIds: string[]): { field: "ownerId"; anyOfFold: string[] } {
+  return { field: "ownerId", anyOfFold: ownerIds.flatMap((id) => personIds(id)) };
+}
+
+function bucketByOwner<C extends { ownerId: string }, T>(
+  creds: Iterable<C>,
+  ownerIds: string[],
+  include: (c: C) => boolean,
+  item: (c: C) => T,
+): Map<string, T[]> {
+  const byKey = new Map(ownerIds.map((id) => [personKey(id), id]));
+  const out = new Map<string, T[]>();
+  for (const c of creds) {
+    if (!include(c)) continue;
+    const owner = byKey.get(personKey(c.ownerId));
+    if (owner === undefined) continue;
+    const list = out.get(owner) ?? [];
+    list.push(item(c));
+    out.set(owner, list);
+  }
+  return out;
+}
+
+export function createKeychain(deps: {
+  creds: DurableMap<KeychainCredential>;
+  grants: DurableMap<KeychainGrant>;
+  asks: DurableMap<KeychainAsk>;
+  key: SecretKey;
+  lock: AdvisoryLock;
+  refreshConnector?: OAuthRefresh;
+  oauthSkewMs?: number;
+  oauthRefreshMarginMs?: number;
+  now?: () => number;
+}): Keychain {
+  const now = deps.now ?? Date.now;
+  const lock = deps.lock;
+  const oauthSkew = deps.oauthSkewMs ?? 60_000;
+  const oauthRefreshMargin = Math.max(deps.oauthRefreshMarginMs ?? 10 * 60_000, oauthSkew);
+
+  async function getOwned(ownerId: string, id: string): Promise<KeychainCredential | null> {
+    const rec = await deps.creds.get(id);
+    return rec && samePerson(rec.ownerId, ownerId) ? rec : null;
+  }
+
+  function decryptToEnv(rec: KeychainCredential, extra?: { grantId: string; purpose: string }): MaterializedEnvCred {
+    const raw = decryptSecret(rec.secretEnc, deps.key);
+    let env: Array<{ key: string; value: string; secret?: boolean }>;
+    if (rec.fields) {
+      const values = JSON.parse(raw) as Record<string, string>;
+      env = rec.fields.map((f) => ({ key: f.envKey, value: values[f.envKey] ?? "", secret: f.secret }));
+    } else {
+      const envKey = rec.envKey ?? defaultEnvKey(rec.service);
+      env = [{ key: envKey, value: raw }];
+      const legacyUsername = (rec as { username?: string }).username;
+      if (legacyUsername) env.push({ key: legacyUsernameEnvKey(envKey), value: legacyUsername, secret: false });
+    }
+    return {
+      credentialId: rec.id,
+      ownerId: rec.ownerId,
+      service: rec.service,
+      env,
+      ...extra,
+    };
+  }
+
+  function decryptToFiles(rec: KeychainCredential, extra?: { grantId: string; purpose: string }): MaterializedFileCred {
+    const raw = decryptSecret(rec.secretEnc, deps.key);
+    const files: CredentialFile[] = rec.targets
+      ? (JSON.parse(raw) as CredentialFile[])
+      : [{ path: keychainFilePath(rec.target ?? ""), contentBase64: Buffer.from(raw, "utf8").toString("base64") }];
+    return {
+      credentialId: rec.id,
+      ownerId: rec.ownerId,
+      service: rec.service,
+      files,
+      ...(rec.origin ? { origin: rec.origin } : {}),
+      ...extra,
+    };
+  }
+
+  function tryDecrypt<T>(rec: KeychainCredential, fn: (rec: KeychainCredential) => T): T | null {
+    try {
+      return fn(rec);
+    } catch (err) {
+      console.error(
+        `[keychain] credential ${rec.id} (${rec.service}, owner ${rec.ownerId}) does not decrypt under the current key — skipped: ${errMessage(err)}`,
+      );
+      return null;
+    }
+  }
+
+  async function activeGrantsFor(scopeId: ScopeId): Promise<KeychainGrant[]> {
+    const t = now();
+    return (await deps.grants.all()).filter(
+      (g) => g.audienceScopeId === scopeId && g.status === "active" && !consumedGrant(g) && !expired(g, t),
+    );
+  }
+
+  async function freshAsk(rec: KeychainAsk, t: number): Promise<KeychainAsk> {
+    if (rec.status !== "pending" && rec.status !== "expired") return rec;
+    const grant = await deps.grants.get(hashId([rec.credentialId, "ask", rec.id]));
+    if (grant?.askId === rec.id) {
+      return (
+        (await deps.asks.update(rec.id, (current) =>
+          current.status === "pending" || current.status === "expired"
+            ? { ...current, status: "approved", resolvedAt: grant.createdAt, grantId: grant.id, notifiedAt: undefined }
+            : current,
+        )) ?? rec
+      );
+    }
+    if (rec.status !== "pending" || rec.expiresAt >= t) return rec;
+    return (
+      (await deps.asks.update(rec.id, (current) =>
+        current.status === "pending" && current.expiresAt < t
+          ? { ...current, status: "expired", resolvedAt: t }
+          : current,
+      )) ?? rec
+    );
+  }
+
+  const brokerId = (orgScopeId: string, slug: string) => credId(orgScopeId, slug, "broker");
+  const orgIdOf = (orgScopeId: string) => orgScopeId.replace(/^org:/, "");
+
+  function brokerToPublic(rec: KeychainCredential): PublicServiceCredential {
+    const b = rec.broker ?? { name: rec.service, enabled: true };
+    return {
+      slug: rec.service,
+      name: b.name,
+      delivery: b.delivery ?? "broker",
+      ...(b.envKey ? { envKey: b.envKey } : {}),
+      host: rec.host ?? "",
+      ...(b.injection ? { injection: b.injection } : {}),
+      ...(b.allowedMethods ? { allowedMethods: b.allowedMethods } : {}),
+      ...(b.allowedPathPrefixes ? { allowedPathPrefixes: b.allowedPathPrefixes } : {}),
+      deployments: b.deployments !== false,
+      enabled: b.enabled,
+      hasSecret: !!rec.secretEnc,
+      ...(b.updatedBy ? { updatedBy: b.updatedBy } : {}),
+      updatedAt: rec.updatedAt,
+    };
+  }
+
+  async function brokerRecord(orgScopeId: string, slug: string): Promise<KeychainCredential | null> {
+    return deps.creds.get(brokerId(orgScopeId, slug));
+  }
+
+  function serviceCredentialRecord(
+    orgScopeId: string,
+    input: ServiceCredentialInput,
+    prior: KeychainCredential | null,
+  ): KeychainCredential {
+    const injectionError = credentialInjectionError(input.injection);
+    if (injectionError) throw new Error(injectionError);
+    const trimmedSecret = input.secret?.trim();
+    const t = Math.max(now(), (prior?.updatedAt ?? 0) + 1);
+    const delivery = input.delivery ?? "broker";
+    if (delivery === "env") {
+      if (!input.envKey || !isValidServiceCredentialEnvKey(input.envKey)) {
+        throw new Error(
+          `env-delivery credential ${input.slug} needs an UPPER_SNAKE_CASE envKey outside AGENT_* (got ${JSON.stringify(input.envKey ?? null)})`,
+        );
+      }
+    } else if (input.envKey) {
+      throw new Error(`broker-delivery credential ${input.slug} must not carry an envKey`);
+    }
+    return {
+      id: brokerId(orgScopeId, input.slug),
+      ownerId: orgScopeId,
+      orgId: orgIdOf(orgScopeId),
+      service: input.slug,
+      kind: "broker",
+      host: input.host,
+      broker: {
+        name: input.name,
+        ...(delivery === "env" ? { delivery, envKey: input.envKey! } : {}),
+        ...(input.injection ? { injection: input.injection } : {}),
+        ...(input.allowedMethods ? { allowedMethods: input.allowedMethods.map((m) => m.toUpperCase()) } : {}),
+        ...(input.allowedPathPrefixes ? { allowedPathPrefixes: input.allowedPathPrefixes } : {}),
+        ...(input.deployments === false ? { deployments: false } : {}),
+        enabled: input.enabled !== false,
+        ...(input.updatedBy ? { updatedBy: input.updatedBy } : {}),
+      },
+      secretEnc: trimmedSecret ? encryptSecret(trimmedSecret, deps.key) : (prior?.secretEnc ?? ""),
+      fingerprint: trimmedSecret ? fingerprintOf(trimmedSecret) : (prior?.fingerprint ?? ""),
+      createdAt: prior?.createdAt ?? t,
+      updatedAt: t,
+    };
+  }
+
+  const oauthSlot = (accountType?: string) => `oauth:${accountType && accountType !== "default" ? accountType : ""}`;
+  const oauthId = (host: string, principalId: string, accountType?: string) =>
+    credId(principalId, host.toLowerCase(), oauthSlot(accountType));
+  const inflightRefreshes = new Map<string, Promise<string | null>>();
+
+  const sameVersion = (a: KeychainCredential, b: KeychainCredential) =>
+    a.updatedAt === b.updatedAt && a.fingerprint === b.fingerprint;
+
+  function connectorRec(
+    id: string,
+    host: string,
+    principalId: string,
+    token: OAuthToken,
+    accountType: string | undefined,
+    prior: KeychainCredential | null,
+  ): KeychainCredential {
+    const t = now();
+    const at = token.accountType ?? accountType;
+    return {
+      id,
+      ownerId: principalId,
+      orgId: token.orgId ?? configOrgId(),
+      service: host.toLowerCase(),
+      kind: "env",
+      host: host.toLowerCase(),
+      managed: "connector",
+      secretEnc: encryptSecret(token.accessToken, deps.key),
+      fingerprint: fingerprintOf(token.accessToken),
+      origin: "connector-oauth",
+      ...(token.expiresAt !== undefined ? { expiresAt: token.expiresAt } : {}),
+      refresh: {
+        ...(token.refreshToken ? { refreshTokenEnc: encryptSecret(token.refreshToken, deps.key) } : {}),
+        ...(token.idToken ? { idTokenEnc: encryptSecret(token.idToken, deps.key) } : {}),
+        ...(token.accountId ? { accountId: token.accountId } : {}),
+        ...(at ? { accountType: at } : {}),
+        ...(token.clientRef ? { clientRef: token.clientRef } : {}),
+        ...(token.grantedScopes ? { grantedScopes: token.grantedScopes } : {}),
+        ...(token.orgId ? { orgId: token.orgId } : {}),
+      },
+      createdAt: prior?.createdAt ?? t,
+      updatedAt: t,
+    };
+  }
+
+  async function putConnectorToken(
+    host: string,
+    principalId: string,
+    token: OAuthToken,
+    accountType?: string,
+  ): Promise<KeychainCredential> {
+    const prior = await connectorRecord(host, principalId, accountType);
+    const ownerId = prior?.ownerId ?? canonicalPerson(principalId);
+    const id = prior?.id ?? oauthId(host, ownerId, accountType);
+    const rec = connectorRec(id, host, ownerId, token, accountType, prior);
+    await deps.creds.put(id, rec);
+    return rec;
+  }
+
+  async function connectorRecord(
+    host: string,
+    principalId: string,
+    accountType?: string,
+  ): Promise<KeychainCredential | null> {
+    const ids = [...new Set([principalId, ...personIds(principalId)])].map((id) => oauthId(host, id, accountType));
+    const recs = await deps.creds.getMany(ids);
+    return ids.map((id) => recs.find((rec) => rec.id === id)).find((rec) => rec !== undefined) ?? null;
+  }
+
+  function recToOAuthToken(rec: KeychainCredential): OAuthToken {
+    return {
+      accessToken: decryptSecret(rec.secretEnc, deps.key),
+      ...(rec.refresh?.refreshTokenEnc ? { refreshToken: decryptSecret(rec.refresh.refreshTokenEnc, deps.key) } : {}),
+      ...(rec.refresh?.idTokenEnc ? { idToken: decryptSecret(rec.refresh.idTokenEnc, deps.key) } : {}),
+      ...(rec.refresh?.accountId ? { accountId: rec.refresh.accountId } : {}),
+      ...(rec.expiresAt !== undefined ? { expiresAt: rec.expiresAt } : {}),
+      ...(rec.refresh?.grantedScopes ? { grantedScopes: rec.refresh.grantedScopes } : {}),
+      ...(rec.refresh?.clientRef ? { clientRef: rec.refresh.clientRef } : {}),
+      ...(rec.refresh?.accountType ? { accountType: rec.refresh.accountType } : {}),
+      ...(rec.refresh?.orgId ? { orgId: rec.refresh.orgId } : {}),
+    };
+  }
+
+  function storedRefreshError(e: unknown): string {
+    const msg = errMessage(e).replace(/\s+/g, " ").trim();
+    return msg.length > 500 ? `${msg.slice(0, 497)}...` : msg;
+  }
+
+  const refreshDue = (rec: KeychainCredential) =>
+    rec.expiresAt !== undefined && now() >= rec.expiresAt - oauthRefreshMargin;
+  const accessTokenOf = (rec: KeychainCredential) => tryDecrypt(rec, (r) => decryptSecret(r.secretEnc, deps.key));
+  const unexpiredAccessToken = (rec: KeychainCredential) =>
+    oauthExpired(rec, now(), oauthSkew) ? null : accessTokenOf(rec);
+
+  async function refreshAndStore(id: string, host: string, refresh: OAuthRefresh): Promise<string | null> {
+    return lock.withLock(`keychain-connector-refresh:${id}`, async () => {
+      const rec = await deps.creds.get(id);
+      if (!rec) return null;
+      if (!refreshDue(rec)) return accessTokenOf(rec);
+      const stored = tryDecrypt(rec, recToOAuthToken);
+      if (!stored?.refreshToken) return unexpiredAccessToken(rec);
+      try {
+        const fresh = await refresh(host, stored, {
+          ...(stored.accountType ? { accountType: stored.accountType } : {}),
+          ...(stored.clientRef ? { clientRef: stored.clientRef } : {}),
+        });
+        if (!fresh.accessToken) throw new Error("refresh returned an empty access token");
+        const merged: OAuthToken = {
+          ...(stored.clientRef ? { clientRef: stored.clientRef } : {}),
+          ...(stored.accountType ? { accountType: stored.accountType } : {}),
+          ...(stored.orgId ? { orgId: stored.orgId } : {}),
+          ...(stored.idToken ? { idToken: stored.idToken } : {}),
+          ...(stored.accountId ? { accountId: stored.accountId } : {}),
+          ...fresh,
+        };
+        const written = await deps.creds.update(id, (current) =>
+          sameVersion(current, rec)
+            ? connectorRec(id, host, rec.ownerId, merged, rec.refresh?.accountType, current)
+            : current,
+        );
+        return written ? accessTokenOf(written) : null;
+      } catch (e) {
+        const message = storedRefreshError(e);
+        console.error(`[keychain] connector token refresh failed for ${host}: ${message}`);
+        const t = now();
+        try {
+          await deps.creds.update(id, (current) =>
+            sameVersion(current, rec)
+              ? { ...current, refresh: { ...current.refresh, refreshFailedAt: t, refreshError: message }, updatedAt: t }
+              : current,
+          );
+        } catch (writeErr) {
+          console.error(
+            `[keychain] connector token refresh failure metadata write failed for ${host}: ${errMessage(writeErr)}`,
+          );
+        }
+        return unexpiredAccessToken(rec);
+      }
+    });
+  }
+
+  async function connectorTokenForRecord(rec: KeychainCredential): Promise<string | null> {
+    const refresh = deps.refreshConnector;
+    if (refresh && rec.refresh?.refreshTokenEnc && rec.host && refreshDue(rec)) {
+      const refreshKey = `${currentTenant()}\0${rec.id}`;
+      let pending = inflightRefreshes.get(refreshKey);
+      if (!pending) {
+        pending = refreshAndStore(rec.id, rec.host, refresh).catch((e) => {
+          console.error(`[keychain] connector token refresh could not run for ${rec.host}: ${errMessage(e)}`);
+          return unexpiredAccessToken(rec);
+        });
+        inflightRefreshes.set(refreshKey, pending);
+        void pending.finally(() => inflightRefreshes.delete(refreshKey));
+      }
+      return pending;
+    }
+    return unexpiredAccessToken(rec);
+  }
+
+  function credentialRecord(input: SaveCredentialInput) {
+    const service = keychainService(input.service);
+    if (!service) throw new KeychainError(400, "service required");
+    let files: CredentialFile[] | undefined;
+    if (input.files?.length) {
+      files = checkedFiles(input.files.map((f) => ({ ...f, path: keychainFilePath(f.path) })));
+    } else if (input.target && input.secret) {
+      files = [
+        {
+          path: keychainFilePath(input.target),
+          contentBase64: Buffer.from(input.secret, "utf8").toString("base64"),
+        },
+      ];
+    }
+    const kind: CredentialKind = files ? "file" : "env";
+    const fields =
+      !files && input.fields?.length
+        ? input.fields.map((f) => ({ envKey: f.envKey.trim(), value: f.value, secret: f.secret !== false }))
+        : undefined;
+    if (fields) {
+      if (fields.some((f) => !isPersonalCredentialEnvKey(f.envKey)))
+        throw new KeychainError(400, "each credential field needs a valid environment-variable envKey outside AGENT_*");
+      if (fields.some((f) => !f.value || !f.value.trim()))
+        throw new KeychainError(400, "each credential field needs a value");
+      if (new Set(fields.map((f) => f.envKey)).size !== fields.length)
+        throw new KeychainError(400, "credential field envKeys must be unique");
+    }
+    let secret = input.secret;
+    if (files) secret = JSON.stringify(files);
+    else if (fields) secret = JSON.stringify(Object.fromEntries(fields.map((f) => [f.envKey, f.value])));
+    if (!secret || !secret.trim()) throw new KeychainError(400, "empty secret");
+    const envKey = kind === "env" && !fields ? input.envKey?.trim() || defaultEnvKey(service) : undefined;
+    if (envKey && !isPersonalCredentialEnvKey(envKey))
+      throw new KeychainError(400, `envKey ${envKey} must be a valid environment-variable name outside AGENT_*`);
+    const fieldsMeta = fields?.map((f) => ({ envKey: f.envKey, secret: f.secret }));
+    const targets = files?.map((f) => f.path);
+    const t = now();
+    let slot = `env:${envKey}`;
+    if (kind === "file") slot = "file";
+    else if (fields)
+      slot = `env:${fields
+        .map((f) => f.envKey)
+        .sort()
+        .join(",")}`;
+    const ownerId = canonicalPerson(input.ownerId);
+    const id = credId(ownerId, service, slot);
+    const buildRec = (prior?: KeychainCredential | null): KeychainCredential => {
+      return {
+        id,
+        ownerId,
+        orgId: configOrgId(),
+        service,
+        kind,
+        ...(envKey ? { envKey } : {}),
+        ...(fieldsMeta ? { fields: fieldsMeta } : {}),
+        ...(targets ? { targets } : {}),
+        ...(input.host ? { host: input.host } : {}),
+        ...(input.accountLabel ? { accountLabel: input.accountLabel } : {}),
+        secretEnc: encryptSecret(secret, deps.key),
+        fingerprint: fingerprintOf(secret),
+        ...(input.origin ? { origin: input.origin } : {}),
+        ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+        ...(prior?.writer ? { writer: prior.writer } : {}),
+        createdAt: prior?.createdAt ?? t,
+        updatedAt: t,
+      };
+    };
+    return { id, buildRec };
+  }
+
+  async function saveCredential(input: SaveCredentialInput): Promise<KeychainCredentialMeta> {
+    const { id, buildRec } = credentialRecord(input);
+    const [rec] = await deps.creds.mutateMany([{ id, apply: buildRec }]);
+    return toMeta(rec!);
+  }
+
+  async function materializeConnectorEnv(
+    cred: KeychainCredential,
+    extra?: { grantId: string; purpose: string },
+  ): Promise<MaterializedCred> {
+    const value = cred.host ? await connectorTokenForRecord(cred) : null;
+    if (!value || !cred.host) {
+      throw new KeychainError(
+        410,
+        "connector token expired and could not be refreshed — its owner must reconnect the app",
+      );
+    }
+    return {
+      kind: "env",
+      credentialId: cred.id,
+      ownerId: cred.ownerId,
+      service: cred.service,
+      env: [{ key: envKey(cred.host), value }],
+      ...extra,
+    };
+  }
+
+  function materializeDecrypted(
+    cred: KeychainCredential,
+    extra?: { grantId: string; purpose: string },
+  ): MaterializedCred {
+    if (isBackendCredential(cred))
+      throw new KeychainError(403, "Composio keys stay in the backend; use /v1/composio through the agent API");
+    const materialized = tryDecrypt(cred, (c) =>
+      c.kind === "file"
+        ? { kind: "file" as const, ...decryptToFiles(c, extra) }
+        : { kind: "env" as const, ...decryptToEnv(c, extra) },
+    );
+    if (!materialized) {
+      throw new KeychainError(422, "credential does not decrypt under the current key");
+    }
+    return materialized;
+  }
+
+  async function claimOnceGrant(grant: KeychainGrant, scopeId: ScopeId, usedBy: string): Promise<void> {
+    if (grant.mode !== "once") return;
+    const usedAt = now();
+    const claimed = await deps.grants.update(grant.id, (current) => {
+      if (current.audienceScopeId !== scopeId) throw new KeychainError(403, "grant is for a different conversation");
+      if (current.status === "revoked") throw new KeychainError(410, "grant was revoked");
+      if (consumedGrant(current)) throw new KeychainError(410, "one-time grant already used");
+      if (expired(current, usedAt)) throw new KeychainError(410, "grant is expired");
+      return { ...current, status: "used", usedAt, usedBy };
+    });
+    if (!claimed) throw new KeychainError(404, "unknown grant");
+  }
+
+  async function authorizedGrant(grantId: string, scopeId: ScopeId) {
+    const grant = await deps.grants.get(grantId);
+    if (!grant) throw new KeychainError(404, "unknown grant");
+    if (grant.audienceScopeId !== scopeId) throw new KeychainError(403, "grant is for a different conversation");
+    if (grant.status === "revoked") throw new KeychainError(410, "grant was revoked");
+    if (consumedGrant(grant)) throw new KeychainError(410, "one-time grant already used");
+    if (expired(grant, now())) throw new KeychainError(410, "grant is expired");
+    const cred = await deps.creds.get(grant.credentialId);
+    if (!cred) throw new KeychainError(404, "credential no longer exists");
+    if (cred.kind === "broker") {
+      throw new KeychainError(403, "broker credentials are not grantable — they are used via the credential broker");
+    }
+    if (cred.managed !== "connector" && credExpired(cred, now())) {
+      throw new KeychainError(410, "credential is expired");
+    }
+    return { grant, cred };
+  }
+
+  async function prepareMaterialize(grantId: string, scopeId: ScopeId, usedBy: string) {
+    const { grant, cred } = await authorizedGrant(grantId, scopeId);
+    const extra = { grantId: grant.id, purpose: grant.purpose };
+    const materialized =
+      cred.managed === "connector" ? await materializeConnectorEnv(cred, extra) : materializeDecrypted(cred, extra);
+    const version = cred.managed === "connector" ? await deps.creds.get(cred.id) : cred;
+    if (
+      !version ||
+      (cred.managed === "connector" &&
+        (materialized.kind !== "env" || version.fingerprint !== fingerprintOf(materialized.env[0]!.value)))
+    )
+      throw new KeychainError(409, "credential changed while preparing execution; request it again");
+    return {
+      materialized,
+      singleUse: grant.mode === "once",
+      commit: async () => {
+        const current = await authorizedGrant(grantId, scopeId);
+        if (current.cred.updatedAt !== version.updatedAt || current.cred.secretEnc !== version.secretEnc) {
+          throw new KeychainError(409, "credential changed while preparing execution; request it again");
+        }
+        await claimOnceGrant(current.grant, scopeId, usedBy);
+      },
+    };
+  }
+
+  async function mintGrant(input: CreateGrantInput): Promise<KeychainGrant> {
+    const cred = await deps.creds.get(input.credentialId);
+    if (!cred) throw new KeychainError(404, "unknown credential");
+    if (cred.kind === "broker") {
+      throw new KeychainError(400, "broker credentials are org-owned and used via the credential broker, not grants");
+    }
+    if (!samePerson(cred.ownerId, input.ownerId)) {
+      throw new KeychainError(
+        403,
+        "only the credential's owner can grant it — and only on a turn the owner themself sent",
+      );
+    }
+    const purpose = input.purpose.trim();
+    if (!purpose) throw new KeychainError(400, "purpose required — record the owner's approval verbatim");
+    const t = now();
+    if (!cred.managed && credExpired(cred, t)) throw new KeychainError(410, "credential is expired");
+    const grant: KeychainGrant = {
+      id: input.askId
+        ? hashId([cred.id, "ask", input.askId])
+        : hashId([cred.id, input.audienceScopeId, String(t), purpose]),
+      credentialId: cred.id,
+      ownerId: cred.ownerId,
+      orgId: cred.orgId,
+      audienceScopeId: input.audienceScopeId,
+      mode: input.mode,
+      purpose,
+      status: "active",
+      createdAt: t,
+      ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+      ...(input.askId ? { askId: input.askId } : {}),
+      ...(input.botActor ? { botActor: true } : {}),
+    };
+    if (input.askId) return deps.grants.putIfAbsent(grant.id, grant);
+    await deps.grants.put(grant.id, grant);
+    return grant;
+  }
+
+  const revokeActiveGrant = (id: string) =>
+    deps.grants.update(id, (current) =>
+      current.status === "active" ? { ...current, status: "revoked", revokedAt: now() } : current,
+    );
+
+  async function deleteCredential(id: string): Promise<void> {
+    for (const grant of await deps.grants.all()) {
+      if (grant.credentialId === id && grant.status === "active") await revokeActiveGrant(grant.id);
+    }
+    await deps.creds.delete(id);
+  }
+
+  return {
+    save: saveCredential,
+
+    async create(input) {
+      const { id, buildRec } = credentialRecord(input);
+      const rec = buildRec();
+      return (await deps.creds.insertIfAbsent(id, rec)) ? toMeta(rec) : null;
+    },
+
+    withLoginTicket: (ticketId, fn) => lock.withLock(`keychain-login-ticket:${ticketId}`, fn),
+
+    async claimWriter(ownerId, id, writer) {
+      let claimed: boolean | null = null;
+      await deps.creds.update(id, (current) => {
+        if (!samePerson(current.ownerId, ownerId)) return current;
+        claimed = !current.writer || current.writer.holder === writer.holder || current.writer.until <= now();
+        return claimed ? { ...current, writer } : current;
+      });
+      return claimed;
+    },
+
+    async releaseWriter(ownerId, id, holder) {
+      let released: boolean | null = null;
+      await deps.creds.update(id, (current) => {
+        if (!samePerson(current.ownerId, ownerId)) return current;
+        released = !current.writer || current.writer.holder === holder || current.writer.until <= now();
+        if (!released) return current;
+        const { writer: _, ...rest } = current;
+        return rest;
+      });
+      return released;
+    },
+
+    async updateFiles(materialized, files) {
+      const unchanged = { overruled: [], withheld: [] };
+      if (!materialized.writeback) return unchanged;
+      const normalized = checkedFiles(files.map((file) => ({ ...file, path: keychainFilePath(file.path) })));
+      if (!normalized.length) throw new KeychainError(409, "Refreshed credential files are missing");
+      const fingerprint = credentialFilesFingerprint;
+      const baseline = new Map(Object.entries(materialized.baseline ?? credentialFileHashes(materialized.files)));
+      const ours = Object.entries(credentialFileHashes(normalized));
+      if (ours.length === baseline.size && ours.every(([path, hash]) => baseline.get(path) === hash)) return unchanged;
+      let overruled: string[] = [];
+      let withheld: CredentialFileMerge["withheld"] = [];
+      let byExpiry: Array<{ path: string; kept: string }> = [];
+
+      const updated = await deps.creds.update(materialized.credentialId, (current) => {
+        if (current.kind !== "file" || !samePerson(current.ownerId, materialized.ownerId))
+          throw new KeychainError(409, "Credential changed during execution");
+        const currentFiles = decryptToFiles(current).files;
+        const merged = mergeCredentialFiles({
+          baseline,
+          stored: currentFiles,
+          refreshed: normalized,
+          hash: (file) => fingerprint([file]),
+          refreshOnly: !materialized.live,
+        });
+        overruled = merged.overruled;
+        withheld = merged.withheld;
+        byExpiry = merged.byExpiry;
+        const next = checkedFiles(merged.files);
+        if (!next.length) {
+          console.warn(
+            `[credentials] ${materialized.credentialId}: a save would have left no files, so the stored login was kept unchanged`,
+          );
+          return current;
+        }
+        if (fingerprint(next) === fingerprint(currentFiles)) return current;
+        const secret = JSON.stringify(next);
+        return {
+          ...current,
+          targets: next.map((file) => file.path),
+          secretEnc: encryptSecret(secret, deps.key),
+          fingerprint: fingerprintOf(secret),
+          updatedAt: now(),
+        };
+      });
+      if (!updated) throw new KeychainError(410, "Credential was removed during execution");
+      if (overruled.length)
+        console.warn(
+          `[credentials] ${materialized.credentialId}: kept the stored version of ${overruled.join(", ")} over a concurrent change`,
+        );
+      if (withheld.length)
+        console.warn(
+          `[credentials] ${materialized.credentialId}: kept the stored version of ${withheld.map(({ path, reason }) => `${path} (${reason})`).join(", ")} because a run that isn't its owner's live turn saves only token refreshes`,
+        );
+      for (const { path, kept } of byExpiry)
+        console.warn(
+          `[credentials] ${materialized.credentialId}: kept the ${kept} version of ${path} over a concurrent change because it expires later`,
+        );
+      return { overruled, withheld };
+    },
+
+    async writebackBaseline(source, fileHashes) {
+      const current = await deps.creds.get(source.credentialId);
+      if (!current || current.kind !== "file" || !samePerson(current.ownerId, source.ownerId))
+        throw new KeychainError(410, "Credential was removed during execution");
+      const files = decryptToFiles(current).files;
+      return {
+        kind: "file",
+        credentialId: current.id,
+        ownerId: current.ownerId,
+        service: current.service,
+        files,
+        baseline: fileHashes,
+        ...(source.grantId ? { grantId: source.grantId } : {}),
+        ...(source.writeback ? { writeback: true } : {}),
+        ...(source.live ? { live: true } : {}),
+      };
+    },
+
+    async listAllMetadata() {
+      return (await deps.creds.select({ omit: ["secretEnc"] })).filter(listed).map(toMeta);
+    },
+
+    async listByOwner(ownerId) {
+      return (await deps.creds.select({ omit: ["secretEnc"], where: byOwners([ownerId]) }))
+        .filter((c) => samePerson(c.ownerId, ownerId) && listed(c))
+        .map(toMeta);
+    },
+
+    async listByOwners(ownerIds) {
+      return bucketByOwner(
+        await deps.creds.select({ omit: ["secretEnc"], where: byOwners(ownerIds) }),
+        ownerIds,
+        listed,
+        toMeta,
+      );
+    },
+
+    async getCredential(id) {
+      const rec = await deps.creds.get(id);
+      return rec ? toMeta(rec) : null;
+    },
+
+    async readOwnSecret(ownerId, id) {
+      const rec = await getOwned(ownerId, id);
+      if (!rec || rec.kind !== "env") return null;
+      return tryDecrypt(rec, (r) => decryptSecret(r.secretEnc, deps.key));
+    },
+
+    async remove(ownerId, id) {
+      const rec = await getOwned(ownerId, id);
+      if (!rec) return false;
+      if (rec.managed || rec.kind === "broker") return false;
+      await deleteCredential(id);
+      return true;
+    },
+
+    createGrant: mintGrant,
+
+    async grantConnectorToScope({ host, principalId, accountType, audienceScopeId, purpose }) {
+      const cred = await connectorRecord(host, principalId, accountType);
+      if (!cred) return null;
+      const id = cred.id;
+      for (const g of await deps.grants.all()) {
+        if (
+          g.credentialId === id &&
+          g.audienceScopeId === audienceScopeId &&
+          g.mode === "standing" &&
+          g.status === "active"
+        ) {
+          return g;
+        }
+      }
+      return mintGrant({ credentialId: id, ownerId: cred.ownerId, audienceScopeId, mode: "standing", purpose });
+    },
+
+    async getGrant(id) {
+      return (await deps.grants.get(id)) ?? null;
+    },
+
+    async listGrants(filter) {
+      const grants =
+        filter.ownerId === undefined
+          ? await deps.grants.all()
+          : await deps.grants.select({ where: byOwners([filter.ownerId]) });
+      return grants.filter(
+        (g) =>
+          (filter.ownerId === undefined || samePerson(g.ownerId, filter.ownerId)) &&
+          (filter.audienceScopeId === undefined || g.audienceScopeId === filter.audienceScopeId),
+      );
+    },
+
+    async revokeGrant(ownerId, grantId) {
+      const g = await deps.grants.get(grantId);
+      if (!g || !samePerson(g.ownerId, ownerId)) return false;
+      await revokeActiveGrant(grantId);
+      return true;
+    },
+
+    async grantsForScope(scopeId, opts) {
+      const out: Array<{ grant: KeychainGrant; credential: KeychainCredentialMeta }> = [];
+      for (const grant of await activeGrantsFor(scopeId)) {
+        if (!opts?.includePersonGrants && grant.botActor !== true) continue;
+        const cred = await deps.creds.get(grant.credentialId);
+        if (cred && (cred.managed === "connector" || !credExpired(cred, now())))
+          out.push({ grant, credential: toMeta(cred) });
+      }
+      return out;
+    },
+
+    async createAsk(input) {
+      const purpose = input.purpose.trim();
+      if (!purpose)
+        throw new KeychainError(400, "purpose required — describe the specific task requiring this credential");
+      const cred = await deps.creds.get(input.credentialId);
+      if (!cred || cred.kind === "broker") throw new KeychainError(404, "unknown credential");
+      const t = now();
+      if (!cred.managed && credExpired(cred, t))
+        throw new KeychainError(410, "credential is expired — its owner must re-auth before it can be asked for");
+      const scope = parseScopeId(input.requesterScopeId);
+      if (
+        scope.kind === "personal" &&
+        (!samePerson(scope.ref, input.requesterId) || !samePerson(cred.ownerId, input.requesterId))
+      ) {
+        throw new KeychainError(403, "personal requests require the credential owner's own conversation");
+      }
+      const task = askTask({ ...input, credentialId: cred.id });
+      for (const rec of (await deps.asks.all()).reverse().sort((a, b) => b.createdAt - a.createdAt)) {
+        const a = await freshAsk(rec, t);
+        if (askTask(a) !== task) continue;
+        if (a.status === "pending") return { ask: a, existing: true };
+        if (a.status === "approved") break;
+        if (input.triggered && (a.status === "declined" || a.status === "expired")) {
+          throw new KeychainError(
+            409,
+            "the owner declined or did not answer this task's request — wait for a live owner turn instead of asking again",
+          );
+        }
+      }
+      const ask: KeychainAsk = {
+        id: randomBytes(6).toString("hex"),
+        credentialId: cred.id,
+        ownerId: cred.ownerId,
+        requesterId: input.requesterId,
+        orgId: configOrgId(),
+        requesterScopeId: input.requesterScopeId,
+        ...(input.requesterDestination ? { requesterDestination: input.requesterDestination } : {}),
+        ...(input.requesterThreadRef ? { requesterThreadRef: input.requesterThreadRef } : {}),
+        ...(input.requesterSeq !== undefined ? { requesterSeq: input.requesterSeq } : {}),
+        ...(input.requesterMessageTs ? { requesterMessageTs: input.requesterMessageTs } : {}),
+        ...(input.ownerSurfaceUser ? { ownerSurfaceUser: input.ownerSurfaceUser } : {}),
+        purpose,
+        ...(input.requestedMode ? { requestedMode: input.requestedMode } : {}),
+        ...(input.botActor ? { botActor: true } : {}),
+        status: "pending",
+        createdAt: t,
+        expiresAt: input.expiresAt ?? t + ASK_TTL_MS,
+      };
+      await deps.asks.put(ask.id, ask);
+      return { ask, existing: false };
+    },
+
+    async getAsk(id) {
+      const rec = await deps.asks.get(id);
+      return rec ? freshAsk(rec, now()) : null;
+    },
+
+    async listAsks(filter) {
+      const t = now();
+      const out: KeychainAsk[] = [];
+      for (const rec of await deps.asks.all()) {
+        const a = await freshAsk(rec, t);
+        if (filter.requesterId !== undefined && !samePerson(a.requesterId, filter.requesterId)) continue;
+        if (filter.ownerId !== undefined && !samePerson(a.ownerId, filter.ownerId)) continue;
+        if (filter.requesterScopeId !== undefined && a.requesterScopeId !== filter.requesterScopeId) continue;
+        out.push(a);
+      }
+      return out.sort((x, y) => x.createdAt - y.createdAt);
+    },
+
+    async approveAsk(input) {
+      return lock.withLock(`keychain-ask:${input.askId}`, async () => {
+        const rec = await deps.asks.get(input.askId);
+        if (!rec) throw new KeychainError(404, "unknown ask");
+        const t = now();
+        const ask = await freshAsk(rec, t);
+        if (ask.status !== "pending") throw new KeychainError(410, `ask already ${ask.status}`);
+        const grant = await mintGrant({
+          credentialId: ask.credentialId,
+          ownerId: input.ownerId,
+          audienceScopeId: ask.requesterScopeId,
+          mode: input.mode,
+          purpose: input.purpose,
+          ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+          askId: ask.id,
+          ...(ask.botActor ? { botActor: true } : {}),
+        });
+        const patch = { status: "approved" as const, resolvedAt: t, grantId: grant.id, notifiedAt: undefined };
+        await deps.asks.merge(ask.id, patch);
+        return { ask: { ...ask, ...patch }, grant };
+      });
+    },
+
+    async declineAsk(input) {
+      return lock.withLock(`keychain-ask:${input.askId}`, async () => {
+        const rec = await deps.asks.get(input.askId);
+        if (!rec) throw new KeychainError(404, "unknown ask");
+        if (!samePerson(rec.ownerId, input.ownerId))
+          throw new KeychainError(403, "only the credential's owner can decline an ask");
+        const t = now();
+        const ask = await freshAsk(rec, t);
+        if (ask.status !== "pending") throw new KeychainError(410, `ask already ${ask.status}`);
+        const note = input.note?.trim();
+        const patch = { status: "declined" as const, resolvedAt: t, ...(note ? { note } : {}) };
+        await deps.asks.merge(ask.id, patch);
+        return { ...ask, ...patch };
+      });
+    },
+
+    async unnotifiedResolvedAsks(nowAt) {
+      const out = await claimThenBind(deps.asks.claimTenants, async () => {
+        const found: Array<KeychainAsk & { tenantId: string }> = [];
+        const taskDecisions = new Set<string>();
+        for (const rec of (await deps.asks.all()).reverse().sort((a, b) => b.createdAt - a.createdAt)) {
+          const a = await freshAsk(rec, nowAt);
+          const task = askTask(a);
+          const retain =
+            a.requesterThreadRef !== undefined && !taskDecisions.has(task) && !!(await deps.creds.get(a.credentialId));
+          taskDecisions.add(task);
+          if (a.status === "pending") continue;
+          if (a.notifiedAt === undefined) found.push({ ...a, tenantId: currentTenant() });
+          else if (!retain && a.notifiedAt < nowAt - ASK_PRUNE_AFTER_MS) await deps.asks.delete(a.id);
+        }
+        return found;
+      });
+      return out.flat().sort((a, b) => b.createdAt - a.createdAt);
+    },
+
+    async markAskNotified(id, status) {
+      await deps.asks.update(id, (current) =>
+        current.status === status ? { ...current, notifiedAt: now() } : current,
+      );
+    },
+
+    async setServiceCredential(orgScopeId, input) {
+      const prior = await brokerRecord(orgScopeId, input.slug);
+      const rec = serviceCredentialRecord(orgScopeId, input, prior);
+      await deps.creds.put(rec.id, rec);
+    },
+
+    async setServiceCredentialIfAbsent(orgScopeId, input) {
+      const rec = serviceCredentialRecord(orgScopeId, input, null);
+      return (await deps.creds.insertIfAbsent(rec.id, rec)) ? rec.updatedAt : null;
+    },
+
+    async setServiceCredentialIfCurrent(orgScopeId, input, expectedUpdatedAt) {
+      let updatedAt: number | null = null;
+      await deps.creds.update(brokerId(orgScopeId, input.slug), (prior) => {
+        if (prior.kind !== "broker" || prior.ownerId !== orgScopeId || prior.updatedAt !== expectedUpdatedAt)
+          return prior;
+        const next = serviceCredentialRecord(orgScopeId, input, prior);
+        updatedAt = next.updatedAt;
+        return next;
+      });
+      return updatedAt;
+    },
+
+    async listServiceCredentials(orgScopeId) {
+      return (await deps.creds.select({ where: byOwners([orgScopeId]) }))
+        .filter((c) => c.kind === "broker" && c.ownerId === orgScopeId)
+        .map(brokerToPublic);
+    },
+
+    async deleteServiceCredential(orgScopeId, slug) {
+      await deps.creds.delete(brokerId(orgScopeId, slug));
+    },
+
+    async deleteServiceCredentialIfCurrent(orgScopeId, slug, expectedUpdatedAt) {
+      return deps.creds.deleteIf(
+        brokerId(orgScopeId, slug),
+        (prior) => prior.kind === "broker" && prior.ownerId === orgScopeId && prior.updatedAt === expectedUpdatedAt,
+      );
+    },
+
+    async getServiceCredentialSecret(orgScopeId, slug) {
+      const rec = await brokerRecord(orgScopeId, slug);
+      if (!rec?.secretEnc) return null;
+      const b = rec.broker ?? { name: rec.service, enabled: true };
+      return {
+        slug: rec.service,
+        name: b.name,
+        secret: decryptSecret(rec.secretEnc, deps.key),
+        delivery: b.delivery ?? "broker",
+        ...(b.envKey ? { envKey: b.envKey } : {}),
+        host: rec.host ?? "",
+        ...(b.injection ? { injection: b.injection } : {}),
+        ...(b.allowedMethods ? { allowedMethods: b.allowedMethods } : {}),
+        ...(b.allowedPathPrefixes ? { allowedPathPrefixes: b.allowedPathPrefixes } : {}),
+        deployments: b.deployments !== false,
+        enabled: b.enabled,
+      };
+    },
+
+    async setConnectorToken(host, principalId, token, accountType) {
+      await putConnectorToken(host, principalId, token, accountType);
+    },
+
+    async deleteConnectorToken(host, principalId, accountType) {
+      const rec = await connectorRecord(host, principalId, accountType);
+      if (rec) await deleteCredential(rec.id);
+    },
+
+    async connectorTokenStatus(host, principalId, accountType) {
+      const rec = await connectorRecord(host, principalId, accountType);
+      if (!rec) return { connected: false };
+      const hasRefresh = !!rec.refresh?.refreshTokenEnc;
+      const refreshFailedAt = rec.refresh?.refreshFailedAt;
+      const refreshFailed = typeof refreshFailedAt === "number";
+      const tokenExpired = oauthExpired(rec, now(), oauthSkew);
+      return {
+        connected: true,
+        ...(rec.expiresAt !== undefined ? { expiresAt: rec.expiresAt } : {}),
+        ...(hasRefresh ? { hasRefreshToken: true } : {}),
+        ...(tokenExpired && (!hasRefresh || refreshFailed) ? { needsReconnect: true } : {}),
+        ...(refreshFailed ? { refreshFailedAt } : {}),
+        ...(refreshFailed && rec.refresh?.refreshError ? { refreshError: rec.refresh.refreshError } : {}),
+        ...(rec.refresh?.accountType ? { accountType: rec.refresh.accountType } : {}),
+        ...(rec.refresh?.grantedScopes ? { grantedScopes: rec.refresh.grantedScopes } : {}),
+      };
+    },
+
+    async connectorAccessToken(host, principalId, accountType) {
+      const rec = await connectorRecord(host, principalId, accountType);
+      if (!rec) return null;
+      return connectorTokenForRecord(rec);
+    },
+
+    async connectorDerivedAuth(host, principalId, accountType) {
+      const rec = await connectorRecord(host, principalId, accountType);
+      if (!rec) return null;
+      const accessToken = await connectorTokenForRecord(rec);
+      if (accessToken === null) return null;
+      const fresh = (await connectorRecord(host, principalId, accountType)) ?? rec;
+      const token = tryDecrypt(fresh, recToOAuthToken);
+      if (!token) return null;
+      return {
+        accessToken: token.accessToken,
+        ...(token.idToken ? { idToken: token.idToken } : {}),
+        ...(token.accountId ? { accountId: token.accountId } : {}),
+        ...(token.expiresAt !== undefined ? { expiresAt: token.expiresAt } : {}),
+      };
+    },
+
+    async listConnectorsByOwners(ownerIds) {
+      const t = now();
+      return bucketByOwner(
+        await deps.creds.select({ omit: ["secretEnc"], where: byOwners(ownerIds) }),
+        ownerIds,
+        (c) => c.managed === "connector",
+        (c) => connectorMeta(c, t, oauthSkew),
+      );
+    },
+
+    async composioKey(ownerId, credentialId) {
+      const cred = await getOwned(ownerId, credentialId);
+      if (!cred || cred.kind !== "env" || !isBackendCredential(cred) || credExpired(cred, now())) return null;
+      return tryDecrypt(cred, decryptToEnv)?.env.find((e) => e.key === COMPOSIO_ENV_KEY)?.value ?? null;
+    },
+    prepareMaterialize,
+
+    async materializeOwnById(ownerId, credentialId, scopeId) {
+      if (scopeId !== toScopeId("personal", ownerId)) {
+        throw new KeychainError(
+          403,
+          "a credential id loads only in its owner's own personal conversation — anywhere else needs a grant from the owner",
+        );
+      }
+      const cred = await deps.creds.get(credentialId);
+      if (!cred || !samePerson(cred.ownerId, ownerId)) throw new KeychainError(404, "unknown credential");
+      if (cred.kind === "broker") {
+        throw new KeychainError(403, "broker credentials are used via the credential broker, never materialized");
+      }
+      if (cred.managed === "connector") return materializeConnectorEnv(cred);
+      if (credExpired(cred, now())) throw new KeychainError(410, "credential is expired");
+      return materializeDecrypted(cred);
+    },
+
+    async materializeOwn(ownerId) {
+      const t = now();
+      return (await deps.creds.select({ where: byOwners([ownerId]) }))
+        .filter(
+          (c) =>
+            samePerson(c.ownerId, ownerId) &&
+            c.kind === "env" &&
+            !c.managed &&
+            !isBackendCredential(c) &&
+            !expired(c, t),
+        )
+        .map((c) => tryDecrypt(c, decryptToEnv))
+        .filter((c): c is MaterializedEnvCred => c !== null);
+    },
+
+    async materializeOwnFiles(ownerId) {
+      return (await deps.creds.select({ where: byOwners([ownerId]) }))
+        .filter((c) => samePerson(c.ownerId, ownerId) && c.kind === "file" && listed(c))
+        .map((c) => tryDecrypt(c, decryptToFiles))
+        .filter((c): c is MaterializedFileCred => c !== null);
+    },
+
+    async materializeStanding(scopeId) {
+      const out: MaterializedEnvCred[] = [];
+      for (const grant of await activeGrantsFor(scopeId)) {
+        if (grant.mode !== "standing") continue;
+        const cred = await deps.creds.get(grant.credentialId);
+        if (!cred || cred.kind !== "env" || isBackendCredential(cred)) continue;
+        if (cred.managed === "connector") {
+          const value = cred.host ? await connectorTokenForRecord(cred) : null;
+          if (value && cred.host) {
+            out.push({
+              credentialId: cred.id,
+              ownerId: cred.ownerId,
+              service: cred.service,
+              env: [{ key: envKey(cred.host), value }],
+              grantId: grant.id,
+              purpose: grant.purpose,
+            });
+          }
+          continue;
+        }
+        if (cred.managed || credExpired(cred, now())) continue;
+        const mat = tryDecrypt(cred, (c) => decryptToEnv(c, { grantId: grant.id, purpose: grant.purpose }));
+        if (mat) out.push(mat);
+      }
+      return out;
+    },
+  };
+}
+
+export function fileCredentialEnvironment(files: CredentialFile[], home: string): Record<string, string> {
+  const env: Record<string, string> = { HOME: home };
+  const pointers: Array<[RegExp, string, boolean?]> = [
+    [/^\.aws\/credentials$/, "AWS_SHARED_CREDENTIALS_FILE"],
+    [/^\.aws\/config$/, "AWS_CONFIG_FILE"],
+    [/^\.kube\/config$/, "KUBECONFIG"],
+    [/^\.config\/gh\/hosts\.yml$/, "GH_CONFIG_DIR", true],
+    [/^(?:\.config\/(?:glab-cli|glab)|Library\/Application Support\/glab-cli)\/config\.yml$/, "GLAB_CONFIG_DIR", true],
+    [/^\.docker\/config\.json$/, "DOCKER_CONFIG", true],
+    [/^\.npmrc$/, "NPM_CONFIG_USERCONFIG"],
+    [/^\.netrc$/, "NETRC"],
+  ];
+  for (const file of files) {
+    const rel = homeRelativePath(file.path);
+    for (const [pattern, key, directory] of pointers) {
+      if (pattern.test(rel) && !(key in env)) env[key] = `${home}/${directory ? rel.replace(/\/[^/]*$/, "") : rel}`;
+    }
+    if (/^\.ssh\/[^/]*(id_|key)[^/]*$/.test(rel) && !env.GIT_SSH_COMMAND)
+      env.GIT_SSH_COMMAND = `ssh -i ${shq(`${home}/${rel}`)} -o IdentitiesOnly=yes`;
+  }
+  return env;
+}
+
+function hoursLeft(expiresAt: number, now: number): number {
+  return Math.max(1, Math.round((expiresAt - now) / 3_600_000));
+}
+
+export function renderAskNotice(
+  input: {
+    ask: KeychainAsk;
+    credential: KeychainCredentialMeta;
+    requesterName?: string;
+    channelName?: string;
+    scopeName?: string;
+    taskTitle?: string;
+  },
+  now: number = Date.now(),
+): string {
+  const { ask, credential } = input;
+  const who = input.requesterName ? `${input.requesterName} (${ask.requesterId})` : ask.requesterId;
+  let where: string;
+  if (input.channelName) where = `**#${input.channelName.replace(/^#/, "")}**`;
+  else if (input.scopeName) where = `**${input.scopeName}**`;
+  else if (ask.requesterScopeId.startsWith("group:")) where = "a group conversation";
+  else if (ask.requesterScopeId.startsWith("channel:")) where = "a Slack channel";
+  else if (ask.requesterScopeId.startsWith("personal:")) where = "their own conversation";
+  else where = "a shared conversation";
+  const task = input.taskTitle ? `Scheduled task "${input.taskTitle}": ` : "";
+  const account = credential.accountLabel ? ` (${credential.accountLabel})` : "";
+  const self = ask.requesterScopeId.startsWith("personal:") && samePerson(ask.ownerId, ask.requesterId);
+  return (
+    `${task}${self ? "A task in your personal conversation" : `${who} in ${where}`} wants to use your **${credential.service}** credential${account}. ` +
+    `Approve or deny on the card (expires in ${hoursLeft(ask.expiresAt, now)}h).`
+  );
+}
+
+export interface KeychainManifestInput {
+  scopeId: ScopeId;
+  conversationKind: "dm" | "channel" | "group";
+  openSpeakerKeychain?: boolean;
+  actorId: string;
+  members: Array<{ id: string; displayName?: string }>;
+  entriesByOwner: Map<string, KeychainCredentialMeta[]>;
+  connectorsByOwner?: Map<string, ConnectorMeta[]>;
+  scopeGrants: Array<{ grant: KeychainGrant; credential: KeychainCredentialMeta }>;
+  execution?: Array<{
+    handle: string;
+    ownerId: string;
+    credentialId?: string;
+    description: string;
+  }>;
+  detectedByOwner?: Map<string, string[]>;
+}
+
+interface CredentialLine {
+  label: string;
+  use: string;
+  expired: boolean;
+  refreshError?: string;
+}
+
+export const credentialLineText = (line: CredentialLine): string => {
+  if (!line.expired) return `${line.label}; ${line.use}`;
+  return `${line.label}; expired${line.refreshError ? ` (refresh failed: ${line.refreshError})` : ""}`;
+};
+
+export const connectorHandle = (host: string, accountType?: string): string =>
+  `connector:${host}:${accountType ?? "default"}`;
+
+export function connectorLine(
+  host: string,
+  accountType?: string,
+  expired = false,
+  refreshError?: string,
+): CredentialLine {
+  const account = accountType && accountType !== "default" ? ` (${accountType})` : "";
+  return {
+    label: `${connectorHostLabel(host)}${account}`,
+    use: `env \`${envKey(host)}\``,
+    expired,
+    ...(expired && refreshError ? { refreshError } : {}),
+  };
+}
+
+function credentialLine(c: KeychainCredentialMeta, now: number): CredentialLine {
+  if (c.managed === "connector") {
+    const meta = connectorMeta(c, now);
+    return connectorLine(meta.host, meta.accountType, meta.needsReconnect, meta.refreshError);
+  }
+  if (isBackendCredential(c))
+    return { label: "Composio backend access", use: "use the composio skill", expired: false };
+  const use =
+    c.kind === "env"
+      ? `env ${(c.fields?.map((f) => f.envKey) ?? [c.envKey])
+          .filter(Boolean)
+          .sort()
+          .map((key) => `\`${key}\``)
+          .join(" + ")}`
+      : "files in $HOME";
+  return {
+    label: `${c.service}${c.accountLabel ? ` (${c.accountLabel})` : ""}`,
+    use,
+    expired: c.kind !== "file" && typeof c.expiresAt === "number" && c.expiresAt < now,
+  };
+}
+
+const oauthExpired = (rec: KeychainCredentialMeta, t: number, oauthSkew: number) =>
+  rec.expiresAt !== undefined && t >= rec.expiresAt - oauthSkew;
+
+function connectorMeta(rec: KeychainCredentialMeta, t: number, oauthSkew = 60_000): ConnectorMeta {
+  const hasRefresh = !!rec.refresh?.refreshTokenEnc;
+  const refreshFailed = typeof rec.refresh?.refreshFailedAt === "number";
+  const tokenExpired = oauthExpired(rec, t, oauthSkew);
+  return {
+    credentialId: rec.id,
+    ownerId: rec.ownerId,
+    host: rec.host ?? rec.service,
+    ...(rec.refresh?.accountType ? { accountType: rec.refresh.accountType } : {}),
+    ...(rec.expiresAt !== undefined ? { expiresAt: rec.expiresAt } : {}),
+    connected: true,
+    ...(tokenExpired && (!hasRefresh || refreshFailed) ? { needsReconnect: true } : {}),
+    ...(tokenExpired && refreshFailed && rec.refresh?.refreshError ? { refreshError: rec.refresh.refreshError } : {}),
+  };
+}
+
+export const MAX_CREDENTIAL_FILES = 500;
+export const MAX_CREDENTIAL_BYTES = 8 * 1024 * 1024;
+
+function checkedFiles(files: CredentialFile[]): CredentialFile[] {
+  const bytes = files.reduce((sum, file) => sum + Buffer.byteLength(file.contentBase64, "base64"), 0);
+  if (files.length > MAX_CREDENTIAL_FILES || bytes > MAX_CREDENTIAL_BYTES)
+    throw new KeychainError(
+      413,
+      `A saved login is limited to ${MAX_CREDENTIAL_FILES} files and ${MAX_CREDENTIAL_BYTES} bytes`,
+    );
+  return files;
+}
+
+function listed(c: Pick<KeychainCredential, "managed" | "kind">): boolean {
+  return !c.managed && c.kind !== "broker";
+}
+
+const ORGANIZATION_OWNER_KEY = personKey("Organization");
+
+export function renderKeychainManifest(input: KeychainManifestInput, now: number = Date.now()): string {
+  const groups = new Map<string, Set<string>>();
+  const ownerNames = new Map<string, string>();
+  const add = (ownerId: string, text: string): void => {
+    const owner = personKey(ownerId);
+    let rows = groups.get(owner);
+    if (!rows) groups.set(owner, (rows = new Set()));
+    rows.add(text);
+    if (!ownerNames.has(owner))
+      ownerNames.set(owner, input.members.find((member) => samePerson(member.id, ownerId))?.displayName ?? ownerId);
+  };
+  const execution = input.execution ?? [];
+  const handleNames = new Set(execution.map((entry) => entry.handle));
+  const handles = (credentialId: string): string =>
+    execution
+      .filter((entry) => entry.credentialId === credentialId)
+      .map((entry) => `\`${entry.handle}\``)
+      .sort()
+      .join(", ");
+  const rows = new Map<string, { ownerId: string; line: CredentialLine; connector?: string }>();
+  const entries = new Map(input.scopeGrants.map(({ credential }) => [credential.id, credential]));
+  for (const member of input.members)
+    for (const credential of input.entriesByOwner.get(member.id) ?? []) entries.set(credential.id, credential);
+  for (const credential of entries.values())
+    rows.set(credential.id, { ownerId: credential.ownerId, line: credentialLine(credential, now) });
+  for (const member of input.members) {
+    for (const connector of input.connectorsByOwner?.get(member.id) ?? [])
+      rows.set(connector.credentialId, {
+        ownerId: member.id,
+        line: connectorLine(connector.host, connector.accountType, connector.needsReconnect, connector.refreshError),
+        connector: connectorHandle(connector.host, connector.accountType),
+      });
+    const registered = new Set((input.entriesByOwner.get(member.id) ?? []).map((c) => c.service.toLowerCase()));
+    for (const service of input.detectedByOwner?.get(member.id) ?? [])
+      if (!registered.has(service.toLowerCase()))
+        add(member.id, `- ${service} — detected on their computer, NOT registered or grantable`);
+  }
+  for (const [credentialId, { ownerId, line, connector }] of rows) {
+    const shown = handles(credentialId);
+    if (shown) add(ownerId, `- ${shown} — ${credentialLineText(line)}`);
+    else if (connector && line.expired && !handleNames.has(connector)) add(ownerId, `- ${credentialLineText(line)}`);
+  }
+  for (const entry of execution)
+    if (!entry.credentialId || !rows.has(entry.credentialId))
+      add(entry.ownerId, `- \`${entry.handle}\` — ${entry.description}`);
+  const lines = [
+    "## Credentials",
+    "Select handles in execute.credentials. Send tokens yourself (connectors as `Authorization: Bearer`); proxy handles via the use-shared-credential skill.",
+  ];
+  const owners = [...groups.keys()].sort(
+    (a, b) => Number(b === ORGANIZATION_OWNER_KEY) - Number(a === ORGANIZATION_OWNER_KEY) || a.localeCompare(b),
+  );
+  for (const owner of owners) lines.push(`### ${ownerNames.get(owner)}`, ...[...(groups.get(owner) ?? [])].sort());
+  if (!owners.length) lines.push("No credentials available.");
+  return lines.join("\n");
+}
+
+export async function askResolutionEvents(
+  asks: readonly KeychainAsk[],
+  since: number,
+  ownerName: (ownerId: string) => string,
+  credential: (id: string) => Promise<KeychainCredentialMeta | null>,
+): Promise<string> {
+  const resolved = asks
+    .filter((ask) => ask.status !== "pending" && ask.resolvedAt !== undefined && ask.resolvedAt > since)
+    .toSorted((a, b) => a.resolvedAt! - b.resolvedAt!);
+  const lines = await Promise.all(
+    resolved.map(async (ask) => {
+      const service = (await credential(ask.credentialId))?.service;
+      const what = service ? `\`${service}\`` : `deleted credential \`${ask.credentialId}\``;
+      return `Access request to ${ownerName(ask.ownerId)} for ${what} was ${ask.status}.`;
+    }),
+  );
+  return lines.join("\n");
+}

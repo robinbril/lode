@@ -1,0 +1,98 @@
+"""
+Debug trigger utility, for inserting code to replicate specific timing sequences, mock error conditions, etc.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from threading import Lock, Semaphore
+from typing import Callable, Dict, Optional
+
+
+@dataclass
+class DebugAction:
+    sleep_ms: Optional[int] = None
+    callback: Optional[Callable[[], None]] = None
+    semaphore: Optional[Semaphore] = None
+    exception_to_throw: Optional[BaseException] = None
+    _lock: Lock = field(default_factory=Lock, repr=False)
+
+    def set_exception_to_throw(self, exc: Optional[BaseException]) -> "DebugAction":
+        self.exception_to_throw = exc
+        return self
+
+    def pop_exception_once(self) -> Optional[BaseException]:
+        """Return and clear the exception atomically."""
+        with self._lock:
+            exc = self.exception_to_throw
+            self.exception_to_throw = None
+            return exc
+
+
+class DebugTriggers:
+    # ----- Constants (Should use in just one place in the code) -----
+    DEBUG_TRIGGER_STEP_COMMIT = "DEBUG_TRIGGER_STEP_COMMIT"
+    DEBUG_TRIGGER_INITWF_COMMIT = "DEBUG_TRIGGER_INITWF_COMMIT"
+    # Fires in start_queued_workflows after the row-lock select, before the claimed rows are marked PENDING.
+    DEBUG_TRIGGER_FIND_AND_MARK_AFTER_SELECT = (
+        "DEBUG_TRIGGER_FIND_AND_MARK_AFTER_SELECT"
+    )
+    # Fires in start_queued_partitioned_workflows inside a batch's transaction, before it takes its partition locks.
+    DEBUG_TRIGGER_PARTITIONED_DEQUEUE_BEFORE_LOCKS = (
+        "DEBUG_TRIGGER_PARTITIONED_DEQUEUE_BEFORE_LOCKS"
+    )
+    # Fires in start_queued_partitioned_workflows between a batch's head re-pick and its row lock.
+    DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES = (
+        "DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES"
+    )
+    # Fires in start_queued_workflows after the global-concurrency pending count is read.
+    DEBUG_TRIGGER_QUEUE_CONCURRENCY_AFTER_BUDGET_READ = (
+        "DEBUG_TRIGGER_QUEUE_CONCURRENCY_AFTER_BUDGET_READ"
+    )
+
+    # Internal registries
+    _point_triggers: Dict[str, DebugAction] = {}
+    _triggers_lock = Lock()
+
+    @classmethod
+    def debug_trigger_point(cls, name: str) -> None:
+        """
+        Proceed according to the configured DebugAction.
+
+        Order:
+          1) sleep (if configured)
+          2) run callback (if configured)
+          3) raise exception once (if configured)
+          4) acquire semaphore (if configured) and block until released
+        """
+
+        # get current action (no lock held during action execution)
+        with cls._triggers_lock:
+            action = cls._point_triggers.get(name)
+
+        if action is None:
+            return
+
+        if action.sleep_ms is not None and action.sleep_ms > 0:
+            time.sleep(action.sleep_ms / 1000.0)
+
+        if action.callback is not None:
+            action.callback()
+
+        exc = action.pop_exception_once()
+        if exc is not None:
+            raise exc
+
+        if action.semaphore is not None:
+            action.semaphore.acquire()
+
+    @classmethod
+    def set_debug_trigger(cls, name: str, action: DebugAction) -> None:
+        with cls._triggers_lock:
+            cls._point_triggers[name] = action
+
+    @classmethod
+    def clear_debug_triggers(cls) -> None:
+        with cls._triggers_lock:
+            cls._point_triggers.clear()

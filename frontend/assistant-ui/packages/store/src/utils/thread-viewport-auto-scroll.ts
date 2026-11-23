@@ -1,0 +1,567 @@
+import {
+  isViewportAtBottom,
+  observeContentResize,
+  viewportOverflows,
+} from "./viewport-scroll";
+
+const MESSAGE_SELECTOR = "[data-message-id]";
+const DISCLOSURE_SELECTOR = "[aria-expanded], summary";
+const TEXT_ENTRY_SELECTOR = [
+  "textarea",
+  "select",
+  "[contenteditable]:not([contenteditable='false'])",
+  "input:not([type='checkbox']):not([type='radio']):not([type='button'])" +
+    ":not([type='submit']):not([type='reset']):not([type='image'])" +
+    ":not([type='range']):not([type='file']):not([type='color'])",
+].join(", ");
+const SCROLL_KEYS = new Set([
+  " ",
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+]);
+const UPWARD_SCROLL_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
+
+const isOpeningDisclosure = (target: Element) => {
+  const control = target.closest(DISCLOSURE_SELECTOR);
+  if (!control) return false;
+  if (control.tagName === "SUMMARY")
+    return control.parentElement?.hasAttribute("open") === false;
+  const popup = control.getAttribute("aria-haspopup");
+  return (
+    control.getAttribute("aria-expanded") === "false" &&
+    (popup === null || popup === "false") &&
+    control.getAttribute("role") !== "combobox"
+  );
+};
+
+const isUpwardKey = (event: KeyboardEvent) =>
+  UPWARD_SCROLL_KEYS.has(event.key) || (event.key === " " && event.shiftKey);
+
+type MessageOffset = { readonly id: string; readonly offset: number };
+
+const offsetInViewport = (element: Element, viewport: Element) =>
+  element.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+
+const measureFirstMessage = (viewport: HTMLElement): MessageOffset | null => {
+  const element = viewport.querySelector<HTMLElement>(MESSAGE_SELECTOR);
+  const id = element?.dataset["messageId"];
+  return element && id
+    ? { id, offset: offsetInViewport(element, viewport) }
+    : null;
+};
+
+const measureReaderMessage = (viewport: HTMLElement): MessageOffset | null => {
+  const { top, bottom } = viewport.getBoundingClientRect();
+  let spanning: MessageOffset | null = null;
+  for (const element of viewport.querySelectorAll<HTMLElement>(
+    MESSAGE_SELECTOR,
+  )) {
+    const rect = element.getBoundingClientRect();
+    if (rect.bottom <= top) continue;
+    if (rect.top >= bottom) break;
+    const id = element.dataset["messageId"];
+    if (!id) continue;
+    if (rect.top >= top) return { id, offset: rect.top - top };
+    spanning ??= { id, offset: rect.top - top };
+  }
+  return spanning;
+};
+
+const findMessage = (viewport: HTMLElement, id: string) => {
+  for (const element of viewport.querySelectorAll<HTMLElement>(
+    MESSAGE_SELECTOR,
+  )) {
+    if (element.dataset["messageId"] === id) return element;
+  }
+  return null;
+};
+
+export type ThreadViewportAutoScrollOptions = {
+  readonly autoScroll: boolean;
+  readonly holdFollow?: boolean;
+  readonly scrollToBottomOnInitialize: boolean;
+  readonly scrollToBottomOnRunStart: boolean;
+  readonly scrollToBottomOnThreadSwitch: boolean;
+};
+
+export type ThreadViewportAutoScroll = {
+  attach(element: HTMLElement): () => void;
+  readonly isAtBottom: boolean;
+  scrollToBottom(behavior?: ScrollBehavior): void;
+  messagesPrepended(previousFirstMessageId: string): void;
+  setContentInset(inset: number): void;
+  registerContentInset(measure?: () => number): {
+    setHeight(height: number): void;
+    unregister(): void;
+  };
+  setHasMessages(hasMessages: boolean): void;
+  runStarted(): void;
+  threadSwitched(): void;
+  dispose(): void;
+};
+
+export const createThreadViewportAutoScroll = (input: {
+  getOptions: () => ThreadViewportAutoScrollOptions;
+  onAtBottomChange: (isAtBottom: boolean) => void;
+  onContentInsetChange?: (total: number) => void;
+}): ThreadViewportAutoScroll => {
+  let element: HTMLElement | null = null;
+  let detachAttached: (() => void) | null = null;
+  let intent: ScrollBehavior | null = null;
+  let isAtBottom = true;
+  let followBottom = true;
+  let followPaused = false;
+  let scrolledSincePause = false;
+  let upwardInput = false;
+  let upwardInputFrame: number | null = null;
+  let lastTouchY: number | null = null;
+  let contentInset = 0;
+  let directContentInset = 0;
+  const contentInsetEntries = new Map<
+    symbol,
+    { height: number; measure: (() => number) | undefined }
+  >();
+  let hasMessages = false;
+  let initialized = false;
+  let lastScrollTop = 0;
+  let lastScrollHeight = 0;
+  let lastObservedScrollHeight = 0;
+  let lastObservedClientHeight = 0;
+  let frame: number | null = null;
+  let firstMessage: MessageOffset | null = null;
+  let prependAnchor: MessageOffset | null = null;
+  let heldScrollTop = 0;
+
+  const keepMessageAt = (anchor: MessageOffset) => {
+    if (!element) return false;
+    const message = findMessage(element, anchor.id);
+    if (!message) return false;
+    const delta = offsetInViewport(message, element) - anchor.offset;
+    heldScrollTop = element.scrollTop + delta;
+    if (Math.abs(delta) >= 1) {
+      element.scrollTo({ top: heldScrollTop, behavior: "instant" });
+    }
+    heldScrollTop = element.scrollTop;
+    return true;
+  };
+
+  const setAtBottom = (value: boolean) => {
+    if (value === isAtBottom) return;
+    isAtBottom = value;
+    input.onAtBottomChange(value);
+  };
+
+  const cancelFrame = () => {
+    if (frame === null) return;
+    cancelAnimationFrame(frame);
+    frame = null;
+  };
+
+  const clearUpwardInput = () => {
+    upwardInput = false;
+    if (upwardInputFrame === null) return;
+    cancelAnimationFrame(upwardInputFrame);
+    upwardInputFrame = null;
+  };
+
+  // A smooth scroll delivers its first scroll event a frame after the input, so
+  // the signal lasts two frames and cannot outlive the scroll it caused.
+  const noteUpwardInput = () => {
+    upwardInput = true;
+    if (upwardInputFrame !== null) cancelAnimationFrame(upwardInputFrame);
+    upwardInputFrame = requestAnimationFrame(() => {
+      upwardInputFrame = requestAnimationFrame(() => {
+        upwardInputFrame = null;
+        upwardInput = false;
+      });
+    });
+  };
+
+  const scrollToBottom = (behavior: ScrollBehavior = "auto") => {
+    if (!element) return;
+    followBottom = true;
+    followPaused = false;
+    scrolledSincePause = false;
+    clearUpwardInput();
+    intent = behavior;
+    prependAnchor = null;
+    element.scrollTo?.({ top: element.scrollHeight, behavior });
+    lastScrollTop = element.scrollTop;
+    lastScrollHeight = element.scrollHeight;
+    handleScroll();
+  };
+
+  const scheduleScrollToBottom = (behavior: ScrollBehavior) => {
+    intent = behavior;
+    // Initialization can run during SSR, where no frame scheduler exists.
+    if (typeof requestAnimationFrame === "undefined") return;
+    cancelFrame();
+    frame = requestAnimationFrame(() => {
+      frame = null;
+      scrollToBottom(behavior);
+    });
+  };
+
+  const handleScroll = ({
+    preserveFollow = false,
+    insetShrank = false,
+    userScroll = false,
+  }: {
+    preserveFollow?: boolean;
+    insetShrank?: boolean;
+    userScroll?: boolean;
+  } = {}) => {
+    if (!element) return;
+
+    if (prependAnchor && Math.abs(element.scrollTop - heldScrollTop) >= 1)
+      prependAnchor = null;
+
+    const { autoScroll, holdFollow } = input.getOptions();
+    const newIsAtBottom = isViewportAtBottom(element, contentInset);
+    const clientHeight = element.clientHeight;
+    const clampTarget = Math.max(0, lastScrollHeight - clientHeight);
+    const clampedScrollTop = Math.min(lastScrollTop, clampTarget);
+    const scrolledUp =
+      element.scrollTop < clampedScrollTop &&
+      element.scrollHeight >= lastScrollHeight;
+    // A browser clamp lands at the bottom, which `newIsAtBottom` excludes, so a stop
+    // above `clampTarget` after upward input is a reader scroll-up.
+    const escapedClamp =
+      userScroll &&
+      element.scrollHeight >= lastScrollHeight &&
+      element.scrollTop < lastScrollTop &&
+      element.scrollTop > clampTarget;
+    const scrolledAway = scrolledUp || escapedClamp;
+    if (
+      !holdFollow &&
+      !newIsAtBottom &&
+      (!autoScroll ||
+        (!preserveFollow &&
+          intent === null &&
+          !followPaused &&
+          (scrolledAway || insetShrank)))
+    )
+      followBottom = false;
+    const inFlightDownward =
+      intent !== null && !newIsAtBottom && lastScrollTop < element.scrollTop;
+    if (!inFlightDownward) {
+      if (newIsAtBottom) {
+        // At-bottom is ambiguous without overflow, so intent stays alive until content can scroll.
+        if (viewportOverflows(element, contentInset)) {
+          intent = null;
+          if (followPaused && scrolledSincePause) followPaused = false;
+          scrolledSincePause = false;
+        }
+        followBottom = true;
+      } else if (scrolledAway) {
+        intent = null;
+        cancelFrame();
+        followBottom = false;
+      }
+      if (newIsAtBottom || intent === null) setAtBottom(newIsAtBottom);
+    }
+
+    lastScrollTop = element.scrollTop;
+    lastScrollHeight = element.scrollHeight;
+    firstMessage = measureFirstMessage(element);
+  };
+
+  const onScroll = () => handleScroll({ userScroll: upwardInput });
+
+  const followGrowth = () => {
+    if (frame !== null) return;
+    const { autoScroll, holdFollow } = input.getOptions();
+    if (intent && holdFollow) {
+      intent = null;
+    } else if (intent) {
+      scrollToBottom(intent);
+    } else if (!holdFollow && autoScroll && followBottom && !followPaused) {
+      scrollToBottom("instant");
+    } else if (prependAnchor && !keepMessageAt(prependAnchor)) {
+      prependAnchor = null;
+    }
+  };
+
+  const onContentResize = () => {
+    if (!element) return;
+    for (const entry of contentInsetEntries.values()) {
+      if (entry.measure) entry.height = entry.measure();
+    }
+    const insetGrew = recalculateContentInset();
+    const { scrollHeight, clientHeight } = element;
+    if (
+      scrollHeight === lastObservedScrollHeight &&
+      clientHeight === lastObservedClientHeight
+    ) {
+      if (insetGrew !== null) {
+        if (insetGrew) followGrowth();
+        handleScroll({ insetShrank: !insetGrew });
+      }
+      return;
+    }
+    lastObservedScrollHeight = scrollHeight;
+    lastObservedClientHeight = clientHeight;
+
+    if (insetGrew === false) handleScroll({ insetShrank: true });
+    followGrowth();
+    handleScroll({ insetShrank: insetGrew === false });
+  };
+
+  const cancelPendingScrollToBottom = () => {
+    if (intent === null && frame === null) return;
+    intent = null;
+    cancelFrame();
+    handleScroll({ preserveFollow: true });
+  };
+
+  const cancelOnKeyDown = (event: KeyboardEvent) => {
+    if (event.key !== "Enter" && !SCROLL_KEYS.has(event.key)) return;
+    if ((event.target as Element | null)?.closest?.(TEXT_ENTRY_SELECTOR))
+      return;
+    cancelPendingScrollToBottom();
+  };
+
+  const pauseFollowOnExpand = (event: MouseEvent) => {
+    const target = event.target as Element | null;
+    if (
+      !target?.closest?.(MESSAGE_SELECTOR) ||
+      target.closest(TEXT_ENTRY_SELECTOR) ||
+      !isOpeningDisclosure(target)
+    )
+      return;
+    followPaused = true;
+    scrolledSincePause = false;
+    intent = null;
+    cancelFrame();
+  };
+
+  const touchY = (event: Event) =>
+    (event as TouchEvent).touches?.[0]?.clientY ?? null;
+
+  // An upward gesture moves the nearest nested scroller that can still scroll
+  // up, and reaches the viewport only once that scroller is at its top.
+  const nestedScrollerTakesUpward = (target: EventTarget | null) => {
+    for (
+      let node = target instanceof Element ? target : null;
+      node && node !== element;
+      node = node.parentElement
+    ) {
+      if (
+        node.scrollTop > 0 &&
+        /^(auto|scroll)$/.test(getComputedStyle(node).overflowY)
+      )
+        return true;
+    }
+    return false;
+  };
+
+  const noteScrollGesture = (event: Event) => {
+    let upward = false;
+    if (event.type === "keydown") {
+      const keyEvent = event as KeyboardEvent;
+      if (!SCROLL_KEYS.has(keyEvent.key)) return;
+      if ((event.target as Element | null)?.closest?.(TEXT_ENTRY_SELECTOR))
+        return;
+      upward = isUpwardKey(keyEvent);
+    } else if (event.type === "pointerdown") {
+      if (event.target !== element) return;
+    } else if (event.type === "wheel") {
+      upward = (event as WheelEvent).deltaY < 0;
+    } else if (event.type === "touchmove") {
+      const y = touchY(event);
+      upward = y !== null && lastTouchY !== null && y > lastTouchY;
+      lastTouchY = y;
+    }
+    if (upward && !nestedScrollerTakesUpward(event.target)) noteUpwardInput();
+    else clearUpwardInput();
+    scrolledSincePause = true;
+  };
+
+  const noteTouchStart = (event: Event) => {
+    lastTouchY = touchY(event);
+  };
+
+  const releasePrependAnchor = () => {
+    prependAnchor = null;
+  };
+
+  const checkInitialize = () => {
+    if (!hasMessages) {
+      initialized = false;
+      return;
+    }
+    if (!input.getOptions().scrollToBottomOnInitialize || initialized) return;
+    initialized = true;
+    if (intent !== null) return;
+    scheduleScrollToBottom("instant");
+  };
+
+  const recalculateContentInset = () => {
+    let inset = directContentInset;
+    for (const entry of contentInsetEntries.values()) inset += entry.height;
+    if (contentInset === inset) return null;
+    const grew = inset > contentInset;
+    contentInset = inset;
+    input.onContentInsetChange?.(inset);
+    return grew;
+  };
+
+  const updateContentInset = () => {
+    const grew = recalculateContentInset();
+    if (grew === null) return;
+    const dimensionsChanged =
+      element !== null &&
+      (element.scrollHeight !== lastObservedScrollHeight ||
+        element.clientHeight !== lastObservedClientHeight);
+    // A growing inset or changed dimensions follow like a resize; a shrinking inset alone reveals content without moving the viewport.
+    if (!grew && dimensionsChanged) handleScroll({ insetShrank: true });
+    if (grew || dimensionsChanged) followGrowth();
+    handleScroll({ insetShrank: !grew });
+    if (!element) return;
+    lastObservedScrollHeight = element.scrollHeight;
+    lastObservedClientHeight = element.clientHeight;
+  };
+
+  return {
+    attach: (el) => {
+      detachAttached?.();
+      element = el;
+      intent = null;
+      lastScrollTop = el.scrollTop;
+      lastScrollHeight = el.scrollHeight;
+      lastObservedScrollHeight = 0;
+      lastObservedClientHeight = 0;
+      initialized = false;
+      followBottom = true;
+      followPaused = false;
+      scrolledSincePause = false;
+      clearUpwardInput();
+      lastTouchY = null;
+      firstMessage = null;
+      prependAnchor = null;
+      heldScrollTop = el.scrollTop;
+      setAtBottom(true);
+      const disconnect = observeContentResize(el, onContentResize);
+      el.addEventListener("scroll", onScroll);
+      el.addEventListener("pointerdown", cancelPendingScrollToBottom);
+      el.addEventListener("wheel", cancelPendingScrollToBottom, {
+        passive: true,
+      });
+      el.addEventListener("touchstart", cancelPendingScrollToBottom, {
+        passive: true,
+      });
+      el.addEventListener("keydown", cancelOnKeyDown);
+      el.addEventListener("click", pauseFollowOnExpand, true);
+      for (const gesture of ["pointerdown", "wheel", "touchmove", "keydown"])
+        el.addEventListener(gesture, noteScrollGesture, { passive: true });
+      el.addEventListener("touchstart", noteTouchStart, { passive: true });
+      for (const gesture of ["pointerdown", "wheel", "touchstart", "keydown"])
+        el.addEventListener(gesture, releasePrependAnchor, { passive: true });
+      checkInitialize();
+      if (contentInset > 0) followGrowth();
+      const detach = () => {
+        if (detachAttached !== detach) return;
+        disconnect();
+        el.removeEventListener("scroll", onScroll);
+        el.removeEventListener("pointerdown", cancelPendingScrollToBottom);
+        el.removeEventListener("wheel", cancelPendingScrollToBottom);
+        el.removeEventListener("touchstart", cancelPendingScrollToBottom);
+        el.removeEventListener("keydown", cancelOnKeyDown);
+        el.removeEventListener("click", pauseFollowOnExpand, true);
+        for (const gesture of [
+          "pointerdown",
+          "wheel",
+          "touchmove",
+          "keydown",
+        ]) {
+          el.removeEventListener(gesture, noteScrollGesture);
+        }
+        el.removeEventListener("touchstart", noteTouchStart);
+        for (const gesture of [
+          "pointerdown",
+          "wheel",
+          "touchstart",
+          "keydown",
+        ]) {
+          el.removeEventListener(gesture, releasePrependAnchor);
+        }
+        cancelFrame();
+        clearUpwardInput();
+        if (element === el) element = null;
+        detachAttached = null;
+      };
+      detachAttached = detach;
+      return detach;
+    },
+    get isAtBottom() {
+      return isAtBottom;
+    },
+    scrollToBottom,
+    messagesPrepended: (previousFirstMessageId) => {
+      if (
+        !element ||
+        (input.getOptions().autoScroll && followBottom && !followPaused) ||
+        intent !== null
+      )
+        return;
+      const anchor = firstMessage;
+      if (anchor?.id === previousFirstMessageId && keepMessageAt(anchor)) {
+        prependAnchor = measureReaderMessage(element) ?? anchor;
+      } else {
+        const top = element.scrollHeight - (lastScrollHeight - lastScrollTop);
+        if (Math.abs(element.scrollTop - top) >= 1)
+          element.scrollTo({ top, behavior: "instant" });
+      }
+      lastScrollTop = element.scrollTop;
+      lastScrollHeight = element.scrollHeight;
+    },
+    setContentInset: (inset) => {
+      if (directContentInset === inset) return;
+      directContentInset = inset;
+      updateContentInset();
+    },
+    registerContentInset: (measure) => {
+      const id = Symbol();
+      const entry = { height: 0, measure };
+      contentInsetEntries.set(id, entry);
+      return {
+        setHeight: (height) => {
+          if (!contentInsetEntries.has(id) || entry.height === height) return;
+          entry.height = height;
+          updateContentInset();
+        },
+        unregister: () => {
+          if (!contentInsetEntries.delete(id)) return;
+          updateContentInset();
+        },
+      };
+    },
+    setHasMessages: (value) => {
+      hasMessages = value;
+      checkInitialize();
+    },
+    runStarted: () => {
+      prependAnchor = null;
+      followPaused = false;
+      scrolledSincePause = false;
+      if (input.getOptions().scrollToBottomOnRunStart)
+        scheduleScrollToBottom("auto");
+    },
+    threadSwitched: () => {
+      prependAnchor = null;
+      followPaused = false;
+      scrolledSincePause = false;
+      clearUpwardInput();
+      if (input.getOptions().scrollToBottomOnThreadSwitch)
+        scheduleScrollToBottom("instant");
+    },
+    dispose: () => {
+      detachAttached?.();
+      cancelFrame();
+    },
+  };
+};

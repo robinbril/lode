@@ -1,0 +1,49 @@
+import type { ToolContext } from "../../tools/primitives.ts";
+
+const PRIVATE_CONTINUATION_DENIAL =
+  "This operation requires private access. Continue in the requesting person's DM with [[continue-private: task]].";
+
+export const GUEST_CHAT_DENIAL =
+  "This operation isn't available while guests are in this chat. Tell the requester to ask you in a private chat instead.";
+
+export function externalTools(
+  tools: ToolContext,
+  authorizeSandbox?: (id: string) => Promise<unknown>,
+  denial: string = PRIVATE_CONTINUATION_DENIAL,
+): ToolContext {
+  const denied = (): never => {
+    throw new Error(denial);
+  };
+  const allowed = new Set(["attach", "history", "historyOpen"]);
+  return new Proxy(tools, {
+    get(target, property, receiver) {
+      if (property === "sessionSyscalls" || property === "runtime") return undefined;
+      if (property === "execute")
+        return async (command: string, opts?: Parameters<ToolContext["execute"]>[1]) => {
+          if (opts?.scratch) return denied();
+          if (opts?.sandboxId) {
+            if (!authorizeSandbox) return denied();
+            await authorizeSandbox(opts.sandboxId);
+          }
+          return target.execute(command, opts);
+        };
+      if (property === "sandboxResources" && target.sandboxResources)
+        return async (...args: Parameters<NonNullable<ToolContext["sandboxResources"]>>) => {
+          const id = args[1]?.sandboxId;
+          if (id) {
+            if (!authorizeSandbox) return denied();
+            await authorizeSandbox(id);
+          }
+          return target.sandboxResources!(...args);
+        };
+      if (property === "computerStatus")
+        return (sandboxId?: string) => {
+          if (sandboxId) return denied();
+          return target.computerStatus();
+        };
+      if (allowed.has(String(property))) return Reflect.get(target, property, receiver);
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? denied : undefined;
+    },
+  });
+}

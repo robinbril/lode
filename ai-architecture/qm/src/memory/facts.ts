@@ -1,0 +1,121 @@
+import { createHash } from "node:crypto";
+import { parseScopeId, type ScopeId } from "../types.ts";
+import { dateStr } from "./notebook.ts";
+
+export type MemorySensitivity = "ordinary" | "unknown" | "sensitive" | "restricted";
+
+export interface MemoryProvenance {
+  sensitivity: MemorySensitivity;
+  sources: ScopeId[];
+  sourceUnknown: boolean;
+}
+
+export interface MemoryFact extends MemoryProvenance {
+  id: string;
+  text: string;
+  author?: string;
+  sessionId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MemoryCaptureMetadata {
+  conversationScopeId?: ScopeId;
+  sessionId?: string;
+  sensitivity?: MemorySensitivity;
+  inheritedFacts?: readonly MemoryProvenance[];
+}
+
+export const UNTRACKED_PROVENANCE: MemoryProvenance = { sensitivity: "unknown", sources: [], sourceUnknown: true };
+
+export class MemoryFactsMissing extends Error {
+  readonly ids: readonly string[];
+  constructor(ids: readonly string[]) {
+    super(
+      `No fact ${ids.map((id) => `#${id}`).join(", ")} in a notebook this conversation can edit. Nothing was changed; search again for current ids.`,
+    );
+    this.ids = ids;
+  }
+}
+
+export class MemoryForgetRefused extends Error {}
+
+const sensitivityOrder: MemorySensitivity[] = ["ordinary", "unknown", "sensitive", "restricted"];
+
+export function isMemorySensitivity(value: unknown): value is MemorySensitivity {
+  return sensitivityOrder.includes(value as MemorySensitivity);
+}
+
+export function mergeProvenance(
+  items: readonly MemoryProvenance[],
+  sensitivity: MemorySensitivity = "ordinary",
+): MemoryProvenance {
+  const sources = new Set<ScopeId>();
+  for (const item of items) {
+    if (sensitivityOrder.indexOf(item.sensitivity) > sensitivityOrder.indexOf(sensitivity))
+      sensitivity = item.sensitivity;
+    for (const source of item.sources) sources.add(source);
+  }
+  return { sensitivity, sources: [...sources], sourceUnknown: items.some((item) => item.sourceUnknown) };
+}
+
+export function captureProvenance(scope: ScopeId, context: MemoryCaptureMetadata | undefined): MemoryProvenance {
+  const merged = mergeProvenance(context?.inheritedFacts ?? [], context?.sensitivity ?? "unknown");
+  const source = parseScopeId(scope).kind === "persona" ? scope : (context?.conversationScopeId ?? scope);
+  return {
+    sensitivity: merged.sensitivity,
+    sources: merged.sources.includes(source) ? merged.sources : [...merged.sources, source],
+    sourceUnknown: merged.sourceUnknown || context?.inheritedFacts === undefined,
+  };
+}
+
+type Shown = Pick<MemoryFact, "text" | "createdAt">;
+
+export function renderFacts(facts: readonly Shown[]): string {
+  return facts.map((fact) => `- (${dateStr(fact.createdAt)}) ${fact.text}`).join("\n");
+}
+
+export function factHash(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+export interface MemorySource {
+  provider: string;
+  label: string;
+}
+
+export interface MemoryCandidate {
+  id?: string;
+  ref?: string;
+  claim?: string;
+  text: string;
+  source?: MemorySource;
+  sessionId?: string;
+}
+
+export const normalizeClaim = (text: string) => text.trim().toLowerCase();
+
+export const fromOtherSession = (fact: { sessionId?: string }, sessionId: string | undefined): boolean =>
+  !sessionId || fact.sessionId !== sessionId;
+
+export function recentCandidates(facts: readonly MemoryFact[]): MemoryCandidate[] {
+  return facts.map(factCandidate).reverse();
+}
+
+export function factCandidate(fact: MemoryFact): MemoryCandidate {
+  return {
+    id: fact.id,
+    claim: fact.text,
+    text: renderFacts([fact]),
+    ...(fact.sessionId ? { sessionId: fact.sessionId } : {}),
+  };
+}
+
+export function factLine(fact: Shown & Pick<MemoryFact, "id">): string {
+  return `#${fact.id} (${dateStr(fact.createdAt)}) ${fact.text}`;
+}
+
+export function parseFactId(value: string): string {
+  const id = value.trim();
+  return id.startsWith("#") ? id.slice(1) : id;
+}

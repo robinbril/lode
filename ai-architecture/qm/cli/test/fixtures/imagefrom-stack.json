@@ -1,0 +1,32 @@
+{
+  "contract": 1,
+  "orgId": "beta",
+  "publicUrl": "https://beta.example.com",
+  "target": "fly",
+  "appPrefix": "beta",
+  "region": "sjc",
+  "flyOrg": "personal",
+  "imageFrom": "qm",
+  "sandbox": {
+    "app": "beta-sandboxes"
+  },
+  "services": ["core", "slack"],
+  "vms": {
+    "core": { "size": "shared-cpu-2x", "memory": "4gb" }
+  },
+  "env": {
+    "core": {
+      "PUBLIC_WEB_URL": "https://beta-core.fly.dev",
+      "STACK_MARKER": "beta-sandboxes",
+      "SNAPSHOT_STORE": "s3",
+      "TRANSFER_STORE": "s3",
+      "S3_BUCKET": "beta-data",
+      "S3_REGION": "auto",
+      "OIDC_CLIENT_ID": "1111111111.2222222222",
+      "PORTAL_EXPECTED_TEAM_ID": "T00000000"
+    },
+    "slack": {
+      "PUBLIC_WEB_URL": "https://beta-core.fly.dev"
+    }
+  }
+}

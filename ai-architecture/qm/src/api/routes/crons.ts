@@ -1,0 +1,470 @@
+import { isCronRuntime } from "../../cron/runtime.ts";
+import { CRON_SCRIPT_TOOL_ONLY } from "../../cron/script.ts";
+import type { Cron } from "../../triggers/types.ts";
+import type { CreateCronInput, CronPatch } from "../../cron/cron-store.ts";
+import { describeRunNowRefusal } from "../../cron/scheduler.ts";
+import { DEFAULT_CRON_TIMEZONE, userScheduleFromBody } from "../../cron/schedule.ts";
+import type { CapabilityClaims } from "../../auth/capability-token.ts";
+import { errMessage } from "../../util/errors.ts";
+import { sendJson } from "../http.ts";
+import { isObj } from "./shared.ts";
+import { notifyOwnerOfCronEdit } from "../../triggers/edit-notice.ts";
+import { administersCron, cronTaskRewrite } from "../control-service.ts";
+import { CRON_PATCH_NOTHING_TO_CHANGE } from "../control-service.ts";
+import { tenantOf, withActor, type ApiCtx, type Route } from "./route.ts";
+
+function defaultTimezoneFor(capability: CapabilityClaims | null): string {
+  return typeof capability?.timezone === "string" && capability.timezone.trim()
+    ? capability.timezone
+    : DEFAULT_CRON_TIMEZONE;
+}
+
+function isCreateCron(b: unknown): b is CreateCronInput {
+  return (
+    isObj(b) &&
+    isCronRuntime(b.runtime) &&
+    userScheduleFromBody(b.schedule) !== null &&
+    (typeof b.action === "string" || typeof (b as { message?: unknown }).message === "string") &&
+    typeof b.ownerScopeId === "string" &&
+    typeof b.owner === "string" &&
+    typeof b.createdBy === "string" &&
+    ((b as { title?: unknown }).title === undefined || typeof (b as { title?: unknown }).title === "string") &&
+    (b.destination === undefined || isObj(b.destination))
+  );
+}
+
+type CapabilityCronBody = {
+  runtime?: unknown;
+  schedule?: unknown;
+  title?: unknown;
+  task?: unknown;
+  text?: unknown;
+  action?: unknown;
+  message?: unknown;
+  destinationKey?: unknown;
+  recipient?: unknown;
+  channel?: unknown;
+  participants?: unknown;
+  scope?: unknown;
+  unfurlLinks?: unknown;
+  session?: unknown;
+  persona?: unknown;
+};
+
+function taskText(b: CapabilityCronBody): string | undefined {
+  if (typeof b.action === "string") return b.action;
+  if (typeof b.task === "string") return b.task;
+  return undefined;
+}
+
+function exactText(b: CapabilityCronBody): string | undefined {
+  if (typeof b.message === "string") return b.message;
+  if (typeof b.text === "string") return b.text;
+  return undefined;
+}
+
+async function gateSourceCron(ctx: ApiCtx, id: string): Promise<Cron | null> {
+  const { res, app, url } = ctx;
+  const cron = await app.getCron(id);
+  if (!cron) {
+    sendJson(res, 404, { error: "not_found" });
+    return null;
+  }
+  const principalId = url.searchParams.get("principalId");
+  if (principalId && (await administersCron(app, cron, { actorId: principalId }))) return cron;
+  sendJson(res, 404, { error: "not_found" });
+  return null;
+}
+
+async function gateSourceCronRead(ctx: ApiCtx, id: string): Promise<Cron | null> {
+  const { res, app, url } = ctx;
+  const cron = await app.getCron(id);
+  if (!cron) {
+    sendJson(res, 404, { error: "not_found" });
+    return null;
+  }
+  const principalId = url.searchParams.get("principalId");
+  if (principalId && (await administersCron(app, cron, { actorId: principalId }))) return cron;
+  if (principalId && (await app.listCronsForViewer(principalId)).visible.some((candidate) => candidate.id === id))
+    return cron;
+  sendJson(res, 404, { error: "not_found" });
+  return null;
+}
+
+function isCronPatch(b: unknown): b is {
+  runtime?: Cron["runtime"];
+  title?: string;
+  task?: string;
+  action?: string;
+  schedule?: unknown;
+  enabled?: boolean;
+  archived?: boolean;
+  unfurlLinks?: boolean;
+  session?: boolean;
+} {
+  if (!isObj(b) || !isCronRuntime(b.runtime)) return false;
+  if (!hasCronPatchFields(b)) return true;
+  const hasTitle = b.title !== undefined;
+  const hasAction = b.action !== undefined;
+  const hasTask = b.task !== undefined;
+  const hasSchedule = b.schedule !== undefined;
+  const hasEnabled = b.enabled !== undefined;
+  const hasArchived = b.archived !== undefined;
+  const hasUnfurlLinks = b.unfurlLinks !== undefined;
+  if (hasTitle && typeof b.title !== "string") return false;
+  if (hasAction && typeof b.action !== "string") return false;
+  if (hasTask && typeof b.task !== "string") return false;
+  if (hasEnabled && typeof b.enabled !== "boolean") return false;
+  if (hasArchived && typeof b.archived !== "boolean") return false;
+  if (hasUnfurlLinks && typeof b.unfurlLinks !== "boolean") return false;
+  if (hasSchedule && userScheduleFromBody(b.schedule) === null) return false;
+  if (b.session !== undefined && typeof b.session !== "boolean") return false;
+  return true;
+}
+
+function hasCronPatchFields(b: Record<string, unknown>): boolean {
+  return (
+    b.runtime !== undefined ||
+    b.title !== undefined ||
+    b.action !== undefined ||
+    b.task !== undefined ||
+    b.schedule !== undefined ||
+    b.enabled !== undefined ||
+    b.archived !== undefined ||
+    b.unfurlLinks !== undefined ||
+    b.session !== undefined
+  );
+}
+
+const CRON_ERROR_STATUS: Record<string, number> = {
+  bad_request: 400,
+  recipient_not_found: 404,
+  ambiguous_recipient: 409,
+  channel_not_found: 404,
+  ambiguous_channel: 409,
+  group_not_found: 404,
+  not_a_member: 403,
+  identity_unverified: 403,
+  unknown_destination: 400,
+  cron_create_failed: 400,
+  not_found: 404,
+  forbidden: 403,
+  unavailable: 404,
+  cron_update_failed: 400,
+  already_running: 409,
+};
+
+async function createCron(ctx: ApiCtx): Promise<void> {
+  const { res, app, body, capability } = ctx;
+  if (isObj(body) && body.script !== undefined)
+    return sendJson(res, 400, { error: "bad_request", message: CRON_SCRIPT_TOOL_ONLY });
+  if (capability) {
+    const b = body as CapabilityCronBody;
+    const schedule = userScheduleFromBody(b.schedule, defaultTimezoneFor(capability));
+    const task = taskText(b);
+    const text = exactText(b);
+    if (!schedule || (task === undefined && text === undefined)) {
+      return sendJson(res, 400, {
+        error: "bad_request",
+        message:
+          "schedule.cron (5-field expression) or schedule.everyMs/firstFireAt, plus task (what to do) or text (exact text to send), required",
+      });
+    }
+    if (!isCronRuntime(b.runtime)) return sendJson(res, 400, { error: "bad_request", message: "invalid cron runtime" });
+    const result = await ctx.deps.control.createCron(
+      {
+        schedule,
+        ...(b.runtime !== undefined ? { runtime: b.runtime } : {}),
+        ...(task !== undefined ? { action: task } : {}),
+        ...(text !== undefined ? { text } : {}),
+        ...(typeof b.title === "string" ? { title: b.title } : {}),
+        ...(typeof b.recipient === "string" ? { recipient: b.recipient } : {}),
+        ...(typeof b.channel === "string" ? { channel: b.channel } : {}),
+        ...(Array.isArray(b.participants)
+          ? { participants: b.participants.filter((p): p is string => typeof p === "string") }
+          : {}),
+        ...(b.scope === "personal" ? { scope: "personal" as const } : {}),
+        ...(typeof b.destinationKey === "string" ? { destinationKey: b.destinationKey } : {}),
+        ...(typeof b.unfurlLinks === "boolean" ? { unfurlLinks: b.unfurlLinks } : {}),
+        ...(typeof b.session === "boolean" ? { session: b.session } : {}),
+        ...(typeof b.persona === "string" || b.persona === null ? { persona: b.persona } : {}),
+      },
+      capability,
+    );
+    if (!result.ok) {
+      const candidates = result.candidates?.map((c) =>
+        result.code === "ambiguous_recipient"
+          ? { principalId: c.id, displayName: c.label }
+          : { channelId: c.id, name: c.label },
+      );
+      return sendJson(res, CRON_ERROR_STATUS[result.code] ?? 400, {
+        error: result.code,
+        message: result.message,
+        ...(candidates ? { candidates } : {}),
+      });
+    }
+    return sendJson(res, 200, {
+      cron: result.cron,
+      ...(result.recipient ? { recipient: result.recipient } : {}),
+      ...(result.channel ? { channel: result.channel } : {}),
+      ...(result.group ? { group: result.group } : {}),
+    });
+  }
+  if (!isCreateCron(body)) return sendJson(res, 400, { error: "bad_request", message: "expected a CreateCronInput" });
+  try {
+    const cron = await app.createCron(body);
+    return sendJson(res, 200, { cron });
+  } catch (e) {
+    return sendJson(res, 400, { error: "cron_create_failed", message: errMessage(e) });
+  }
+}
+
+async function listCrons(ctx: ApiCtx): Promise<void> {
+  const { res, app, url, capability } = ctx;
+  if (capability) {
+    const { crons, visible } = await ctx.deps.control.listCrons(capability, tenantOf(ctx));
+    return sendJson(res, 200, { crons, visible });
+  }
+  const viewer = url.searchParams.get("viewer");
+  if (!viewer) return sendJson(res, 400, { error: "bad_request", message: "viewer required" });
+  const { owned, visible } = await app.listCronsForViewer(viewer);
+  const admits = await app.cronAdministration(tenantOf(ctx), { actorId: viewer }, [...owned, ...visible]);
+  const decorate = (cron: Cron, i: number) => ({
+    ...cron,
+    permission: admits[i] ? "manage" : "read",
+  });
+  return sendJson(res, 200, {
+    crons: owned.map((cron, i) => decorate(cron, i)),
+    visible: visible.map((cron, i) => decorate(cron, owned.length + i)),
+  });
+}
+
+function toggleCron(enabled: boolean): (ctx: ApiCtx) => Promise<void> {
+  return async (ctx) => {
+    const { res, app, capability } = ctx;
+    const id = ctx.params.id!;
+    if (capability) {
+      const r = await ctx.deps.control.setCronEnabled(id, enabled, capability);
+      if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+      return sendJson(res, 200, { ok: true });
+    }
+    const cron = await gateSourceCron(ctx, id);
+    if (!cron) return;
+    if (enabled) return patchCronAsPerson(ctx, cron, { enabled: true, archived: false });
+    await app.setCronEnabled(id, false);
+    return sendJson(res, 200, { ok: true });
+  };
+}
+
+async function retargetCron(ctx: ApiCtx): Promise<void> {
+  const { res, body, capability } = ctx;
+  const id = ctx.params.id!;
+  if (!capability)
+    return sendJson(res, 403, { error: "forbidden", message: "retarget requires an agent capability token" });
+  const dk = isObj(body) ? body.destinationKey : undefined;
+  if (typeof dk !== "string")
+    return sendJson(res, 400, { error: "bad_request", message: "destinationKey (string) required" });
+  const r = await ctx.deps.control.retargetCron(id, dk, capability);
+  if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+  return sendJson(res, 200, { cron: r.cron });
+}
+
+async function noteCron(ctx: ApiCtx): Promise<void> {
+  const { res, body, capability } = ctx;
+  const id = ctx.params.id!;
+  if (!capability)
+    return sendJson(res, 403, { error: "forbidden", message: "note requires an agent capability token" });
+  const note = isObj(body) ? body.note : undefined;
+  if (typeof note !== "string") return sendJson(res, 400, { error: "bad_request", message: "note (string) required" });
+  const r = await ctx.deps.control.noteCron(id, note, capability);
+  if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+  return sendJson(res, 200, { ok: true, applied: r.applied });
+}
+
+async function runCronNow(ctx: ApiCtx): Promise<void> {
+  const { res, deps, capability } = ctx;
+  const id = ctx.params.id!;
+  if (capability) {
+    const r = await ctx.deps.control.runCron(id, capability);
+    if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+    return sendJson(res, 200, { ok: true, fireKey: r.fireKey });
+  }
+  const cron = await gateSourceCron(ctx, id);
+  if (!cron) return;
+  if (!deps.scheduler) return sendJson(res, 404, { error: "not_found", message: "scheduler not wired" });
+  if (cron.archived || !cron.enabled)
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: `cron ${id} is ${cron.archived ? "archived" : "paused"} — enable it before firing it on demand`,
+    });
+  const result = await deps.scheduler.runNow(id);
+  if (!result.started) {
+    const refusal = describeRunNowRefusal(id, result)!;
+    return sendJson(res, CRON_ERROR_STATUS[refusal.error] ?? 400, refusal);
+  }
+  return sendJson(res, 200, { ok: true, fireKey: result.fireKey });
+}
+
+async function cronRuns(ctx: ApiCtx): Promise<void> {
+  const { res, url, capability, app } = ctx;
+  const id = ctx.params.id!;
+  const rawLimit = url.searchParams.get("limit");
+  const limit = rawLimit === null ? undefined : Number(rawLimit);
+  if (capability) {
+    const r = await ctx.deps.control.getCronRuns(id, limit !== undefined ? { limit } : {}, capability);
+    if (!r.ok) return sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+    return sendJson(res, 200, { cron: r.cron, runs: r.runs, total: r.total });
+  }
+  const cron = await gateSourceCron(ctx, id);
+  if (!cron) return;
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) {
+    return sendJson(res, 400, { error: "bad_request", message: "limit must be a positive integer" });
+  }
+  const { runs, total } = await app.listCronFires(id, limit !== undefined ? { limit } : {});
+  return sendJson(res, 200, { cron, runs, total });
+}
+
+const CRON_PATCH_BAD_REQUEST =
+  "expected a cron patch: title (string), task (string), schedule, enabled (boolean), archived (boolean), unfurlLinks (boolean), and/or session (boolean)";
+
+async function cronById(ctx: ApiCtx): Promise<void> {
+  const { res, app, url, pathname, method, body, capability } = ctx;
+  const id = decodeURIComponent(pathname.slice("/v1/crons/".length));
+  if (method === "PATCH" && isObj(body) && body.script !== undefined)
+    return sendJson(res, 400, { error: "bad_request", message: CRON_SCRIPT_TOOL_ONLY });
+  if (capability) {
+    if (method === "GET") {
+      const r = await ctx.deps.control.getCron(id, capability);
+      return r.ok
+        ? sendJson(res, 200, { cron: r.cron })
+        : sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+    }
+    if (method === "DELETE") {
+      const r = await ctx.deps.control.deleteCron(id, capability);
+      return r.ok
+        ? sendJson(res, 200, { ok: true })
+        : sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+    }
+    if (!isCronPatch(body)) return sendJson(res, 400, { error: "bad_request", message: CRON_PATCH_BAD_REQUEST });
+    if (!hasCronPatchFields(body)) {
+      return sendJson(res, 400, { error: "bad_request", message: CRON_PATCH_NOTHING_TO_CHANGE });
+    }
+    const schedule =
+      body.schedule !== undefined ? userScheduleFromBody(body.schedule, defaultTimezoneFor(capability))! : undefined;
+    const task = body.action ?? body.task;
+    const r = await ctx.deps.control.patchCron(
+      id,
+      {
+        ...(body.runtime !== undefined ? { runtime: body.runtime } : {}),
+        ...(body.title !== undefined ? { title: body.title } : {}),
+        ...(task !== undefined ? { action: task } : {}),
+        ...(schedule !== undefined ? { schedule } : {}),
+        ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+        ...(body.archived !== undefined ? { archived: body.archived } : {}),
+        ...(body.unfurlLinks !== undefined ? { unfurlLinks: body.unfurlLinks } : {}),
+        ...(body.session !== undefined ? { session: body.session } : {}),
+      },
+      capability,
+    );
+    return r.ok
+      ? sendJson(res, 200, { cron: r.cron })
+      : sendJson(res, CRON_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+  }
+  if (method === "GET") {
+    const cron = await gateSourceCronRead(ctx, id);
+    if (!cron) return;
+    return sendJson(res, 200, { cron });
+  }
+  const cron = await gateSourceCron(ctx, id);
+  if (!cron) return;
+  if (method === "DELETE") {
+    const editor = url.searchParams.get("principalId")!;
+    await app.deleteCron(id, { actorId: editor });
+    await notifyOwnerOfCronEdit(app, { cron, editorId: editor, changeSummary: ["deleted"] });
+    return sendJson(res, 200, { ok: true });
+  }
+  return patchCronAsPerson(ctx, cron, body);
+}
+
+const PERSON_CRON_PATCH_FIELDS = new Set(["runtime", "title", "task", "schedule", "enabled", "archived"]);
+
+const PERSON_CRON_PATCH_BAD_REQUEST =
+  "expected a cron patch: title (string), task (non-empty string), schedule, enabled (boolean), archived (boolean), and/or runtime";
+
+function isPersonCronPatch(b: unknown): b is {
+  runtime?: Cron["runtime"];
+  title?: string;
+  task?: string;
+  schedule?: unknown;
+  enabled?: boolean;
+  archived?: boolean;
+} {
+  return (
+    isCronPatch(b) &&
+    hasCronPatchFields(b) &&
+    Object.keys(b).every((key) => PERSON_CRON_PATCH_FIELDS.has(key)) &&
+    (b.task === undefined || b.task.trim() !== "")
+  );
+}
+
+async function patchCronAsPerson(ctx: ApiCtx, cron: Cron, body: unknown): Promise<void> {
+  const { res, app, url } = ctx;
+  if (!isPersonCronPatch(body))
+    return sendJson(res, 400, { error: "bad_request", message: PERSON_CRON_PATCH_BAD_REQUEST });
+  const schedule = body.schedule !== undefined ? userScheduleFromBody(body.schedule)! : undefined;
+  const editor = url.searchParams.get("principalId")!;
+  const rewrite = body.task !== undefined ? await cronTaskRewrite(app, cron, editor, true) : {};
+  const patch: CronPatch = {
+    ...rewrite,
+    ...(body.runtime !== undefined ? { runtime: body.runtime } : {}),
+    ...(body.title !== undefined ? { title: body.title } : {}),
+    ...(body.task !== undefined ? { action: body.task } : {}),
+    ...(schedule !== undefined ? { schedule } : {}),
+    ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+    ...(body.archived !== undefined ? { archived: body.archived } : {}),
+  };
+  try {
+    const updated = await app.updateCron(cron.id, patch, { actorId: editor });
+    if (updated)
+      await notifyOwnerOfCronEdit(app, {
+        cron: { ...updated, owner: cron.owner },
+        editorId: editor,
+        changeSummary: [
+          ...(body.runtime !== undefined ? ["runtime"] : []),
+          ...(body.title !== undefined ? ["title"] : []),
+          ...(body.task !== undefined ? ["task"] : []),
+          ...(rewrite.owner ? ["owner"] : []),
+          ...(rewrite.script === null ? ["script"] : []),
+          ...(schedule !== undefined ? ["schedule"] : []),
+          ...(body.enabled !== undefined ? [`enabled=${body.enabled}`] : []),
+          ...(body.archived !== undefined ? [`archived=${body.archived}`] : []),
+        ],
+        ...(schedule !== undefined ? { detail: { schedule } } : {}),
+      });
+    return sendJson(res, 200, { cron: updated ?? null });
+  } catch (e) {
+    return sendJson(res, 400, { error: "cron_update_failed", message: errMessage(e) });
+  }
+}
+
+export const cronRoutes: ReadonlyArray<Route<ApiCtx>> = [
+  { method: "POST", path: "/v1/crons", actor: "body.createdBy", auth: "either", handle: createCron },
+  { method: "GET", path: "/v1/crons", browser: true, actor: "query.viewer", auth: "either", handle: listCrons },
+  { method: "POST", path: "/v1/crons/:id/note", auth: "either", handle: noteCron },
+  ...withActor("query.principalId", [
+    { method: "POST", path: "/v1/crons/:id/disable", browser: true, auth: "either", handle: toggleCron(false) },
+    { method: "POST", path: "/v1/crons/:id/enable", browser: true, auth: "either", handle: toggleCron(true) },
+    { method: "POST", path: "/v1/crons/:id/destination", auth: "either", handle: retargetCron },
+    { method: "POST", path: "/v1/crons/:id/run", browser: true, auth: "either", handle: runCronNow },
+    { method: "GET", path: "/v1/crons/:id/runs", browser: true, auth: "either", handle: cronRuns },
+    {
+      match: (m, p) =>
+        p.startsWith("/v1/crons/") &&
+        !p.slice("/v1/crons/".length).includes("/") &&
+        (m === "GET" || m === "PATCH" || m === "DELETE"),
+      browser: true,
+      auth: "either",
+      handle: cronById,
+    },
+  ]),
+];

@@ -1,0 +1,30 @@
+{
+  "contract": 1,
+  "orgId": "acme",
+  "publicUrl": "https://agent.example.com",
+  "target": "fly",
+  "appPrefix": "qm",
+  "region": "sjc",
+  "flyOrg": "personal",
+  "deployAppPrefix": "qm-d",
+  "sandbox": {
+    "app": "acme-sandboxes",
+  },
+  "services": ["core", "slack", "auth"],
+  "env": {
+    "core": {
+      "SNAPSHOT_STORE": "s3",
+      "TRANSFER_STORE": "s3",
+      "S3_BUCKET": "acme-data",
+      "S3_REGION": "auto",
+    },
+    "slack": {
+      "SLACK_IDENTITY_EMAIL": "1",
+    },
+    "auth": {
+      "AUTH_EMAIL_TRANSPORT": "resend",
+      "AUTH_ALLOWED_EMAIL_DOMAIN": "example.com",
+      "AUTH_BRAND_NAME": "Acme",
+    },
+  },
+}

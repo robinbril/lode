@@ -1,0 +1,285 @@
+package olap
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/hatchet-dev/hatchet/internal/enumerables"
+	"github.com/hatchet-dev/hatchet/internal/services/shared/recoveryutils"
+	"github.com/hatchet-dev/hatchet/pkg/enums"
+	"github.com/hatchet-dev/hatchet/pkg/integrations/metrics/prometheus"
+	"github.com/hatchet-dev/hatchet/pkg/logger"
+)
+
+type taskPrometheusUpdate struct {
+	tenantId       uuid.UUID
+	taskId         int64
+	taskInsertedAt pgtype.Timestamptz
+	readableStatus enums.V1ReadableStatusOlap
+	workflowId     uuid.UUID
+	isDAGTask      bool
+}
+
+type dagPrometheusUpdate struct {
+	tenantId       uuid.UUID
+	dagExternalId  uuid.UUID
+	dagInsertedAt  pgtype.Timestamptz
+	readableStatus enums.V1ReadableStatusOlap
+	workflowId     uuid.UUID
+}
+
+func (o *OLAPControllerImpl) runTaskPrometheusUpdateWorker() {
+	defer func() {
+		if r := recover(); r != nil {
+			_ = recoveryutils.RecoverWithAlert(o.l, o.a, r)
+		}
+	}()
+
+	const batchSize = 1000
+	batch := make([]taskPrometheusUpdate, 0, batchSize)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	processBatch := func(updates []taskPrometheusUpdate) {
+		if len(updates) == 0 {
+			return
+		}
+
+		tenantToUpdates := enumerables.GroupBy(updates, func(update taskPrometheusUpdate) uuid.UUID {
+			return update.tenantId
+		})
+
+		eg := errgroup.Group{}
+
+		for tenantId, tenantUpdates := range tenantToUpdates {
+			eg.Go(func() error {
+				workflowIds := make([]uuid.UUID, 0, len(tenantUpdates))
+				for _, update := range tenantUpdates {
+					workflowIds = append(workflowIds, update.workflowId)
+				}
+
+				workflowNames, err := o.repo.Workflows().ListWorkflowNamesByIds(o.taskPrometheusWorkerCtx, tenantId, workflowIds)
+				if err != nil {
+					return err
+				}
+
+				taskIds := make([]int64, 0, len(tenantUpdates))
+				taskInsertedAts := make([]pgtype.Timestamptz, 0, len(tenantUpdates))
+				readableStatuses := make([]enums.V1ReadableStatusOlap, 0, len(tenantUpdates))
+
+				for _, update := range tenantUpdates {
+					taskIds = append(taskIds, update.taskId)
+					taskInsertedAts = append(taskInsertedAts, update.taskInsertedAt)
+					readableStatuses = append(readableStatuses, update.readableStatus)
+				}
+
+				taskDurations, err := o.repo.OLAP().GetTaskDurationsByTaskIds(o.taskPrometheusWorkerCtx, tenantId, taskIds, taskInsertedAts, readableStatuses)
+				if err != nil {
+					return err
+				}
+
+				tenantMetricsEnabled := o.promGate.Enabled(o.taskPrometheusWorkerCtx, tenantId)
+
+				// TODO: remove once the task duration undercount is diagnosed
+				var standalone, observed, noWorkflowName, noRow, nullStarted, nullFinished int
+
+				for _, update := range tenantUpdates {
+					if update.isDAGTask {
+						continue
+					}
+
+					if !tenantMetricsEnabled {
+						continue
+					}
+
+					standalone++
+
+					workflowName := workflowNames[update.workflowId]
+					if workflowName == "" {
+						noWorkflowName++
+						continue
+					}
+
+					taskDuration := taskDurations[update.taskId]
+					if taskDuration == nil {
+						noRow++
+						continue
+					}
+
+					if !taskDuration.StartedAt.Valid || !taskDuration.FinishedAt.Valid {
+						if !taskDuration.StartedAt.Valid {
+							nullStarted++
+						}
+						if !taskDuration.FinishedAt.Valid {
+							nullFinished++
+						}
+						continue
+					}
+
+					observed++
+
+					duration := int(taskDuration.FinishedAt.Time.Sub(taskDuration.StartedAt.Time).Milliseconds())
+					prometheus.TenantWorkflowDurationBuckets.WithLabelValues(tenantId.String(), workflowName, string(update.readableStatus)).Observe(float64(duration))
+				}
+
+				if observed < standalone {
+					o.l.Warn().
+						Str("tenant_id", tenantId.String()).
+						Int("updates", len(tenantUpdates)).
+						Int("standalone_updates", standalone).
+						Int("duration_rows", len(taskDurations)).
+						Int("observed", observed).
+						Int("no_workflow_name", noWorkflowName).
+						Int("no_row", noRow).
+						Int("null_started", nullStarted).
+						Int("null_finished", nullFinished).
+						Msg("task prometheus batch skipped observations")
+				}
+
+				return nil
+			})
+		}
+
+		err := eg.Wait()
+
+		if err != nil {
+			logger.ShutdownAware(o.taskPrometheusWorkerCtx, o.l, err, zerolog.ErrorLevel).Err(err).Msg("failed to process task prometheus updates")
+		}
+	}
+
+	for {
+		select {
+		case <-o.taskPrometheusWorkerCtx.Done():
+			// Process remaining batch before exiting
+			processBatch(batch)
+			return
+		case update, ok := <-o.taskPrometheusUpdateCh:
+			if !ok {
+				// Channel closed, process remaining batch
+				processBatch(batch)
+				return
+			}
+			batch = append(batch, update)
+			if len(batch) >= batchSize {
+				processBatch(batch)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			// Process batch on timer
+			processBatch(batch)
+			batch = batch[:0]
+		}
+	}
+}
+
+func (o *OLAPControllerImpl) runDAGPrometheusUpdateWorker() {
+	defer func() {
+		if r := recover(); r != nil {
+			_ = recoveryutils.RecoverWithAlert(o.l, o.a, r)
+		}
+	}()
+
+	const batchSize = 1000
+	batch := make([]dagPrometheusUpdate, 0, batchSize)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	processBatch := func(updates []dagPrometheusUpdate) {
+		if len(updates) == 0 {
+			return
+		}
+
+		tenantToUpdates := enumerables.GroupBy(updates, func(update dagPrometheusUpdate) uuid.UUID {
+			return update.tenantId
+		})
+
+		eg := errgroup.Group{}
+
+		for tenantId, tenantUpdates := range tenantToUpdates {
+			eg.Go(func() error {
+				workflowIds := make([]uuid.UUID, 0, len(tenantUpdates))
+				for _, update := range tenantUpdates {
+					workflowIds = append(workflowIds, update.workflowId)
+				}
+
+				workflowNames, err := o.repo.Workflows().ListWorkflowNamesByIds(o.dagPrometheusWorkerCtx, tenantId, workflowIds)
+				if err != nil {
+					return err
+				}
+
+				dagExternalIds := make([]uuid.UUID, 0, len(tenantUpdates))
+				var minInsertedAt pgtype.Timestamptz
+
+				for _, update := range tenantUpdates {
+					dagExternalIds = append(dagExternalIds, update.dagExternalId)
+
+					if !minInsertedAt.Valid || update.dagInsertedAt.Time.Before(minInsertedAt.Time) {
+						minInsertedAt = update.dagInsertedAt
+					}
+				}
+
+				dagDurations, err := o.repo.OLAP().GetDAGDurations(o.dagPrometheusWorkerCtx, tenantId, dagExternalIds, minInsertedAt)
+				if err != nil {
+					return err
+				}
+
+				tenantMetricsEnabled := o.promGate.Enabled(o.dagPrometheusWorkerCtx, tenantId)
+
+				for _, update := range tenantUpdates {
+					if !tenantMetricsEnabled {
+						continue
+					}
+
+					workflowName := workflowNames[update.workflowId]
+					if workflowName == "" {
+						continue
+					}
+
+					dagDuration := dagDurations[update.dagExternalId.String()]
+					if dagDuration == nil || !dagDuration.StartedAt.Valid || !dagDuration.FinishedAt.Valid {
+						continue
+					}
+
+					duration := int(dagDuration.FinishedAt.Time.Sub(dagDuration.StartedAt.Time).Milliseconds())
+					prometheus.TenantWorkflowDurationBuckets.WithLabelValues(tenantId.String(), workflowName, string(update.readableStatus)).Observe(float64(duration))
+				}
+
+				return nil
+			})
+		}
+
+		err := eg.Wait()
+
+		if err != nil {
+			logger.ShutdownAware(o.dagPrometheusWorkerCtx, o.l, err, zerolog.ErrorLevel).Err(err).Msg("failed to process dag prometheus updates")
+		}
+	}
+
+	for {
+		select {
+		case <-o.dagPrometheusWorkerCtx.Done():
+			// Process remaining batch before exiting
+			processBatch(batch)
+			return
+		case update, ok := <-o.dagPrometheusUpdateCh:
+			if !ok {
+				// Channel closed, process remaining batch
+				processBatch(batch)
+				return
+			}
+			batch = append(batch, update)
+			if len(batch) >= batchSize {
+				processBatch(batch)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			// Process batch on timer
+			processBatch(batch)
+			batch = batch[:0]
+		}
+	}
+}

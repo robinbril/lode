@@ -1,0 +1,719 @@
+from datetime import datetime
+from enum import Enum
+from typing import Annotated, Any, Literal, Union
+
+from pydantic import BaseModel, Field, JsonValue
+
+from onyx.chat.mention_models import RecordedMention
+from onyx.context.search.models import SearchDoc
+from onyx.server.features.build.sandbox.models import ExecCompletionName
+from onyx.server.query_and_chat.placement import Placement
+from onyx.tools.models import CustomToolErrorInfo, GeneratedImage
+from onyx.tools.tool_implementations.code_mode.models import CodeModeStatus
+from onyx.tools.tool_implementations.question.models import (
+    ToolQuestion,
+    ToolQuestionAnswer,
+)
+from onyx.tools.tool_implementations.sandbox.models import (
+    ApplyPatchFileChange,
+    FileToolName,
+    PublishedFileView,
+    PublishFileArgument,
+)
+
+
+class StreamingError(BaseModel):
+    error: str
+    stack_trace: str | None = None
+    error_code: str | None = (
+        None  # e.g., "RATE_LIMIT", "AUTH_ERROR", "TOOL_CALL_FAILED"
+    )
+    is_retryable: bool = True  # Hint to frontend if retry might help
+    details: dict | None = None  # Additional context (tool name, model name, etc.)
+
+
+class StreamCursor(BaseModel):
+    """A complete cache prefix that the client can retain with its rendered content."""
+
+    stream_id: int
+    next_cursor: int
+    replay_complete: bool
+
+
+class StreamingType(Enum):
+    """Enum defining all streaming packet types. This is the single source of truth for type strings."""
+
+    SECTION_END = "section_end"
+    STOP = "stop"
+    ERROR = "error"
+    CHAT_HEARTBEAT = "chat_heartbeat"
+
+    MESSAGE_START = "message_start"
+    MESSAGE_DELTA = "message_delta"
+    USER_MESSAGE = "user_message"
+    SEARCH_TOOL_START = "search_tool_start"
+    SEARCH_TOOL_QUERIES_DELTA = "search_tool_queries_delta"
+    SEARCH_TOOL_FILTER_DELTA = "search_tool_filter_delta"
+    SEARCH_TOOL_DOCUMENTS_DELTA = "search_tool_documents_delta"
+    OPEN_URL_START = "open_url_start"
+    OPEN_URL_URLS = "open_url_urls"
+    OPEN_URL_DOCUMENTS = "open_url_documents"
+    IMAGE_GENERATION_START = "image_generation_start"
+    IMAGE_GENERATION_HEARTBEAT = "image_generation_heartbeat"
+    IMAGE_GENERATION_FINAL = "image_generation_final"
+    PYTHON_TOOL_START = "python_tool_start"
+    PYTHON_TOOL_DELTA = "python_tool_delta"
+    CUSTOM_TOOL_START = "custom_tool_start"
+    CUSTOM_TOOL_ARGS = "custom_tool_args"
+    CUSTOM_TOOL_DELTA = "custom_tool_delta"
+    TOOL_APPROVAL_REQUEST = "tool_approval_request"
+    TOOL_APPROVAL_RESOLVED = "tool_approval_resolved"
+    TOOL_QUESTION_REQUEST = "tool_question_request"
+    TOOL_QUESTION_RESOLVED = "tool_question_resolved"
+    REPLAY_END = "replay_end"
+    FILE_READER_START = "file_reader_start"
+    FILE_READER_RESULT = "file_reader_result"
+    REASONING_START = "reasoning_start"
+    REASONING_DELTA = "reasoning_delta"
+    REASONING_DONE = "reasoning_done"
+    CITATION_INFO = "citation_info"
+    TOOL_CALL_DEBUG = "tool_call_debug"
+    TOOL_CALL_ARGUMENT_DELTA = "tool_call_argument_delta"
+
+    MEMORY_TOOL_START = "memory_tool_start"
+    MEMORY_TOOL_DELTA = "memory_tool_delta"
+    MEMORY_TOOL_NO_ACCESS = "memory_tool_no_access"
+
+    POSTGRES_TOOL_START = "postgres_tool_start"
+    POSTGRES_TOOL_DOCUMENTS = "postgres_tool_documents"
+
+    DEEP_RESEARCH_PLAN_START = "deep_research_plan_start"
+    DEEP_RESEARCH_PLAN_DELTA = "deep_research_plan_delta"
+    RESEARCH_AGENT_START = "research_agent_start"
+    INTERMEDIATE_REPORT_START = "intermediate_report_start"
+    INTERMEDIATE_REPORT_DELTA = "intermediate_report_delta"
+    INTERMEDIATE_REPORT_CITED_DOCS = "intermediate_report_cited_docs"
+
+    CODE_MODE_START = "code_mode_start"
+    CODE_MODE_DELTA = "code_mode_delta"
+
+    EXEC_COMMAND_START = "exec_command_start"
+    WRITE_STDIN_START = "write_stdin_start"
+    EXEC_OUTPUT_DELTA = "exec_output_delta"
+    EXEC_END = "exec_end"
+    FILE_TOOL_PROGRESS = "file_tool_progress"
+    APPLY_PATCH_START = "apply_patch_start"
+    APPLY_PATCH_END = "apply_patch_end"
+    PUBLISH_FILES_START = "publish_files_start"
+    PUBLISH_FILES_END = "publish_files_end"
+
+
+class BaseObj(BaseModel):
+    type: str = ""
+
+
+################################################
+# Control Packets
+################################################
+# This one isn't strictly necessary, remove in the future
+class SectionEnd(BaseObj):
+    type: Literal["section_end"] = StreamingType.SECTION_END.value
+
+
+# The stop reason of a response whose run waits for the user: approval
+# decisions or answers to its questions. It continues in a new stream after them.
+AWAITING_USER = "awaiting_user"
+
+
+class OverallStop(BaseObj):
+    type: Literal["stop"] = StreamingType.STOP.value
+    stop_reason: str | None = None
+
+
+# Ends the replayed prefix of a stream that continues a suspended response:
+# the packets before it repeat the saved output, the packets after it are live.
+class ReplayEnd(BaseObj):
+    type: Literal["replay_end"] = StreamingType.REPLAY_END.value
+
+
+class PacketException(BaseObj):
+    type: Literal["error"] = StreamingType.ERROR.value
+
+    exception: Exception = Field(exclude=True)
+    model_config = {"arbitrary_types_allowed": True}
+
+
+# Payload-less keepalive so idle proxies don't kill an otherwise-silent stream
+class ChatHeartbeat(BaseObj):
+    type: Literal["chat_heartbeat"] = StreamingType.CHAT_HEARTBEAT.value
+
+
+class UserMessagePacket(BaseObj):
+    type: Literal["user_message"] = StreamingType.USER_MESSAGE.value
+    id: str
+    message: str
+    # What the message picked, as its acceptance resolved it.
+    mentions: list[RecordedMention]
+
+
+################################################
+# Reasoning Packets
+################################################
+# Tells the frontend to display the reasoning block
+class ReasoningStart(BaseObj):
+    type: Literal["reasoning_start"] = StreamingType.REASONING_START.value
+
+
+# The stream of tokens for the reasoning
+class ReasoningDelta(BaseObj):
+    type: Literal["reasoning_delta"] = StreamingType.REASONING_DELTA.value
+
+    reasoning: str
+
+
+class ReasoningDone(BaseObj):
+    type: Literal["reasoning_done"] = StreamingType.REASONING_DONE.value
+
+
+################################################
+# Final Agent Response Packets
+################################################
+# Start of the final answer
+class AgentResponseStart(BaseObj):
+    type: Literal["message_start"] = StreamingType.MESSAGE_START.value
+
+    final_documents: list[SearchDoc] | None = None
+    pre_answer_processing_seconds: float | None = None
+
+
+# The stream of tokens for the final response
+# There is no end packet for this as the stream is over and a final OverallStop packet is emitted
+class AgentResponseDelta(BaseObj):
+    type: Literal["message_delta"] = StreamingType.MESSAGE_DELTA.value
+
+    content: str
+
+
+# Citation info for the sidebar and inline citations
+class CitationInfo(BaseObj):
+    type: Literal["citation_info"] = StreamingType.CITATION_INFO.value
+
+    # The numerical number of the citation as provided by the LLM
+    citation_number: int
+    # The document id of the SearchDoc (same as the field stored in the DB)
+    # This is the actual document id from the connector, not the int id
+    document_id: str
+
+
+class ToolCallDebug(BaseObj):
+    type: Literal["tool_call_debug"] = StreamingType.TOOL_CALL_DEBUG.value
+
+    tool_call_id: str
+    tool_name: str
+    tool_args: dict[str, Any]
+
+
+################################################
+# Tool Packets
+################################################
+# Search tool is called and the UI block needs to start
+class SearchToolStart(BaseObj):
+    type: Literal["search_tool_start"] = StreamingType.SEARCH_TOOL_START.value
+
+    is_internet_search: bool = False
+
+
+# Queries coming through as the LLM determines what to search
+# Mostly for query expansions and advanced search strategies
+class SearchToolQueriesDelta(BaseObj):
+    type: Literal["search_tool_queries_delta"] = (
+        StreamingType.SEARCH_TOOL_QUERIES_DELTA.value
+    )
+
+    queries: list[str]
+
+
+# Filters applied to this internal search. Empty `sources` == scope not narrowed
+# (searched everything); either time bound may be absent (open-ended).
+class SearchToolFilterDelta(BaseObj):
+    type: Literal["search_tool_filter_delta"] = (
+        StreamingType.SEARCH_TOOL_FILTER_DELTA.value
+    )
+
+    sources: list[str] = []
+    time_filter_start: datetime | None = None
+    time_filter_end: datetime | None = None
+
+
+# Documents coming through as the system knows what to add to the context
+class SearchToolDocumentsDelta(BaseObj):
+    type: Literal["search_tool_documents_delta"] = (
+        StreamingType.SEARCH_TOOL_DOCUMENTS_DELTA.value
+    )
+
+    # This cannot be the SavedSearchDoc as this is yielded by the SearchTool directly
+    # which does not save documents to the DB.
+    documents: list[SearchDoc]
+
+
+# OpenURL tool packets - 3-stage sequence
+class OpenUrlStart(BaseObj):
+    """Signal that OpenURL tool has started."""
+
+    type: Literal["open_url_start"] = StreamingType.OPEN_URL_START.value
+
+
+class OpenUrlUrls(BaseObj):
+    """URLs to be fetched (sent before crawling begins)."""
+
+    type: Literal["open_url_urls"] = StreamingType.OPEN_URL_URLS.value
+
+    urls: list[str]
+
+
+class OpenUrlDocuments(BaseObj):
+    """Final documents after crawling completes."""
+
+    type: Literal["open_url_documents"] = StreamingType.OPEN_URL_DOCUMENTS.value
+
+    documents: list[SearchDoc]
+
+
+# Image generation starting, needs to allocate a placeholder block for it on the UI
+class ImageGenerationToolStart(BaseObj):
+    type: Literal["image_generation_start"] = StreamingType.IMAGE_GENERATION_START.value
+
+
+# Since image generation can take a while
+# we send a heartbeat to the frontend to keep the UI/connection alive
+class ImageGenerationToolHeartbeat(BaseObj):
+    type: Literal["image_generation_heartbeat"] = (
+        StreamingType.IMAGE_GENERATION_HEARTBEAT.value
+    )
+
+
+# The final generated images all at once at the end of image generation
+class ImageGenerationFinal(BaseObj):
+    type: Literal["image_generation_final"] = StreamingType.IMAGE_GENERATION_FINAL.value
+
+    images: list[GeneratedImage]
+
+
+class PythonToolStart(BaseObj):
+    type: Literal["python_tool_start"] = StreamingType.PYTHON_TOOL_START.value
+    code: str
+
+
+class PythonToolDelta(BaseObj):
+    type: Literal["python_tool_delta"] = StreamingType.PYTHON_TOOL_DELTA.value
+
+    stdout: str = ""
+    stderr: str = ""
+    file_ids: list[str] = []
+
+
+# Custom tool being called, first allocate a placeholder block for it on the UI
+class CustomToolStart(BaseObj):
+    type: Literal["custom_tool_start"] = StreamingType.CUSTOM_TOOL_START.value
+
+    # The name the model calls; custom and MCP tools use a qualified name.
+    tool_name: str
+    # The name users see.
+    display_name: str
+    tool_id: int | None = None
+
+
+class CustomToolArgs(BaseObj):
+    type: Literal["custom_tool_args"] = StreamingType.CUSTOM_TOOL_ARGS.value
+
+    tool_name: str
+    tool_args: dict[str, Any]
+
+
+# The allowed streamed packets for a custom tool
+class CustomToolDelta(BaseObj):
+    type: Literal["custom_tool_delta"] = StreamingType.CUSTOM_TOOL_DELTA.value
+
+    tool_name: str
+    tool_id: int | None = None
+    response_type: str
+    # For non-file responses
+    data: dict | list | str | int | float | bool | None = None
+    # For file-based responses like image/csv
+    file_ids: list[str] | None = None
+    error: CustomToolErrorInfo | None = None
+
+
+class ToolCallArgumentDelta(BaseObj):
+    type: Literal["tool_call_argument_delta"] = (
+        StreamingType.TOOL_CALL_ARGUMENT_DELTA.value
+    )
+
+    tool_type: str
+    argument_deltas: dict[str, Any]
+
+
+class FileToolProgress(BaseObj):
+    """The files a file tool call's arguments name while the model streams
+    them; the call's start packet follows. A call sends one only when the
+    files change. A `write` or `edit` card names its file; an `apply_patch`
+    card shows the count and list of files.
+    """
+
+    type: Literal["file_tool_progress"] = StreamingType.FILE_TOOL_PROGRESS.value
+    tool_name: FileToolName
+    # The files the arguments name so far, in order.
+    paths: list[str]
+
+
+################################################
+# File Reader Packets
+################################################
+class FileReaderStart(BaseObj):
+    type: Literal["file_reader_start"] = StreamingType.FILE_READER_START.value
+
+
+class FileReaderResult(BaseObj):
+    type: Literal["file_reader_result"] = StreamingType.FILE_READER_RESULT.value
+
+    file_name: str
+    file_id: str
+    start_char: int
+    end_char: int
+    total_chars: int
+    # Short previews of the retrieved text for the collapsed/expanded UI
+    preview_start: str = ""
+    preview_end: str = ""
+
+
+# Memory Tool Packets
+################################################
+class MemoryToolStart(BaseObj):
+    type: Literal["memory_tool_start"] = StreamingType.MEMORY_TOOL_START.value
+
+
+class MemoryToolDelta(BaseObj):
+    type: Literal["memory_tool_delta"] = StreamingType.MEMORY_TOOL_DELTA.value
+
+    memory_text: str
+    operation: Literal["add", "update"]
+    memory_id: int | None = None
+    index: int | None = None
+
+
+class MemoryToolNoAccess(BaseObj):
+    type: Literal["memory_tool_no_access"] = StreamingType.MEMORY_TOOL_NO_ACCESS.value
+
+
+################################################
+# Postgres Tool Packets
+################################################
+class PostgresToolStart(BaseObj):
+    type: Literal["postgres_tool_start"] = StreamingType.POSTGRES_TOOL_START.value
+
+    # The call's arguments, for the step's query summary.
+    query: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class PostgresToolDocuments(BaseObj):
+    type: Literal["postgres_tool_documents"] = (
+        StreamingType.POSTGRES_TOOL_DOCUMENTS.value
+    )
+    documents: list[SearchDoc]
+
+
+################################################
+# Deep Research Packets
+################################################
+class DeepResearchPlanStart(BaseObj):
+    type: Literal["deep_research_plan_start"] = (
+        StreamingType.DEEP_RESEARCH_PLAN_START.value
+    )
+
+
+class DeepResearchPlanDelta(BaseObj):
+    type: Literal["deep_research_plan_delta"] = (
+        StreamingType.DEEP_RESEARCH_PLAN_DELTA.value
+    )
+
+    content: str
+
+
+class ResearchAgentStart(BaseObj):
+    type: Literal["research_agent_start"] = StreamingType.RESEARCH_AGENT_START.value
+    research_task: str
+
+
+class IntermediateReportStart(BaseObj):
+    type: Literal["intermediate_report_start"] = (
+        StreamingType.INTERMEDIATE_REPORT_START.value
+    )
+
+
+class IntermediateReportDelta(BaseObj):
+    type: Literal["intermediate_report_delta"] = (
+        StreamingType.INTERMEDIATE_REPORT_DELTA.value
+    )
+    content: str
+
+
+class IntermediateReportCitedDocs(BaseObj):
+    type: Literal["intermediate_report_cited_docs"] = (
+        StreamingType.INTERMEDIATE_REPORT_CITED_DOCS.value
+    )
+    cited_docs: list[SearchDoc] | None = None
+
+
+################################################
+################################################
+
+
+################################################
+################################################
+
+
+################################################
+# Code Mode Packets
+################################################
+# Nested tool calls use their own packets at sub_turn_index = call index.
+class CodeModeStart(BaseObj):
+    """Starts one observation of a cell: `execute_code` or `wait_code`."""
+
+    type: Literal["code_mode_start"] = StreamingType.CODE_MODE_START.value
+    # Empty for wait_code.
+    code: str
+    # From the call arguments: None for execute_code, whose cell gets its id when it runs.
+    cell_id: int | None = None
+    # 0 starts a cell (execute_code); 1 continues one (wait_code). The final delta
+    # carries the exact observation number.
+    observation: int = 0
+
+
+class CodeModeDelta(BaseObj):
+    type: Literal["code_mode_delta"] = StreamingType.CODE_MODE_DELTA.value
+    # Appended to the stdout shown so far, or replaces it when `replace_stdout` is set.
+    stdout: str = ""
+    # Set on a final delta whose saved stdout differs from the streamed stdout.
+    replace_stdout: bool = False
+    result: str | None = None
+    error: str | None = None
+    # Set only on the final delta.
+    status: CodeModeStatus | None = None
+    duration_seconds: float | None = None
+    tool_call_count: int | None = None
+    # Keys the program saved with store(); set only on the final delta.
+    stored_keys: list[str] | None = None
+    # The cell and the observation number; set only on the final delta.
+    cell_id: int | None = None
+    observation: int | None = None
+    # Set on the final delta of a cell's closing record: the cell stopped, or was
+    # found ended, when its response ended.
+    response_ended: bool = False
+
+
+################################################
+# Sandbox Tool Packets
+################################################
+class ExecCommandStart(BaseObj):
+    type: Literal["exec_command_start"] = StreamingType.EXEC_COMMAND_START.value
+    cmd: str
+    workdir: str | None = None
+
+
+class WriteStdinStart(BaseObj):
+    type: Literal["write_stdin_start"] = StreamingType.WRITE_STDIN_START.value
+    session_id: str
+    chars: str
+
+
+# Live output of exec_command and write_stdin (stdout and stderr in arrival
+# order): a preview that exec_end's output replaces.
+class ExecOutputDelta(BaseObj):
+    type: Literal["exec_output_delta"] = StreamingType.EXEC_OUTPUT_DELTA.value
+    text: str
+
+
+class ExecEnd(BaseObj):
+    type: Literal["exec_end"] = StreamingType.EXEC_END.value
+    # The output that the model got (cut to its character budget, head and
+    # tail), or, when it went to the sandbox VM, its head and tail with a
+    # plain note. None only with an error.
+    output: str | None = None
+    exit_code: int | None = None
+    # None while the command runs, or when it ended in a way the sandbox
+    # did not report.
+    completion: ExecCompletionName | None = None
+    # Set while the command still runs.
+    session_id: str | None = None
+    wall_time_seconds: float | None = None
+    truncated: bool = False
+    # Set when the call failed: there is no process result.
+    error: str | None = None
+
+
+class ApplyPatchStart(BaseObj):
+    type: Literal["apply_patch_start"] = StreamingType.APPLY_PATCH_START.value
+    patch: str
+    # The file tool that made the change; it names the card.
+    tool_name: FileToolName
+
+
+class ApplyPatchEnd(BaseObj):
+    type: Literal["apply_patch_end"] = StreamingType.APPLY_PATCH_END.value
+    files: list[ApplyPatchFileChange] = []
+    # Set when the patch failed; no file changed then, unless a write failed.
+    error: str | None = None
+
+
+# The files that a publish_files call asks for, as the model wrote them.
+class PublishFilesStart(BaseObj):
+    type: Literal["publish_files_start"] = StreamingType.PUBLISH_FILES_START.value
+    # Empty when the arguments are not valid, for example cut off.
+    files: list[PublishFileArgument] = []
+    description: str | None = None
+
+
+class PublishFilesEnd(BaseObj):
+    type: Literal["publish_files_end"] = StreamingType.PUBLISH_FILES_END.value
+    # In the order of the start's files; each downloads from /chat/file/{file_id}.
+    files: list[PublishedFileView] = []
+    # Set when the call failed; it published no file then.
+    error: str | None = None
+
+
+# A tool call waits for the user's decision; placed with the call's tool packets.
+class ToolApprovalRequest(BaseObj):
+    type: Literal["tool_approval_request"] = StreamingType.TOOL_APPROVAL_REQUEST.value
+
+    approval_id: str
+    tool_call_id: str
+    tool_name: str
+    display_name: str
+    arguments: dict[str, JsonValue]
+    # The background agent that asks; its request shows in the reply's call
+    # that started the agent and waits whether or not the reply ended. None for
+    # the reply's own runs.
+    agent_name: str | None = None
+
+
+# How a tool approval request ended: the user's decision, an approval of the
+# action for the rest of the chat session (approved_for_chat: this request's or
+# an earlier request's), an approval that the action policy blocked or a
+# request deleted with its tool's server (disabled), or the call stopped
+# waiting because its run or program stopped.
+ToolApprovalOutcome = Literal[
+    "approved", "approved_for_chat", "rejected", "disabled", "cancelled"
+]
+
+
+class ToolApprovalResolved(BaseObj):
+    type: Literal["tool_approval_resolved"] = StreamingType.TOOL_APPROVAL_RESOLVED.value
+
+    approval_id: str
+    outcome: ToolApprovalOutcome
+
+
+# A question call waits for the user's answers; placed at the call.
+class ToolQuestionRequest(BaseObj):
+    type: Literal["tool_question_request"] = StreamingType.TOOL_QUESTION_REQUEST.value
+
+    question_request_id: str
+    tool_call_id: str
+    questions: list[ToolQuestion]
+
+
+# How a question call ended: answered on its card (`answers`) or by a message
+# that the user typed in the chat (`message`), or cancelled because its run
+# stopped first.
+class ToolQuestionResolved(BaseObj):
+    type: Literal["tool_question_resolved"] = StreamingType.TOOL_QUESTION_RESOLVED.value
+
+    question_request_id: str
+    outcome: Literal["answered", "cancelled"]
+    answered_via: Literal["card", "message"] | None = None
+    answers: list[ToolQuestionAnswer] | None = None
+    message: str | None = None
+
+
+################################################
+# Packet Object
+################################################
+# Discriminated union of all possible packet object types
+PacketObj = Union[
+    UserMessagePacket,
+    # Control Packets
+    OverallStop,
+    SectionEnd,
+    PacketException,
+    ChatHeartbeat,
+    # Agent Response Packets
+    AgentResponseStart,
+    AgentResponseDelta,
+    # Tool Packets
+    SearchToolStart,
+    SearchToolQueriesDelta,
+    SearchToolFilterDelta,
+    SearchToolDocumentsDelta,
+    ImageGenerationToolStart,
+    ImageGenerationToolHeartbeat,
+    ImageGenerationFinal,
+    OpenUrlStart,
+    OpenUrlUrls,
+    OpenUrlDocuments,
+    PythonToolStart,
+    PythonToolDelta,
+    CustomToolStart,
+    CustomToolArgs,
+    CustomToolDelta,
+    ToolApprovalRequest,
+    ToolApprovalResolved,
+    ToolQuestionRequest,
+    ToolQuestionResolved,
+    ReplayEnd,
+    FileReaderStart,
+    FileReaderResult,
+    MemoryToolStart,
+    MemoryToolDelta,
+    MemoryToolNoAccess,
+    PostgresToolStart,
+    PostgresToolDocuments,
+    # Reasoning Packets
+    ReasoningStart,
+    ReasoningDelta,
+    ReasoningDone,
+    # Citation Packets
+    CitationInfo,
+    ToolCallDebug,
+    ToolCallArgumentDelta,
+    # Deep Research Packets
+    DeepResearchPlanStart,
+    DeepResearchPlanDelta,
+    ResearchAgentStart,
+    IntermediateReportStart,
+    IntermediateReportDelta,
+    IntermediateReportCitedDocs,
+    # Code Mode Packets
+    CodeModeStart,
+    CodeModeDelta,
+    # Sandbox Tool Packets
+    ExecCommandStart,
+    WriteStdinStart,
+    ExecOutputDelta,
+    ExecEnd,
+    FileToolProgress,
+    ApplyPatchStart,
+    ApplyPatchEnd,
+    PublishFilesStart,
+    PublishFilesEnd,
+]
+
+
+class Packet(BaseModel):
+    placement: Placement
+
+    obj: Annotated[PacketObj, Field(discriminator="type")]
+
+
+def heartbeat_packet() -> Packet:
+    """Keepalive for silent stretches; carries no run state."""
+    return Packet(placement=Placement(turn_index=0), obj=ChatHeartbeat())

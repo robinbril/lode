@@ -1,0 +1,841 @@
+import type { CapabilityClaims } from "../auth/capability-token.ts";
+import { livePersonCapability, personAtKeyboard } from "./artifact-share.ts";
+import { matchesSearchTerms, searchTerms } from "../sessions/entry-search.ts";
+
+interface AgentApiRoute {
+  method: string;
+  path: string;
+  summary: string;
+}
+
+interface AgentApiView {
+  claims: CapabilityClaims;
+  isAdmin: boolean;
+  swarmsEnabled: boolean;
+  personasEnabled: boolean;
+}
+
+interface AgentApiFamily {
+  when?: (view: AgentApiView) => boolean;
+  guidance?: string;
+  routes: AgentApiRoute[];
+}
+
+const CONVERSATION_UPDATE =
+  "update one of the asking person's conversations — body {archived?, pinned?, title?, color?, unread?}; archive/unarchive, pin/unpin, rename (null title clears), set the sidebar color (#rrggbb; null clears), or mark read/unread. These are per-person.";
+
+const FAMILIES: AgentApiFamily[] = [
+  {
+    guidance:
+      "Use the composio skill for backend app access. Never load a Composio project key or call its SDK directly. Execution binds accounts to your identity and sharing permissions.",
+    routes: [
+      { method: "GET", path: "/v1/composio/toolkits", summary: "discover available apps; cursor pagination" },
+      { method: "GET", path: "/v1/composio/connections", summary: "list your active connections; cursor pagination" },
+      {
+        method: "GET",
+        path: "/v1/composio/tools?toolkit=&query=",
+        summary: "discover tool schemas and concrete versions; cursor pagination",
+      },
+      {
+        method: "POST",
+        path: "/v1/composio/authorize",
+        summary: "{toolkit} creates a personal consent link on a human-started turn",
+      },
+      {
+        method: "POST",
+        path: "/v1/composio/execute",
+        summary: "{tool,accountId,version,arguments} executes a discovered tool using your own active connection",
+      },
+      {
+        method: "POST",
+        path: "/v1/composio/proxy",
+        summary:
+          "{url,method?,query?,headers?,body?|bodyBase64?,accountId?} sends one raw request to a connected app's own API (Google, Dropbox, Linear, Zoom) through your own connection; replies with the provider's status and body. Used by native app skills when no direct token is present",
+      },
+      {
+        method: "POST",
+        path: "/v1/composio/disconnect",
+        summary:
+          "{accountId} permanently removes one of your own connections on a human-started turn; use when asked to remove or reset one, or to retire the old account after a reconnect",
+      },
+      {
+        method: "GET",
+        path: "/v1/composio/identity",
+        summary:
+          "read your canonical Composio userId and verified linked userIds used by the web app picker; this selects accounts and does not grant access to them",
+      },
+      {
+        method: "POST",
+        path: "/v1/composio/twitter/media",
+        summary:
+          "{accountId,data} uploads one base64 PNG, JPEG or WebP image (5 MB max) through your own active X connection and returns mediaId for a post's media ids",
+      },
+    ],
+  },
+  {
+    when: (view) => view.personasEnabled,
+    guidance:
+      "Personas are reusable agents (instructions, skills, notes, credentials) living in a persona:<id> scope; people hold owner, write or read on them through people (personal:), teams (team:), the org (org:) or Slack channels (channel:, read only, usable only in that channel). Writers edit instructions with PATCH and add a skill by creating it with scopeId persona:<id> on POST /v1/skills or moving one in with the skills tool; only owners share, attach credentials or delete. Writers set its default model (new conversations wearing it start on it) with PUT /v1/runtime-config and scopeId persona:<id>. Use the persona-fork skill to copy one.",
+    routes: [
+      { method: "GET", path: "/v1/personas", summary: "personas you hold a role on, with your role" },
+      {
+        method: "GET",
+        path: "/v1/personas/:id",
+        summary: "one persona: instructions, access list, attached credential names (never secrets), skills",
+      },
+      {
+        method: "POST",
+        path: "/v1/personas",
+        summary: "{name,description?,instructions?,icon?} creates one you own",
+      },
+      {
+        method: "PATCH",
+        path: "/v1/personas/:id",
+        summary:
+          '{name?,description?,instructions?,icon?} edits it (write or owner); icon is {kind:"emoji",value}, {kind:"custom",name} (Slack custom emoji), {kind:"image",url} (any https image URL) or null; each change that alters a field records a new version',
+      },
+      {
+        method: "GET",
+        path: "/v1/personas/:id/versions",
+        summary:
+          "?before=&limit=&full=1 its versions newest first, 20 a page by default: number, who and when, plus name, description, instructions and icon with full=1; {versions, more}",
+      },
+      {
+        method: "POST",
+        path: "/v1/personas/:id/versions/:version/restore",
+        summary:
+          "rolls name, description, instructions and icon back to that version as a new version (write or owner)",
+      },
+      {
+        method: "PUT",
+        path: "/v1/personas/:id/access",
+        summary:
+          "{access:[{scopeId,role:'owner'|'write'|'read',pinned?}]} replaces who holds which role (owner; at least one owner stays). channel: and group: holders get read only. pinned:true on a channel: or group: entry pins the persona there, so every conversation there wears it and posts under its name and icon, and one whose members are all from the organization saves memory to its notebook, which every conversation using it reads; each pins one persona at most (owner, on a turn you sent)",
+      },
+      {
+        method: "POST",
+        path: "/v1/personas/:id/credentials",
+        summary: "{credentialId} attaches one of your own keychain credentials (owner, on a turn you sent)",
+      },
+      {
+        method: "DELETE",
+        path: "/v1/personas/:id/credentials/:grantId",
+        summary: "detaches an attached credential (owner, on a turn you sent)",
+      },
+      { method: "DELETE", path: "/v1/personas/:id", summary: "deletes it and detaches its credentials (owner)" },
+      {
+        method: "PUT",
+        path: "/v1/sessions/:id/persona",
+        summary:
+          "{personaId|null} switches this conversation (your own session id) to a persona you can use here, from the next turn",
+      },
+    ],
+  },
+  {
+    when: (view) => view.swarmsEnabled,
+    guidance:
+      "Start a swarm only when the person explicitly asks for a swarm; a large or parallelizable task is not a request for one, so do that work yourself or with subagents. Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead (only in a swarm a person starts; a swarm a Slack bot starts never takes one, from the bot or from a person spawning into it, and always uses its own board). Spawn accepts model, effort and fastMode to choose the runtime for the workers it creates; children inherit it unless they choose again. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker. To keep a worker going instead of stopping after one reply, give it a goal on spawn or send ({objective, floor?, token_cap?}): its turn then runs like a goal turn, past the swarm turn deadline, until the goal is complete, paused or out of tokens. Any member can send any worker, itself included, a goal (not the root session); send a goal again to replace a running, paused or finished one.",
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/swarm",
+        summary:
+          "own identity and all peers with editable JSON context, session IDs and sandbox IDs; ?read=1&after=0&waitMs=0&replyTo=... reads scoped messages, not only intended audience; replies read with replyTo count as handed to you",
+      },
+      {
+        method: "POST",
+        path: "/v1/swarm",
+        summary:
+          "{action:'spawn',requestId,text,count?,context?,contexts?,forumSandboxId?,settings?,backend?,goal?} spawns one or an initial pool (a new swarm only on an explicit request for a swarm); {action:'context',context} updates own JSON; {action:'send',requestId,text,audience,replyTo?,wake?,goal?} sends to explicit peer ids or all and wakes each recipient (wake:false leaves it in their mailboxes for their next turn); {action:'control',memberId,state:'active'|'paused'|'stopped'} controls a descendant worker. Retry the same requestId and payload for idempotency.",
+      },
+    ],
+  },
+  {
+    guidance:
+      'Publish important outputs to durable Files before retiring a sandbox. Run: curl -fsS "$AGENT_API_URL/v1/files/upload-client" -H "x-agent-capability: $AGENT_API_TOKEN" -o /tmp/qm-upload.py && python3 /tmp/qm-upload.py path/to/file. The helper uploads directly to S3, retries parts, and resumes when rerun with the same file. Only final success means the file is published. Files are saved to this conversation\'s scope. Up to 100 GiB per file, including empty files. If the upload quota is full, the helper\'s --list and --abort ID free slots.',
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/files/upload-client",
+        summary: "download the resumable Python Files publisher; execute it in the sandbox with a file path",
+      },
+      {
+        method: "POST",
+        path: "/v1/files/uploads",
+        summary:
+          "begin a direct upload with {name,mimetype?,scopeId?,sizeBytes,checksums,requestId?}; checksums are ordered base64 SHA-256 hashes of 64 MiB parts",
+      },
+      {
+        method: "GET",
+        path: "/v1/files/uploads",
+        summary: "list your unfinished uploads here",
+      },
+      { method: "GET", path: "/v1/files/uploads/:id", summary: "inspect an owned upload session" },
+      {
+        method: "POST",
+        path: "/v1/files/uploads/:id/parts/:part",
+        summary: "get a short-lived signed PUT URL and required headers for one part",
+      },
+      {
+        method: "POST",
+        path: "/v1/files/uploads/:id/complete",
+        summary: "verify uploaded parts and publish Files metadata; safe to retry after interruption",
+      },
+      { method: "DELETE", path: "/v1/files/uploads/:id", summary: "abort an unfinished owned upload" },
+    ],
+  },
+  {
+    guidance:
+      "Search uses this conversation's complete principal set as its visibility floor. Shared conversations without a complete roster fail closed.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/search",
+        summary:
+          "search configured knowledge backends with {query, limit?}; results are visible to every person in this conversation",
+      },
+    ],
+  },
+  {
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/apis",
+        summary: "this list — every endpoint your token can call right now, plus whether the user is an org admin",
+      },
+    ],
+  },
+  {
+    guidance:
+      "The pinned Slack header (a small pinned message naming the model in use) follows an org-wide default (off unless an admin turned it on). Only override it for a channel scope when someone in that channel asks.",
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/channel-header-pin",
+        summary: "read whether this channel scope shows the pinned model header in Slack",
+      },
+      {
+        method: "PUT",
+        path: "/v1/channel-header-pin",
+        summary:
+          "override the pinned Slack header for this channel scope with {on: boolean}; {on: null} reverts to the org default",
+      },
+    ],
+  },
+  {
+    guidance:
+      "These act as the ASKING PERSON across every project they belong to, matching the web UI. Do not send principalId; the capability token always determines the person, and inaccessible projects return 404.",
+    routes: [
+      { method: "GET", path: "/v1/projects", summary: "list every project the asking person belongs to" },
+      {
+        method: "POST",
+        path: "/v1/projects",
+        summary: "create a project owned by the asking person — body {name}",
+      },
+      {
+        method: "PATCH",
+        path: "/v1/projects/:id",
+        summary:
+          'update a project — body {name} renames it (owner only); body {icon} sets its sidebar icon — {kind:"emoji",value} with one emoji, {kind:"custom",name} with a workspace custom emoji, {kind:"image",url} with an https image URL, or null to clear (any member)',
+      },
+      {
+        method: "POST",
+        path: "/v1/projects/:id/members",
+        summary: "add an internal directory member to a project the asking person belongs to — body {memberId}",
+      },
+      {
+        method: "DELETE",
+        path: "/v1/projects/:id/members/:memberId",
+        summary: "remove a member from a project the asking person owns",
+      },
+      {
+        method: "PUT",
+        path: "/v1/projects/:id/slack-channel",
+        summary:
+          "link a project to its Slack home channel — body {channel} (name or id; the asking person must be in the project and able to see the channel — public, or a private one they belong to; a channel that already has its own agent workspace is rejected with 409). Everyone in the channel joins the project, and the roster follows the channel from then on; the channel becomes the project's default delivery audience for crons and report-outs.",
+      },
+      {
+        method: "DELETE",
+        path: "/v1/projects/:id/slack-channel",
+        summary: "unlink a project's Slack home channel — members who joined via the channel leave the project",
+      },
+    ],
+  },
+  {
+    guidance:
+      "A loop's ledger is its durable queue of work items. Each entry carries an opaque sourcePayload the loop's own frontend understands, a proposal held for human review, and a follow-up chat thread. States run pending -> processed -> held -> actioned|dismissed. Ingest only what the loop's playbook tells you to; proposals are prepared, never executed — the person actions them from their review surface.",
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/loops/:id/items",
+        summary:
+          "the loop's ledger — items (dedupeKey, state, sourcePayload, proposal, thread, sourceAt, …) plus counts per state; read this first and skip any dedupeKey already tracked unless a newer source event arrived (compare sourceAt)",
+      },
+      {
+        method: "POST",
+        path: "/v1/loops/:id/items",
+        summary:
+          'upsert ledger items — body {"items":[…]}. For a loop with a known source, each item is that source\'s own shape: {source:"gmail"|"slack", sourceKey, title, from, fromDetail?, snippet, context?:[{author,at?,text}], receivedAt(ms), externalUrl?, draft?:{to?,cc?,subject?,body}, gmail?:{threadId,messageId?,rfcMessageId?,to?,cc?,subject?}, slack?:{channelId,channelLabel?,ts,threadTs?}}. Otherwise: {dedupeKey, sourcePayload:{…}, sourceAt?, summary?, proposal?:{…}}. Dedupes by dedupeKey per loop, never resurrects items the person already handled unless a newer source event arrived, keeps a proposal the person edited, and stamps the drafting session automatically',
+      },
+      {
+        method: "GET",
+        path: "/v1/loops/:id/items/:itemId",
+        summary: "one ledger item with its full sourcePayload, current proposal, and follow-up thread",
+      },
+      {
+        method: "POST",
+        path: "/v1/loops/:id/items/:itemId/action",
+        summary:
+          'act on a held item — body {kind, args?}. kind "edit" replaces the proposal ({args:{proposal}}), "dismiss" drops the item, "reopen" un-dismisses it, and any action the loop\'s source declares (e.g. "send", or Slack\'s "react" with {args:{name}}, which annotates the item without closing it) executes it and records the outcome',
+      },
+      {
+        method: "POST",
+        path: "/v1/loops/:id/items/:itemId/followup",
+        summary:
+          "chat about one held item — body {message}; the reply lands on the item's thread and may revise its proposal",
+      },
+    ],
+  },
+  {
+    guidance:
+      'A loop is standing autonomous work: a trigger plus a playbook plus a durable work ledger, with finished outputs HELD for a person to ship. Prefer the define-loop skill to author one (it interviews, shadow-runs one item, then creates the loop). New loops should declare every externally-visible ship action at gate "hold"; "auto" is earned through grants after real approvals. Work turns run without surface tools or addressed delivery; final external actions happen in the fenced ship stage. Broader work-stage tool restriction is a known limitation pending turn-runner tool policy.',
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/loops",
+        summary:
+          'create a loop — body {name, icon?, playbook, successCondition, shipActions: [{action, gate: "hold"|"auto"}], schedule?, destinationKey?, caps?, governor?: {maxConsecutiveFailedFires?, maxReturnRate?, returnRateMinDecisions?, maxQueueAgeMs?, maxQueueDepth?, staleFireMs?}, successChecks?, purpose?}; a schedule creates a bound child cron that fires the loop; setting an escalation destination requires a live human',
+      },
+      {
+        method: "DELETE",
+        path: "/v1/loops/:id/grants/:grantId",
+        summary: "revoke a standing ship grant immediately while retaining its audit record",
+      },
+      { method: "GET", path: "/v1/loops", summary: "list loops you can administer" },
+      {
+        method: "GET|PATCH|DELETE",
+        path: "/v1/loops/:id",
+        summary:
+          "inspect a loop (items, held outputs, vitals), edit it (icon sets a named icon such as bug or slack, or an uploaded PNG data URL up to 64 KiB and 128×128 pixels; null restores the default; playbook edits are versioned; destinationKey sets escalation delivery and null clears it; state: enabled|paused clears or sets the pause; clearing quarantine or changing destination requires a live human), or delete it and its child cron",
+      },
+      { method: "POST", path: "/v1/loops/:id/fire", summary: "fire a loop now (intake → work → judge → hold/ship)" },
+      {
+        method: "POST",
+        path: "/v1/loops/:id/outputs/:outputId/decide",
+        summary:
+          'decide a held output — body {decision: "ship"} executes the ship action, {decision: "return", note} sends the item back to work carrying the note',
+      },
+      {
+        method: "POST",
+        path: "/v1/loops/:id/grants",
+        summary:
+          "graduate a ship action to auto — body {shipAction, label?}; scoped to this loop (and label slice) only, honours org approval-grant modes",
+      },
+      {
+        method: "POST",
+        path: "/v1/loops/:id/autopilot",
+        summary:
+          "toggle every ship action between review and auto — body {enabled}; enabling requires a live human and creates standing grants, while disabling is allowed for agents and revokes every active grant",
+      },
+    ],
+  },
+  {
+    guidance:
+      "Pins are conversation-scoped bookmarks shown at the top of the web UI — for the handful of things worth keeping in view for a whole session: a decision, a link, a working answer, a key transcript entry. Use them SPARINGLY — a few pins that matter, not a running log (there is a hard cap, and every pin takes reader attention); durable facts belong in memory, working state in files. Pin a transcript entry by its seq, or a short free-text note. In a Slack DM, pinning a transcript entry also pins the underlying Slack message natively (and unpinning removes it). Keep them current — unpin what no longer matters.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/pins",
+        summary:
+          "pin something worth keeping in view for this whole session — `seq` (a transcript entry) and/or `text` (a short note); shows pinned in the web UI; use sparingly (hard cap; unpin stale ones)",
+      },
+      { method: "GET", path: "/v1/pins", summary: "list this conversation's pins" },
+      { method: "DELETE", path: "/v1/pins/:id", summary: "unpin an item" },
+    ],
+  },
+  {
+    guidance:
+      "These act on the ASKING PERSON's own conversation list (the web UI sidebar) — archiving, pinning, or renaming is a per-person view change, never a deletion, and never touches anyone else's list. Confirm before bulk-archiving.",
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/conversations",
+        summary:
+          "list the asking person's own conversations (id, title, archived, pinned, unread, lastActivityAt) — the same list their web sidebar shows",
+      },
+      {
+        method: "GET",
+        path: "/v1/conversations/:id?tailTurns=20",
+        summary:
+          "read the bounded transcript of one of the asking person's conversations; defaults to the last 20 turns and supports older paging with tailTurns and beforeSeq; returns 404 for a conversation they cannot see",
+      },
+    ],
+  },
+  {
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/conversations/:id",
+        summary: `${CONVERSATION_UPDATE} 404 for a conversation not on their list`,
+      },
+    ],
+  },
+  {
+    guidance:
+      "These show the ASKING PERSON's file library across every context they can reach. A file outside their visibility returns 404 without revealing whether it exists.",
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/files",
+        summary:
+          "list files the asking person can reach across their contexts, split into owned and shared files, newest first; q=<text> matches file names, and limit and cursor page owned files",
+      },
+      {
+        method: "GET",
+        path: "/v1/files/:id/content",
+        summary: "download the bytes of a file from the asking person's file library",
+      },
+    ],
+  },
+  {
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/reach",
+        summary:
+          "send a teammate a DM, post to a channel, or post to a group DM RIGHT NOW — `text` plus `recipient`, `channel`, or `participants` (the group DM's other members — the group is opened for you if it doesn't exist yet, so never ask someone to create one), optionally with `files` (workspace paths or {file_id: \"stored Files ID\"}, sent all-or-nothing); `sandbox_id` selects the sandbox for paths, omitted means default, ignored for stored IDs. EXTREMELY IMPORTANT: a `channel` post broadcasts to everyone there — pick the narrowest audience that can act; a question or errand for one person goes to their DM (`recipient`), NEVER a public channel, unless the person you're helping explicitly named that channel as the destination or the message genuinely concerns the whole room; pass `threadTs` (the parent message's ts) with a `recipient`/`channel`/`participants` post to reply inside that thread instead of top-level; or react to a message instead of posting with `react:{ts,emoji}` plus a `channel`/`participants`; or retract one of your own messages with `delete:{ts}` (no target = this conversation, or name a `channel`/`participants` to delete elsewhere); or rewrite one of your own Slack messages in place with `edit:{ts}` plus `text` (the complete new message) — find a message's `ts` via /v1/surface-context; pass `unfurlLinks:false` to suppress Slack previews (no schedule; for later/recurring use /v1/crons)",
+      },
+    ],
+  },
+  {
+    guidance:
+      'To see the published apps you can reach across scopes, GET /v1/apps (each row carries your permission and a clone/push gitUrl). Read what an app renders as the asking person with GET /v1/apps/:id/fetch. A published app (`apps` action `publish`) is reachable only by its owner plus whoever the owner shares it with. For authenticated access, POST /v1/shares/deploy/:id with `scope:"org"`, `recipient:"<name>"`, or an exact `email:"person@example.com"` with `access:"view"`; email grants to people outside the organization are view-only, send an invitation with the app link, and are refused unless an org admin has enabled external app sharing (off by default). Check `invitation.emailSent` and surface `emailProblem` if delivery fails. This does not make the recipient an instance member. To make the app reachable without sign-in, POST the same endpoint with `{public:true}`; `{public:false}` restricts it again. Public access is never the default, only the owner may change it, and it is refused (and existing public links require sign-in) unless an org admin has enabled external app sharing. POST /v1/apps/:id/embed-ancestors with `{embedAncestors:["https://tools.example.com", ...]}` lets those sites embed the app; pass `[]` to forbid embedding again. To rename, archive, restore, or change always-on behavior, use the corresponding endpoint.',
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/apps",
+        summary:
+          "list the published apps you can reach across scopes — each row carries your effective permission (read|write) and a ready-to-clone/push gitUrl; find app ids here for share / name / display-name / archive / git-url",
+      },
+      {
+        method: "GET",
+        path: "/v1/apps/:id",
+        summary:
+          "inspect one app you can reach — status, owner/home scope, effective permission, current and applied versions, version history with commit ids and timestamps, and gitUrl",
+      },
+      {
+        method: "GET",
+        path: "/v1/apps/:id/fetch",
+        summary:
+          "read an app's rendered content as the asking person — query path defaults to / and maxBytes defaults to 256KB; returns upstream status, contentType, body, and truncation metadata",
+      },
+      {
+        method: "GET",
+        path: "/v1/apps/:id/logs",
+        summary:
+          "recent runtime output (entrypoint stdout+stderr) of a running app you can reach — query tailLines (default 200, max 2000); returns {logs} (null when the provider keeps none)",
+      },
+      {
+        method: "GET",
+        path: "/v1/apps/:id/git-url",
+        summary:
+          "get an authed git remote URL for an app you can reach (clone its source; push a new version if you have write access) — returns {url, permission}",
+      },
+      {
+        method: "GET",
+        path: "/v1/shares/:type/:id",
+        summary:
+          "inspect who can reach a resource you may share (:type deploy|cron|skill|file; an app's :id is its name or id) — returns {owner, offers, grantees[{scope, permission, status?}]}, plus {public, externalSharing} for apps",
+      },
+      {
+        method: "POST",
+        path: "/v1/shares/:type/:id",
+        summary:
+          'change who can reach a resource you may share (:type deploy|cron|skill|file). Target ONE of: `scope` — "org" or a scope id like personal:<id> or channel:<id>; `recipient` — a teammate\'s name; or (apps only) `email` — an exact address, view-only. `access`: view (default), manage, or none (stop sharing). Apps only: pass just `public` (boolean) for anonymous link access. `offers` from GET says which of these the resource allows. Apps: owner-only, on a turn you sent',
+      },
+      {
+        method: "POST",
+        path: "/v1/apps/:id/name",
+        summary: "rename an app you manage — body {name} (its URL slug; must be unique)",
+      },
+      {
+        method: "POST",
+        path: "/v1/apps/:id/display-name",
+        summary: "set an app's human-friendly display name — body {displayName} (empty clears it)",
+      },
+      {
+        method: "POST",
+        path: "/v1/apps/:id/always-on",
+        summary:
+          "keep an app you manage permanently warm — body {alwaysOn:true} exempts it from idle sleep so visitors never hit a cold start; {alwaysOn:false} returns it to the default sleep-when-idle",
+      },
+      {
+        method: "POST",
+        path: "/v1/apps/:id/embed-ancestors",
+        summary:
+          "let named sites show an app you manage inside their page (iframe) — body {embedAncestors:[https origins, optionally https://*.example.com]}; list every frame between the app and the browser tab; [] forbids embedding again",
+      },
+      {
+        method: "POST",
+        path: "/v1/apps/:id/connectors",
+        summary:
+          "publisher only, after they ask: lend an app they published their connected apps — body {connectors:[hosts]}; [] withdraws; broker use is in the publish skill",
+      },
+      {
+        method: "POST",
+        path: "/v1/apps/:id/archive",
+        summary: "take down an app you manage (stops it and frees its endpoint; the source is kept)",
+      },
+      {
+        method: "POST",
+        path: "/v1/apps/:id/restore",
+        summary: "restore an archived app you manage by reapplying its current saved version",
+      },
+    ],
+  },
+  {
+    when: (v) => !!v.claims.memory,
+    guidance: "Memory bodies and curation rules are documented in the memory skill.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/memory/search",
+        summary: "search authorized notebooks; optional scope selects one notebook",
+      },
+      { method: "POST", path: "/v1/memory/facts", summary: "append durable facts to this conversation's notebook now" },
+      { method: "GET", path: "/v1/memory/self", summary: "list this conversation's notebook facts with their ids" },
+      {
+        method: "PATCH|DELETE",
+        path: "/v1/memory/facts",
+        summary:
+          "edit facts ({facts:[{id,text}]}) or forget them ({ids}: notebook ids or brain refs); an unknown notebook id fails the whole call, each brain ref reports its own outcome, and notebook ids stay while a ref's outcome is unknown",
+      },
+    ],
+  },
+  {
+    when: (v) => personAtKeyboard(v.claims),
+    routes: [
+      {
+        method: "GET|PUT|DELETE",
+        path: "/v1/memory/brain",
+        summary:
+          "the speaker's own memory brain, a gbrain they run: read it (with the principal id their gbrain must link), connect or change it ({url, clientId, label?}, never the client secret), or disconnect it; see the memory skill",
+      },
+    ],
+  },
+  {
+    when: (v) => !!v.claims.memory?.orgWrite,
+    routes: [
+      {
+        method: "POST|PATCH|DELETE",
+        path: "/v1/memory/facts",
+        summary:
+          'add "scope":"org" (?scope=org on GET) to target the org-wide notebook every conversation recalls — admin only, confirm wording first',
+      },
+    ],
+  },
+  {
+    guidance: "The keychain ask→card approval→execute.credentials protocol is documented in the request-access skill.",
+    routes: [
+      {
+        method: "POST|GET",
+        path: "/v1/keychain/credentials",
+        summary:
+          "register a login to the user's keychain (secret, files[], or a multi-input fields[] of [{envKey,value,secret?}]); replacing a login the user already saved needs their own running turn or a loginTicket / list participants' registered logins (metadata)",
+      },
+      {
+        method: "POST",
+        path: "/v1/keychain/login-tickets",
+        summary:
+          "{service} from the user's own running turn: a one-time loginTicket that lets the save finishing this sign-in replace their existing login once, after the turn ends (the interactive-login skill does this)",
+      },
+      {
+        method: "POST|DELETE",
+        path: "/v1/keychain/credentials/:id/writer",
+        summary:
+          "claim {holder, until} / release ?holder= the single-writer lease on one of the user's own credentials, such as a browser profile; 409 writer_held while another holder's lease runs",
+      },
+      {
+        method: "GET",
+        path: "/v1/keychain/overview",
+        summary: "list this user's credential metadata, grants, and pending asks (never secret values)",
+      },
+      { method: "DELETE", path: "/v1/keychain/credentials/:id", summary: "remove a registered login" },
+      { method: "GET", path: "/v1/keychain/grants", summary: "list grants for this conversation" },
+      { method: "POST", path: "/v1/keychain/grants/:id/revoke", summary: "revoke a grant" },
+      {
+        method: "POST|GET",
+        path: "/v1/keychain/asks",
+        summary:
+          "ask a credential's owner for access by {owner, service} (the server resolves the credential, or returns the candidates when it can't), including scheduled turns in personal or shared conversations (no access until owner approval) / list asks",
+      },
+      {
+        method: "POST",
+        path: "/v1/keychain/drops",
+        summary:
+          "mint a single-use, expiring link for someone to enter a new credential into their keychain, or (body {memoryBrain, purpose}, for an org admin or the brain's own member) a memory brain's client secret, which QM's core keeps and never puts in a keychain — follow the `secret-drop` skill",
+      },
+    ],
+  },
+  {
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/surface-context",
+        summary:
+          "fetch recent messages from a channel/DM YOU can see (count/before/match) — a private channel only if you're a member; live:true reads Slack directly for current reaction counts (reactions:[] means none), with no mirror fallback on failure; omitted uses configured history; directory-resolved, never a raw address",
+      },
+      {
+        method: "POST",
+        path: "/v1/surface-file",
+        summary:
+          "fetch a file someone posted in a channel/DM the asking person can see — body {ts, channel?, threadTs?, name?} (ts from /v1/surface-context; threadTs for a thread reply; name when the message carries several files) → file metadata plus a short-lived download: curl it with the returned header+token to save the bytes into your workspace, then use or deliver them (attach that path, or name it in post's files)",
+      },
+    ],
+  },
+  {
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/environments",
+        summary: "list the org's named environments (computers) and which scopes are attached",
+      },
+      {
+        method: "POST",
+        path: "/v1/environments",
+        summary: "promote this conversation's computer to a NAMED environment owned by this user",
+      },
+      {
+        method: "POST",
+        path: "/v1/environments/attach",
+        summary: "point this conversation at a named environment (owner attaches freely; others go through the owner)",
+      },
+    ],
+  },
+  {
+    guidance:
+      "Save a skill when you've worked out a repeatable procedure worth keeping (a checklist, a multi-step flow, a house style) — it is advertised in the skill index and loaded with the skills tool on future turns. The skill homes in THIS conversation's scope: in a 1:1 DM it's yours alone; in a private channel or group DM it's owned by that room and every member can edit or delete it (the audit trail records who changed what); a public channel stays owner-only. Write the `body` as a plain-step recipe addressed to your future self; edit or delete it as it goes stale. The skills tool's save and edit actions make the POST and PUT calls for you.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/skills",
+        summary:
+          "save a NEW skill in this conversation's scope — {name, description, body} (the SKILL.md). Auto review+published; a name already taken in this scope is a 409 (edit it instead).",
+      },
+      {
+        method: "GET",
+        path: "/v1/skills/:id",
+        summary: "read a skill you can see, including an archived skill's body, files, status, and version",
+      },
+      {
+        method: "PUT",
+        path: "/v1/skills/:id",
+        summary:
+          "edit a skill you manage — {description?, body?} (the name is fixed; create a new skill to rename). 404 if it isn't yours to edit",
+      },
+      {
+        method: "DELETE",
+        path: "/v1/skills/:id",
+        summary: "archive a skill you manage. 404 if missing, 403 if it isn't yours to archive",
+      },
+      {
+        method: "POST",
+        path: "/v1/skills/:id/restore",
+        summary: "restore an archived skill you manage by re-reviewing and publishing its preserved version",
+      },
+    ],
+  },
+  {
+    guidance:
+      "Pick or produce a square image under ~128KB, base64 it, then call this once. An upload error is a real result to relay, not a reason to ask the user to do it by hand.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/emoji",
+        summary:
+          "add one Slack custom emoji — {name, image:<base64 PNG/GIF>} (optional workspace); runs under your own Slack session or a configured fallback. An error here is a real result to relay, not a reason to ask the user to upload manually",
+      },
+      {
+        method: "PUT",
+        path: "/v1/emoji/session",
+        summary:
+          "save your Slack sign-in for the uploader — {cookies:[…]} from a browser the person just signed in to Slack on (optional workspace); checked against the workspace before it's stored. Use it when an upload says the session expired",
+      },
+    ],
+  },
+  {
+    guidance:
+      "Disconnect a user's OAuth connector (the reverse of connecting one). Defaults to you; to disconnect a teammate's, name them with principalId — they must share this conversation. Confirm before revoking someone else's.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/connectors/oauth/revoke",
+        summary:
+          'disconnect an OAuth connector — body {provider} (e.g. "google") or {host}, optional principalId (a conversation member; default you). Deletes the stored token across account slots; reversible by reconnecting',
+      },
+    ],
+  },
+  {
+    routes: [
+      {
+        method: "GET",
+        path: "/v1/connectors/catalog",
+        summary:
+          "list the direct OAuth apps this deployment knows; `configured: true` marks the ones an admin enabled, the only ones to offer consent links for",
+      },
+      {
+        method: "POST",
+        path: "/v1/connectors/oauth/consent/mint",
+        summary:
+          "mint a chat-first connect link for an OAuth provider, for YOURSELF (the current actor) only — use $AGENT_OAUTH_CONSENT_TOKEN. To get anyone else connected, don't mint anything: point them at the durable /connect/<provider>/self-connect page on the org's web UI, where signing in as themselves is the identity (no token; a refused mint's error message carries the full URL). A new login stays private to its owner; using it in a shared conversation requires a separate explicit credential grant.",
+      },
+      {
+        method: "POST",
+        path: "/v1/credentials/broker",
+        summary:
+          "call a vended org credential's host BY PROXY — secret stays server-side (use $AGENT_CREDENTIAL_TOKEN)",
+      },
+    ],
+  },
+  {
+    when: (v) => v.isAdmin && livePersonCapability(v.claims),
+    guidance:
+      "Admin plane: you act AS this org admin — authorized per call under their own standing (a cron, webhook or loop fire carries its owner's authority just as a typed turn does), audited under their name; confirm before any mutation (bodies/params in the admin skill). Enforced limits: content reads require a DM or effective Open sharing for the admin (organization, personal, and conversation restrictions all apply); configuration mutations work anywhere; admin grant changes, impersonation, and identity links are portal-only. Open admin reads can expose private data to the conversation; retrieve and report only what the request needs.",
+    routes: [
+      { method: "GET", path: "/v1/admin/whoami", summary: "this user's admin status" },
+      {
+        method: "GET",
+        path: "/v1/admin/scopes",
+        summary: "every scope with labels and what lives there — find scope ids here, don't guess",
+      },
+      {
+        method: "GET",
+        path: "/v1/admin/scopes/:scopeId",
+        summary:
+          "a scope's resolved config: command policy, SOUL, egress, flags, connectors, service credentials (non-org scopes: DM or effective Open sharing)",
+      },
+      {
+        method: "PUT",
+        path: "/v1/admin/scopes/:scopeId/:resource",
+        summary:
+          "govern a scope: soul | security-posture | command-policy | egress | connectors | service-credentials | runtime ({ modelId })",
+      },
+      {
+        method: "PUT",
+        path: "/v1/admin/memory-registry/member-brains",
+        summary: "turn members' own memory brains on or off for the whole org ({enabled}); off stops every one at once",
+      },
+      {
+        method: "GET|POST|PATCH|DELETE",
+        path: "/v1/admin/memory?scope=",
+        summary:
+          "read any scope's notebook facts, add ({facts:[text]}), edit ({facts:[{id,text}]}) or forget ({ids}) them (e.g. fix poisoned memory; non-org reads: DM or effective Open sharing)",
+      },
+      {
+        method: "GET",
+        path: "/v1/admin/sessions?scope=",
+        summary:
+          "conversation metadata; /v1/admin/sessions/:id for a transcript and /:id/llm for captured prompts (DM or effective Open sharing)",
+      },
+      {
+        method: "GET",
+        path: "/v1/admin/files?scope=",
+        summary:
+          "document store listing; files/read?id= and files/download?id= for content (DM or effective Open sharing)",
+      },
+      {
+        method: "GET",
+        path: "/v1/admin/crons|apps|skills?scope=",
+        summary: "artifacts by owning scope (DM or effective Open sharing)",
+      },
+      {
+        method: "GET",
+        path: "/v1/admin/audit|errors|egress?scope=",
+        summary:
+          "observability: audit log, error telemetry, outbound-destination log (logs: DM or effective Open sharing)",
+      },
+      { method: "GET", path: "/v1/admin/retention", summary: "org-wide usage and retention report" },
+      {
+        method: "GET",
+        path: "/v1/admin/users",
+        summary:
+          "org roster with admin status plus externalUsers (invited outside collaborators with role, expiry, status); /v1/admin/users/:id for one user's personal conversation count, admin status, configuration, and onboarding (DM or effective Open sharing)",
+      },
+      {
+        method: "POST",
+        path: "/v1/admin/external-users",
+        summary:
+          "invite an outside collaborator by email — {email, role?: member|org_admin, expiresAt (ISO date-time, a bare YYYY-MM-DD meaning end of that day UTC, or epoch ms)}; until expiry they count as members everywhere, including as guests in the org's own Slack, and the invitation email carries a single-use sign-in link; 409 if the address already belongs to an org member (org email domain, Slack directory, sign-in allow-list, or anyone who has used the agent). The invitation email needs Resend on core (RESEND_API_KEY + AUTH_EMAIL_FROM); when the response says emailSent:false, relay emailProblem; the signInUrl you get is the plain portal address, so once email works, re-invite with resendInvite:true to send a link. org_admin role is portal-only",
+      },
+      {
+        method: "DELETE",
+        path: "/v1/admin/external-users/:email",
+        summary:
+          "revoke an external user's access now — they stay listed as expired, and a DELETE a day after expiry removes the row (externals holding org_admin: portal-only)",
+      },
+      {
+        method: "GET",
+        path: "/v1/admin/directory?q=",
+        summary: "resolve a name or principal id to org-directory candidates (incl. members who've never messaged)",
+      },
+      {
+        method: "GET",
+        path: "/v1/admin/keychain",
+        summary: "person-owned keychain metadata, grants, and asks (DM or effective Open sharing)",
+      },
+      {
+        method: "POST",
+        path: "/v1/admin/keychain/grants",
+        summary:
+          "grant any person's keychain credential to a scope so admin work can use it — {credentialId, purpose, scope? (default: this conversation)}; audited",
+      },
+    ],
+  },
+];
+
+const WHOAMI_FOR_ALL: AgentApiFamily = {
+  when: (v) => !(v.isAdmin && livePersonCapability(v.claims)),
+  routes: [
+    { method: "GET", path: "/v1/admin/whoami", summary: "this user's org capabilities: {permissions, isAdmin, role?}" },
+  ],
+};
+
+export interface AgentApiListing {
+  actorId: string;
+  scopeId: string;
+  admin: { isAdmin: boolean; role?: string };
+  endpoints: AgentApiRoute[];
+  guidance: string[];
+}
+
+export function renderAgentApis(
+  claims: CapabilityClaims,
+  admin: { isAdmin: boolean; role?: string },
+  features: { swarmsEnabled: boolean; personasEnabled: boolean },
+  query = "",
+): AgentApiListing {
+  const view: AgentApiView = {
+    claims,
+    isAdmin: admin.isAdmin,
+    swarmsEnabled: features.swarmsEnabled,
+    personasEnabled: features.personasEnabled,
+  };
+  const terms = searchTerms(query);
+  const visible = [...FAMILIES, WHOAMI_FOR_ALL]
+    .filter((f) => f.when?.(view) ?? true)
+    .filter(
+      (f) =>
+        !terms.length ||
+        matchesSearchTerms(
+          [f.guidance ?? "", ...f.routes.map((r) => `${r.method} ${r.path} ${r.summary}`)].join(" "),
+          terms,
+        ),
+    );
+  return {
+    actorId: claims.actorId,
+    scopeId: claims.scopeId,
+    admin,
+    endpoints: visible.flatMap((f) => f.routes),
+    guidance: visible.flatMap((f) => (f.guidance ? [f.guidance] : [])),
+  };
+}

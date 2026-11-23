@@ -1,0 +1,152 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createOrchestrator, type OrchestratorInput } from "../src/core/orchestrator.ts";
+import { createIdentityService } from "../src/identity/identity-service.ts";
+import { createAclStore } from "../src/acl/acl-store.ts";
+import { createResolutionService } from "../src/resolution/resolution-service.ts";
+import { createMemoryDurableByteStore } from "../src/files/durable-byte-store.ts";
+import type { Agent } from "../src/agent/agent.ts";
+import { createDeployStore } from "../src/deploy/deploy-store.ts";
+import { createDockerDeployProvider } from "../src/deploy/docker-deploy-provider.ts";
+import { createDeployService } from "../src/deploy/deploy-service.ts";
+import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
+import { scopeId, type Conversation, type Principal } from "../src/types.ts";
+import type { AgentTurnResult } from "../src/agent/agent.ts";
+import type { Sandbox } from "../src/sandbox/sandbox.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { orchestratorTestDeps } from "./support/orchestrator-deps.ts";
+import { createPostgresAuditLog } from "../src/admin/postgres-audit-log.ts";
+import { createPostgresFileArtifactStore } from "../src/files/postgres-file-artifact-store.ts";
+import { createPostgresMemoryService } from "../src/memory/postgres-memory-service.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testConfigStore, testDatabaseUrl, testDeployBackings, testMap } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+
+const ORG = "default-org";
+const actor: Principal = { id: "U1", type: "internal" };
+const conversation: Conversation = {
+  kind: "channel",
+  threadRef: "ch:C1:bookkeeping",
+  channelRef: "C1",
+  audience: [actor],
+};
+scopeId("channel", "C1");
+
+function fakeSandbox(): Sandbox {
+  const unreached = () => {
+    throw new Error("the bookkeeping tests must not provision a sandbox");
+  };
+  return {
+    profile: { backend: "fake", writablePersistence: "snapshot_to_workspace", processSessions: false },
+    provision: unreached as never,
+    run: unreached as never,
+    readFile: unreached as never,
+    writeFile: unreached as never,
+    writeFileBytes: unreached as never,
+    readFileBytes: unreached as never,
+    listDir: unreached as never,
+    removeDir: unreached as never,
+    teardown: unreached as never,
+  };
+}
+
+function buildScenario(turnResult?: Partial<AgentTurnResult>) {
+  const agent: Agent = {
+    async runTurn(turn) {
+      await turn.emit({ kind: "UserMessage", text: turn.input });
+      await turn.emit({ kind: "AgentMessage", text: "done" });
+      return { reply: "done", modelCalls: 1, ...turnResult };
+    },
+    async screenSecurity() {
+      return { decision: "auto" as const };
+    },
+  };
+  const sessions = createPostgresSessionStore(testDatabaseUrl());
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
+  const auditLog = createPostgresAuditLog(testDatabaseUrl());
+  const deploy = createDeployService({
+    ...singleProcessDeps(),
+    deployStore: createDeployStore(testDeployBackings()),
+    provider: createDockerDeployProvider(),
+    deployDir: join(tmpdir(), "bookkeeping-deploy"),
+    auditLog,
+    acl,
+  });
+  const deliveries = createDeliveryStore();
+  const orchestrator = createOrchestrator({
+    ...orchestratorTestDeps(),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
+    resolution: createResolutionService(ORG, testConfigStore(ORG), acl),
+    config: testConfigStore(ORG),
+    sessions,
+    files: createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore()),
+    sandbox: fakeSandbox(),
+    auditLog,
+    agent,
+    memory: createPostgresMemoryService(testDatabaseUrl()),
+    deploy,
+    acl,
+    deliveries,
+  });
+  const input = (text: string, extra: Partial<OrchestratorInput> = {}): OrchestratorInput => ({
+    surface: "slack",
+    actor,
+    conversation,
+    origin: { kind: "direct" },
+    text,
+    ...extra,
+  });
+  return { orchestrator, sessions, deliveries, input };
+}
+
+test("a cancel-stopped turn still persists and surfaces its pending approvals", async () => {
+  const { orchestrator, input } = buildScenario({
+    reply: "",
+    stopped: true,
+    pendingApprovals: [{ command: "rm -rf /srv/data", reason: "destructive command" }],
+  });
+  const controller = new AbortController();
+  controller.abort();
+  const result = await orchestrator.handleTurn(input("wipe the data dir", { cancel: controller.signal }));
+  assert.equal(result.status, "pending_approval", "the approval is surfaced, not orphaned by the cancel");
+  assert.equal(result.pendingApprovals?.length, 1);
+  assert.equal(result.pendingApprovals?.[0]?.command, "rm -rf /srv/data");
+});
+
+test("an overheard import failure aborts the batch instead of skipping one message", async () => {
+  const { orchestrator, sessions, input } = buildScenario();
+  await orchestrator.handleTurn(input("prime"));
+  const appendMany = sessions.appendMany.bind(sessions);
+  sessions.appendMany = async (lease, items) => {
+    if (items.some((item) => item.body?.overheard === true && item.externalId === "200.2"))
+      throw new Error("append refused");
+    return appendMany(lease, items);
+  };
+  const request = input("what did I miss?", {
+    overheard: [
+      { role: "user", name: "Ann", text: "first overheard", ts: "100.1" },
+      { role: "user", name: "Bob", text: "second overheard", ts: "200.2" },
+      { role: "user", name: "Cee", text: "third overheard", ts: "300.3" },
+    ],
+  });
+  const result = await orchestrator.handleTurn(request);
+  assert.equal(result.status, "ok");
+  const session = (await sessions.getByThread(conversation.threadRef))!;
+  const overheardTexts = (await sessions.getItems(session.id))
+    .filter((item) => item.body.overheard === true)
+    .map((item) => item.text);
+  assert.deepEqual(overheardTexts, [], "the atomic batch leaves no partial history on failure");
+  sessions.appendMany = appendMany;
+  await orchestrator.handleTurn(request);
+  await orchestrator.handleTurn(request);
+  const recovered = (await sessions.getItems(session.id))
+    .filter((item) => item.body.overheard === true)
+    .map((item) => item.text);
+  assert.deepEqual(
+    recovered,
+    ["first overheard", "second overheard", "third overheard"],
+    "retry imports the whole batch once, in order",
+  );
+});

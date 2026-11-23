@@ -1,0 +1,960 @@
+package cli
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-cli/cli/internal/config/cli"
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-cli/cli/internal/styles"
+	"github.com/hatchet-dev/hatchet/pkg/analytics"
+	"github.com/hatchet-dev/hatchet/pkg/client"
+	"github.com/hatchet-dev/hatchet/pkg/config/cli/profilestore"
+	"github.com/hatchet-dev/hatchet/pkg/config/loader/loaderutils"
+
+	cliconfig "github.com/hatchet-dev/hatchet/pkg/config/cli"
+)
+
+// profileCmd represents the profile command
+var profileCmd = &cobra.Command{
+	Use:     "profile",
+	Aliases: []string{"profiles", "prof"},
+	Short:   "Manage profiles for different Hatchet environments",
+	Long:    `Manage profiles that store connection information (address and token) for different Hatchet environments.`,
+	Example: `
+# Create a new profile (interactive)
+hatchet profile add
+
+# Create a new profile (non-interactive)
+hatchet profile add --name [name] --token [token]
+
+# Remove a profile (interactive)
+hatchet profile remove
+
+# Remove a profile (non-interactive)
+hatchet profile remove --name [name]
+
+# List all profiles
+hatchet profile list
+
+# Show details of a specific profile
+hatchet profile show --name [name] [--show-token]
+
+# Print shell exports for a profile's HATCHET_CLIENT_ variables
+eval "$(hatchet profile env --name [name])"
+
+# Update an existing profile (interactive)
+hatchet profile update
+
+# Update an existing profile (non-interactive)
+hatchet profile update --name [name] --token [token]
+
+# Set a profile as default (interactive)
+hatchet profile set-default
+
+# Set a profile as default (non-interactive)
+hatchet profile set-default --name [name]
+
+# Unset the default profile
+hatchet profile unset-default
+`,
+}
+
+// profileAddCmd represents the profile add command
+var profileAddCmd = &cobra.Command{
+	Use:   "add",
+	Short: "Add a new profile",
+	Long:  `Add a new profile with an address and token for a Hatchet environment.`,
+	Example: `  # Create a new profile interactively (prompts for token)
+  hatchet profile add
+
+  # Create a new profile with a specific name
+  hatchet profile add --name production --token <your-token>`,
+	Run: func(cmd *cobra.Command, args []string) {
+		name, _ := cmd.Flags().GetString("name")
+		token, _ := cmd.Flags().GetString("token")
+		tlsStrategy, _ := cmd.Flags().GetString("tls-strategy")
+
+		if token == "" {
+			token = getApiTokenForm()
+		}
+
+		profile, err := getProfileFromToken(cmd, token, name, tlsStrategy)
+
+		if err != nil {
+			cli.Logger.Fatalf("could not get profile from token: %v", err)
+		}
+
+		// If name is not provided via flag, prompt for it with tenant name as default
+		if name == "" {
+			candidateName := profile.Name
+
+			nameForm := huh.NewForm(
+				huh.NewGroup(
+					huh.NewInput().
+						Title(fmt.Sprintf("Enter a name for this profile (default: %s)", candidateName)).
+						Placeholder(candidateName).
+						Value(&name),
+				),
+			).WithTheme(styles.HatchetTheme())
+
+			err = nameForm.Run()
+			if err != nil {
+				cli.Logger.Fatalf("could not run name input form: %v", err)
+			}
+
+			// If user leaves it empty, use the candidate name
+			if name == "" {
+				name = candidateName
+			}
+		}
+
+		err = cli.Profiles.AddProfile(name, profile)
+
+		if err != nil {
+			cli.Logger.Fatalf("could not add profile: %v", err)
+		}
+
+		fmt.Println(profileActionView("added", name))
+		printPlaintextTokenWarning()
+	},
+}
+
+// profileRemoveCmd represents the profile remove command
+var profileRemoveCmd = &cobra.Command{
+	Use:   "remove",
+	Short: "Remove a profile",
+	Long:  `Remove an existing profile from the configuration.`,
+	Example: `  # Remove a profile interactively (shows selection menu)
+  hatchet profile remove
+
+  # Remove a specific profile by name
+  hatchet profile remove --name production`,
+	Run: func(cmd *cobra.Command, args []string) {
+		name, _ := cmd.Flags().GetString("name")
+
+		// if there's no name, list profiles and ask user to select one
+		if name == "" {
+			name = selectProfileForm(false)
+
+			// if still no name, exit
+			if name == "" {
+				cli.Logger.Info("No profile selected, exiting")
+				return
+			}
+		}
+
+		err := cli.Profiles.RemoveProfile(name)
+		if err != nil {
+			cli.Logger.Fatalf("could not remove profile: %v", err)
+		}
+
+		fmt.Println(profileActionView("removed", name))
+	},
+}
+
+// profileListCmd represents the profile list command
+var profileListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List all profiles",
+	Long:  `List all configured profiles.`,
+	Example: `  # List all configured profiles
+  hatchet profile list`,
+	Run: func(cmd *cobra.Command, args []string) {
+		profileNames := cli.Profiles.ListProfiles()
+
+		fmt.Println(profileListView(profileNames))
+	},
+}
+
+// profileShowCmd represents the profile show command
+var profileShowCmd = &cobra.Command{
+	Use:   "show",
+	Short: "Show details of a specific profile",
+	Long:  `Show the details of a specific profile including address and token.`,
+	Example: `  # Show profile details interactively (shows selection menu)
+  hatchet profile show
+
+  # Show a specific profile with masked token
+  hatchet profile show --name production
+
+  # Show a specific profile with full token visible
+  hatchet profile show --name production --show-token`,
+	Run: func(cmd *cobra.Command, args []string) {
+		name, _ := cmd.Flags().GetString("name")
+		showToken, _ := cmd.Flags().GetBool("show-token")
+
+		if name == "" {
+			name = selectProfileForm(false)
+		}
+
+		profile, err := cli.Profiles.GetProfile(name)
+		if err != nil {
+			cli.Logger.Fatalf("could not get profile: %v", err)
+		}
+
+		fmt.Println(profileView(name, profile.Token, profile.ApiServerURL, profile.GrpcHostPort, showToken, slices.Contains(cli.Profiles.PlaintextProfiles(), strings.ToLower(name))))
+	},
+}
+
+// migratePlaintextTokens runs before every command. Plain-text tokens in the
+// profile file are moved into the keyring; when that is not possible a one-line
+// warning is printed instead.
+func migratePlaintextTokens(cmd *cobra.Command) {
+	if isQuietCommand(cmd) || len(cli.Profiles.PlaintextProfiles()) == 0 {
+		return
+	}
+
+	moved, err := cli.Profiles.MigrateTokens()
+	if err != nil {
+		cli.Logger.Warnf("could not move tokens to the %s; they remain in %s", profilestore.KeyringName(), cli.Profiles.Path())
+	}
+	if len(moved) > 0 {
+		fmt.Fprintln(os.Stderr, styles.Muted.Render(fmt.Sprintf("Moved %d API token(s) from %s to the %s.", len(moved), cli.Profiles.Path(), profilestore.KeyringName())))
+	}
+
+	printPlaintextTokenWarning()
+}
+
+// printPlaintextTokenWarning is called after every profile write and at
+// startup, so a token that just fell back to the file is reported right away.
+func printPlaintextTokenWarning() {
+	if w := plaintextTokenWarning(); w != "" {
+		fmt.Fprintln(os.Stderr, w)
+	}
+}
+
+// plaintextTokenWarning is the one-line yellow warning shown while any profile
+// keeps its token in the profile file, or "" when none does.
+func plaintextTokenWarning() string {
+	if len(cli.Profiles.PlaintextProfiles()) == 0 {
+		return ""
+	}
+	return styles.Warning.Render(fmt.Sprintf("Warning: API tokens are stored in plain text in %s (%s unavailable).", cli.Profiles.Path(), profilestore.KeyringName()))
+}
+
+// profileEnvCmd exists so credentials can be loaded by command substitution,
+// never by the user reading, printing, or pasting the token themselves.
+var profileEnvCmd = &cobra.Command{
+	Use:   "env",
+	Short: "Print shell exports for a profile's HATCHET_CLIENT_ variables",
+	Long: `Print a shell export block of the HATCHET_CLIENT_ environment variables for a profile, so credentials can be loaded without reading or pasting the token.
+
+In scripts, prefer the two-step form below over 'eval "$(...)"'. Command
+substitution discards this command's exit code, so a failed profile lookup would
+evaluate to an empty string and succeed (even under 'set -e'), silently leaving
+any previously loaded credentials in effect.`,
+	Example: `  # Load the default profile into the current shell
+  eval "$(hatchet profile env)"
+
+  # Load a specific profile
+  eval "$(hatchet profile env --name production)"
+
+  # In a script, fail loudly if the profile cannot be loaded
+  env_block=$(hatchet profile env --name production) || exit $?
+  eval "$env_block"`,
+	Run: func(cmd *cobra.Command, args []string) {
+		name, _ := cmd.Flags().GetString("name")
+		noExport, _ := cmd.Flags().GetBool("no-export")
+
+		// No interactive selection here: this command feeds eval "$(...)", so
+		// stdout must stay clean and it must never block on a prompt.
+		if name == "" {
+			name = cli.Profiles.GetDefaultProfile()
+			if name == "" {
+				cli.Logger.Fatalf("no profile specified and no default profile set; pass --name")
+			}
+		}
+
+		profile, err := cli.Profiles.GetProfile(name)
+		if err != nil {
+			cli.Logger.Fatalf("could not get profile: %v", err)
+		}
+
+		block, err := renderProfileEnv(name, *profile, noExport)
+		if err != nil {
+			cli.Logger.Fatalf("could not render profile env: %v", err)
+		}
+
+		// When stdout is a terminal the command was run directly rather than
+		// captured by `eval "$(...)"` or a redirect, so printing the block would
+		// dump the token onto the screen. Show how to use it instead of leaking
+		// it. Command substitution and file redirects make stdout a pipe/file,
+		// not a TTY, so the normal path still emits the block for them.
+		if term.IsTerminal(int(os.Stdout.Fd())) {
+			printProfileEnvTTYHint(cmd, name)
+			return
+		}
+
+		fmt.Print(block)
+	},
+}
+
+// printProfileEnvTTYHint explains, on stderr, how to consume `profile env`
+// output. It runs only when stdout is an interactive terminal, where emitting
+// the raw export block would print the profile's token in the clear.
+func printProfileEnvTTYHint(cmd *cobra.Command, name string) {
+	out := cmd.ErrOrStderr()
+
+	// Profile names are unrestricted (they can come from tenant names), so the
+	// name is single-quoted before it goes into a command the user is told to
+	// copy. An unquoted name with spaces or shell metacharacters would select
+	// the wrong profile or run arbitrary commands when the hint is pasted.
+	nameFlag := ""
+	if name != "" {
+		nameFlag = " --name " + shellSingleQuote(name)
+	}
+
+	fmt.Fprintln(out, styles.Bold.Render("hatchet profile env prints credentials meant for your shell, not the screen."))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Load this profile into your current shell:")
+	fmt.Fprintln(out, "  "+styles.Code.Render(fmt.Sprintf("eval \"$(hatchet profile env%s)\"", nameFlag)))
+	// Deliberately no "redirect to a file" suggestion: `> file` would create a
+	// world-readable (umask-dependent, typically 0644) file holding the token,
+	// and would follow a pre-existing symlink or reuse a destination's
+	// permissions. Anyone who wants a file can redirect it themselves and own
+	// that risk; the tool does not recommend leaking the token to disk.
+}
+
+// profileUpdateCmd represents the profile update command
+var profileUpdateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Update an existing profile",
+	Long:  `Update the address and/or token of an existing profile.`,
+	Example: `  # Update a profile interactively (prompts for profile and token)
+  hatchet profile update
+
+  # Update a specific profile with a new token
+  hatchet profile update --name production --token <new-token>`,
+	Run: func(cmd *cobra.Command, args []string) {
+		name, _ := cmd.Flags().GetString("name")
+		token, _ := cmd.Flags().GetString("token")
+		tlsStrategy, _ := cmd.Flags().GetString("tls-strategy")
+
+		if name == "" {
+			name = selectProfileForm(false)
+		}
+
+		if token == "" {
+			token = getApiTokenForm()
+		}
+
+		profile, err := getProfileFromToken(cmd, token, name, tlsStrategy)
+
+		if err != nil {
+			cli.Logger.Fatalf("could not get profile from token: %v", err)
+		}
+
+		err = cli.Profiles.UpdateProfile(name, profile)
+
+		if err != nil {
+			cli.Logger.Fatalf("could not update profile: %v", err)
+		}
+
+		fmt.Println(profileActionView("updated", name))
+		printPlaintextTokenWarning()
+	},
+}
+
+// profileSetDefaultCmd represents the profile set-default command
+var profileSetDefaultCmd = &cobra.Command{
+	Use:   "set-default",
+	Short: "Set a profile as the default",
+	Long:  `Set a profile as the default. The default profile will be automatically used when no profile is specified.`,
+	Example: `  # Set a profile as default interactively (shows selection menu)
+  hatchet profile set-default
+
+  # Set a specific profile as default
+  hatchet profile set-default --name production`,
+	Run: func(cmd *cobra.Command, args []string) {
+		name, _ := cmd.Flags().GetString("name")
+
+		if name == "" {
+			name = selectProfileForm(false)
+
+			if name == "" {
+				cli.Logger.Info("No profile selected, exiting")
+				return
+			}
+		}
+
+		err := cli.Profiles.SetDefaultProfile(name)
+		if err != nil {
+			cli.Logger.Fatalf("could not set default profile: %v", err)
+		}
+
+		fmt.Println(profileActionView("set-as-default", name))
+	},
+}
+
+// profileUnsetDefaultCmd represents the profile unset-default command
+var profileUnsetDefaultCmd = &cobra.Command{
+	Use:   "unset-default",
+	Short: "Unset the default profile",
+	Long:  `Unset the default profile. After unsetting, you will be prompted to select a profile when running commands.`,
+	Example: `  # Unset the default profile
+  hatchet profile unset-default`,
+	Run: func(cmd *cobra.Command, args []string) {
+		currentDefault := cli.Profiles.GetDefaultProfile()
+
+		if currentDefault == "" {
+			fmt.Println(styles.InfoMessage("No default profile is currently set"))
+			return
+		}
+
+		err := cli.Profiles.ClearDefaultProfile()
+		if err != nil {
+			cli.Logger.Fatalf("could not unset default profile: %v", err)
+		}
+
+		fmt.Println(profileActionView("unset-default", currentDefault))
+	},
+}
+
+func init() {
+	// Add profile command to root
+	rootCmd.AddCommand(profileCmd)
+
+	// Add subcommands to profile
+	profileCmd.AddCommand(profileAddCmd)
+	profileCmd.AddCommand(profileRemoveCmd)
+	profileCmd.AddCommand(profileListCmd)
+	profileCmd.AddCommand(profileShowCmd)
+	profileCmd.AddCommand(profileEnvCmd)
+	profileCmd.AddCommand(profileUpdateCmd)
+	profileCmd.AddCommand(profileSetDefaultCmd)
+	profileCmd.AddCommand(profileUnsetDefaultCmd)
+
+	// Add flags to profile add command
+	profileAddCmd.Flags().StringP("token", "t", "", "Authentication token (prompted if not provided)")
+	profileAddCmd.Flags().StringP("name", "n", "", "Name of the profile (defaults to tenant name)")
+	profileAddCmd.Flags().String("tls-strategy", "", "TLS strategy for the gRPC endpoint: tls, mtls, or none (auto-detected if not provided)")
+
+	// Add flags to profile remove command
+	profileRemoveCmd.Flags().StringP("name", "n", "", "Name of the profile to remove (prompted if not provided)")
+
+	// Add flags to profile show command
+	profileShowCmd.Flags().StringP("name", "n", "", "Name of the profile to show (prompted if not provided)")
+	profileShowCmd.Flags().Bool("show-token", false, "Show the full token (default: masked)")
+
+	// Add flags to profile env command
+	profileEnvCmd.Flags().StringP("name", "n", "", "Name of the profile (uses the default profile if not provided)")
+	profileEnvCmd.Flags().Bool("no-export", false, "Emit VAR='value' lines without the leading 'export '")
+
+	// Add flags to profile update command
+	profileUpdateCmd.Flags().StringP("token", "t", "", "Authentication token (prompted if not provided)")
+	profileUpdateCmd.Flags().StringP("name", "n", "", "Name of the profile to update (prompted if not provided)")
+	profileUpdateCmd.Flags().String("tls-strategy", "", "TLS strategy for the gRPC endpoint: tls, mtls, or none (auto-detected if not provided)")
+
+	// Add flags to profile set-default command
+	profileSetDefaultCmd.Flags().StringP("name", "n", "", "Name of the profile to set as default (prompted if not provided)")
+}
+
+func getApiTokenForm() string {
+	// ask for a token
+	var resp string
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Enter your Hatchet API token").
+				Placeholder("API Token").
+				Value(&resp).
+				EchoMode(huh.EchoModePassword),
+		),
+	).WithTheme(styles.HatchetTheme())
+
+	err := form.Run()
+
+	if err != nil {
+		cli.Logger.Fatalf("could not run profile add form: %v", err)
+	}
+
+	return parseToken(resp)
+}
+
+// parseToken extracts the token from various formats that users might paste
+func parseToken(input string) string {
+	input = strings.TrimSpace(input)
+
+	// Remove "export " prefix if present
+	input = strings.TrimPrefix(input, "export ")
+	input = strings.TrimSpace(input)
+
+	// Check for HATCHET_CLIENT_TOKEN= or HATCHET_CLIENT_TOKEN: prefix
+	if strings.HasPrefix(input, "HATCHET_CLIENT_TOKEN=") {
+		input = strings.TrimPrefix(input, "HATCHET_CLIENT_TOKEN=")
+	} else if strings.HasPrefix(input, "HATCHET_CLIENT_TOKEN:") {
+		input = strings.TrimPrefix(input, "HATCHET_CLIENT_TOKEN:")
+	}
+
+	input = strings.TrimSpace(input)
+
+	// Remove surrounding quotes if present
+	if len(input) >= 2 {
+		if (strings.HasPrefix(input, "\"") && strings.HasSuffix(input, "\"")) ||
+			(strings.HasPrefix(input, "'") && strings.HasSuffix(input, "'")) {
+			input = input[1 : len(input)-1]
+		}
+	}
+
+	return strings.TrimSpace(input)
+}
+
+// addProfileFromToken prompts for an API token and creates a profile, returning the profile name
+func addProfileFromToken(cmd *cobra.Command) (string, error) {
+	var token string
+
+	tokenForm := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Enter your Hatchet API token").
+				Placeholder("API Token").
+				Value(&token).
+				EchoMode(huh.EchoModePassword),
+		),
+	).WithTheme(styles.HatchetTheme())
+
+	err := tokenForm.Run()
+	if err != nil {
+		return "", fmt.Errorf("could not run token input form: %w", err)
+	}
+
+	if token == "" {
+		return "", fmt.Errorf("no token provided")
+	}
+
+	// Get profile details from token
+	profile, err := getProfileFromToken(cmd, token, "", "")
+	if err != nil {
+		return "", fmt.Errorf("could not get profile from token: %w", err)
+	}
+
+	// Prompt for custom name or use tenant name
+	name := profile.Name
+
+	nameForm := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title(fmt.Sprintf("Enter a name for this profile (default: %s)", name)).
+				Placeholder(name).
+				Value(&name),
+		),
+	).WithTheme(styles.HatchetTheme())
+
+	err = nameForm.Run()
+	if err != nil {
+		return "", fmt.Errorf("could not run name input form: %w", err)
+	}
+
+	if name == "" {
+		name = profile.Name
+	}
+
+	// Save the profile
+	err = cli.Profiles.AddProfile(name, profile)
+	if err != nil {
+		return "", fmt.Errorf("could not add profile: %w", err)
+	}
+	printPlaintextTokenWarning()
+
+	return name, nil
+}
+
+// cliSourceEditor tags an outgoing REST request as coming from the CLI, so the
+// server can record that this CLI was attached to the tenant. Every caller of
+// getProfileFromToken is a point where a token gets bound to this machine, which
+// is the moment worth recording.
+//
+// This honors the same opt-out as the anonymous version-check ping, so
+// telemetry.enabled=false stays a single switch from a user's point of view.
+func cliSourceEditor(cmd *cobra.Command) func(context.Context, *http.Request) error {
+	return func(_ context.Context, req *http.Request) error {
+		if !cli.TelemetryEnabled() {
+			return nil
+		}
+
+		req.Header.Set(analytics.SourceMetadataKey, string(analytics.SourceCLI))
+		req.Header.Set(analytics.CLIVersionMetadataKey, Version)
+		req.Header.Set(analytics.CLICommandMetadataKey, cmd.CommandPath())
+
+		return nil
+	}
+}
+
+func getProfileFromToken(cmd *cobra.Command, token, nameOverride, tlsOverride string) (*cliconfig.Profile, error) {
+	name := nameOverride
+	parsedTokenConf, err := loaderutils.GetConfFromJWT(token)
+
+	if err != nil {
+		cli.Logger.Fatalf("invalid token provided: %v", err)
+	}
+
+	// make sure client can connect with token
+	nopLogger := zerolog.Nop()
+	client, err := client.New(client.WithToken(token), client.WithLogger(&nopLogger)) // TODO: improve logging here
+
+	if err != nil {
+		cli.Logger.Fatalf("could not create client with provided token: %v", err)
+	}
+
+	tenant, err := client.API().TenantGetWithResponse(cmd.Context(), uuid.MustParse(client.TenantId()), cliSourceEditor(cmd))
+
+	if err != nil {
+		cli.Logger.Fatalf("could not connect to Hatchet server with provided token: %v", err)
+	} else if tenant.JSON200 == nil {
+		cli.Logger.Warnf("got a %d response from Hatchet server running at %s", tenant.StatusCode(), parsedTokenConf.ServerURL)
+		cli.Logger.Warnf("response body: %s", string(tenant.Body))
+		cli.Logger.Fatalf("could not connect to Hatchet server with provided token: invalid response. Ensure the Hatchet server is running at %s", parsedTokenConf.ServerURL)
+	}
+
+	if name == "" {
+		name = tenant.JSON200.Name
+	}
+
+	// Determine TLS strategy based on port or override
+	var tlsStrategy string
+	if tlsOverride != "" {
+		tlsStrategy = tlsOverride
+	} else {
+		tlsStrategy = determineTLSStrategy(parsedTokenConf.GrpcBroadcastAddress)
+	}
+
+	return &cliconfig.Profile{
+		TenantId:     client.TenantId(),
+		Name:         name,
+		Token:        token,
+		ApiServerURL: parsedTokenConf.ServerURL,
+		GrpcHostPort: parsedTokenConf.GrpcBroadcastAddress,
+		ExpiresAt:    parsedTokenConf.ExpiresAt,
+		TLSStrategy:  tlsStrategy,
+	}, nil
+}
+
+func determineTLSStrategy(grpcHostPort string) string {
+	// Try to auto-detect TLS by probing the endpoint
+	strategy, err := probeTLSEndpoint(grpcHostPort)
+	if err == nil && strategy == "tls" {
+		return strategy
+	}
+
+	// A plaintext detection is never trusted on its own: a peer on the path can
+	// answer the TLS probe with non-TLS bytes and would otherwise switch the
+	// profile, and every SDK that loads it, to sending the token in the clear.
+	description := "Auto-detection failed."
+	if err != nil {
+		cli.Logger.Warnf("could not auto-detect TLS for %s: %v", grpcHostPort, err)
+	} else {
+		cli.Logger.Warnf("%s did not answer the TLS probe; disabling TLS sends the API token in cleartext", grpcHostPort)
+		description = "The endpoint appears to speak plaintext. Answer no only if you trust this network."
+	}
+	cli.Logger.Info("falling back to user prompt")
+
+	useTLS := true
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewConfirm().
+				Title(fmt.Sprintf("Does the gRPC endpoint %s use TLS?", grpcHostPort)).
+				Description(description).
+				Value(&useTLS),
+		),
+	).WithTheme(styles.HatchetTheme())
+
+	if err := form.Run(); err != nil {
+		cli.Logger.Fatalf("could not run TLS confirmation form: %v", err)
+	}
+
+	if useTLS {
+		return "tls"
+	}
+	return "none"
+}
+
+// probeTLSEndpoint attempts to detect if an endpoint uses TLS by probing it
+func probeTLSEndpoint(hostPort string) (string, error) {
+	// Parse the host:port to ensure it's valid
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return "", fmt.Errorf("invalid host:port format: %w", err)
+	}
+
+	// Create a context with timeout for the probe
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Try TLS connection first (most common case)
+	tlsConfig := &tls.Config{
+		// we just want to see if TLS is spoken, not validate the cert
+		InsecureSkipVerify: true, // nolint: gosec
+		ServerName:         host,
+	}
+
+	// Attempt TLS dial
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
+
+	conn, err := tls.DialWithDialer(dialer, "tcp", hostPort, tlsConfig)
+	if err == nil {
+		// TLS connection succeeded
+		conn.Close()
+		return "tls", nil
+	}
+
+	dialNoTLS := func() (string, error) {
+		plainConn, plainErr := dialer.DialContext(ctx, "tcp", hostPort)
+		if plainErr == nil {
+			plainConn.Close()
+			return "none", nil
+		}
+		return "", fmt.Errorf("endpoint not reachable: %w", plainErr)
+	}
+
+	// Check if the error is a RecordHeaderError - this means the server sent non-TLS data
+	var recordHeaderErr tls.RecordHeaderError
+	if errors.As(err, &recordHeaderErr) {
+		return dialNoTLS()
+	}
+
+	// Check for EOF, which commonly occurs when connecting to a non-TLS server with TLS
+	if errors.Is(err, io.EOF) {
+		return dialNoTLS()
+	}
+
+	// If it's neither a RecordHeaderError nor EOF, it's likely a connection error
+	return "", fmt.Errorf("could not connect to endpoint: %w", err)
+}
+
+func selectProfileForm(useDefault bool) string {
+	profiles := cli.Profiles.GetProfiles()
+
+	if len(profiles) == 0 {
+		cli.Logger.Info("No profiles configured")
+		return ""
+	}
+
+	// Get and sort profile names for stable ordering
+	names := make([]string, 0, len(profiles))
+	for profileName := range profiles {
+		names = append(names, profileName)
+	}
+	sort.Strings(names)
+
+	if name, ok := resolveProfileWithoutForm(names, cli.Profiles.GetDefaultProfile(), useDefault); ok {
+		return name
+	}
+
+	// Create options in sorted order
+	profileNames := make([]huh.Option[string], 0, len(names))
+	for _, name := range names {
+		profileNames = append(profileNames, huh.Option[string]{
+			Key:   name,
+			Value: name,
+		})
+	}
+
+	var selectedName string
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Select a profile:").
+				Options(profileNames...).
+				Value(&selectedName),
+		),
+	).WithTheme(styles.HatchetTheme())
+
+	err := form.Run()
+
+	if err != nil {
+		cli.Logger.Fatalf("%s", profileSelectionFailureMessage(err, names))
+	}
+
+	return selectedName
+}
+
+// resolveProfileWithoutForm picks the profile when the form can be skipped: the still-valid
+// default, or the only profile when useDefault is set. Management commands keep the form even
+// with a single profile because they act immediately on the returned name.
+func resolveProfileWithoutForm(names []string, defaultProfile string, useDefault bool) (string, bool) {
+	if !useDefault {
+		return "", false
+	}
+
+	if defaultProfile != "" && slices.Contains(names, defaultProfile) {
+		return defaultProfile, true
+	}
+
+	if len(names) == 1 {
+		return names[0], true
+	}
+
+	return "", false
+}
+
+// Form failures here usually mean a session without a TTY, where the form library cannot
+// open /dev/tty.
+func profileSelectionFailureMessage(err error, names []string) string {
+	return fmt.Sprintf(
+		"could not run profile selection form: %v\n"+
+			"In a non-interactive session, pass the profile explicitly where the command supports it "+
+			"(for example --profile <name> or a profile name argument), or set a default with "+
+			"'hatchet profile set-default <name>'. Available profiles: %s",
+		err,
+		strings.Join(names, ", "),
+	)
+}
+
+// renderProfileEnv turns a profile into the block that `hatchet profile env`
+// emits. Two decisions are worth calling out. The API URL is emitted twice, as
+// HATCHET_CLIENT_SERVER_URL (read by the Go and Ruby SDKs) and
+// HATCHET_CLIENT_API_URL (read by the TypeScript SDK), so a loaded profile
+// resolves the same endpoint whichever SDK consumes it. And in export mode an
+// empty optional field is `unset` rather than skipped: switching profiles with
+// `eval "$(...)"` must clear the previous profile's endpoint and tenant, which
+// would otherwise stay set and override the values embedded in the new token.
+// A --no-export dump is a fresh file snapshot with nothing to clear, so it just
+// omits empty fields.
+func renderProfileEnv(name string, p cliconfig.Profile, noExport bool) (string, error) {
+	if p.Token == "" {
+		return "", fmt.Errorf("profile '%s' has no token", name)
+	}
+
+	// The SDKs assume TLS when the strategy is unset, so a profile that turned
+	// TLS off has to say so explicitly rather than fall through to that default.
+	tlsStrategy := p.TLSStrategy
+	if tlsStrategy == "" {
+		tlsStrategy = "tls"
+	}
+
+	pairs := []struct {
+		key   string
+		value string
+	}{
+		{"HATCHET_CLIENT_TOKEN", p.Token},
+		{"HATCHET_CLIENT_TLS_STRATEGY", tlsStrategy},
+		{"HATCHET_CLIENT_HOST_PORT", p.GrpcHostPort},
+		{"HATCHET_CLIENT_SERVER_URL", p.ApiServerURL},
+		{"HATCHET_CLIENT_API_URL", p.ApiServerURL},
+		{"HATCHET_CLIENT_TENANT_ID", p.TenantId},
+	}
+
+	prefix := "export "
+	if noExport {
+		prefix = ""
+	}
+
+	var b strings.Builder
+	for _, pair := range pairs {
+		if pair.value == "" {
+			if !noExport {
+				fmt.Fprintf(&b, "unset %s\n", pair.key)
+			}
+			continue
+		}
+		fmt.Fprintf(&b, "%s%s=%s\n", prefix, pair.key, shellSingleQuote(pair.value))
+	}
+
+	return b.String(), nil
+}
+
+// shellSingleQuote makes an emitted value a single shell literal so a token or
+// URL that contains spaces or metacharacters cannot break out of, or inject
+// into, the block the caller eval's. Single quotes suppress all shell
+// interpretation; an embedded single quote (the one character that cannot
+// appear inside them) is closed, escaped, and reopened.
+func shellSingleQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
+// profileView renders a profile view with details
+func profileView(name, token, apiURL, grpcHost string, showToken, plaintext bool) string {
+	var lines []string
+
+	// Title
+	lines = append(lines, styles.Section("Profile: "+name))
+	lines = append(lines, "")
+
+	// Token
+	tokenValue := token
+	if !showToken && len(token) > 4 {
+		tokenValue = token[:4] + "****"
+	}
+	switch {
+	case token == "":
+		tokenValue = styles.Muted.Render("(missing: not in profiles.yaml or the " + profilestore.KeyringName() + ")")
+	case plaintext:
+		tokenValue += " " + styles.Warning.Render("(plain text in profiles.yaml)")
+	default:
+		tokenValue += " " + styles.Muted.Render("("+profilestore.KeyringName()+")")
+	}
+	lines = append(lines, styles.KeyValue("Token", tokenValue))
+
+	// URLs
+	lines = append(lines, styles.KeyValue("API Server URL", apiURL))
+	lines = append(lines, styles.KeyValue("gRPC Host Port", grpcHost))
+
+	return styles.InfoBox.Render(strings.Join(lines, "\n"))
+}
+
+// profileListView renders a list of profiles
+func profileListView(profiles []string) string {
+	if len(profiles) == 0 {
+		return styles.InfoMessage("No profiles configured")
+	}
+
+	defaultProfile := cli.Profiles.GetDefaultProfile()
+	plaintext := cli.Profiles.PlaintextProfiles()
+
+	var lines []string
+	// Use Primary.Bold instead of Section to avoid the MarginBottom spacing
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(styles.PrimaryColor)
+	lines = append(lines, headerStyle.Render("Configured Profiles"))
+	for _, profile := range profiles {
+		profileDisplay := profile
+		if profile == defaultProfile {
+			profileDisplay = profile + " " + styles.Muted.Render("(default)")
+		}
+		if slices.Contains(plaintext, profile) {
+			profileDisplay += " " + styles.Warning.Render("(token in plain text)")
+		}
+		lines = append(lines, styles.ListItem.Render(styles.Accent.Render("• ")+profileDisplay))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// profileActionView renders a profile action result (add, update, remove, set-as-default, unset-default)
+func profileActionView(action, profileName string) string {
+	var message string
+	switch action {
+	case "added":
+		message = fmt.Sprintf("Profile '%s' added successfully", profileName)
+	case "updated":
+		message = fmt.Sprintf("Profile '%s' updated successfully", profileName)
+	case "removed":
+		message = fmt.Sprintf("Profile '%s' removed successfully", profileName)
+	case "set-as-default":
+		message = fmt.Sprintf("Profile '%s' set as default", profileName)
+	case "unset-default":
+		message = fmt.Sprintf("Default profile '%s' unset successfully", profileName)
+	default:
+		message = fmt.Sprintf("Profile '%s' %s", profileName, action)
+	}
+
+	return styles.SuccessMessage(message)
+}

@@ -1,0 +1,175 @@
+"""
+IMPORTANT
+----------
+
+These tests are intended to prevent us from changing defaults in one place and
+forgetting to change them in other places, or otherwise breaking the default handling logic.
+If you get a failure here, you likely changed the default values for some of the params (below)
+in one of the task decorators e.g. `Workflow.task`, etc.
+
+The intention of these tests is to:
+ 1. Ensure that the behavior of falling back to `TaskDefaults` works as expected, which means that
+    if no value for a certain parameter to one of these decorators is provided, it should fall back to the
+    value in `TaskDefaults` if one is set.
+2. Ensure that the default values set in the rest of the codebase don't change, and are consistent with each other.
+
+If you change the default values for any of these parameters, please update the tests accordingly.
+"""
+
+from datetime import timedelta
+from typing import Any
+
+import pytest
+
+from hatchet_sdk import Context, DurableContext, Hatchet, Task, TaskDefaults
+
+
+def dummy_task(input: None, context: Context) -> dict[str, str]:
+    return {"foo": "bar"}
+
+
+async def dummy_durable_task(input: None, context: DurableContext) -> dict[str, str]:
+    return {"foo": "bar"}
+
+
+DEFAULT_SCHEDULE_TIMEOUT = timedelta(minutes=5)
+DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=60)
+DEFAULT_RETRIES = 0
+DEFAULT_BACKOFF_FACTOR = None
+DEFAULT_BACKOFF_MAX = None
+
+
+def task(
+    hatchet: Hatchet,
+    is_durable: bool,
+    task_defaults: TaskDefaults,
+    **kwargs: Any,
+) -> Task[None, dict[str, str]]:
+    workflow = hatchet.workflow(
+        name="foo",
+        task_defaults=task_defaults,
+    )
+
+    if is_durable:
+        return workflow.durable_task(**kwargs)(dummy_durable_task)
+
+    return workflow.task(**kwargs)(dummy_task)
+
+
+@pytest.mark.parametrize("is_durable", [False, True])
+def test_task_defaults_applied_correctly(hatchet: Hatchet, is_durable: bool) -> None:
+    schedule_timeout = timedelta(seconds=3)
+    execution_timeout = timedelta(seconds=1)
+    retries = 4
+    backoff_factor = 1
+    backoff_max = timedelta(seconds=5)
+
+    t = task(
+        hatchet=hatchet,
+        is_durable=is_durable,
+        task_defaults=TaskDefaults(
+            schedule_timeout=schedule_timeout,
+            execution_timeout=execution_timeout,
+            retries=retries,
+            backoff_factor=backoff_factor,
+            backoff_max=backoff_max,
+        ),
+    )
+
+    assert t._schedule_timeout == schedule_timeout
+    assert t._execution_timeout == execution_timeout
+    assert t._retries == retries
+    assert t._backoff_factor == backoff_factor
+    assert t._backoff_max == backoff_max
+
+
+@pytest.mark.parametrize(
+    ("is_durable", "is_standalone"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
+def test_fallbacking_ensure_default_unchanged(
+    hatchet: Hatchet, is_durable: bool, is_standalone: bool
+) -> None:
+    t = task(
+        hatchet=hatchet,
+        is_durable=is_durable,
+        task_defaults=TaskDefaults(),
+    )
+
+    """If this test fails, it means that you changed the default values for the params to one of the `task` or `durable_task` decorators"""
+    assert t._schedule_timeout == DEFAULT_SCHEDULE_TIMEOUT
+    assert t._execution_timeout == DEFAULT_EXECUTION_TIMEOUT
+    assert t._retries == DEFAULT_RETRIES
+    assert t._backoff_factor == DEFAULT_BACKOFF_FACTOR
+    assert t._backoff_max == DEFAULT_BACKOFF_MAX
+
+
+@pytest.mark.parametrize(
+    ("is_durable", "is_standalone"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
+def test_defaults_correctly_overridden_by_params_passed_in(
+    hatchet: Hatchet, is_durable: bool, is_standalone: bool
+) -> None:
+    t = task(
+        hatchet=hatchet,
+        is_durable=is_durable,
+        task_defaults=TaskDefaults(
+            schedule_timeout=timedelta(seconds=3),
+            execution_timeout=timedelta(seconds=1),
+            retries=4,
+            backoff_factor=1,
+            backoff_max=timedelta(seconds=5),
+        ),
+        schedule_timeout=timedelta(seconds=9),
+        execution_timeout=timedelta(seconds=2),
+        retries=6,
+        backoff_factor=3,
+        backoff_max=timedelta(seconds=5),
+    )
+
+    assert t._schedule_timeout == timedelta(seconds=9)
+    assert t._execution_timeout == timedelta(seconds=2)
+    assert t._retries == 6
+    assert t._backoff_factor == 3
+    assert t._backoff_max == timedelta(seconds=5)
+
+
+@pytest.mark.parametrize(
+    ("is_durable", "is_standalone"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
+def test_params_correctly_set_with_no_defaults(
+    hatchet: Hatchet, is_durable: bool, is_standalone: bool
+) -> None:
+    t = task(
+        hatchet=hatchet,
+        is_durable=is_durable,
+        task_defaults=TaskDefaults(),
+        schedule_timeout=timedelta(seconds=9),
+        execution_timeout=timedelta(seconds=2),
+        retries=6,
+        backoff_factor=3,
+        backoff_max=timedelta(seconds=5),
+    )
+
+    assert t._schedule_timeout == timedelta(seconds=9)
+    assert t._execution_timeout == timedelta(seconds=2)
+    assert t._retries == 6
+    assert t._backoff_factor == 3
+    assert t._backoff_max == timedelta(seconds=5)

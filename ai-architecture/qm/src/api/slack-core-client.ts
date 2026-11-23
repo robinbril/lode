@@ -1,0 +1,444 @@
+import { recordErrorInBinding, type ErrorEvent } from "../admin/error-log.ts";
+import { isSessionTurn } from "../core/turn-origin.ts";
+import { replayableRequest } from "../core/orchestrator/turn-helpers.ts";
+import {
+  createSlackSessionStatus,
+  type SlackStatusActivity,
+  type SlackSessionStatus,
+  type SlackSessionStatusState,
+} from "../slack/session-status.ts";
+import type { FeatureFlagStore } from "../feature-flags.ts";
+import { decideAppAccess } from "../slack/deploy-access.ts";
+import type { IdentityService } from "../identity/identity-service.ts";
+import type { ActorAssertion } from "../types.ts";
+import type { KeychainApprovals } from "../credentials/keychain-approval.ts";
+import { createTaskAcknowledgements, type TaskAckState, type TaskAcknowledgements } from "../slack/task-ack.ts";
+import { orgId as configOrgId } from "../config.ts";
+import type { StagedEnvelope } from "../slack/envelope-staging.ts";
+import { resolveBranding } from "../resolution/branding.ts";
+import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
+import { buffer } from "node:stream/consumers";
+import type { App } from "./app.ts";
+import type { ErrorLog } from "../admin/error-log.ts";
+import type { LeaderLease } from "../persistence/leader-lease.ts";
+import type { PendingApproval, ScopeId, TurnRequest, TurnResult } from "../types.ts";
+import type { SurfaceContextRequest, SurfaceContextResult } from "../reach/reach.ts";
+import { scopeActor, scopeId } from "../types.ts";
+import type { MemoryService } from "../memory/memory-service.ts";
+import type { CachedMessage, ReadMessagesOpts, SurfaceCache, IngestEvent } from "../surface-cache/surface-cache.ts";
+import type { AckEmojiPickStore } from "../surface-cache/ack-emoji-pick-store.ts";
+import type { OrgBranding, ScopedConfigStore } from "../resolution/config-store.ts";
+import type { BlobTransferStore } from "../persistence/blob-transfer.ts";
+import { MAX_BLOB_BYTES } from "../persistence/blob-transfer.ts";
+import type { RunStore } from "../runs/run-store.ts";
+import type { TurnStream } from "../runs/turn-stream.ts";
+import { createRunWaiter } from "../surfaces/run-wait.ts";
+import type { RunHooks } from "../surfaces/turn-flow.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
+import { swallowAs } from "../util/errors.ts";
+import { resolveRuntimeChoice } from "../agent/runtime-choice.ts";
+import type { RuntimeChoice } from "../agent/agent.ts";
+import { modelDisplayName } from "../model/pi-models.ts";
+import type { ConversationEvent } from "../loops/sources/adapter.ts";
+import { slackConversationRef } from "../loops/sources/slack.ts";
+import { ambientTenant } from "../tenants/context.ts";
+import type { DeliveryLane, SlackDeliveryJobs } from "../slack/delivery-jobs.ts";
+
+interface StoredApprovalView extends Omit<PendingApproval, "reason"> {
+  createdAt?: number;
+  reason?: string;
+  sessionId?: string;
+  request?: Record<string, unknown>;
+}
+
+interface DirectoryPush {
+  members?: Array<{
+    principalId: string;
+    displayName: string;
+    type: "internal";
+    slackId?: string;
+    avatarUrl?: string;
+    isBot?: boolean;
+  }>;
+  channels?: Array<{ channelId: string; name: string; isPrivate?: boolean; isExternal?: boolean }>;
+  channelMembers?: Array<{ channelId: string; principalId: string }>;
+  channelRosterIds?: string[];
+  channelRevocations?: Array<{ channelId: string; principalId: string }>;
+  groupMembers?: Array<{ groupId: string; principalId: string }>;
+  groupIds?: string[];
+  groupRosterIds?: string[];
+  workspaceUrl?: string;
+  appIconUrl?: string;
+  membersSyncedAt?: number;
+  channelsSyncedAt?: number;
+  partialChannels?: boolean;
+  groupsSyncedAt?: number;
+}
+
+export interface SlackCoreClient {
+  privateContinuationSource?(runId: string): Promise<TurnRequest | null>;
+  decideAppAccess(value: string, actor: ActorAssertion, approve: boolean): Promise<string>;
+  keychainApprovals?: KeychainApprovals;
+  taskAcknowledgements?: TaskAcknowledgements;
+  sessionStatus?: SlackSessionStatus;
+  externalSlackParticipants(): Promise<boolean>;
+  invitedExternal(email: string): boolean;
+  ackEmojiOverride(): Promise<string[] | null>;
+  publishEmojiCatalog(emoji: Record<string, string>): Promise<void>;
+  surfaceHeaderFacts(scope: ScopeId): Promise<{ agentLabel?: string; modelName: string }>;
+  channelHeaderPinEnabled(scope: ScopeId): Promise<boolean>;
+  onScopeModelChanged(listener: (scope: ScopeId) => void): void;
+  onChannelHeaderPinChanged(listener: (scope: ScopeId) => void): void;
+  stageBlob(bytes: Uint8Array): Promise<{ blobId: string; sizeBytes: number }>;
+  readBlob(blobId: string): Promise<Buffer>;
+  readFileArtifact(artifactId: string, viewerId: string): Promise<Buffer>;
+  rememberSurfaceHistory?(events: IngestEvent[]): Promise<void>;
+  noteSurfaceHistoryGap?(container: string, note: string): Promise<void>;
+  readSurfaceMessages?(container: string, opts?: ReadMessagesOpts): Promise<CachedMessage[]>;
+  ingestSurfaceEvents(events: IngestEvent[], self?: { name?: string; mentionId?: string }): Promise<void>;
+  submitTurn(body: Omit<TurnRequest, "surface">): Promise<TurnResult>;
+  waitRun(runId: string, hooks?: RunHooks): Promise<TurnResult | null>;
+  ackRunDelivery(runId: string): Promise<void>;
+  reportRunEditRef(runId: string, editRef: string): Promise<void>;
+  getApproval(requestId: string): Promise<StoredApprovalView | null>;
+  pushDirectory(body: DirectoryPush): Promise<boolean>;
+  registerGroupRoster(groupId: string, principalIds: readonly string[]): Promise<void>;
+  ackDelivery(
+    id: string,
+    body?: { recipientThreadRef?: string; slackApiMs?: number; messageTs?: string },
+  ): Promise<void>;
+  reportDeliveryUndeliverable?(id: string, reason: string): Promise<void>;
+  failDelivery(id: string, reason: string): Promise<void>;
+
+  serveDeliveries(tenant: string, lane: DeliveryLane): () => void;
+  holdEnvelopeReplay<T>(account: string, fn: (lost: Promise<void>) => Promise<T>): Promise<T | null>;
+  stagedEnvelopes?: DurableMap<StagedEnvelope>;
+  holdDirectorySync<T>(account: string, fn: (lost: Promise<void>) => Promise<T>): Promise<T | null>;
+  pendingContextRequests(): Promise<SurfaceContextRequest[]>;
+  onContextRequest(listener: (request: SurfaceContextRequest) => void): () => void;
+  fulfillContextRequest(id: string, outcome: { result?: SurfaceContextResult; error?: string }): Promise<void>;
+  pickAckEmoji(text: string, candidates: readonly string[]): Promise<string | undefined>;
+  recordAckPick(pick: AckPickInput): Promise<void>;
+  inboxSlackMessage(msg: {
+    channel: string;
+    ts: string;
+    threadTs?: string;
+    text?: string;
+    senderEmail?: string;
+    isDirectMessage: boolean;
+  }): Promise<void>;
+}
+
+type AckPickInput = {
+  channel: string;
+  ts: string;
+  outcome: "picked" | "declined";
+  picked?: string;
+  icon?: string;
+  message?: string;
+  candidates?: string;
+  latencyMs?: number;
+};
+
+export type { SurfaceContextRequest };
+
+export interface SlackCoreClientDeps {
+  identity: IdentityService;
+  keychainApprovals?: KeychainApprovals;
+  taskAcknowledgements?: DurableMap<TaskAckState>;
+  sessionStatus?: DurableMap<SlackSessionStatusState>;
+  statusActivity?: SlackStatusActivity;
+  featureFlags?: FeatureFlagStore;
+  app: App;
+  config: ScopedConfigStore;
+  runtimeFallback: RuntimeChoice;
+  blobTransfer: BlobTransferStore;
+  deliveryJobs: SlackDeliveryJobs;
+  errors?: ErrorLog;
+  runs: RunStore;
+  turnStream: TurnStream;
+  pickAckEmoji?(text: string, candidates: readonly string[]): Promise<string | undefined>;
+  ackPicks?: AckEmojiPickStore;
+  ackModelId?: () => string | undefined;
+  brandingDefault?: OrgBranding;
+  leaderLease: LeaderLease;
+  stagedEnvelopes?: DurableMap<StagedEnvelope>;
+  surfaceCache?: SurfaceCache;
+  memory?: MemoryService;
+  inboxEvent?(event: ConversationEvent): Promise<void>;
+}
+
+export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClient {
+  const recordDeliveryError = (e: Omit<ErrorEvent, "ts">): void => recordErrorInBinding(deps.errors, e);
+  const lease = deps.leaderLease;
+  const orgScope: ScopeId = scopeId("org", configOrgId());
+
+  return {
+    invitedExternal: (email) =>
+      deps.identity.externalMember(email) !== undefined && deps.identity.classify(email).type === "internal",
+    decideAppAccess: (value, actor, approve) =>
+      decideAppAccess(ambientTenant(), deps.app, deps.identity, value, actor, approve),
+    ...(deps.keychainApprovals ? { keychainApprovals: deps.keychainApprovals } : {}),
+    ...(deps.taskAcknowledgements
+      ? {
+          taskAcknowledgements: createTaskAcknowledgements(deps.taskAcknowledgements, lease, {
+            runs: deps.runs,
+            ...(deps.statusActivity?.work ? { work: deps.statusActivity.work } : {}),
+          }),
+        }
+      : {}),
+    ...(deps.sessionStatus && deps.featureFlags
+      ? {
+          sessionStatus: createSlackSessionStatus(
+            deps.sessionStatus,
+            lease,
+            deps.runs,
+            deps.featureFlags,
+            Date.now,
+            deps.statusActivity,
+          ),
+        }
+      : {}),
+    async externalSlackParticipants() {
+      return (await deps.config.getExternalSlackParticipantsDurable(orgScope)) === true;
+    },
+
+    async ackEmojiOverride() {
+      return await deps.config.getAckEmojiDurable(orgScope);
+    },
+
+    async publishEmojiCatalog(emoji) {
+      await deps.config.setSlackEmojiCatalog(orgScope, emoji);
+    },
+
+    async surfaceHeaderFacts(scope) {
+      const [choice, branding] = await Promise.all([
+        resolveRuntimeChoice(deps.config, orgScope, scope, deps.runtimeFallback),
+        resolveBranding(deps.config, orgScope, deps.brandingDefault),
+      ]);
+      return {
+        ...(branding.selfLabel ? { agentLabel: branding.selfLabel } : {}),
+        modelName: modelDisplayName(choice.modelId),
+      };
+    },
+
+    async channelHeaderPinEnabled(scope) {
+      return deps.config.getChannelHeaderPinDurable(scope);
+    },
+
+    onScopeModelChanged(listener) {
+      deps.config.onRuntimeSelectionChanged((scope) => listener(scope));
+    },
+
+    onChannelHeaderPinChanged(listener) {
+      deps.config.onChannelHeaderPinChanged((scope) => listener(scope));
+    },
+
+    async stageBlob(bytes) {
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const info = await deps.blobTransfer.put(Readable.from([Buffer.from(bytes)]), {
+        maxBytes: MAX_BLOB_BYTES,
+        expectedSha256: sha256,
+      });
+      return { blobId: info.blobId, sizeBytes: info.sizeBytes };
+    },
+
+    async readBlob(blobId) {
+      const blob = await deps.blobTransfer.open(blobId);
+      if (!blob) throw new Error(`blob ${blobId} not found`);
+      return buffer(blob.stream);
+    },
+
+    async readFileArtifact(artifactId, viewerId) {
+      const opened = await deps.app.openFileForViewer(ambientTenant(), artifactId, viewerId, false);
+      if (!opened) throw new Error(`file artifact ${artifactId} not found (or not visible to ${viewerId})`);
+      return buffer(opened.stream);
+    },
+
+    async rememberSurfaceHistory(events) {
+      await deps.surfaceCache?.ingest(events);
+    },
+
+    async noteSurfaceHistoryGap(container, note) {
+      if (!deps.memory) return;
+      const kind = (await deps.surfaceCache?.containerState(container))?.kind;
+      const scope = scopeId(kind === "group" ? "group" : "channel", container);
+      await deps.memory.capture(scope, [note], Date.now(), { actorId: scopeActor(scope), context: "maintenance" });
+    },
+
+    async readSurfaceMessages(container, opts) {
+      return deps.app.readSurfaceMessages(container, { ...opts, noFallback: true });
+    },
+
+    async ingestSurfaceEvents(events, self) {
+      if (!events.length) return;
+      await deps.app.ingestSurfaceEvents(events, "slack", self);
+    },
+
+    async privateContinuationSource(runId) {
+      const run = await deps.runs.get(runId);
+      if (
+        run?.request.surfaceOrigin?.audience !== "external" ||
+        run.request.origin.kind !== "human" ||
+        isSessionTurn(run.request) ||
+        run.request.actor.type !== "internal"
+      )
+        return null;
+      return replayableRequest(run.request);
+    },
+
+    submitTurn(body) {
+      return deps.app.turn({ ...body, surface: "slack" });
+    },
+
+    waitRun: createRunWaiter({ runs: deps.runs, turnStream: deps.turnStream, getRun: (id) => deps.app.getRun(id) }),
+
+    async ackRunDelivery(runId) {
+      await deps.app.ackDeliveryByKey(`run:${runId}`);
+    },
+
+    async reportRunEditRef(runId, editRef) {
+      const found = await deps.app.setRunDeliveryState(runId, { editRef });
+      if (!found) throw new Error(`run ${runId} not found`);
+    },
+
+    async getApproval(requestId) {
+      const record = await deps.app.getApproval(requestId);
+      if (!record) return null;
+      return {
+        requestId: record.requestId,
+        ...(record.createdAt !== undefined ? { createdAt: record.createdAt } : {}),
+        command: record.command,
+        sessionId: record.sessionId,
+        ...(record.reason !== undefined ? { reason: record.reason } : {}),
+        ...(record.purpose !== undefined ? { purpose: record.purpose } : {}),
+        ...(record.summary !== undefined ? { summary: record.summary } : {}),
+        ...(record.summaryDetail !== undefined ? { summaryDetail: record.summaryDetail } : {}),
+        ...(record.grantModes !== undefined ? { grantModes: record.grantModes } : {}),
+        ...(record.kind !== undefined ? { kind: record.kind } : {}),
+        ...(record.request !== undefined ? { request: record.request as unknown as Record<string, unknown> } : {}),
+      };
+    },
+
+    async pushDirectory(body) {
+      if (body.workspaceUrl)
+        await deps.app.setDirectoryWorkspace({ workspaceUrl: body.workspaceUrl, appIconUrl: body.appIconUrl ?? null });
+      let applied = true;
+      if (body.members) applied = (await deps.app.upsertDirectory(body.members, body.membersSyncedAt)) && applied;
+      if (body.channels) {
+        applied =
+          (await deps.app.upsertChannels(
+            body.channels,
+            body.channelMembers,
+            body.channelsSyncedAt,
+            body.channelRosterIds,
+            body.channelRevocations,
+            body.partialChannels,
+          )) && applied;
+      }
+      if (body.groupMembers) {
+        applied =
+          (await deps.app.upsertGroups(body.groupMembers, body.groupsSyncedAt, body.groupIds, body.groupRosterIds)) &&
+          applied;
+      }
+      return applied;
+    },
+
+    registerGroupRoster(groupId, principalIds) {
+      return deps.app.registerGroupRoster(groupId, principalIds);
+    },
+
+    serveDeliveries(tenant, lane) {
+      return deps.deliveryJobs.serve(tenant, lane);
+    },
+    holdDirectorySync(account, fn) {
+      return lease.hold(`slack:directory-sync:${account}`, fn);
+    },
+    holdEnvelopeReplay(account, fn) {
+      return lease.hold(`slack:envelope-replay:${account}`, fn);
+    },
+    stagedEnvelopes: deps.stagedEnvelopes,
+
+    async ackDelivery(id, body) {
+      if (body?.recipientThreadRef) await deps.app.recordPrincipalDelivery(id, body.recipientThreadRef);
+      await deps.app.ackDelivery(id, body?.slackApiMs, body?.messageTs);
+    },
+
+    async reportDeliveryUndeliverable(id, reason) {
+      recordDeliveryError({
+        category: "delivery",
+        code: "delivery_undeliverable",
+        message: `delivery ${id} cannot be delivered (${reason}) — retrying until the TTL expires it`,
+        scopeLabel: "slack:deliveries" as ScopeId,
+      });
+    },
+
+    async failDelivery(id, reason) {
+      const failed = await deps.app.failDelivery(id, reason);
+      if (!failed) return;
+      recordDeliveryError({
+        category: "delivery",
+        code: "delivery_failed",
+        message:
+          `delivery ${id} to ${failed.destination.type} ${failed.destination.target} was refused permanently (${reason}) — ` +
+          `dropped, not retried${failed.destination.commandApprovalId ? `; approval ${failed.destination.commandApprovalId} never reached its requester` : ""}`,
+        scopeLabel: "slack:deliveries" as ScopeId,
+      });
+    },
+
+    pendingContextRequests() {
+      return deps.app.pendingContextRequests("slack");
+    },
+
+    onContextRequest(listener) {
+      return deps.app.onContextRequestCreated((request) => {
+        if (request.source === "slack") listener(request);
+      });
+    },
+
+    pickAckEmoji(text, candidates) {
+      return deps.pickAckEmoji?.(text, candidates) ?? Promise.resolve(undefined);
+    },
+
+    async inboxSlackMessage(msg) {
+      const at = Math.round(Number.parseFloat(msg.ts) * 1000);
+      if (!Number.isFinite(at)) return;
+      await deps.inboxEvent?.({
+        source: "slack",
+        conversationRef: slackConversationRef(msg.channel, msg.ts, msg.threadTs, msg.isDirectMessage),
+        at,
+        ...(msg.text ? { text: msg.text } : {}),
+        ...(msg.senderEmail ? { senderEmail: msg.senderEmail } : {}),
+      });
+    },
+    async recordAckPick(pick) {
+      if (!deps.ackPicks) return;
+      const ackModel = deps.ackModelId?.();
+      await deps.ackPicks
+        .record({
+          surface: "slack",
+          channel: pick.channel,
+          ts: pick.ts,
+          outcome: pick.outcome,
+          ...(pick.picked ? { picked: pick.picked } : {}),
+          ...(pick.icon ? { icon: pick.icon } : {}),
+          ...(pick.message ? { message: pick.message } : {}),
+          ...(pick.candidates ? { candidates: pick.candidates } : {}),
+          ...(ackModel ? { model: ackModel } : {}),
+          ...(pick.latencyMs != null ? { latencyMs: pick.latencyMs } : {}),
+          createdAt: Date.now(),
+        })
+        .catch(swallowAs("slack: record ack emoji pick", undefined));
+    },
+
+    async fulfillContextRequest(id, outcome) {
+      await deps.app
+        .fulfillContextRequest(id, outcome)
+        .then((ok) => {
+          if (!ok) return;
+        })
+        .catch(swallowAs("slack-core-client: fulfill context request", undefined));
+    },
+  };
+}

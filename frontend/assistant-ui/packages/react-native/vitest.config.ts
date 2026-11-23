@@ -1,0 +1,27 @@
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  resolve: {
+    alias: {
+      "react-native": "react-native-web",
+    },
+  },
+  test: {
+    coverage: {
+      include: ["src/**/*.{ts,tsx}"],
+      thresholds: {
+        lines: 97,
+        functions: 95,
+        branches: 91,
+        statements: 97,
+        autoUpdate: (threshold, previous) =>
+          Math.max(previous, Math.floor(threshold) - 1),
+      },
+    },
+    environment: "jsdom",
+    pool: "threads",
+    fsModuleCache: true,
+    globals: true,
+    include: ["src/**/*.test.{ts,tsx}"],
+  },
+});

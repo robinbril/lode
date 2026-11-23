@@ -1,0 +1,197 @@
+---
+title: Model Context
+description: Configure assistant behavior through system instructions, tools, and context providers.
+platforms: ["react"]
+---
+
+Model context is the set of system instructions and tools that components provide to the assistant through a context provider system.
+
+## Core Concepts
+
+### System Instructions
+
+System instructions define the base behavior and knowledge available to the assistant. These can be provided in several ways:
+
+```tsx
+import {
+  useAssistantInstructions,
+  useAssistantContext,
+  makeAssistantVisible,
+} from "@assistant-ui/react";
+
+// Static instructions
+useAssistantInstructions("You are a helpful assistant...");
+
+// Dynamic context — callback is evaluated lazily at send-time
+useAssistantContext({
+  getContext: () => `Current page: ${window.location.href}`,
+});
+
+// Via makeAssistantVisible
+const ReadableComponent = makeAssistantVisible(MyComponent);
+// Automatically provides component HTML as system context
+```
+
+`useAssistantInstructions` takes a static string that re-registers when changed. `useAssistantContext` takes a callback that is evaluated fresh each time the model context is read, so it suits frequently changing application state and does not trigger re-registration.
+
+### Tools
+
+Tools are functions that the assistant can use to interact with your application. They can be provided through various mechanisms:
+
+```tsx title="app/form-toolkit.tsx"
+"use generative";
+
+import { defineToolkit } from "@assistant-ui/react";
+import { z } from "zod";
+
+export default defineToolkit({
+  submitForm: {
+    description: "Submit the form with the user's details.",
+    parameters: z.object({
+      email: z.string().email(),
+      name: z.string(),
+    }),
+    execute: async ({ email, name }) => {
+      "use client";
+      // Implementation
+      return { success: true };
+    },
+    renderText: { running: "Submitting…", complete: "Submitted" },
+  },
+});
+```
+
+```tsx title="app/Form.tsx"
+import {
+  AuiConfig,
+  AuiProvider,
+  makeAssistantVisible,
+  Tools,
+  useAui,
+} from "@assistant-ui/react";
+import toolkit from "./form-toolkit";
+
+// Via makeAssistantVisible's clickable option
+const ClickableButton = makeAssistantVisible(Button, {
+  clickable: true, // Provides a click tool
+});
+
+// Use in your component
+function Form() {
+  const aui = useAui();
+  const config = AuiConfig({ tools: Tools({ toolkit }) });
+  return (
+    <AuiProvider extends={aui} config={config}>
+      <form>{/* form fields */}</form>
+    </AuiProvider>
+  );
+}
+```
+
+## Context Provider System
+
+The context provider system allows components to contribute to the model context. Here's a typical usage pattern:
+
+```tsx
+import { useAui, tool } from "@assistant-ui/react";
+import { useEffect } from "react";
+import { z } from "zod";
+
+// Define tool outside the component (no runtime dependencies)
+const myTool = tool({
+  parameters: z.object({
+    query: z.string(),
+  }),
+  execute: async ({ query }) => {
+    const result = await searchDatabase(query);
+    return { result };
+  },
+});
+
+function MyComponent() {
+  const aui = useAui();
+
+  useEffect(() => {
+    // Register context provider
+    return aui.modelContext.register({
+      getModelContext: () => ({
+        system: "You are a helpful search assistant...",
+        tools: { myTool },
+      }),
+    });
+  }, [aui]); // Re-register if api changes
+
+  return <div>{/* component content */}</div>;
+}
+```
+
+### Provider Composition
+
+Multiple providers can be registered, and their contexts will be composed:
+
+- System instructions are concatenated, highest `priority` first, separated by a blank line
+- Tool sets are merged
+- Nested readable components only contribute their context at the outermost level
+
+### Capping the System Prompt
+
+A transport with a hard size limit can cap the merged system prompt by passing `maxSystemLength` (in characters) to the model context client in your `AuiConfig`:
+
+```tsx
+import {
+  AssistantRuntimeProvider,
+  AuiConfig,
+  ModelContextClient,
+  Tools,
+} from "@assistant-ui/react";
+
+const config = AuiConfig({
+  modelContext: ModelContextClient({ maxSystemLength: 40_000 }),
+  tools: Tools({ toolkit }),
+});
+
+// <AssistantRuntimeProvider runtime={runtime} config={config}>
+```
+
+Parts stay in priority order. Higher-priority parts are kept whole, the first part that does not fit is cut to the remaining budget, and every lower-priority part after it is dropped. The blank-line separators count toward the cap. A provider that should be trimmed first registers with a negative priority:
+
+```tsx
+aui.modelContext.register({
+  getModelContext: () => ({ system: longReferenceText, priority: -1 }),
+});
+```
+
+To change how the parts combine, pass `mergeSystem` instead. It receives the parts as `{ system, priority }` objects, highest priority first, and returns the merged system prompt:
+
+```tsx
+const config = AuiConfig({
+  modelContext: ModelContextClient({
+    mergeSystem: (parts) =>
+      parts.map((part) => `<section>${part.system}</section>`).join("\n"),
+  }),
+});
+```
+
+`maxSystemLength` and `mergeSystem` are mutually exclusive, and passing both throws when the client mounts; apply any cap inside `mergeSystem` instead. The options apply to context registered through `aui.modelContext`, such as `useAssistantInstructions` and `useAssistantContext`.
+
+## Best Practices
+
+1. **System Instructions**
+
+   - Keep them focused and specific to the component's purpose
+   - Use useAssistantInstructions for explicit instructions
+   - Let makeAssistantVisible handle component structure
+
+2. **Tools**
+
+   - Use toolkit entries to define tool schemas and behavior
+   - Prefer `Tools({ toolkit })` for reusable tools
+   - Handle errors gracefully
+   - Consider async operations and loading states
+   - Use the built-in click tool when possible
+
+3. **Context Management**
+   - Register providers in useEffect for proper cleanup
+   - Clean up providers when components unmount
+   - Avoid deeply nested readable components
+   - Consider performance implications of large HTML structures

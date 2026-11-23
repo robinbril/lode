@@ -1,0 +1,352 @@
+import type {
+  CandidateDestination,
+  CommandApprovalGrant,
+  Destination,
+  EgressPolicy,
+  Principal,
+  ScopeId,
+  TurnRequest,
+  ActorAssertion,
+} from "../../types.ts";
+import { isAgentReply, isHidden, isOverheard, isUserItem, type Item, proseText } from "../../sessions/items.ts";
+import type { DeliveryStore } from "../../delivery/delivery-store.ts";
+import type { SkillBundle, SkillBundleStore } from "../../skills/skill-bundle-store.ts";
+import type { SkillResolution } from "../../skills/skill-store.ts";
+import { hostMatches } from "../../resolution/egress-policy.ts";
+import { swallow } from "../../util/errors.ts";
+import { hashId } from "../../util/crypto.ts";
+import type { PersonaForTurn } from "../../personas/persona-service.ts";
+import { deliveryMenu } from "./prompt-blocks.ts";
+import type { OrchestratorDeps, OrchestratorInput } from "./types.ts";
+
+export const MAX_AUTO_ATTACHMENT_SCREEN_BYTES = 12_000;
+
+export function isScreenableTextAttachment(mimetype: string): boolean {
+  const mime = mimetype.split(";", 1)[0]!.trim().toLowerCase();
+  return (
+    mime.startsWith("text/") ||
+    [
+      "application/json",
+      "application/xml",
+      "application/javascript",
+      "application/yaml",
+      "application/x-yaml",
+    ].includes(mime)
+  );
+}
+
+export function stripAckPrefix(text: string, ack: string | undefined): string {
+  if (!text || !ack) return text;
+  const lead = text.trimStart();
+  if (!lead.startsWith(ack)) return text;
+  return lead.slice(ack.length).trimStart();
+}
+
+const CONNECTOR_SKILLS: Readonly<Record<string, { provider: string; appConnection?: true }>> = {
+  dropbox: { provider: "dropbox", appConnection: true },
+  "email-draft-in-voice": { provider: "google" },
+  "email-voice-profile": { provider: "google" },
+  "google-drive-sheets": { provider: "google", appConnection: true },
+  "google-workspace": { provider: "google", appConnection: true },
+  linear: { provider: "linear", appConnection: true },
+  "morning-digest": { provider: "x" },
+  "slack-drafts": { provider: "slack" },
+  x: { provider: "x" },
+  zoom: { provider: "zoom", appConnection: true },
+};
+
+export function filterConnectorSkills(
+  resolved: SkillResolution[],
+  availableProviders: readonly string[],
+  appConnections: boolean,
+): SkillResolution[] {
+  const available = new Set(availableProviders);
+  return resolved.filter((entry) => {
+    const skill = CONNECTOR_SKILLS[entry.skill?.manifest.name ?? ""];
+    return !skill || available.has(skill.provider) || (appConnections && skill.appConnection === true);
+  });
+}
+
+export async function loadActiveBundles(store: SkillBundleStore, resolved: SkillResolution[]): Promise<SkillBundle[]> {
+  const packIds = [...new Set(resolved.map((r) => r.skill?.pack?.packId).filter((id): id is string => Boolean(id)))];
+  const bundles = await Promise.all(packIds.map((id) => store.get(id)));
+  return bundles.filter((b): b is SkillBundle => b !== null);
+}
+
+export function egressClaimAllowingControlPlane(
+  egress: EgressPolicy,
+  apiBaseUrl: string,
+  denyPrivateNetworks = false,
+): EgressPolicy | undefined {
+  const allowedHosts = egress.allowedHosts ?? [];
+  const deniedHosts = egress.deniedHosts ?? [];
+  if (allowedHosts.length === 0 && deniedHosts.length === 0 && !denyPrivateNetworks) return undefined;
+  let coreHost = "";
+  if (apiBaseUrl) {
+    try {
+      coreHost = new URL(apiBaseUrl).hostname;
+    } catch (e) {
+      swallow("orchestrator: apiBaseUrl parse", e);
+    }
+  }
+  const safeDenied = coreHost ? deniedHosts.filter((d) => !hostMatches(coreHost, d)) : deniedHosts;
+  const allowedWithCore =
+    coreHost && allowedHosts.length > 0 && !allowedHosts.includes(coreHost)
+      ? [...allowedHosts, coreHost]
+      : allowedHosts;
+  const claim: EgressPolicy = {
+    allowedHosts: allowedWithCore,
+    ...(denyPrivateNetworks ? { denyPrivateNetworks: true } : {}),
+    ...(denyPrivateNetworks && coreHost ? { privateNetworkAllowedHosts: [coreHost] } : {}),
+    ...(safeDenied.length ? { deniedHosts: safeDenied } : {}),
+  };
+  return claim.allowedHosts.length || claim.deniedHosts?.length || claim.denyPrivateNetworks ? claim : undefined;
+}
+
+export function stripTurnBoilerplate(text: string): string {
+  const kept = text
+    .split("\n\n")
+    .filter((p) => !/^\s*\[/.test(p))
+    .join("\n\n")
+    .trim();
+  return kept || text.trim();
+}
+
+export function visibleTitleEntryText(item: Item): string | undefined {
+  const value = isUserItem(item) && typeof item.body.display === "string" ? item.body.display : proseText(item);
+  return value?.trim() || undefined;
+}
+
+function* visibleTurnTexts(items: Item[]): Generator<{ role: "User" | "Assistant"; text: string }> {
+  for (const e of items) {
+    if (!isUserItem(e) && !isAgentReply(e)) continue;
+    if (isOverheard(e) || isHidden(e)) continue;
+    const raw = visibleTitleEntryText(e);
+    const text = raw && isUserItem(e) ? stripTurnBoilerplate(raw) : raw;
+    if (text) yield { role: isUserItem(e) ? "User" : "Assistant", text };
+  }
+}
+
+export function renderTitleTranscript(items: Item[]): string {
+  const lines: string[] = [];
+  for (const { role, text } of visibleTurnTexts(items)) {
+    lines.push(`${role}:\n${text}`);
+    if (lines.length >= 6) break;
+  }
+  return lines.join("\n\n");
+}
+
+export function renderNextPromptTranscript(items: Item[]): string | undefined {
+  const turns = [...visibleTurnTexts(items)];
+  const reply = turns.at(-1);
+  if (reply?.role !== "Assistant") return undefined;
+  const asked = turns.findLast((turn) => turn.role === "User");
+  const lines = [...(asked ? [`User:\n${asked.text}`] : []), `Assistant:\n${reply.text}`];
+  return `<conversation>\n${lines.join("\n\n")}\n</conversation>`;
+}
+
+const DELIVERY_NOTE_ITEM_MAX_CHARS = 200;
+
+export async function recentPrincipalDeliveryNote(
+  deliveries: DeliveryStore,
+  threadRef: string,
+  since = 0,
+): Promise<string> {
+  const recent = (await deliveries.listByRecipientThread(threadRef, { limit: 5 })).filter(
+    (d) => (d.deliveredAt ?? d.createdAt) > since,
+  );
+  if (!recent.length) return "";
+  const lines = recent.map((d) => {
+    const from = d.destination.onBehalfOf ? ` from ${d.destination.onBehalfOf}` : "";
+    const trigger = d.provenance?.trigger ? ` [${d.provenance.trigger}]` : "";
+    const flattened = d.text.trim().replace(/\s+/g, " ");
+    const text =
+      flattened.length > DELIVERY_NOTE_ITEM_MAX_CHARS
+        ? `${flattened.slice(0, DELIVERY_NOTE_ITEM_MAX_CHARS)}…`
+        : flattened;
+    return `- ${new Date(d.deliveredAt ?? d.createdAt).toISOString()}${trigger}${from}: ${text}`;
+  });
+  return ["Delivered here since the user's last message (delivery events, not your turns):", ...lines].join("\n");
+}
+
+function principalAssertion(p: Principal): ActorAssertion {
+  return {
+    externalId: p.id,
+    ...(p.type === "guest" ? { isExternalGuest: true } : {}),
+    ...(p.teamIds ? { teamIds: p.teamIds } : {}),
+    ...(p.displayName ? { displayName: p.displayName } : {}),
+  };
+}
+
+export function replayableRequest(input: OrchestratorInput): TurnRequest {
+  const c = input.conversation;
+  return {
+    surface: input.surface ?? "unknown",
+    ...(input.surfaceOrigin ? { surfaceOrigin: input.surfaceOrigin } : {}),
+    ...(input.sessionSenderId ? { sessionSenderId: input.sessionSenderId } : {}),
+    ...(input.delegatingRunId ? { delegatingRunId: input.delegatingRunId } : {}),
+    ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
+    ...(input.deliveryTarget ? { deliveryTarget: input.deliveryTarget } : {}),
+    ...(input.deliveryCandidates?.length ? { deliveryCandidates: input.deliveryCandidates } : {}),
+    actor: principalAssertion(input.actor),
+    conversation: {
+      kind: c.kind,
+      threadRef: c.threadRef,
+      ...(c.channelRef ? { channelRef: c.channelRef } : {}),
+      ...(c.channelName ? { channelName: c.channelName } : {}),
+      audience: c.audience.map(principalAssertion),
+      ...(c.isPrivate !== undefined ? { isPrivate: c.isPrivate } : {}),
+      ...(c.isMpim !== undefined ? { isMpim: c.isMpim } : {}),
+      ...(c.publishMembers ? { publishMembers: c.publishMembers.map(principalAssertion) } : {}),
+    },
+    text: input.text,
+    ...(input.gatewayContext ? { gatewayContext: input.gatewayContext } : {}),
+    ...(input.proactiveOpener ? { proactiveOpener: true } : {}),
+    origin: input.origin,
+    ...(input.botActor ? { botActor: true } : {}),
+    ...(input.conversationHeader ? { conversationHeader: input.conversationHeader } : {}),
+    ...(input.priorTurns?.length ? { priorTurns: input.priorTurns } : {}),
+    ...(input.overheard?.length ? { overheard: input.overheard } : {}),
+    ...(input.detectContext ? { detectContext: input.detectContext } : {}),
+    ...(input.detectOpener ? { detectOpener: input.detectOpener } : {}),
+    ...(input.attachments?.length ? { attachments: input.attachments } : {}),
+    ...(input.inboundNotes?.length ? { inboundNotes: input.inboundNotes } : {}),
+    ...(input.model ? { model: input.model } : {}),
+    ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
+    ...(input.fastMode !== undefined ? { fastMode: input.fastMode } : {}),
+    ...(input.readOnly ? { readOnly: true } : {}),
+    ...(input.privateSessionMessage ? { privateSessionMessage: true as const } : {}),
+    ...(input.sessionMessageDepth !== undefined ? { sessionMessageDepth: input.sessionMessageDepth } : {}),
+    ...(input.skipMemory ? { skipMemory: true } : {}),
+    ...(input.memoryNotebookOnly ? { memoryNotebookOnly: true } : {}),
+    ...(input.surfaceTools ? { surfaceTools: true } : {}),
+    ...(input.addressed ? { addressed: true } : {}),
+    ...(input.envelopeWrapped ? { envelopeWrapped: true } : {}),
+    ...(input.liveReplies ? { liveReplies: true } : {}),
+    ...(input.displayText ? { displayText: input.displayText } : {}),
+    ...(typeof input.turnWallClockMs === "number" ? { turnWallClockMs: input.turnWallClockMs } : {}),
+    ...(input.timezone ? { timezone: input.timezone } : {}),
+  };
+}
+
+export function approvalGrantId(
+  grant: Pick<CommandApprovalGrant, "actorId" | "command" | "scope" | "sessionId" | "approvalKey">,
+): string {
+  return hashId([grant.actorId, grant.scope, grant.sessionId ?? "*", grant.approvalKey ?? grant.command], 24);
+}
+
+function candidateKey(target: string, audienceScopeId: ScopeId): string {
+  return hashId([target, audienceScopeId]);
+}
+
+const SURFACE_ENQUEUE_ACTIONS = new Set(["post", "reach", "react", "edit", "delete"]);
+
+export function completedSurfaceEnqueues(items: readonly Item[], sinceSeq: number, surfaceTool: string): number {
+  const calls: Array<{ enqueues: boolean; callId: string | null; done: boolean }> = [];
+  for (const e of items) {
+    if (e.seq <= sinceSeq) continue;
+    if (e.kind === "ToolCall") {
+      calls.push({
+        enqueues: e.tool === surfaceTool && SURFACE_ENQUEUE_ACTIONS.has(String(e.body.action)),
+        callId: e.callId,
+        done: false,
+      });
+    } else if (e.kind === "ToolResult") {
+      if (e.body.interrupted === true) continue;
+      const cid = e.callId;
+      const call = cid ? calls.find((c) => c.callId === cid && !c.done) : calls.findLast((c) => !c.done);
+      if (call) call.done = true;
+    }
+  }
+  return calls.filter((c) => c.enqueues && c.done).length;
+}
+
+export interface TurnPostKeys {
+  seed(completed: number): void;
+  take(): number;
+  key(destination: Destination, seq: number): string;
+  readonly ackKey: string;
+}
+
+export function turnPostKeys(turnKey: string): TurnPostKeys {
+  let next = 0;
+  return {
+    ackKey: `ack:${turnKey}`,
+    seed(completed) {
+      next = completed;
+    },
+    take: () => next++,
+    key: (destination, seq) => `post:${turnKey}:${destination.type}:${destination.target}:${seq}`,
+  };
+}
+
+export function replaceThreadSegment(target: string, threadTs: string): string {
+  const i = target.lastIndexOf(":");
+  const channel = i < 0 ? target : target.slice(0, i);
+  return `${channel}:${threadTs}`;
+}
+
+export function deliveryCandidatesFor(
+  request: Pick<Partial<TurnRequest>, "surface" | "deliveryTarget" | "deliveryCandidates">,
+  sessionScopeId: ScopeId,
+): { candidates: CandidateDestination[]; defaultKey?: string } {
+  const { surface, deliveryTarget, deliveryCandidates: surfaceCandidates } = request;
+  if (!surface) return { candidates: [] };
+  let raw: { target: string; label: string }[] = [];
+  if (surfaceCandidates && surfaceCandidates.length > 0) raw = surfaceCandidates;
+  else if (deliveryTarget) raw = [{ target: deliveryTarget, label: "this conversation" }];
+  const seen = new Set<string>();
+  const candidates: CandidateDestination[] = [];
+  for (const c of raw) {
+    const key = candidateKey(c.target, sessionScopeId);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({
+      type: surface,
+      target: c.target,
+      audienceScopeId: sessionScopeId,
+      key,
+      label: c.label,
+    });
+  }
+  const defaultKey = candidates.find((c) => c.target === deliveryTarget)?.key ?? candidates[0]?.key;
+  return { candidates, ...(defaultKey ? { defaultKey } : {}) };
+}
+
+export function resolveTurnDelivery(turn: {
+  deps: Pick<OrchestratorDeps, "signingSecret" | "apiBaseUrl">;
+  input: OrchestratorInput;
+  scopeId: ScopeId;
+  persona: PersonaForTurn | null;
+}) {
+  const { deps, input, scopeId, persona } = turn;
+  const delivery = deliveryCandidatesFor(input, scopeId);
+  if (input.surfaceOrigin)
+    for (const candidate of delivery.candidates)
+      candidate.account = { id: input.surfaceOrigin.author.account, workspace: input.surfaceOrigin.workspace };
+  const defaultCandidate = delivery.candidates.find((c) => c.key === delivery.defaultKey);
+  let defaultDestination: Destination | undefined;
+  if (defaultCandidate) {
+    defaultDestination = {
+      type: defaultCandidate.type,
+      target: defaultCandidate.target,
+      ...(defaultCandidate.account ? { account: defaultCandidate.account } : {}),
+      ...(defaultCandidate.audienceScopeId ? { audienceScopeId: defaultCandidate.audienceScopeId } : {}),
+    };
+  } else if (input.surfaceTools && input.origin.kind === "automation" && input.origin.destination) {
+    defaultDestination = input.origin.destination;
+  }
+  const wornPersona = persona
+    ? {
+        id: persona.persona.id,
+        name: persona.persona.name,
+        ...(persona.persona.icon ? { icon: persona.persona.icon } : {}),
+      }
+    : undefined;
+  if (defaultDestination && wornPersona) defaultDestination = { ...defaultDestination, persona: wornPersona };
+  const cronBlock =
+    delivery.candidates.length > 1 && deps.signingSecret && deps.apiBaseUrl
+      ? `\n\n${deliveryMenu(delivery.candidates, delivery.defaultKey)}`
+      : "";
+  return { delivery, defaultDestination, wornPersona, cronBlock };
+}

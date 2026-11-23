@@ -1,0 +1,230 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+import { JSDOM } from "jsdom";
+
+const preload = await readFile(new URL("../workspace-preload.cjs", import.meta.url), "utf8");
+
+async function workspace(platform = "darwin") {
+  const dom = new JSDOM('<div id="sidebar-body"></div><textarea></textarea>', { runScripts: "outside-only" });
+  const { window } = dom;
+  window.process = { platform };
+  const listeners = new Map();
+  window.require = () => ({
+    contextBridge: { exposeInMainWorld() {} },
+    ipcRenderer: { invoke() {}, on: (name, listener) => listeners.set(name, listener) },
+  });
+  window.HTMLElement.prototype.checkVisibility = function () {
+    return !this.closest("[hidden], .collapsed, .sidebar-closed");
+  };
+  await new Promise((resolve) => window.addEventListener("DOMContentLoaded", resolve));
+  window.eval(preload);
+  window.dispatchEvent(new window.Event("DOMContentLoaded"));
+  const list = window.document.querySelector("#sidebar-body");
+  const opened = [];
+  const add = (id, hidden = false) => {
+    const row = window.document.createElement("div");
+    row.className = "session-row";
+    row.dataset.sessionId = id;
+    row.hidden = hidden;
+    row.innerHTML = `<a class="session" href="/s/${id}">Session ${id}</a>`;
+    row.firstChild.addEventListener("click", (event) => {
+      event.preventDefault();
+      opened.push(id);
+    });
+    list.append(row);
+    return row;
+  };
+  const key = (key, options = {}, type = "keydown") => {
+    const event = new window.KeyboardEvent(type, { key, bubbles: true, cancelable: true, ...options });
+    window.document.querySelector("textarea").dispatchEvent(event);
+    return event;
+  };
+  return {
+    window,
+    list,
+    opened,
+    add,
+    key,
+    cycle: (step) => listeners.get("qm:cycle-tab")({}, step),
+    newSession: () => listeners.get("qm:new-session")({}),
+    close: () => {
+      window.dispatchEvent(new window.Event("blur"));
+      window.close();
+    },
+  };
+}
+
+test("Command shortcuts match expanded sidebar order, exclude hidden and duplicate sessions, and stop at nine", async () => {
+  const app = await workspace();
+  try {
+    app.add("hidden", true);
+    app.add("first");
+    app.add("first");
+    for (let i = 2; i <= 11; i++) app.add(String(i));
+    app.key("Meta", { metaKey: true });
+    const hints = [...app.list.querySelectorAll("[data-qm-shortcut]")];
+    assert.equal(hints.length, 9);
+    assert.equal(hints[0].textContent, "Session first");
+    assert.equal(hints[8].dataset.qmShortcut, "⌘9");
+    assert.equal(app.key("2", { metaKey: true }).defaultPrevented, true);
+    assert.deepEqual(app.opened, ["2"]);
+    app.key("2", { metaKey: true, repeat: true });
+    assert.deepEqual(app.opened, ["2"]);
+    assert.equal(app.key("0", { metaKey: true }).defaultPrevented, false);
+    app.key("Meta", {}, "keyup");
+    assert.equal(app.window.document.documentElement.hasAttribute("data-qm-shortcuts"), false);
+  } finally {
+    app.close();
+  }
+});
+
+test("hints follow reordered and removed rows while Command is held and clear on blur", async () => {
+  const app = await workspace();
+  try {
+    const first = app.add("first");
+    const second = app.add("second");
+    app.key("Meta", { metaKey: true });
+    app.list.prepend(second);
+    await Promise.resolve();
+    assert.equal(second.firstChild.dataset.qmShortcut, "⌘1");
+    first.remove();
+    await Promise.resolve();
+    assert.equal(first.firstChild.hasAttribute("data-qm-shortcut"), false);
+    app.key("1", { metaKey: true });
+    assert.deepEqual(app.opened, ["second"]);
+    app.window.dispatchEvent(new app.window.Event("blur"));
+    assert.equal(app.window.document.documentElement.hasAttribute("data-qm-shortcuts"), false);
+  } finally {
+    app.close();
+  }
+});
+
+test("modal dialogs, hidden sidebar, composition and extra modifiers do not switch sessions", async () => {
+  const app = await workspace();
+  try {
+    app.add("first");
+    for (const options of [{ shiftKey: true }, { altKey: true }, { ctrlKey: true }, { isComposing: true }]) {
+      assert.equal(app.key("1", { metaKey: true, ...options }).defaultPrevented, false);
+    }
+    app.list.classList.add("sidebar-closed");
+    app.key("1", { metaKey: true });
+    app.list.classList.remove("sidebar-closed");
+    const dialog = app.window.document.createElement("dialog");
+    dialog.open = true;
+    app.window.document.body.append(dialog);
+    app.key("1", { metaKey: true });
+    assert.deepEqual(app.opened, []);
+  } finally {
+    app.close();
+  }
+});
+
+test("non-Mac desktop uses Control without intercepting bare number keys", async () => {
+  const app = await workspace("linux");
+  try {
+    const first = app.add("first");
+    app.key("1");
+    app.key("1", { metaKey: true });
+    assert.deepEqual(app.opened, []);
+    app.key("1", { ctrlKey: true });
+    assert.deepEqual(app.opened, ["first"]);
+    assert.equal(first.firstChild.dataset.qmShortcut, "Ctrl 1");
+  } finally {
+    app.close();
+  }
+});
+
+test("the compact sidebar remains a shortcut target when it is an accessible modal drawer", async () => {
+  const app = await workspace();
+  try {
+    const sidebar = app.window.document.createElement("aside");
+    sidebar.className = "sidebar";
+    sidebar.setAttribute("role", "dialog");
+    sidebar.setAttribute("aria-modal", "true");
+    app.list.replaceWith(sidebar);
+    sidebar.append(app.list);
+    app.add("first");
+    app.key("1", { metaKey: true });
+    assert.deepEqual(app.opened, ["first"]);
+  } finally {
+    app.close();
+  }
+});
+
+test("cycle-tab commands reach the page unless a modal dialog is open", async () => {
+  const app = await workspace();
+  try {
+    const steps = [];
+    app.window.addEventListener("qm:cycle-tab", (event) => steps.push(event.detail));
+    app.cycle(1);
+    const dialog = app.window.document.createElement("dialog");
+    dialog.open = true;
+    app.window.document.body.append(dialog);
+    app.cycle(1);
+    dialog.remove();
+    app.cycle(-1);
+    assert.deepEqual(steps, [1, -1]);
+  } finally {
+    app.close();
+  }
+});
+
+test("new-session commands reach the page unless a modal dialog is open", async () => {
+  const app = await workspace();
+  try {
+    let count = 0;
+    app.window.addEventListener("qm:new-session", () => count++);
+    app.newSession();
+    const dialog = app.window.document.createElement("dialog");
+    dialog.open = true;
+    app.window.document.body.append(dialog);
+    app.newSession();
+    dialog.remove();
+    app.newSession();
+    assert.equal(count, 2);
+  } finally {
+    app.close();
+  }
+});
+
+function useAppRegionAsCustomProperty(document) {
+  const styles = [...document.querySelectorAll("style")];
+  const probe = document.createElement("style");
+  probe.textContent = styles
+    .map((style) => style.textContent.replaceAll("-webkit-app-region", "--app-region"))
+    .join("\n");
+  document.head.append(probe);
+  const flat = [...probe.sheet.cssRules].flatMap((rule) => (rule.media ? [...rule.cssRules] : [rule]));
+  probe.textContent = flat.map((rule) => rule.cssText).join("\n");
+  for (const style of styles) style.remove();
+  return (selector) =>
+    document.defaultView.getComputedStyle(document.querySelector(selector)).getPropertyValue("--app-region").trim();
+}
+
+test("Mac pane strips drag the window only in single-pane mode", async () => {
+  const app = await workspace();
+  try {
+    const { document } = app.window;
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      `<div class="split-canvas"><div class="dv-groupview dv-inactive-group"><div class="dv-tabs-and-actions-container">
+        <div class="dv-scrollable"><div class="dv-tabs-container"><div class="dv-tab" role="tab"><span class="split-pane-title">A</span></div></div></div>
+        <div class="dv-void-container"></div>
+        <div class="dv-right-actions-container">
+          <div class="dv-tabs-overflow-dropdown-root"><div class="dv-tabs-overflow-dropdown-default"><svg></svg><span>2</span></div></div>
+        </div>
+      </div></div></div>`,
+    );
+    const region = useAppRegionAsCustomProperty(document);
+    assert.notEqual(region(".dv-void-container"), "drag");
+    assert.equal(region(".dv-tab"), "no-drag");
+    assert.equal(region(".dv-tabs-overflow-dropdown-default span"), "no-drag");
+    document.querySelector(".split-canvas").classList.add("single-pane");
+    assert.equal(region(".dv-void-container"), "drag");
+    assert.equal(region(".dv-tab"), "drag");
+    assert.equal(region(".dv-tabs-overflow-dropdown-default span"), "no-drag");
+  } finally {
+    app.close();
+  }
+});

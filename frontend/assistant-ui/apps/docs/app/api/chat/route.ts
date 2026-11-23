@@ -1,0 +1,213 @@
+import {
+  prepareChatMessages,
+  prepareDemoChatMessages,
+  streamDocsChat,
+} from "@/lib/ai/chat-route";
+import {
+  injectQuoteContext,
+  unstable_injectInteractableContext as injectInteractableContext,
+} from "@assistant-ui/ai-sdk";
+import { withAssistantCloudTraceMetadata } from "assistant-cloud/telemetry";
+import { checkPublicAssistantRateLimit, getClientIp } from "@/lib/rate-limit";
+import {
+  PUBLIC_ASSISTANT_CROSS_ORIGINS,
+  requirePublicAssistantSession,
+} from "@/lib/anonymous-session";
+import { claimConversation, resolveDemoIdentity } from "@/lib/demo-usage";
+import { PUBLIC_ASSISTANT_CONVERSATION_LIMIT_MESSAGE } from "@/lib/public-assistant-errors";
+import {
+  validateDemoChatInput,
+  validateFrontendToolsInput,
+  validateGeneralChatInput,
+} from "@/lib/validate-input";
+import { resolveChatModel } from "@/lib/ai/provider";
+import { getSession } from "@/lib/accounts-auth";
+import { toPublicStreamError } from "@/lib/ai/model-provider-errors";
+import { createSearchDocsTool } from "@/lib/ai/search-docs";
+import { searchImagesTool } from "@/lib/ai/search-images";
+import { AISDKToolkit } from "@assistant-ui/ai-sdk";
+import docsToolkit from "@/lib/docs-toolkit";
+import {
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+  stepCountIs,
+} from "ai";
+
+export const maxDuration = 300;
+
+const aiToolkit = new AISDKToolkit({ toolkit: docsToolkit });
+
+const SEARCH_DOCS_SYSTEM_INSTRUCTION =
+  "When the user asks about assistant-ui (its APIs, components, runtimes, setup, or documentation), call search_docs before answering and answer from its results. Cite the pages you used inline as markdown links with their titles. Never cite a page search_docs did not return.";
+
+function corsHeaders(req: Request) {
+  const origin = req.headers.get("origin") ?? "";
+  if (!PUBLIC_ASSISTANT_CROSS_ORIGINS.has(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers":
+      "Content-Type, User-Agent, X-Assistant-UI-Anonymous-Session",
+    Vary: "Origin",
+  };
+}
+
+function withCors(req: Request, response: Response): Response {
+  for (const [key, value] of Object.entries(corsHeaders(req))) {
+    response.headers.set(key, value);
+  }
+  return response;
+}
+
+export async function OPTIONS(req: Request) {
+  return new Response(null, { status: 204, headers: corsHeaders(req) });
+}
+
+export async function POST(req: Request) {
+  try {
+    const session = requirePublicAssistantSession(req);
+    if (session instanceof Response) return withCors(req, session);
+
+    const rateLimitResponse = await checkPublicAssistantRateLimit(
+      req,
+      session.id,
+    );
+    if (rateLimitResponse) return withCors(req, rateLimitResponse);
+
+    const body = await req.json();
+    const {
+      messages,
+      system: rawSystem,
+      tools,
+      config,
+      searchDocs: searchDocsRequested,
+      countConversations,
+      id: threadId,
+    } = body;
+
+    const sameOrigin = req.headers.get("sec-fetch-site") === "same-origin";
+    const budgeted =
+      countConversations === true &&
+      typeof threadId === "string" &&
+      threadId !== "";
+    // The landing page demo draws on the daily conversation budget, and its
+    // requests carry the preloaded generative UI guidance and the specs it
+    // renders, so only its own requests get a longer system prompt and larger
+    // messages, with older tool calls pruned before the model call.
+    const demo = budgeted && sameOrigin;
+
+    // Basic validation: only accept short system prompts to limit abuse surface
+    const MAX_SYSTEM_LENGTH = demo ? 40_000 : 4000;
+    const groundInDocs = searchDocsRequested === true && sameOrigin;
+    const system = [
+      typeof rawSystem === "string" && rawSystem.length <= MAX_SYSTEM_LENGTH
+        ? rawSystem
+        : undefined,
+      groundInDocs ? SEARCH_DOCS_SYSTEM_INSTRUCTION : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const inputError = demo
+      ? validateDemoChatInput(messages)
+      : validateGeneralChatInput(messages);
+    if (inputError) {
+      return withCors(req, inputError);
+    }
+
+    const toolsError = validateFrontendToolsInput(tools);
+    if (toolsError) return withCors(req, toolsError);
+
+    const signedIn = (await getSession().catch(() => null)) !== null;
+    const modelConfig = resolveChatModel(config, { signedIn });
+    const origin = new URL(req.url).origin;
+
+    const frontendTools = await aiToolkit.tools({ frontend: tools });
+    if (groundInDocs && "search_docs" in frontendTools) {
+      return withCors(
+        req,
+        new Response("search_docs is reserved on this endpoint", {
+          status: 400,
+        }),
+      );
+    }
+
+    // Only a surface that renders specs can show photos, so only it gets image search.
+    const chatTools =
+      "render_spec" in frontendTools
+        ? { ...frontendTools, search_images: searchImagesTool }
+        : frontendTools;
+
+    const prunedMessages = await (
+      demo ? prepareDemoChatMessages : prepareChatMessages
+    )(injectInteractableContext(injectQuoteContext(messages)), chatTools);
+
+    // Every docs surface shares this route, so only the one that opts in draws
+    // on the budget, and only after the deterministic rejections, so a request
+    // that was never going to run cannot spend a slot. The transport sends the
+    // thread id, so the day counts conversations rather than turns.
+    if (budgeted) {
+      const identity = await resolveDemoIdentity(session.id);
+      const { allowed, usage } = await claimConversation(
+        identity,
+        threadId,
+        getClientIp(req),
+      );
+      if (!allowed) {
+        return withCors(
+          req,
+          new Response(PUBLIC_ASSISTANT_CONVERSATION_LIMIT_MESSAGE, {
+            status: 429,
+            headers: {
+              "Retry-After": String(
+                Math.max(1, Math.ceil((usage.resetAt - Date.now()) / 1_000)),
+              ),
+            },
+          }),
+        );
+      }
+    }
+
+    const stream = createUIMessageStream({
+      execute: async ({ writer }) => {
+        const { result, messageMetadata } = streamDocsChat(
+          req,
+          modelConfig,
+          {
+            spanName: "general_chat",
+            source: "general_chat",
+          },
+          {
+            ...(system ? { system } : {}),
+            messages: prunedMessages,
+            maxOutputTokens: modelConfig.reasoning ? 16384 : 4096,
+            stopWhen: stepCountIs(10),
+            tools: groundInDocs
+              ? {
+                  ...chatTools,
+                  search_docs: createSearchDocsTool({ writer, origin }),
+                }
+              : chatTools,
+          },
+        );
+
+        writer.merge(
+          result.toUIMessageStream({
+            originalMessages: messages,
+            sendReasoning: true,
+            messageMetadata: withAssistantCloudTraceMetadata(messageMetadata),
+            onError: toPublicStreamError,
+          }),
+        );
+      },
+      onError: toPublicStreamError,
+    });
+
+    const response = createUIMessageStreamResponse({ stream });
+
+    return withCors(req, response);
+  } catch (e) {
+    console.error("[api/chat]", e);
+    return withCors(req, new Response("Request failed", { status: 500 }));
+  }
+}

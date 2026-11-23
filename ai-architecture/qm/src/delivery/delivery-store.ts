@@ -1,0 +1,285 @@
+import { randomUUID } from "node:crypto";
+import type { Delivery, DeliveryProvenance, Destination, OutgoingAttachment, ScopeId } from "../types.ts";
+import type { TurnOrigin } from "../core/turn-origin.ts";
+import { currentTenant, type Tenant } from "../tenants/context.ts";
+import { tenantListeners } from "../tenants/cache.ts";
+import type { ClaimedRow } from "../tenants/claim.ts";
+
+export const DELIVERY_MAX_AGE_MS = 6 * 3_600_000;
+
+export function logDeliveryExpiry(d: Delivery, now: number, reason = "overaged"): void {
+  console.error(
+    `[delivery] dropped undelivered after ${Math.round((now - d.createdAt) / 60_000)}m (${reason}): ` +
+      `${d.destination.type} ${d.destination.target} id=${d.id}`,
+  );
+}
+
+export function turnDeliveryProvenance(input: {
+  origin: Pick<TurnOrigin, "kind">;
+  surface: string | undefined;
+  fireKey: string;
+  sourceScopeId: ScopeId;
+  sourceThreadRef: string;
+  sourceSessionId?: string;
+  sourceUserSeq?: number;
+  sourceAssistantEntrySeq?: number;
+}): DeliveryProvenance {
+  return {
+    trigger: input.origin.kind === "automation" ? (input.surface ?? "wake") : "conversation",
+    surface: input.surface ?? "unknown",
+    fireKey: input.fireKey,
+    sourceScopeId: input.sourceScopeId,
+    sourceThreadRef: input.sourceThreadRef,
+    ...(input.sourceSessionId !== undefined ? { sourceSessionId: input.sourceSessionId } : {}),
+    ...(input.sourceUserSeq !== undefined ? { sourceUserSeq: input.sourceUserSeq } : {}),
+    ...(input.sourceAssistantEntrySeq !== undefined ? { sourceAssistantEntrySeq: input.sourceAssistantEntrySeq } : {}),
+  };
+}
+
+type ClaimedDelivery = Delivery & { tenantId: string };
+
+export interface DeliveryStore {
+  enqueue(input: {
+    destination: Destination;
+    text: string;
+    attachments?: OutgoingAttachment[];
+    provenance?: DeliveryProvenance;
+    idempotencyKey: string;
+    shadow?: boolean;
+  }): Promise<Delivery>;
+  pending(type: string, sourceThreadRef?: string): Promise<Delivery[]>;
+  claimPending(type: string, ttlMs: number): Promise<Delivery[]>;
+  claimDue(type: string, ttlMs: number): Promise<ClaimedDelivery[]>;
+  undeliveredTenants(type: string): Promise<ClaimedRow[]>;
+  listShadow(opts?: { limit?: number }): Promise<Delivery[]>;
+  ack(id: string, at: number, slackApiMs?: number, messageTs?: string): Promise<void>;
+  claimHead(
+    tenant: Tenant,
+    type: string,
+    target: string,
+    ttlMs: number,
+  ): Promise<{ delivery: Delivery; heldUntil?: number } | null>;
+  defer(tenant: Tenant, id: string, until: number): Promise<void>;
+  pendingHeads(types: readonly string[]): Promise<Array<{ tenantId: string; type: string; target: string }>>;
+  fail(id: string, reason: string, at: number): Promise<Delivery | null>;
+  ackByKey(idempotencyKey: string, at: number): Promise<void>;
+  setEditRefByKey(idempotencyKey: string, editRef: string): Promise<void>;
+  get(id: string): Promise<Delivery | null>;
+  existingKeys(idempotencyKeys: string[]): Promise<Set<string>>;
+  recordRecipientThread(id: string, recipientThreadRef: string, at: number): Promise<void>;
+  listByRecipientThread(recipientThreadRef: string, opts?: { limit?: number }): Promise<Delivery[]>;
+  listBySourceSession(sourceSessionId: string, sourceThreadRef: string, opts?: { limit?: number }): Promise<Delivery[]>;
+  onEnqueue(listener: (type: string, target: string, tenantId: string) => void): () => void;
+}
+
+export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore {
+  const maxAgeMs = opts?.maxAgeMs ?? DELIVERY_MAX_AGE_MS;
+  const deliveries = new Map<string, Delivery>();
+  const byKey = new Map<string, string>();
+  const claimedUntil = new Map<string, number>();
+  const enqueueListeners = tenantListeners<[string, string, string]>("delivery enqueue");
+  const tenantOf = (): string => currentTenant();
+
+  const expireOveraged = (now: number): void => {
+    for (const d of deliveries.values()) {
+      if (
+        d.deliveredAt !== null ||
+        d.shadow ||
+        d.expiredAt !== undefined ||
+        d.destination.webTranscript?.kind === "slack_reply"
+      )
+        continue;
+      if ((claimedUntil.get(d.id) ?? 0) > now) continue;
+      if (now - d.createdAt < maxAgeMs) continue;
+      d.expiredAt = now;
+      logDeliveryExpiry(d, now);
+    }
+  };
+
+  const open = (type: string): Delivery[] =>
+    [...deliveries.values()].filter(
+      (d) => d.deliveredAt === null && d.expiredAt === undefined && !d.shadow && d.destination.type === type,
+    );
+
+  const claim = (type: string, ttlMs: number, oldestPerConversation: boolean): Delivery[] => {
+    const now = Date.now();
+    expireOveraged(now);
+    const seen = new Set<string>();
+    const rows = open(type).filter((d) => {
+      const first = !seen.has(d.destination.target);
+      seen.add(d.destination.target);
+      return (claimedUntil.get(d.id) ?? 0) <= now && (first || !oldestPerConversation);
+    });
+    for (const d of rows) claimedUntil.set(d.id, now + ttlMs);
+    return rows;
+  };
+
+  return {
+    async enqueue(input) {
+      const existingId = byKey.get(input.idempotencyKey);
+      if (existingId) {
+        const existing = deliveries.get(existingId)!;
+        if (existing.deliveredAt === null && existing.expiredAt !== undefined && !existing.failedReason) {
+          existing.destination = input.destination;
+          existing.text = input.text;
+          if (input.attachments?.length) existing.attachments = input.attachments;
+          else delete existing.attachments;
+          if (input.provenance) existing.provenance = input.provenance;
+          else delete existing.provenance;
+          existing.createdAt = Date.now();
+          delete existing.expiredAt;
+          claimedUntil.delete(existing.id);
+          if (input.shadow) existing.shadow = true;
+          else delete existing.shadow;
+          if (!existing.shadow)
+            enqueueListeners.emit(existing.destination.type, existing.destination.target, tenantOf());
+        }
+        return existing;
+      }
+      const delivery: Delivery = {
+        id: randomUUID(),
+        destination: input.destination,
+        text: input.text,
+        ...(input.attachments?.length ? { attachments: input.attachments } : {}),
+        ...(input.provenance ? { provenance: input.provenance } : {}),
+        idempotencyKey: input.idempotencyKey,
+        createdAt: Date.now(),
+        deliveredAt: null,
+        ...(input.shadow ? { shadow: true } : {}),
+      };
+      deliveries.set(delivery.id, delivery);
+      byKey.set(delivery.idempotencyKey, delivery.id);
+      if (!delivery.shadow) enqueueListeners.emit(delivery.destination.type, delivery.destination.target, tenantOf());
+      return delivery;
+    },
+    async pending(type, sourceThreadRef) {
+      return [...deliveries.values()].filter(
+        (d) =>
+          d.deliveredAt === null &&
+          d.expiredAt === undefined &&
+          !d.shadow &&
+          d.destination.type === type &&
+          (sourceThreadRef === undefined || d.provenance?.sourceThreadRef === sourceThreadRef),
+      );
+    },
+    async claimPending(type, ttlMs) {
+      return claim(type, ttlMs, false);
+    },
+    async claimDue(type, ttlMs) {
+      return (await claim(type, ttlMs, true)).map((d) => ({ ...d, tenantId: tenantOf() }));
+    },
+    async undeliveredTenants(type) {
+      return open(type).length ? [{ tenantId: tenantOf(), id: type }] : [];
+    },
+    async listShadow(opts) {
+      const limit = Math.max(1, opts?.limit ?? 100);
+      return [...deliveries.values()]
+        .filter((d) => d.shadow && d.deliveredAt === null)
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .slice(0, limit);
+    },
+    async ack(id, at, slackApiMs, messageTs) {
+      const d = deliveries.get(id);
+      if (d && d.deliveredAt === null) {
+        d.deliveredAt = at;
+        delete d.expiredAt;
+        delete d.failedReason;
+        d.deliverLatencyMs = Math.max(0, at - d.createdAt);
+        if (slackApiMs !== undefined) d.slackApiMs = slackApiMs;
+        if (messageTs !== undefined) d.messageTs = messageTs;
+      }
+    },
+    async claimHead(_tenant, type, target, ttlMs) {
+      const now = Date.now();
+      const delivery = open(type)
+        .filter((d) => d.destination.target === target)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (!delivery) return null;
+      const heldUntil = claimedUntil.get(delivery.id) ?? 0;
+      if (heldUntil > now) return { delivery, heldUntil };
+      claimedUntil.set(delivery.id, now + ttlMs);
+      return { delivery };
+    },
+    async defer(_tenant, id, until) {
+      if (deliveries.get(id)?.deliveredAt === null) claimedUntil.set(id, until);
+    },
+    async pendingHeads(types) {
+      const heads = new Map<string, { tenantId: string; type: string; target: string }>();
+      for (const {
+        destination: { type, target },
+      } of types.flatMap(open))
+        heads.set(`${type} ${target}`, { tenantId: tenantOf(), type, target });
+      return [...heads.values()];
+    },
+    async fail(id, reason, at) {
+      const d = deliveries.get(id);
+      if (!d || d.deliveredAt !== null || d.expiredAt !== undefined) return null;
+      d.expiredAt = at;
+      d.failedReason = reason;
+      claimedUntil.delete(id);
+      return d;
+    },
+    async ackByKey(idempotencyKey, at) {
+      const existingId = byKey.get(idempotencyKey);
+      if (existingId) {
+        const d = deliveries.get(existingId);
+        if (d && d.deliveredAt === null) {
+          d.deliveredAt = at;
+          delete d.expiredAt;
+          delete d.failedReason;
+        }
+        return;
+      }
+      const tombstone: Delivery = {
+        id: randomUUID(),
+        destination: { type: "ack-tombstone", target: "" },
+        text: "",
+        idempotencyKey,
+        createdAt: at,
+        deliveredAt: at,
+      };
+      deliveries.set(tombstone.id, tombstone);
+      byKey.set(idempotencyKey, tombstone.id);
+    },
+    async setEditRefByKey(idempotencyKey, editRef) {
+      const existingId = byKey.get(idempotencyKey);
+      const d = existingId ? deliveries.get(existingId) : undefined;
+      if (d && d.deliveredAt === null) d.destination = { ...d.destination, editRef };
+    },
+    async get(id) {
+      return deliveries.get(id) ?? null;
+    },
+    async existingKeys(idempotencyKeys) {
+      return new Set(idempotencyKeys.filter((key) => byKey.has(key)));
+    },
+    async recordRecipientThread(id, recipientThreadRef, at) {
+      const d = deliveries.get(id);
+      if (!d || d.destination.type !== "principal") return;
+      d.recipientThreadRef = recipientThreadRef;
+      if (d.deliveredAt === null) {
+        d.deliveredAt = at;
+        delete d.expiredAt;
+        delete d.failedReason;
+      }
+    },
+    async listByRecipientThread(recipientThreadRef, opts) {
+      const limit = Math.max(1, opts?.limit ?? 20);
+      return [...deliveries.values()]
+        .filter((d) => d.recipientThreadRef === recipientThreadRef && d.destination.type === "principal")
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .slice(-limit);
+    },
+    async listBySourceSession(sourceSessionId, sourceThreadRef, opts) {
+      const limit = Math.max(1, opts?.limit ?? 20);
+      return [...deliveries.values()]
+        .filter(
+          (d) => d.provenance?.sourceSessionId === sourceSessionId || d.provenance?.sourceThreadRef === sourceThreadRef,
+        )
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .slice(-limit);
+    },
+    onEnqueue(listener) {
+      return enqueueListeners.add(listener);
+    },
+  };
+}

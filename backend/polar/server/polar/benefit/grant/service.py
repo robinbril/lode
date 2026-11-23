@@ -1,0 +1,950 @@
+from collections.abc import Sequence
+from typing import Literal, LiteralString, Unpack
+from uuid import UUID
+
+import dramatiq
+import structlog
+from dramatiq import group
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import joinedload
+
+from polar.auth.models import AuthSubject
+from polar.auth.permission import OrganizationPermission
+from polar.authz.service import assert_organization_permission, get_accessible_org_ids
+from polar.benefit.repository import BenefitRepository
+from polar.benefit.strategies import BenefitRetriableError
+from polar.customer.repository import CustomerRepository
+from polar.event.service import event as event_service
+from polar.event.system import BenefitGrantMetadata, SystemEvent, build_system_event
+from polar.eventstream.service import publish as eventstream_publish
+from polar.exceptions import PolarError, PolarRequestValidationError, ResourceNotFound
+from polar.kit.pagination import PaginationParams, paginate
+from polar.kit.sorting import Sorting
+from polar.kit.utils import utc_now
+from polar.logging import Logger
+from polar.member.repository import MemberRepository
+from polar.member.service import member_service
+from polar.models import (
+    Benefit,
+    BenefitGrant,
+    Customer,
+    Member,
+    Organization,
+    Product,
+    User,
+)
+from polar.models.benefit import BenefitType
+from polar.models.benefit_grant import BenefitGrantScope, BenefitGrantSelector
+from polar.models.webhook_endpoint import WebhookEventType
+from polar.organization.resolver import get_payload_organization
+from polar.postgres import AsyncSession
+from polar.redis import Redis
+from polar.webhook.service import webhook as webhook_service
+from polar.worker import can_retry, enqueue_job
+
+from ..registry import get_benefit_strategy
+from ..strategies import (
+    BenefitActionRequiredError,
+    BenefitGrantProperties,
+    BenefitProperties,
+)
+from .repository import BenefitGrantRepository
+from .schemas import BenefitGrantCreate, BenefitGrantCreateExternal, BenefitGrantUpdate
+from .scope import scope_to_args
+from .sorting import BenefitGrantSortProperty
+
+log: Logger = structlog.get_logger()
+
+
+class BenefitGrantError(PolarError): ...
+
+
+class BenefitGrantAlreadyExists(BenefitGrantError):
+    def __init__(self) -> None:
+        super().__init__(
+            "An active manual grant already exists for this recipient and benefit.", 409
+        )
+
+
+class BenefitGrantService:
+    async def create(
+        self,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
+        create: BenefitGrantCreate | BenefitGrantCreateExternal,
+    ) -> BenefitGrant:
+        external = isinstance(create, BenefitGrantCreateExternal)
+
+        def invalid_reference(
+            field: str, message: LiteralString
+        ) -> PolarRequestValidationError:
+            field = f"external_{field}" if external else field
+            return PolarRequestValidationError(
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("body", field),
+                        "msg": message,
+                        "input": getattr(create, field),
+                    }
+                ]
+            )
+
+        customer_repository = CustomerRepository.from_session(session)
+        benefit_repository = BenefitRepository.from_session(session)
+        member_repository = MemberRepository.from_session(session)
+
+        if isinstance(create, BenefitGrantCreateExternal):
+            organization = await get_payload_organization(session, auth_subject, create)
+            customer = await customer_repository.get_by_external_id_and_organization(
+                create.external_customer_id, organization.id
+            )
+        else:
+            organization = None
+            org_ids = await get_accessible_org_ids(session, auth_subject)
+            customer = await customer_repository.get_readable_by_id(
+                org_ids,
+                create.customer_id,
+                options=(joinedload(Customer.organization),),
+            )
+        if customer is None:
+            raise invalid_reference("customer_id", "Customer not found.")
+        if organization is None:
+            organization = customer.organization
+        await assert_organization_permission(
+            session,
+            auth_subject,
+            organization.id,
+            OrganizationPermission.customers_manage,
+        )
+
+        benefit = await benefit_repository.get_for_manual_grant(
+            organization.id,
+            benefit_id=create.benefit_id
+            if isinstance(create, BenefitGrantCreate)
+            else None,
+            external_id=create.external_benefit_id
+            if isinstance(create, BenefitGrantCreateExternal)
+            else None,
+        )
+        if benefit is None:
+            raise invalid_reference("benefit_id", "Benefit not found.")
+        if benefit.type == BenefitType.meter_credit:
+            raise invalid_reference(
+                "benefit_id", "Meter-credit benefits cannot be granted manually."
+            )
+
+        if (
+            isinstance(create, BenefitGrantCreateExternal)
+            and create.external_member_id is not None
+        ):
+            member = await member_repository.get_by_customer_id_and_external_id(
+                customer.id, create.external_member_id
+            )
+        elif isinstance(create, BenefitGrantCreate) and create.member_id is not None:
+            member = await member_repository.get_by_id_and_customer_id(
+                create.member_id, customer.id
+            )
+        else:
+            member = await member_repository.get_owner_by_customer_id(customer.id)
+            if member is None:
+                member = await member_service.create_owner_member(
+                    session, customer, organization
+                )
+        if member is None:
+            raise invalid_reference("member_id", "Member not found.")
+
+        repository = BenefitGrantRepository.from_session(session)
+        try:
+            async with session.begin_nested():
+                grant = await repository.create(
+                    BenefitGrant(
+                        customer=customer,
+                        benefit=benefit,
+                        member=member,
+                        manually_granted_at=utc_now(),
+                        properties={},
+                    ),
+                    flush=True,
+                )
+        except IntegrityError as e:
+            if "ix_benefit_grants_active_manual_unique" in str(e):
+                raise BenefitGrantAlreadyExists() from e
+            raise
+
+        await self._create_manual_event(
+            session, grant, organization, SystemEvent.benefit_manually_granted
+        )
+        enqueue_job(
+            "benefit.grant",
+            customer_id=customer.id,
+            benefit_id=benefit.id,
+            benefit_grant_id=grant.id,
+        )
+        return grant
+
+    async def revoke(
+        self,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
+        grant_id: UUID,
+    ) -> BenefitGrant:
+        repository = BenefitGrantRepository.from_session(session)
+        grant = await self._get_grant_for_update(session, auth_subject, grant_id)
+        if grant.manually_revoked_at is None:
+            grant = await repository.update(
+                grant, update_dict={"manually_revoked_at": utc_now()}, flush=True
+            )
+            await self._create_manual_event(
+                session,
+                grant,
+                grant.benefit.organization,
+                SystemEvent.benefit_manually_revoked,
+            )
+        if not grant.is_revoked:
+            enqueue_job(
+                "benefit.revoke",
+                customer_id=grant.customer_id,
+                benefit_id=grant.benefit_id,
+                benefit_grant_id=grant.id,
+            )
+        return grant
+
+    async def update(
+        self,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
+        grant_id: UUID,
+        update: BenefitGrantUpdate,
+    ) -> BenefitGrant:
+        grant = await self._get_grant_for_update(session, auth_subject, grant_id)
+        if (
+            "manually_revoked_at" not in update.model_fields_set
+            or grant.manually_revoked_at is None
+        ):
+            return grant
+
+        repository = BenefitGrantRepository.from_session(session)
+        try:
+            async with session.begin_nested():
+                await repository.update(
+                    grant, update_dict={"manually_revoked_at": None}, flush=True
+                )
+        except IntegrityError as e:
+            if "ix_benefit_grants_active_manual_unique" in str(e):
+                raise BenefitGrantAlreadyExists() from e
+            raise
+
+        await self._create_manual_event(
+            session, grant, grant.benefit.organization, SystemEvent.benefit_unrevoked
+        )
+        if grant.is_granted:
+            return grant
+
+        if not grant.scope or await repository.is_scope_active(
+            customer_id=grant.customer_id,
+            benefit_id=grant.benefit_id,
+            member_id=grant.member_id,
+            **grant.scope,
+        ):
+            enqueue_job(
+                "benefit.grant",
+                customer_id=grant.customer_id,
+                benefit_id=grant.benefit_id,
+                benefit_grant_id=grant.id,
+            )
+        return grant
+
+    async def list(
+        self,
+        session: AsyncSession,
+        benefit: Benefit,
+        *,
+        is_granted: bool | None = None,
+        customer_id: Sequence[UUID] | None = None,
+        member_id: Sequence[UUID] | None = None,
+        pagination: PaginationParams,
+    ) -> tuple[Sequence[BenefitGrant], int]:
+        statement = (
+            select(BenefitGrant)
+            .where(
+                BenefitGrant.benefit_id == benefit.id,
+                ~BenefitGrant.is_deleted,
+            )
+            .order_by(BenefitGrant.created_at.desc())
+            .options(
+                joinedload(BenefitGrant.customer),
+                joinedload(BenefitGrant.benefit),
+                joinedload(BenefitGrant.member),
+            )
+        )
+
+        if is_granted is not None:
+            statement = statement.where(BenefitGrant.is_granted.is_(is_granted))
+
+        if customer_id is not None:
+            statement = statement.where(BenefitGrant.customer_id.in_(customer_id))
+
+        if member_id is not None:
+            statement = statement.where(BenefitGrant.member_id.in_(member_id))
+
+        return await paginate(session, statement, pagination=pagination)
+
+    async def list_by_organization(
+        self,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
+        *,
+        organization_id: Sequence[UUID] | None = None,
+        is_granted: bool | None = None,
+        customer_id: Sequence[UUID] | None = None,
+        external_customer_id: Sequence[str] | None = None,
+        external_benefit_id: Sequence[str] | None = None,
+        member_id: Sequence[UUID] | None = None,
+        external_member_id: Sequence[str] | None = None,
+        pagination: PaginationParams,
+        sorting: Sequence[Sorting[BenefitGrantSortProperty]] = (
+            (BenefitGrantSortProperty.created_at, True),
+        ),
+    ) -> tuple[Sequence[BenefitGrant], int]:
+        repository = BenefitGrantRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(
+            session, auth_subject, permission=OrganizationPermission.customers_read
+        )
+        statement = (
+            repository.get_statement_by_org_ids(org_ids)
+            .join(Customer, BenefitGrant.customer_id == Customer.id)
+            .where(~BenefitGrant.is_deleted)
+            .options(
+                joinedload(BenefitGrant.customer),
+                joinedload(BenefitGrant.benefit).joinedload(Benefit.organization),
+                joinedload(BenefitGrant.member),
+            )
+        )
+
+        if organization_id is not None:
+            statement = statement.where(Benefit.organization_id.in_(organization_id))
+
+        if is_granted is not None:
+            statement = statement.where(BenefitGrant.is_granted.is_(is_granted))
+
+        if customer_id is not None:
+            statement = statement.where(BenefitGrant.customer_id.in_(customer_id))
+
+        if external_customer_id is not None:
+            statement = statement.where(Customer.external_id.in_(external_customer_id))
+
+        if external_benefit_id is not None:
+            # A deleted benefit's external ID can be reused before its grants are
+            # revoked, so only match the live benefit.
+            statement = statement.where(
+                Benefit.external_id.in_(external_benefit_id),
+                Benefit.deleted_at.is_(None),
+            )
+
+        if member_id is not None:
+            statement = statement.where(BenefitGrant.member_id.in_(member_id))
+
+        if external_member_id is not None:
+            statement = statement.join(
+                Member, BenefitGrant.member_id == Member.id
+            ).where(
+                Member.external_id.in_(external_member_id),
+                Member.deleted_at.is_(None),
+            )
+
+        statement = repository.apply_sorting(statement, sorting)
+
+        return await repository.paginate(
+            statement, limit=pagination.limit, page=pagination.page
+        )
+
+    async def grant_benefit(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        customer: Customer,
+        benefit: Benefit,
+        *,
+        member: Member | None = None,
+        attempt: int = 1,
+        **selector: Unpack[BenefitGrantSelector],
+    ) -> BenefitGrant:
+        log.info(
+            "Granting benefit",
+            benefit_id=str(benefit.id),
+            customer_id=str(customer.id),
+            member_id=str(member.id) if member else None,
+        )
+
+        grant = await self._get_or_create_grant(
+            session, customer, benefit, member, **selector
+        )
+        if grant.is_granted or grant.manually_revoked_at is not None:
+            return grant
+
+        previous_properties = grant.properties
+        benefit_strategy = get_benefit_strategy(benefit.type, session, redis)
+        try:
+            properties = await benefit_strategy.grant(
+                benefit,
+                customer,
+                grant.properties,
+                attempt=attempt,
+                member=member,
+                **grant.scope,
+            )
+        except BenefitActionRequiredError as e:
+            if e.grant_properties is not None:
+                grant.properties = e.grant_properties
+            grant.set_grant_failed(e)
+        else:
+            grant.properties = properties
+            grant.set_granted()
+
+        session.add(grant)
+        await session.flush()
+
+        await eventstream_publish(
+            "benefit.granted",
+            {"benefit_id": benefit.id, "benefit_type": benefit.type},
+            customer_id=customer.id,
+        )
+
+        await event_service.create_event(
+            session,
+            build_system_event(
+                SystemEvent.benefit_granted,
+                customer=customer,
+                organization=benefit.organization,
+                metadata=self._build_benefit_grant_metadata(grant, benefit),
+            ),
+        )
+
+        log.info(
+            "Benefit granted",
+            benefit_id=str(benefit.id),
+            customer_id=str(customer.id),
+            grant_id=str(grant.id),
+        )
+
+        await self._send_webhook(
+            session,
+            benefit,
+            grant,
+            event_type=WebhookEventType.benefit_grant_created,
+            previous_grant_properties=previous_properties,
+        )
+        return grant
+
+    async def revoke_benefit(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        customer: Customer,
+        benefit: Benefit,
+        *,
+        member: Member | None = None,
+        attempt: int = 1,
+        **selector: Unpack[BenefitGrantSelector],
+    ) -> BenefitGrant:
+        log.info(
+            "Revoking benefit",
+            benefit_id=str(benefit.id),
+            customer_id=str(customer.id),
+            member_id=str(member.id) if member else None,
+        )
+
+        grant = await self._get_or_create_grant(
+            session, customer, benefit, member, **selector
+        )
+        if grant.is_revoked:
+            return grant
+
+        previous_properties = grant.properties
+
+        benefit_strategy = get_benefit_strategy(benefit.type, session, redis)
+        # Revoke provider access if the strategy revokes grants individually
+        # or if no other active grant still provides access.
+        repository = BenefitGrantRepository.from_session(session)
+        granted = await repository.list_granted_by_benefit_and_customer(
+            benefit, customer, member=member
+        )
+        has_other_grants = any(other.id != grant.id for other in granted)
+        if benefit_strategy.should_revoke_individually or not has_other_grants:
+            try:
+                properties = await benefit_strategy.revoke(
+                    benefit,
+                    customer,
+                    grant.properties,
+                    attempt=attempt,
+                    member=member,
+                )
+                grant.properties = properties
+            except BenefitActionRequiredError:
+                pass
+
+        grant.set_revoked()
+
+        session.add(grant)
+        await session.flush()
+
+        await eventstream_publish(
+            "benefit.revoked",
+            {"benefit_id": benefit.id, "benefit_type": benefit.type},
+            customer_id=customer.id,
+        )
+
+        await event_service.create_event(
+            session,
+            build_system_event(
+                SystemEvent.benefit_revoked,
+                customer=customer,
+                organization=benefit.organization,
+                metadata=self._build_benefit_grant_metadata(grant, benefit),
+            ),
+        )
+
+        log.info(
+            "Benefit revoked",
+            benefit_id=str(benefit.id),
+            customer_id=str(customer.id),
+            grant_id=str(grant.id),
+        )
+
+        await self._send_webhook(
+            session,
+            benefit,
+            grant,
+            event_type=WebhookEventType.benefit_grant_revoked,
+            previous_grant_properties=previous_properties,
+        )
+        return grant
+
+    async def enqueue_benefits_grants(
+        self,
+        session: AsyncSession,
+        task: Literal["grant", "revoke"],
+        customer: Customer,
+        product: Product,
+        member_id: UUID | None = None,
+        **scope: Unpack[BenefitGrantScope],
+    ) -> None:
+        repository = BenefitGrantRepository.from_session(session)
+
+        # Get existing grants to avoid redundant jobs
+        # When a member_id is provided, only check that member's grants
+        if member_id is not None:
+            member_repository = MemberRepository.from_session(session)
+            member = await member_repository.get_by_id(
+                member_id, include_deleted=task == "revoke"
+            )
+            if member is not None:
+                existing_grants = await repository.list_by_member_and_scope(
+                    member, **scope
+                )
+            else:
+                existing_grants = []
+        else:
+            existing_grants = await repository.list_by_customer_and_scope(
+                customer, **scope
+            )
+
+        granted_benefit_ids = {
+            g.benefit_id for g in existing_grants if g.is_granted_and_unsuppressed
+        }
+        # Don't retry grants that failed due to required customer action
+        errored_benefit_ids = {
+            g.benefit_id
+            for g in existing_grants
+            if g.error and g.error.get("type") == BenefitActionRequiredError.__name__
+        }
+        # Don't grant benefits that were manually revoked
+        manually_revoked_benefit_ids = {
+            g.benefit_id for g in existing_grants if g.manually_revoked_at is not None
+        }
+
+        grant_benefit_ids = (
+            [
+                b.id
+                for b in product.benefits
+                if b.id not in granted_benefit_ids
+                and b.id not in errored_benefit_ids
+                and b.id not in manually_revoked_benefit_ids
+            ]
+            if task == "grant"
+            else []
+        )
+
+        # Pending grants are revoked too, so a later customer action can't grant them
+        revoke_benefit_ids = (
+            [
+                b.id
+                for b in product.benefits
+                if b.id in granted_benefit_ids
+                or b.id in errored_benefit_ids
+                or b.id in manually_revoked_benefit_ids
+            ]
+            if task == "revoke"
+            else []
+        )
+
+        # Include outdated grants (from subscription upgrades/downgrades)
+        outdated_grants = await repository.list_outdated_grants(
+            product, member_id=member_id, **scope
+        )
+        revoke_benefit_ids.extend(g.benefit_id for g in outdated_grants)
+
+        if not revoke_benefit_ids and not grant_benefit_ids:
+            return
+
+        scope_args = scope_to_args(scope)
+        broker = dramatiq.get_broker()
+        enqueue_grants_actor = broker.get_actor("benefit.enqueue_grants")
+
+        # Pipeline: revoke group → enqueue_grants callback (then per-benefit grants)
+        if revoke_benefit_ids:
+            revoke_actor = broker.get_actor("benefit.revoke")
+            revoke_messages = [
+                revoke_actor.message(
+                    customer_id=customer.id,
+                    benefit_id=benefit_id,
+                    member_id=member_id,
+                    **scope_args,
+                )
+                for benefit_id in revoke_benefit_ids
+            ]
+            revoke_group = group(revoke_messages)
+            revoke_group.add_completion_callback(
+                enqueue_grants_actor.message(
+                    customer_id=customer.id,
+                    grant_benefit_ids=grant_benefit_ids,
+                    member_id=member_id,
+                    **scope_args,
+                )
+            )
+            revoke_group.run()
+        else:
+            enqueue_job(
+                "benefit.enqueue_grants",
+                customer_id=customer.id,
+                grant_benefit_ids=grant_benefit_ids,
+                member_id=member_id,
+                **scope_args,
+            )
+
+    async def enqueue_benefit_grant_updates(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        benefit: Benefit,
+        previous_properties: BenefitProperties,
+    ) -> None:
+        benefit_strategy = get_benefit_strategy(benefit.type, session, redis)
+        if not await benefit_strategy.requires_update(benefit, previous_properties):
+            return
+
+        repository = BenefitGrantRepository.from_session(session)
+        grants = await repository.list_granted_by_benefit(benefit)
+        for grant in grants:
+            enqueue_job("benefit.update", benefit_grant_id=grant.id)
+
+    async def update_benefit_grant(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        grant: BenefitGrant,
+        *,
+        attempt: int = 1,
+    ) -> BenefitGrant:
+        # Don't update revoked benefits
+        if grant.is_revoked or grant.manually_revoked_at:
+            return grant
+
+        benefit, customer, member = grant.benefit, grant.customer, grant.member
+        if (
+            benefit.is_deleted
+            or customer.is_deleted
+            or (member is not None and member.is_deleted)
+        ):
+            return grant
+
+        previous_properties = grant.properties
+        benefit_strategy = get_benefit_strategy(benefit.type, session, redis)
+        try:
+            properties = await benefit_strategy.grant(
+                benefit,
+                customer,
+                grant.properties,
+                update=True,
+                attempt=attempt,
+                member=member,
+                **grant.scope,
+            )
+        except BenefitActionRequiredError as e:
+            if e.grant_properties is not None:
+                grant.properties = e.grant_properties
+            grant.set_grant_failed(e)
+        else:
+            grant.properties = properties
+            grant.set_granted()
+
+        session.add(grant)
+
+        await event_service.create_event(
+            session,
+            build_system_event(
+                SystemEvent.benefit_updated,
+                customer=customer,
+                organization=benefit.organization,
+                metadata=self._build_benefit_grant_metadata(grant, benefit),
+            ),
+        )
+
+        await self._send_webhook(
+            session,
+            benefit,
+            grant,
+            event_type=WebhookEventType.benefit_grant_updated,
+            previous_grant_properties=previous_properties,
+        )
+        return grant
+
+    async def enqueue_benefit_grant_cycles(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        **scope: Unpack[BenefitGrantScope],
+    ) -> None:
+        repository = BenefitGrantRepository.from_session(session)
+        grants = await repository.list_granted_by_scope(**scope)
+        for grant in grants:
+            enqueue_job("benefit.cycle", benefit_grant_id=grant.id)
+
+    async def cycle_benefit_grant(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        grant: BenefitGrant,
+        *,
+        attempt: int = 1,
+    ) -> BenefitGrant:
+        if grant.is_revoked or grant.manually_revoked_at is not None:
+            return grant
+
+        benefit, customer, member = grant.benefit, grant.customer, grant.member
+        if (
+            benefit.is_deleted
+            or customer.is_deleted
+            or (member is not None and member.is_deleted)
+        ):
+            return grant
+
+        previous_properties = grant.properties
+        benefit_strategy = get_benefit_strategy(benefit.type, session, redis)
+        try:
+            properties = await benefit_strategy.cycle(
+                benefit,
+                customer,
+                grant.properties,
+                attempt=attempt,
+                member=member,
+            )
+        except BenefitActionRequiredError as e:
+            grant.set_grant_failed(e)
+        else:
+            grant.properties = properties
+
+        grant.set_modified_at()
+        session.add(grant)
+
+        await event_service.create_event(
+            session,
+            build_system_event(
+                SystemEvent.benefit_cycled,
+                customer=customer,
+                organization=benefit.organization,
+                metadata=self._build_benefit_grant_metadata(grant, benefit),
+            ),
+        )
+
+        await self._send_webhook(
+            session,
+            benefit,
+            grant,
+            event_type=WebhookEventType.benefit_grant_cycled,
+            previous_grant_properties=previous_properties,
+        )
+        return grant
+
+    async def enqueue_benefit_grant_deletions(
+        self, session: AsyncSession, benefit: Benefit
+    ) -> None:
+        repository = BenefitGrantRepository.from_session(session)
+        grants = await repository.list_unrevoked_by_benefit(benefit.id)
+        for grant in grants:
+            enqueue_job("benefit.delete_grant", benefit_grant_id=grant.id)
+
+    async def enqueue_member_grant_deletions(
+        self, session: AsyncSession, member_id: UUID
+    ) -> None:
+        repository = BenefitGrantRepository.from_session(session)
+        grants = await repository.list_unrevoked_by_member(member_id)
+        for grant in grants:
+            enqueue_job("benefit.delete_grant", benefit_grant_id=grant.id)
+
+    async def enqueue_customer_grant_deletions(
+        self, session: AsyncSession, customer: Customer
+    ) -> None:
+        repository = BenefitGrantRepository.from_session(session)
+        grants = await repository.list_unrevoked_by_customer(customer.id)
+        for grant in grants:
+            enqueue_job("benefit.delete_grant", benefit_grant_id=grant.id)
+
+    async def delete_benefit_grant(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        grant: BenefitGrant,
+        *,
+        attempt: int = 1,
+    ) -> BenefitGrant:
+        # Already revoked, nothing to do
+        if grant.is_revoked:
+            return grant
+
+        benefit, customer, member = grant.benefit, grant.customer, grant.member
+        previous_properties = grant.properties
+        benefit_strategy = get_benefit_strategy(benefit.type, session, redis)
+        try:
+            grant.properties = await benefit_strategy.revoke(
+                benefit, customer, grant.properties, attempt=attempt, member=member
+            )
+        except BenefitRetriableError as e:
+            if can_retry():
+                raise
+            log.warning(
+                (
+                    "Retriable error encountered while deleting benefit grant. "
+                    "Stopping retries and marking grant as revoked"
+                ),
+                error=str(e),
+                benefit_grant_id=str(grant.id),
+            )
+        except BenefitActionRequiredError:
+            pass
+
+        grant.set_revoked()
+
+        session.add(grant)
+        await self._send_webhook(
+            session,
+            benefit,
+            grant,
+            event_type=WebhookEventType.benefit_grant_revoked,
+            previous_grant_properties=previous_properties,
+        )
+        return grant
+
+    async def _get_grant_for_update(
+        self,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
+        grant_id: UUID,
+    ) -> BenefitGrant:
+        repository = BenefitGrantRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        grant = await repository.get_readable_for_update(grant_id, org_ids)
+        if grant is None:
+            raise ResourceNotFound()
+        await assert_organization_permission(
+            session,
+            auth_subject,
+            grant.benefit.organization_id,
+            OrganizationPermission.customers_manage,
+        )
+        return grant
+
+    async def _get_or_create_grant(
+        self,
+        session: AsyncSession,
+        customer: Customer,
+        benefit: Benefit,
+        member: Member | None,
+        *,
+        grant: BenefitGrant | None = None,
+        **scope: Unpack[BenefitGrantScope],
+    ) -> BenefitGrant:
+        if grant is not None:
+            return grant
+
+        repository = BenefitGrantRepository.from_session(session)
+        grant = await repository.get_by_benefit_and_scope(
+            customer, benefit, member=member, for_update=True, **scope
+        )
+        if grant is not None:
+            return grant
+        grant = BenefitGrant(
+            customer=customer, benefit=benefit, member=member, properties={}, **scope
+        )
+        return await repository.create(grant, flush=True)
+
+    async def _create_manual_event(
+        self,
+        session: AsyncSession,
+        grant: BenefitGrant,
+        organization: Organization,
+        name: Literal[
+            SystemEvent.benefit_manually_granted,
+            SystemEvent.benefit_manually_revoked,
+            SystemEvent.benefit_unrevoked,
+        ],
+    ) -> None:
+        await event_service.create_event(
+            session,
+            build_system_event(
+                name,
+                customer=grant.customer,
+                organization=organization,
+                metadata=self._build_benefit_grant_metadata(grant, grant.benefit),
+            ),
+        )
+
+    def _build_benefit_grant_metadata(
+        self, grant: BenefitGrant, benefit: Benefit
+    ) -> BenefitGrantMetadata:
+        """Build metadata dict for benefit grant events with optional member_id."""
+        metadata: BenefitGrantMetadata = {
+            "benefit_id": str(benefit.id),
+            "benefit_grant_id": str(grant.id),
+            "benefit_type": benefit.type,
+        }
+        if grant.member_id:
+            metadata["member_id"] = str(grant.member_id)
+        return metadata
+
+    async def _send_webhook(
+        self,
+        session: AsyncSession,
+        benefit: Benefit,
+        grant: BenefitGrant,
+        event_type: Literal[
+            WebhookEventType.benefit_grant_created,
+            WebhookEventType.benefit_grant_updated,
+            WebhookEventType.benefit_grant_cycled,
+            WebhookEventType.benefit_grant_revoked,
+        ],
+        previous_grant_properties: BenefitGrantProperties,
+    ) -> None:
+        repository = BenefitGrantRepository.from_session(session)
+        loaded = await repository.get_by_id(
+            grant.id, options=repository.get_eager_options()
+        )
+        assert loaded is not None
+        loaded.previous_properties = previous_grant_properties
+        await webhook_service.send(session, benefit.organization, event_type, loaded)
+        enqueue_job("customer.state_changed", grant.customer_id)
+
+
+benefit_grant = BenefitGrantService()

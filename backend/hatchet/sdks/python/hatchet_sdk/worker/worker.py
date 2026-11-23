@@ -1,0 +1,649 @@
+import asyncio
+import multiprocessing
+import multiprocessing.context
+import os
+import signal
+import sys
+from collections.abc import AsyncGenerator, Callable, Coroutine
+from concurrent.futures import Future
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from datetime import UTC, datetime
+from multiprocessing import Queue
+from types import FrameType
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
+
+from hatchet_sdk.clients.admin import AdminClient
+from hatchet_sdk.clients.dispatcher.dispatcher import DispatcherClient
+from hatchet_sdk.clients.listeners.run_event_listener import RunEventListenerClient
+from hatchet_sdk.clients.listeners.workflow_listener import PooledWorkflowRunListener
+from hatchet_sdk.config import ClientConfig
+from hatchet_sdk.deprecated.deprecation import emit_deprecation_notice, semver_less_than
+from hatchet_sdk.deprecated.worker import legacy_aio_start
+from hatchet_sdk.engine_version import MinEngineVersion
+from hatchet_sdk.exceptions import (
+    LifespanSetupError,
+    LoopAlreadyRunningError,
+)
+from hatchet_sdk.features.workers import WorkersClient
+from hatchet_sdk.logger import logger
+from hatchet_sdk.runnables.contextvars import task_count
+from hatchet_sdk.runnables.workflow import BaseWorkflow
+from hatchet_sdk.types.labels import WorkerLabel
+from hatchet_sdk.utils.aio import gather_max_concurrency
+from hatchet_sdk.utils.typing import STOP_LOOP, STOP_LOOP_TYPE
+from hatchet_sdk.worker.action_listener_process import (
+    ActionEvent,
+    QueuedBatchActionEvent,
+    worker_action_listener_process,
+)
+from hatchet_sdk.worker.runner.run_loop_manager import WorkerActionRunLoopManager
+from hatchet_sdk.worker.slot_usage import create_shared_slot_usage_by_pool
+
+if TYPE_CHECKING:
+    from multiprocessing.process import BaseProcess
+
+    from hatchet_sdk.runnables.action import Action
+    from hatchet_sdk.runnables.task import Task
+
+T = TypeVar("T")
+
+
+WorkerStatus = Literal["INITIALIZED", "STARTING", "HEALTHY", "UNHEALTHY"]
+
+
+LifespanGenerator = AsyncGenerator[Any, Any]
+LifespanFn = Callable[[], LifespanGenerator]
+
+
+@asynccontextmanager
+async def _create_async_context_manager(
+    gen: LifespanGenerator,
+) -> AsyncGenerator[None, None]:
+    try:
+        yield
+    finally:
+        with suppress(StopAsyncIteration):
+            await anext(gen)
+
+
+class Worker:
+    def __init__(
+        self,
+        name: str,
+        *,
+        config: ClientConfig,
+        slot_config: dict[str, int],
+        labels: list[WorkerLabel] | None = None,
+        workflows: list[BaseWorkflow[Any]] | None = None,
+        lifespan: LifespanFn | None = None,
+    ) -> None:
+        self._config = config
+        self._name = self._config.apply_namespace(name)
+        self._slot_config = slot_config
+        self._slots = slot_config.get("default", 0)
+        self._durable_slots = slot_config.get("durable", 0)
+
+        self._labels = labels or []
+
+        self._action_registry: dict[str, Task[Any, Any]] = {}
+
+        self._killing: bool = False
+        self._status: WorkerStatus = "INITIALIZED"
+
+        self._action_listener_process: BaseProcess | None = None
+        self._durable_action_listener_process: BaseProcess | None = None
+
+        self._action_listener_health_check: asyncio.Task[None]
+
+        self._action_runner: WorkerActionRunLoopManager | None = None
+        self._legacy_durable_action_runner: WorkerActionRunLoopManager | None = None
+        self._engine_version: str | None = None
+
+        self._ctx = multiprocessing.get_context("spawn")
+
+        self._action_queue: Queue[Action | STOP_LOOP_TYPE] = self._ctx.Queue()
+        self._event_queue: Queue[
+            ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE
+        ] = self._ctx.Queue()
+        self._durable_action_queue: Queue[Action | STOP_LOOP_TYPE] | None = None
+        self._durable_event_queue: Queue[ActionEvent | STOP_LOOP_TYPE] | None = None
+
+        # The listener subprocess writes its worker_id here once it has
+        # registered with the engine.  The worker reads it back so it can
+        # pause task assignment directly without going through the subprocess.
+        self._worker_id_queue: Queue[str] = self._ctx.Queue()
+
+        self._shared_slot_usage_by_pool = (
+            create_shared_slot_usage_by_pool(self._ctx, slot_config)
+            if self._config.healthcheck.enabled
+            else None
+        )
+
+        # Set by the parent to tell listener subprocesses to stop their action
+        # loops.  Using a multiprocessing.Event avoids sending OS signals.
+        self._stop_listener_event = self._ctx.Event()
+
+        self._loop: asyncio.AbstractEventLoop | None = None
+        ## held here because asyncio keeps only weak references to tasks
+        self._exit_tasks: set[asyncio.Task[None]] = set()
+        self._aio_start_exception: BaseException | None = None
+
+        self._setup_signal_handlers()
+
+        self._lifespan = lifespan
+        self._lifespan_stack: AsyncExitStack | None = None
+        self._lifespan_cleanup_complete: asyncio.Event | None = None
+        self._workflows = workflows or []
+
+        self._dispatcher_client = DispatcherClient(config=self._config)
+        self._listener_client = RunEventListenerClient(self._config)
+        self._workflow_listener_client = PooledWorkflowRunListener(self._config)
+        self._admin_client = AdminClient(
+            config=self._config,
+            workflow_run_listener=self._workflow_listener_client,
+            workflow_run_event_listener=self._listener_client,
+        )
+        self._workers_client = WorkersClient(self._config)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def register_workflow(self, workflow: BaseWorkflow[Any]) -> None:
+        if not workflow.tasks:
+            msg = f"failed to register workflow: {workflow.name}. Workflows must have at least one task registered before registering"
+            raise ValueError(msg)
+
+        try:
+            self._admin_client.put_workflow(workflow._to_proto())
+        except Exception:
+            logger.exception(f"failed to register workflow: {workflow.name}")
+            raise
+
+        for task in workflow.tasks:
+            action_name = workflow._create_action_name(task)
+
+            self._action_registry[action_name] = task
+
+    async def aio_register_workflow(self, workflow: BaseWorkflow[Any]) -> None:
+        await asyncio.to_thread(self.register_workflow, workflow)
+
+    @property
+    def status(self) -> WorkerStatus:
+        return self._status
+
+    def _setup_loop(self) -> None:
+        try:
+            asyncio.get_running_loop()
+            raise LoopAlreadyRunningError(
+                "An event loop is already running. This worker requires its own dedicated event loop. "
+                "Make sure you're not using asyncio.run() or other loop-creating functions in the main thread."
+            )
+        except RuntimeError:
+            pass
+
+        logger.debug("creating new event loop")
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+
+    def register_workflows(self, workflows: list[BaseWorkflow[Any]]) -> None:
+        for workflow in workflows:
+            self.register_workflow(workflow)
+
+    def start(self) -> None:
+        self._setup_loop()
+
+        if not self._loop:
+            raise RuntimeError("event loop not set, cannot start worker")
+
+        aio_start_future = asyncio.run_coroutine_threadsafe(
+            self._aio_start(), self._loop
+        )
+        aio_start_future.add_done_callback(self._handle_aio_start_done)
+
+        # start the loop and wait until its closed
+        self._loop.run_forever()
+
+        if self._aio_start_exception is not None:
+            raise self._aio_start_exception
+
+    def _handle_aio_start_done(self, future: Future[None]) -> None:
+        if future.cancelled():
+            return
+
+        exception = future.exception()
+        if exception is None:
+            return
+
+        logger.exception("worker failed to start", exc_info=exception)
+        self._aio_start_exception = exception
+
+        if self._loop:
+            self._loop.stop()
+
+    def _emit_legacy_slot_deprecation(self) -> None:
+        emit_deprecation_notice(
+            feature="legacy-engine",
+            message=(
+                "Connected to an older Hatchet engine that does not support "
+                "multiple slot types. Falling back to legacy worker registration. "
+                "Please upgrade your Hatchet engine to the latest version."
+            ),
+            start=datetime(2026, 2, 12, tzinfo=UTC),
+            error_days=180,
+        )
+
+    def _check_eviction_support(self, engine_version: str) -> None:
+        """Warn and strip eviction policies if the engine is too old to support them."""
+        if not semver_less_than(engine_version, MinEngineVersion.DURABLE_EVICTION):
+            return
+
+        tasks_with_eviction = [
+            task
+            for task in self._action_registry.values()
+            if task._eviction_policy is not None
+        ]
+        if not tasks_with_eviction:
+            return
+
+        names = ", ".join(t.name for t in tasks_with_eviction)
+        emit_deprecation_notice(
+            feature="pre-eviction-engine",
+            message=(
+                f"Engine {engine_version} does not support durable eviction "
+                f"(requires >= {MinEngineVersion.DURABLE_EVICTION}). "
+                f"Eviction policies will be ignored for tasks: {names}. "
+                "Please upgrade your Hatchet engine."
+            ),
+            start=datetime(2026, 3, 3, tzinfo=UTC),
+            error_days=180,
+        )
+
+    async def _check_engine_version(self) -> str | None:
+        """Returns the engine version string, or None if engine is legacy (pre-slot-config).
+
+        Compares the engine's semantic version against the minimum required
+        version for slot_config support. Returns the version string for modern
+        engines so callers can branch on specific versions.
+        """
+        version = await self._dispatcher_client.get_version()
+
+        if not version or semver_less_than(version, MinEngineVersion.SLOT_CONFIG):
+            self._emit_legacy_slot_deprecation()
+            return None
+
+        return version
+
+    def _raise_for_duped_action_ids(self) -> None:
+        action_ids = [
+            w._create_action_name(t) for w in self._workflows for t in w.tasks
+        ]
+        duped_action_ids = {a for a in action_ids if action_ids.count(a) > 1}
+
+        if duped_action_ids:
+            raise ValueError(
+                f"duplicate action(s) found: '{', '.join(duped_action_ids)}'. actions must have unique names. this is likely the result of two tasks sharing the same name after being lowercased (e.g. `def fooBar` and `def foobar` would both register as `foobar`). please rename one of the tasks to avoid this conflict."
+            )
+
+    async def _aio_start(self) -> None:
+        main_pid = os.getpid()
+
+        logger.info("------------------------------------------")
+        logger.info("starting hatchet...")
+        logger.debug(f"worker starting on PID: {main_pid}")
+
+        self._status = "STARTING"
+
+        self._raise_for_duped_action_ids()
+
+        await gather_max_concurrency(
+            *[self.aio_register_workflow(wf) for wf in self._workflows],
+            max_concurrency=5,
+        )
+
+        if len(self._action_registry.keys()) == 0:
+            raise ValueError(
+                "no actions registered, register workflows or actions before starting worker"
+            )
+
+        # Check engine version and fall back to legacy dual-worker mode if needed
+        engine_version = await self._check_engine_version()
+        if engine_version is None:
+            await legacy_aio_start(self)
+            return
+
+        self._engine_version = engine_version
+        self._check_eviction_support(engine_version)
+
+        lifespan_context = None
+        if self._lifespan:
+            try:
+                lifespan_context = await self._setup_lifespan()
+            except LifespanSetupError as e:
+                logger.exception("lifespan setup failed")
+                if self._loop:
+                    self._loop.stop()
+                raise e
+
+        self._action_listener_process = self._start_action_listener()
+        self._action_runner = self._run_action_runner(lifespan_context=lifespan_context)
+
+        if self._loop:
+            self._lifespan_cleanup_complete = asyncio.Event()
+            self._action_listener_health_check = self._loop.create_task(
+                self._check_listener_health()
+            )
+
+            await self._action_listener_health_check
+
+            await self._action_runner.wait_for_tasks()
+
+            try:
+                await self._cleanup_lifespan()
+            except LifespanSetupError:
+                logger.exception("lifespan cleanup failed")
+            finally:
+                self._lifespan_cleanup_complete.set()
+
+    def _run_action_runner(
+        self,
+        lifespan_context: Any | None,  # noqa: ANN401
+    ) -> WorkerActionRunLoopManager:
+        # Retrieve the shared queue
+        if self._loop:
+            return WorkerActionRunLoopManager(
+                self.name,
+                self._action_registry,
+                sum(self._slot_config.values()),
+                self._slot_config.get("durable", 0),
+                self._config,
+                self._action_queue,
+                self._event_queue,
+                self._loop,
+                self._labels,
+                lifespan_context,
+                engine_version=self._engine_version,
+                shared_slot_usage_by_pool=self._shared_slot_usage_by_pool,
+            )
+
+        raise RuntimeError("event loop not set, cannot start action runner")
+
+    async def _setup_lifespan(self) -> Any:  # noqa: ANN401
+        if self._lifespan is None:
+            return None
+
+        self._lifespan_stack = AsyncExitStack()
+
+        try:
+            lifespan_gen = self._lifespan()
+            context = await anext(lifespan_gen)
+            await self._lifespan_stack.enter_async_context(
+                _create_async_context_manager(lifespan_gen)
+            )
+            return context
+        except StopAsyncIteration:
+            return None
+        except Exception as e:
+            raise LifespanSetupError("An error occurred during lifespan setup") from e
+
+    async def _cleanup_lifespan(self) -> None:
+        try:
+            if self._lifespan_stack is not None:
+                stack = self._lifespan_stack
+                self._lifespan_stack = None
+                await stack.aclose()
+        except Exception as e:
+            logger.exception("error during lifespan cleanup")
+            raise LifespanSetupError("An error occurred during lifespan cleanup") from e
+
+    def _start_action_listener(self) -> multiprocessing.context.SpawnProcess:
+        try:
+            process = self._ctx.Process(
+                target=worker_action_listener_process,
+                args=(
+                    self.name,
+                    list(self._action_registry.keys()),
+                    self._slot_config,
+                    self._config,
+                    self._action_queue,
+                    self._event_queue,
+                    self._labels,
+                    self._worker_id_queue,
+                    self._stop_listener_event,
+                    self._shared_slot_usage_by_pool,
+                ),
+            )
+            process.start()
+            logger.debug(f"action listener starting on PID: {process.pid}")
+
+            return process
+        except Exception:
+            logger.exception("failed to start action listener")
+            raise
+
+    async def _check_listener_health(self) -> None:
+        logger.debug("starting action listener health check...")
+        try:
+            while not self._killing:
+                if (
+                    not self._action_listener_process
+                    or not self._action_listener_process.is_alive()
+                ):
+                    exitcode = (
+                        self._action_listener_process.exitcode
+                        if self._action_listener_process is not None
+                        else None
+                    )
+                    self._aio_start_exception = RuntimeError(
+                        f"action listener process exited unexpectedly (exit code: {exitcode})"
+                    )
+                    logger.error(str(self._aio_start_exception))
+                    self._status = "UNHEALTHY"
+                    self._start_exit_task(self._exit_gracefully)
+                    break
+
+                if (
+                    self._config.terminate_worker_after_num_tasks
+                    and task_count.value
+                    >= self._config.terminate_worker_after_num_tasks
+                ):
+                    self._start_exit_task(self._exit_gracefully)
+                    break
+
+                self._status = "HEALTHY"
+                await asyncio.sleep(1)
+        except Exception:
+            logger.exception("error checking listener health")
+
+    def _start_exit_task(
+        self, exit_method: Callable[[], Coroutine[Any, Any, None]]
+    ) -> None:
+        if self._loop is None:
+            return
+
+        exit_task = self._loop.create_task(exit_method())
+        self._exit_tasks.add(exit_task)
+        exit_task.add_done_callback(self._exit_tasks.discard)
+
+    def _setup_signal_handlers(self) -> None:
+        signal.signal(
+            signal.SIGTERM,
+            (
+                self._handle_force_quit_signal
+                if self._config.force_shutdown_on_shutdown_signal
+                else self._handle_exit_signal
+            ),
+        )
+        signal.signal(
+            signal.SIGINT,
+            (
+                self._handle_force_quit_signal
+                if self._config.force_shutdown_on_shutdown_signal
+                else self._handle_exit_signal
+            ),
+        )
+        signal.signal(signal.SIGQUIT, self._handle_force_quit_signal)
+
+    def _handle_exit_signal(self, signum: int, _frame: FrameType | None) -> None:
+        sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        logger.info(f"received signal {sig_name}...")
+        self._start_exit_task(self._exit_gracefully)
+
+    def _handle_force_quit_signal(self, signum: int, _frame: FrameType | None) -> None:
+        signal_received = signal.Signals(signum).name
+        logger.info(f"received {signal_received}...")
+        self._start_exit_task(self._exit_forcefully)
+
+    def _close_queues(self) -> None:
+        queues: list[Queue[Any] | None] = [
+            self._action_queue,
+            self._event_queue,
+            self._durable_action_queue,
+            self._durable_event_queue,
+        ]
+
+        for queue in queues:
+            if queue is None:
+                continue
+            try:
+                queue.cancel_join_thread()
+                queue.close()
+            except Exception:
+                continue
+
+    def _terminate_processes(self) -> None:
+        # Signal subprocesses to stop their action loops via the shared event
+        # rather than sending OS signals.
+        self._stop_listener_event.set()
+
+        for process in [
+            self._action_listener_process,
+            self._durable_action_listener_process,
+        ]:
+            if process is not None and process.pid is not None:
+                try:
+                    process.join(timeout=5)
+
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=1)
+                except Exception:
+                    pass
+
+    async def _close(self) -> None:
+        logger.info(f"closing worker '{self.name}'...")
+        self._killing = True
+
+        if self._action_runner is not None:
+            self._action_runner.cleanup()
+
+        # Also clean up the durable action runner (legacy mode)
+        if self._legacy_durable_action_runner is not None:
+            self._legacy_durable_action_runner.cleanup()
+
+        await self._action_listener_health_check
+
+        self._close_queues()
+
+    async def _pause_task_assignment(self) -> None:
+        """Pause task assignment at the engine level.
+
+        Reads the worker_id that the listener subprocess deposited at startup,
+        then calls the REST API to mark the worker as paused so the engine
+        stops routing new work here while in-flight tasks finish.
+        """
+        try:
+            worker_id = await asyncio.to_thread(self._worker_id_queue.get, timeout=10)
+        except Exception:
+            logger.warning("could not read worker_id; skipping pause")
+            return
+        logger.info("pausing task assignment...")
+        try:
+            await asyncio.wait_for(
+                self._workers_client.aio_pause(worker_id), timeout=10
+            )
+        except TimeoutError:
+            logger.warning("timeout while pausing task assignment; continuing shutdown")
+            return
+        except Exception:
+            logger.exception("error while pausing task assignment; continuing shutdown")
+            return
+
+        logger.info("task assignment paused")
+
+    def _stop_listener_action_loops(self) -> None:
+        """Tell listener subprocesses to stop their gRPC action streams.
+
+        Setting the event causes each subprocess's _wait_for_stop_event task
+        to fire _stop_action_loop(), which closes the stream without needing
+        an OS signal.  The event_send_loop keeps running so any in-flight
+        completion events can still be delivered.
+        """
+        self._stop_listener_event.set()
+
+    async def _exit_gracefully(self) -> None:
+        logger.debug(f"gracefully stopping worker: {self.name}")
+
+        if self._killing:
+            return await self._exit_forcefully()
+
+        self._killing = True
+
+        # tell the engine that the worker is paused
+        await self._pause_task_assignment()
+
+        # wait for tasks to complete, needs the event queue so that completion tasks aren't dropped
+        if self._action_runner:
+            await self._action_runner.exit_gracefully()
+
+        if self._legacy_durable_action_runner:
+            await self._legacy_durable_action_runner.exit_gracefully()
+
+        # Only now that in-flight tasks have finished draining is it safe to
+        # stop the gRPC stream.
+        self._stop_listener_action_loops()
+
+        # drain event_send_loop
+        self._event_queue.put(STOP_LOOP)
+        if self._durable_event_queue is not None:
+            self._durable_event_queue.put(STOP_LOOP)
+
+        durable_action_listener_process = self._durable_action_listener_process
+        if durable_action_listener_process is not None:
+            await asyncio.get_event_loop().run_in_executor(
+                None, durable_action_listener_process.join
+            )
+
+        try:
+            await self._cleanup_lifespan()
+        except LifespanSetupError:
+            logger.exception("lifespan cleanup failed")
+
+        await self._close()
+
+        if self._lifespan_cleanup_complete is not None:
+            await self._lifespan_cleanup_complete.wait()
+        if self._loop:
+            self._loop.stop()
+
+        logger.info("👋")
+
+    async def _exit_forcefully(self) -> None:
+        self._killing = True
+
+        logger.debug(f"forcefully stopping worker: {self.name}")
+
+        self._terminate_processes()
+
+        await self._close()
+
+        if self._lifespan_cleanup_complete is not None:
+            try:
+                await asyncio.wait_for(
+                    self._lifespan_cleanup_complete.wait(), timeout=5.0
+                )
+            except TimeoutError:
+                logger.warning("lifespan cleanup timed out during forceful shutdown")
+
+        logger.info("👋")
+        sys.exit(1)

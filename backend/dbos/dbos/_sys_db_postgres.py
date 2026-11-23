@@ -1,0 +1,557 @@
+import hashlib
+import time
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Generator, List, Optional, cast
+
+import psycopg
+import sqlalchemy as sa
+from sqlalchemy import event
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import DBAPIError
+
+from dbos._migration import (
+    ensure_dbos_schema,
+    get_migration_versions,
+    run_dbos_migrations,
+    should_migrate,
+)
+
+from ._datasource_migration import DATASOURCE_MIGRATIONS_TABLE
+from ._error import DBOSException, DBOSInitializationError
+from ._logger import dbos_logger
+from ._sys_db import (
+    SystemDatabase,
+    _dbos_notifications_channel,
+    _dbos_streams_channel,
+    _dbos_workflow_events_channel,
+    advisory_lock_key,
+    lock_name,
+)
+from ._utils import quote_identifier
+
+# How long a background job's lock may sit idle before Postgres ends its holder's session.
+BACKGROUND_JOB_LOCK_IDLE_TIMEOUT_MS = 5000
+
+# Serializes concurrent system database migrations.
+MIGRATION_LOCK_ID = 1234567890
+MIGRATION_LOCK_TIMEOUT_SEC = 30
+
+
+def unprepared_scalar(c: sa.Connection, statement: str) -> Any:
+    """Run a statement unbound and unprepared, returning its first value if any: a bound or
+    prepared statement's portal keeps its snapshot, and so an xmin, while the session idles.
+    """
+    raw = cast("psycopg.Connection[Any]", c.connection.dbapi_connection)
+    cursor = raw.execute(statement.encode(), prepare=False)
+    try:
+        row = cursor.fetchone() if cursor.description is not None else None
+    finally:
+        cursor.close()
+    return row[0] if row is not None else None
+
+
+def _sets_idle_transaction_timeout(url: sa.URL, engine_kwargs: Dict[str, Any]) -> bool:
+    """Whether the user already sets idle_in_transaction_session_timeout through libpq options."""
+    connect_args = engine_kwargs.get("connect_args") or {}
+    sources = [connect_args.get("options"), url.query.get("options")]
+    return any(
+        "idle_in_transaction_session_timeout" in str(source)
+        for source in sources
+        if source is not None
+    )
+
+
+class PostgresSystemDatabase(SystemDatabase):
+    """PostgreSQL-specific implementation of SystemDatabase."""
+
+    notification_conn: Optional[sa.PoolProxiedConnection] = None
+
+    def _create_engine(
+        self, system_database_url: str, engine_kwargs: Dict[str, Any]
+    ) -> sa.Engine:
+        url = sa.make_url(system_database_url).set(drivername="postgresql+psycopg")
+        engine = sa.create_engine(url, **engine_kwargs)
+        timeout_ms = self._idle_transaction_timeout_ms
+        if timeout_ms is not None and not _sets_idle_transaction_timeout(
+            url, engine_kwargs
+        ):
+
+            @event.listens_for(engine, "connect")
+            def set_idle_transaction_timeout(
+                dbapi_conn: Any, connection_record: Any
+            ) -> None:
+                with dbapi_conn.cursor() as cursor:
+                    cursor.execute(
+                        f"SET idle_in_transaction_session_timeout = {int(timeout_ms)}"
+                    )
+                # Committed: the pool rolls a connection back on return, which would undo a bare SET.
+                dbapi_conn.commit()
+
+            dbos_logger.debug(
+                f"System database idle_in_transaction_session_timeout: {timeout_ms}ms"
+            )
+        return engine
+
+    def run_migrations(self, fail_on_lock_timeout: bool = False) -> None:
+        """Run PostgreSQL-specific migrations."""
+        system_db_url = self.engine.url
+        sysdb_name = str(system_db_url.database)
+        # Unless we were provided an engine, if the system database does not already exist, create it
+        if self.created_engine:
+            try:
+                engine = sa.create_engine(
+                    system_db_url.set(database="postgres"), **self._engine_kwargs
+                )
+                with engine.connect() as conn:
+                    conn.execution_options(isolation_level="AUTOCOMMIT")
+                    if not conn.execute(
+                        sa.text("SELECT 1 FROM pg_database WHERE datname=:db_name"),
+                        parameters={"db_name": sysdb_name},
+                    ).scalar():
+                        dbos_logger.info(f"Creating system database {sysdb_name}")
+                        conn.execute(
+                            sa.text(f"CREATE DATABASE {quote_identifier(sysdb_name)}")
+                        )
+            except Exception:
+                dbos_logger.warning(
+                    f"Could not connect to postgres database to verify existence of {sysdb_name}. Continuing..."
+                )
+            finally:
+                engine.dispose()
+        else:
+            # If we were provided an engine, validate it can connect
+            with self.engine.connect() as conn:
+                conn.execute(sa.text("SELECT 1"))
+
+        assert self.schema
+        self._refuse_sharded_schema()
+        # Skip the advisory lock and migration work entirely if the schema
+        # and dbos_migrations table already exist and are at the latest version.
+        if not should_migrate(self.engine, self.schema, self.use_listen_notify):
+            return
+
+        # Serialize concurrent migrations with an advisory lock. On timeout, raise
+        # if fail_on_lock_timeout, otherwise warn and proceed without the lock.
+        locked = False
+        # Use AUTOCOMMIT so the lock connection does not sit idle-in-transaction
+        # while migrations run. Session-level advisory locks are independent of
+        # transaction state, so AUTOCOMMIT is safe.
+        with self.engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as conn:
+            try:
+                deadline = time.monotonic() + MIGRATION_LOCK_TIMEOUT_SEC
+                while True:
+                    got = conn.execute(
+                        sa.text("SELECT pg_try_advisory_lock(:lock_id)"),
+                        {"lock_id": MIGRATION_LOCK_ID},
+                    ).scalar()
+                    if got:
+                        locked = True
+                        break
+                    if time.monotonic() >= deadline:
+                        if fail_on_lock_timeout:
+                            raise DBOSInitializationError(
+                                f"Could not acquire migration advisory lock within "
+                                f"{MIGRATION_LOCK_TIMEOUT_SEC}s. Another process may be "
+                                f"migrating the system database; retry once it finishes."
+                            )
+                        dbos_logger.warning(
+                            f"Could not acquire migration advisory lock within {MIGRATION_LOCK_TIMEOUT_SEC}s. "
+                            f"Attempting migrations without lock."
+                        )
+                        break
+                    time.sleep(1)
+                ensure_dbos_schema(self.engine, self.schema)
+                run_dbos_migrations(self.engine, self.schema, self.use_listen_notify)
+            finally:
+                if locked:
+                    conn.execute(
+                        sa.text("SELECT pg_advisory_unlock(:lock_id)"),
+                        {"lock_id": MIGRATION_LOCK_ID},
+                    )
+
+    def verify_migrations(self) -> None:
+        """Check the system database is migrated, creating and changing nothing."""
+        assert self.schema
+        current_version, latest_version = get_migration_versions(
+            self.engine, self.schema, self.use_listen_notify
+        )
+        self._assert_migration_version(current_version, latest_version)
+
+    def _cleanup_connections(self) -> None:
+        """Clean up PostgreSQL-specific connections."""
+        with self._listener_thread_lock:
+            if self.notification_conn and self.notification_conn.dbapi_connection:
+                self.notification_conn.dbapi_connection.close()
+                self.notification_conn.invalidate()
+
+    @contextmanager
+    def background_job_lock(
+        self, job_name: str
+    ) -> Generator[Optional[Callable[[], None]], None, None]:
+        # CockroachDB grants every advisory lock, so each process runs every job.
+        if self._is_cockroach:
+            yield lambda: None
+            return
+        name = f"dbos.background_job.{self.schema}.{self.app_name or ''}.{job_name}"
+        key = advisory_lock_key(name)
+        with self.engine.connect().execution_options(
+            isolation_level="READ COMMITTED"
+        ) as c:
+            # Begun here, as the lock statements bypass SQLAlchemy, so its rollback releases them.
+            c.begin()
+            # The local idle timeout ends a frozen holder's session, releasing its lock.
+            acquired = bool(
+                unprepared_scalar(
+                    c,
+                    f"SELECT pg_try_advisory_xact_lock({int(key)}) FROM set_config("
+                    "'idle_in_transaction_session_timeout', "
+                    f"'{int(BACKGROUND_JOB_LOCK_IDLE_TIMEOUT_MS)}', true)",
+                )
+            )
+
+            def renew() -> None:
+                # Snapshot-free, so a concurrent index build never waits on it; fails if the session ended.
+                unprepared_scalar(
+                    c,
+                    "SET LOCAL idle_in_transaction_session_timeout = "
+                    f"'{int(BACKGROUND_JOB_LOCK_IDLE_TIMEOUT_MS)}'",
+                )
+
+            try:
+                yield renew if acquired else None
+            finally:
+                try:
+                    c.rollback()
+                except Exception as e:
+                    # A session the idle timeout ended has released the lock already.
+                    dbos_logger.debug(f"Could not release the {job_name} lock: {e}")
+
+    def _uses_claim_locks(self) -> bool:
+        # CockroachDB grants every advisory lock, so it relies on SERIALIZABLE claims instead.
+        return self.sharded or not self._is_cockroach
+
+    def _claim_lock(
+        self, c: sa.Connection, queue_name: str, partition_key: Optional[str]
+    ) -> Optional[bool]:
+        name = lock_name("dbos.queue_claim", self.schema, queue_name, partition_key)
+        return bool(
+            c.execute(
+                sa.text("SELECT pg_try_advisory_xact_lock(CAST(:key AS bigint))"),
+                {"key": advisory_lock_key(name)},
+            ).scalar()
+        )
+
+    def _partition_locks(
+        self, c: sa.Connection, queue_name: str, partition_keys: List[str]
+    ) -> List[str]:
+        # Two-int keys: the queue, then the partition, hashed so every worker computes the same lock.
+        name = lock_name("dbos.partition_claim", self.schema, queue_name)
+        queue_id = int.from_bytes(
+            hashlib.sha256(name.encode()).digest()[4:8], "big", signed=True
+        )
+        lock_ids = [
+            int.from_bytes(hashlib.sha256(pk.encode()).digest()[:4], "big", signed=True)
+            for pk in partition_keys
+        ]
+        held = c.execute(
+            sa.text(
+                "SELECT coalesce(array_agg(p.pk), '{}') "
+                "FROM unnest(CAST(:pks AS text[]), CAST(:lock_ids AS int4[])) AS p(pk, lock_id) "
+                "WHERE pg_try_advisory_xact_lock(CAST(:queue_id AS int4), p.lock_id)"
+            ),
+            {"pks": partition_keys, "lock_ids": lock_ids, "queue_id": queue_id},
+        ).scalar()
+        return list(held or [])
+
+    def _set_statement_timeout(self, conn: sa.Connection, timeout_ms: int) -> None:
+        """SET LOCAL, so the cap covers exactly this transaction and is reverted on
+        commit: a session-level SET would ride the pooled connection into unrelated
+        queries, or leak through a transaction-pooling proxy."""
+        # SET takes no bind parameters, so the value is interpolated; it is an int.
+        conn.execute(sa.text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
+
+    def _is_statement_timeout(self, error: DBAPIError) -> bool:
+        """57014 is query_canceled, which is how statement_timeout cancels a query.
+        psycopg reports it as sqlstate, psycopg2 (which the CockroachDB dialect uses) as pgcode.
+        """
+        orig = error.orig
+        return "57014" in (
+            getattr(orig, "sqlstate", None),
+            getattr(orig, "pgcode", None),
+        )
+
+    def _is_unique_constraint_violation(self, dbapi_error: DBAPIError) -> bool:
+        """Check if the error is a unique constraint violation in PostgreSQL."""
+        return dbapi_error.orig.sqlstate == "23505"  # type: ignore
+
+    def _attributes_contains_clause(
+        self, attributes: Dict[str, Any]
+    ) -> sa.ColumnElement[bool]:
+        # Coerce to JSONB so contains() renders the @> containment operator,
+        # which is served by the GIN index on the attributes column. The
+        # column's generic JSON type would render contains() as a string LIKE.
+        return sa.type_coerce(self.tables.workflow_status.c.attributes, JSONB).contains(
+            attributes
+        )
+
+    def _is_foreign_key_violation(self, dbapi_error: DBAPIError) -> bool:
+        """Check if the error is a foreign key violation in PostgreSQL."""
+        return dbapi_error.orig.sqlstate == "23503"  # type: ignore
+
+    @staticmethod
+    def _truncate_system_database(database_url: str, schema: str) -> None:
+        """Empty every DBOS table in the system database, leaving the schema intact.
+
+        Version tables are spared: clearing them would re-run applied migrations."""
+        # The plain PostgreSQL dialect cannot connect to CockroachDB at all: it
+        # asserts on the server version string. Keep the caller's dialect there.
+        url = sa.make_url(database_url)
+        if not url.drivername.startswith("cockroachdb"):
+            url = url.set(drivername="postgresql+psycopg")
+        engine = sa.create_engine(url, connect_args={"connect_timeout": 10})
+        try:
+            try:
+                # Evict other backends, as DROP DATABASE ... WITH (FORCE) does, or one
+                # holding a lock blocks the deletes. Its own transaction, and best
+                # effort: CockroachDB has no pg_terminate_backend, and a role may not signal.
+                with engine.begin() as conn:
+                    conn.execute(
+                        sa.text(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                        )
+                    )
+            except Exception as e:
+                dbos_logger.warning(
+                    f"Could not evict connections before truncating: {e}"
+                )
+            with engine.begin() as conn:
+                tables = [
+                    table
+                    for table in conn.execute(
+                        sa.text(
+                            "SELECT tablename FROM pg_tables WHERE schemaname = :schema"
+                        ),
+                        {"schema": schema},
+                    ).scalars()
+                    # A datasource sharing the schema keeps its version too.
+                    if table not in ("dbos_migrations", DATASOURCE_MIGRATIONS_TABLE)
+                ]
+                if not tables:
+                    dbos_logger.warning(
+                        f'Found no tables to empty in schema "{schema}" of system '
+                        f"database {url.database}. If it uses a different schema, "
+                        "pass that schema to reset_system_database."
+                    )
+                # For small test tables, DELETE is far faster than TRUNCATE
+                for table in tables:
+                    conn.execute(
+                        sa.text(
+                            f"DELETE FROM {quote_identifier(schema)}.{quote_identifier(table)}"
+                        )
+                    )
+        except Exception as e:
+            # Best effort: an absent or unreachable database must not fail the caller.
+            dbos_logger.warning(f"Could not empty system database {url.database}: {e}")
+        finally:
+            engine.dispose()
+
+    @staticmethod
+    def _reset_system_database(
+        database_url: str, *, truncate: bool = False, schema: Optional[str] = None
+    ) -> None:
+        """Reset the PostgreSQL system database by dropping it, or by emptying its tables."""
+        system_db_url = sa.make_url(database_url)
+        sysdb_name = system_db_url.database
+
+        if sysdb_name is None:
+            raise ValueError(f"System database name not found in URL {system_db_url}")
+
+        if truncate:
+            PostgresSystemDatabase._truncate_system_database(
+                database_url, schema if schema else "dbos"
+            )
+            return
+
+        try:
+            # Connect to postgres default database
+            engine = sa.create_engine(
+                system_db_url.set(database="postgres", drivername="postgresql+psycopg"),
+                connect_args={"connect_timeout": 10},
+            )
+
+            with engine.connect() as conn:
+                # Set autocommit required for database dropping
+                conn.execution_options(isolation_level="AUTOCOMMIT")
+
+                # Drop the database
+                conn.execute(
+                    sa.text(
+                        f"DROP DATABASE IF EXISTS {quote_identifier(sysdb_name)} WITH (FORCE)"
+                    )
+                )
+            engine.dispose()
+        except Exception as e:
+            dbos_logger.error(f"Error resetting PostgreSQL system database: {str(e)}")
+            raise e
+
+    def check_connection(self) -> None:
+        super().check_connection()
+        if not self.sharded:
+            self._refuse_sharded_schema()
+
+    def _refuse_sharded_schema(self) -> None:
+        """Raise if this unsharded handle's schema is sharded: its statements name no shard
+        key, so they would read and write across every tenant's rows."""
+        with self.engine.connect() as c:
+            sharded_schema = c.execute(
+                sa.text(
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = :schema "
+                    "AND table_name = 'workflow_status' AND column_name = 'shard_key'"
+                ),
+                {"schema": self.schema},
+            ).first()
+        if sharded_schema is not None:
+            raise DBOSException(
+                f"The DBOS system schema {self.schema} is sharded. Enable sharding to use "
+                "it: set sharding in DBOSConfig, or pass sharding=True to DBOSClient."
+            )
+
+    @staticmethod
+    def holds_sharded_schema(database_url: str) -> bool:
+        """Whether this database holds a sharded DBOS system schema. False when it can't be
+        reached or doesn't exist yet, leaving the caller to report that."""
+        url = sa.make_url(database_url)
+        if not url.drivername.startswith("cockroachdb"):
+            url = url.set(drivername="postgresql+psycopg")
+        # Bounded like the reset's own connection, so an unreachable host fails as fast.
+        engine = sa.create_engine(url, connect_args={"connect_timeout": 10})
+        try:
+            with engine.connect() as c:
+                return (
+                    c.execute(
+                        sa.text(
+                            "SELECT 1 FROM information_schema.columns WHERE "
+                            "table_name = 'workflow_status' AND column_name = 'shard_key' "
+                            "LIMIT 1"
+                        )
+                    ).first()
+                    is not None
+                )
+        except Exception:
+            return False
+        finally:
+            engine.dispose()
+
+    def _notification_listener(self) -> None:
+        """Listen for PostgreSQL notifications using psycopg."""
+        if not self.use_listen_notify:
+            return self._notification_listener_polling()
+        while self._run_background_processes:
+            try:
+                with self._listener_thread_lock:
+                    self.notification_conn = self.engine.raw_connection()
+                    self.notification_conn.detach()
+                    psycopg_conn = cast(
+                        psycopg.connection.Connection, self.notification_conn
+                    )
+                    psycopg_conn.set_autocommit(True)
+
+                    psycopg_conn.execute(f"LISTEN {_dbos_notifications_channel}")
+                    psycopg_conn.execute(f"LISTEN {_dbos_workflow_events_channel}")
+                    psycopg_conn.execute(f"LISTEN {_dbos_streams_channel}")
+                while self._run_background_processes:
+                    gen = psycopg_conn.notifies()
+                    for notify in gen:
+                        channel = notify.channel
+                        dbos_logger.debug(
+                            f"Received notification on channel: {channel}, payload: {notify.payload}"
+                        )
+                        if channel == _dbos_notifications_channel:
+                            if notify.payload:
+                                event = self.notifications_map.get(notify.payload)
+                                if event is None:
+                                    continue
+                                event.set()
+                                dbos_logger.debug(
+                                    f"Signaled notifications event for {notify.payload}"
+                                )
+                        elif channel == _dbos_workflow_events_channel:
+                            if notify.payload:
+                                event = self.workflow_events_map.get(notify.payload)
+                                if event is None:
+                                    continue
+                                event.set()
+                                dbos_logger.debug(
+                                    f"Signaled workflow_events event for {notify.payload}"
+                                )
+                        elif channel == _dbos_streams_channel:
+                            if notify.payload:
+                                event = self.streams_map.get(notify.payload)
+                                if event is None:
+                                    continue
+                                event.set()
+                                dbos_logger.debug(
+                                    f"Signaled streams event for {notify.payload}"
+                                )
+                        else:
+                            dbos_logger.error(f"Unknown channel: {channel}")
+            except Exception as e:
+                if self._run_background_processes:
+                    dbos_logger.warning(f"Notification listener error: {e}")
+                    time.sleep(1)
+                    # Then the loop will try to reconnect and restart the listener
+            finally:
+                self._cleanup_connections()
+
+    def _signal_notification(self, channel: str, payload: str) -> None:
+        """Accumulate a coalesced wakeup on `channel` for `payload`; run_notifier pushes it off the write path (no-op without L/N)."""
+        if not self.use_listen_notify:
+            return
+        with self._notifier_lock:
+            self._pending_notifications.setdefault(channel, set()).add(payload)
+
+    def run_notifier(self) -> None:
+        """Periodically flush coalesced notifications across all channels, keeping the async-notify queue lock (which serializes notifying commits) off the write path."""
+        if not self.use_listen_notify:
+            return
+        while self._run_background_processes:
+            try:
+                time.sleep(self._notification_coalesce_sec)
+                self._flush_notifications()
+            except Exception as e:
+                # Last resort: a failing flush logs and drops its batch internally, so this catches only unexpected errors, which must not kill the sole push path.
+                if self._run_background_processes:
+                    dbos_logger.warning(f"Notifier error: {e}")
+                    time.sleep(1)
+        # Final flush so values written just before shutdown still wake readers promptly.
+        try:
+            self._flush_notifications()
+        except Exception as e:
+            dbos_logger.warning(f"Notifier final flush error: {e}")
+
+    def _flush_notifications(self) -> None:
+        """Emit one coalesced notifying transaction per channel for all pending payloads; drop a channel's batch if it fails."""
+        with self._notifier_lock:
+            if not any(self._pending_notifications.values()):
+                return
+            batches = self._pending_notifications
+            self._pending_notifications = {}
+        # One transaction per channel so an unsendable payload on one channel drops only its own batch.
+        for channel, batch in batches.items():
+            if not batch:
+                continue
+            try:
+                # One statement, one transaction: one round trip and one acquisition of the async-notify queue lock; unnest emits one notification per payload.
+                with self.engine.begin() as c:
+                    c.execute(
+                        sa.text(
+                            "SELECT pg_notify(:channel, p) FROM unnest(CAST(:payloads AS text[])) AS p"
+                        ),
+                        {"channel": channel, "payloads": list(batch)},
+                    )
+            except Exception as e:
+                # Drop the batch (do not requeue) on failure, e.g. a payload over pg_notify's 8000-byte limit; readers' polling fallback delivers these values, so one poison payload can't stall the notifier forever.
+                dbos_logger.warning(f"Notifier flush error on {channel}: {e}")

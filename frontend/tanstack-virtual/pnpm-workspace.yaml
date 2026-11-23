@@ -1,0 +1,37 @@
+cleanupUnusedCatalogs: true
+minimumReleaseAge: 1440
+linkWorkspacePackages: true
+preferWorkspacePackages: true
+
+packages:
+  - 'packages/*'
+  - 'packages/marko-virtual/e2e/*'
+  - 'examples/angular/*'
+  - 'examples/react/*'
+  - 'examples/svelte/*'
+  - 'examples/vue/*'
+  - 'examples/lit/*'
+  - 'examples/marko/*'
+  - 'benchmarks'
+
+allowBuilds:
+  # root dependency
+  nx: true
+  unrs-resolver: false # not directly required for build
+  esbuild: true
+
+  # @angular/build
+  '@parcel/watcher': false # optional dep of @angular/build
+  lmdb: false # optional dep of @angular/build
+  msgpackr-extract: false # optional dep of @angular/build
+
+  # @tanstack/vue-store
+  vue-demi: false # only required for vue 2 support
+
+overrides:
+  # Exactly one @marko/compiler in the graph. marko, @marko/vite, and
+  # @marko/language-tools (via @marko/type-check) all accept ^5.39/^5.40 ranges;
+  # letting the lockfile resolve them independently can split versions across
+  # entries, and two compiler instances in one process fail every .marko compile
+  # with "Unable to access Marko File outside of a compilation".
+  '@marko/compiler': 5.40.0

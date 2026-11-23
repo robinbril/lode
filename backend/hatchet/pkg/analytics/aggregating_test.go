@@ -1,0 +1,850 @@
+package analytics
+
+import (
+	"bytes"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+)
+
+var nopLogger = zerolog.Nop()
+
+type flushedEvent struct {
+	Resource     Resource
+	Action       Action
+	TenantID     uuid.UUID
+	TokenID      *uuid.UUID
+	Count        int64
+	FirstEventAt time.Time
+	LastEventAt  time.Time
+	Properties   Properties
+}
+
+type flushRecorder struct {
+	mu     sync.Mutex
+	events []flushedEvent
+}
+
+func (r *flushRecorder) record(resource Resource, action Action, tenantID uuid.UUID, tokenID *uuid.UUID, count int64, firstEventAt, lastEventAt time.Time, properties Properties) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, flushedEvent{
+		Resource:     resource,
+		Action:       action,
+		TenantID:     tenantID,
+		TokenID:      tokenID,
+		Count:        count,
+		FirstEventAt: firstEventAt,
+		LastEventAt:  lastEventAt,
+		Properties:   properties,
+	})
+}
+
+func (r *flushRecorder) getEvents() []flushedEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := make([]flushedEvent, len(r.events))
+	copy(cp, r.events)
+	return cp
+}
+
+func TestCount_SingleTenant(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 50*time.Millisecond, 0, rec.record)
+	agg.Start()
+	defer agg.Shutdown()
+
+	tenantID := uuid.New()
+	for i := 0; i < 100; i++ {
+		agg.Count(Event, Create, tenantID, nil, 1)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+
+	events := rec.getEvents()
+	if len(events) == 0 {
+		t.Fatal("expected at least one flushed event")
+	}
+
+	var total int64
+	for _, e := range events {
+		if e.Resource != Event || e.Action != Create {
+			t.Errorf("unexpected resource:action = %s:%s", e.Resource, e.Action)
+		}
+		if e.TenantID != tenantID {
+			t.Errorf("unexpected tenant ID")
+		}
+		total += e.Count
+	}
+
+	if total != 100 {
+		t.Errorf("expected total count 100, got %d", total)
+	}
+}
+
+func TestCount_BatchSize(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 50*time.Millisecond, 0, rec.record)
+	agg.Start()
+	defer agg.Shutdown()
+
+	tenantID := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 500)
+	agg.Count(Event, Create, tenantID, nil, 300)
+
+	time.Sleep(120 * time.Millisecond)
+
+	events := rec.getEvents()
+	var total int64
+	for _, e := range events {
+		total += e.Count
+	}
+
+	if total != 800 {
+		t.Errorf("expected total count 800, got %d", total)
+	}
+}
+
+func TestCount_MultipleTenants(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 50*time.Millisecond, 0, rec.record)
+	agg.Start()
+	defer agg.Shutdown()
+
+	tenant1 := uuid.New()
+	tenant2 := uuid.New()
+
+	agg.Count(Event, Create, tenant1, nil, 10)
+	agg.Count(Event, Create, tenant2, nil, 20)
+	agg.Count(WorkflowRun, Create, tenant1, nil, 5)
+
+	time.Sleep(120 * time.Millisecond)
+
+	events := rec.getEvents()
+	if len(events) != 3 {
+		t.Fatalf("expected 3 flushed events, got %d", len(events))
+	}
+
+	counts := make(map[string]int64)
+	for _, e := range events {
+		key := string(e.Resource) + ":" + string(e.Action) + ":" + e.TenantID.String()
+		counts[key] = e.Count
+	}
+
+	if counts[string(Event)+":"+string(Create)+":"+tenant1.String()] != 10 {
+		t.Error("tenant1 event:create count mismatch")
+	}
+	if counts[string(Event)+":"+string(Create)+":"+tenant2.String()] != 20 {
+		t.Error("tenant2 event:create count mismatch")
+	}
+	if counts[string(WorkflowRun)+":"+string(Create)+":"+tenant1.String()] != 5 {
+		t.Error("tenant1 workflow-run:create count mismatch")
+	}
+}
+
+func TestCountTotals_SumsBytesPerTenant(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, time.Hour, 0, rec.record)
+
+	tenant1 := uuid.New()
+	tenant2 := uuid.New()
+
+	agg.CountTotals(DurableStream, Publish, tenant1, nil, 2, map[string]int64{"bytes": 10})
+	agg.CountTotals(DurableStream, Publish, tenant1, nil, 3, map[string]int64{"bytes": 7})
+	agg.CountTotals(DurableStream, Publish, tenant2, nil, 1, map[string]int64{"bytes": 100})
+	agg.flush()
+
+	events := rec.getEvents()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 flushed events, got %d", len(events))
+	}
+
+	byTenant := make(map[uuid.UUID]flushedEvent, len(events))
+	for _, e := range events {
+		byTenant[e.TenantID] = e
+	}
+
+	got1 := byTenant[tenant1]
+	if got1.Resource != DurableStream || got1.Action != Publish || got1.Count != 5 || got1.Properties["bytes"] != int64(17) {
+		t.Errorf("tenant1 = %+v", got1)
+	}
+
+	got2 := byTenant[tenant2]
+	if got2.Count != 1 || got2.Properties["bytes"] != int64(100) {
+		t.Errorf("tenant2 = %+v", got2)
+	}
+}
+
+func TestFlush_EvictsIdleKeys(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 50*time.Millisecond, 0, rec.record)
+	agg.Start()
+	defer agg.Shutdown()
+
+	tenantID := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 1)
+
+	// Wait for first flush (flushes count=1)
+	time.Sleep(80 * time.Millisecond)
+
+	// Wait for second flush (should evict the zero-count key)
+	time.Sleep(80 * time.Millisecond)
+
+	keyCount := 0
+	agg.counters.Range(func(_, _ any) bool {
+		keyCount++
+		return true
+	})
+
+	if keyCount != 0 {
+		t.Errorf("expected 0 keys after eviction, got %d", keyCount)
+	}
+}
+
+func TestShutdown_FinalFlush(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 10*time.Second, 0, rec.record) // long interval
+	agg.Start()
+
+	tenantID := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 42)
+
+	agg.Shutdown()
+
+	events := rec.getEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event after shutdown flush, got %d", len(events))
+	}
+	if events[0].Count != 42 {
+		t.Errorf("expected count 42, got %d", events[0].Count)
+	}
+}
+
+func TestCount_ConcurrentAccess(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 200*time.Millisecond, 0, rec.record)
+	agg.Start()
+	defer agg.Shutdown()
+
+	tenantID := uuid.New()
+	var wg sync.WaitGroup
+	numGoroutines := 100
+	countsPerGoroutine := 1000
+
+	wg.Add(numGoroutines)
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < countsPerGoroutine; j++ {
+				agg.Count(Event, Create, tenantID, nil, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	time.Sleep(300 * time.Millisecond)
+
+	events := rec.getEvents()
+	var total int64
+	for _, e := range events {
+		total += e.Count
+	}
+
+	expected := int64(numGoroutines * countsPerGoroutine)
+	if total != expected {
+		t.Errorf("expected total count %d, got %d", expected, total)
+	}
+}
+
+func TestCount_NoLossUnderContention(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 20*time.Millisecond, 0, rec.record)
+	agg.Start()
+
+	tenantID := uuid.New()
+	var written atomic.Int64
+	var wg sync.WaitGroup
+
+	wg.Add(50)
+	for i := 0; i < 50; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				agg.Count(Event, Create, tenantID, nil, 1)
+				written.Add(1)
+				time.Sleep(50 * time.Microsecond)
+			}
+		}()
+	}
+	wg.Wait()
+	agg.Shutdown()
+
+	events := rec.getEvents()
+	var total int64
+	for _, e := range events {
+		total += e.Count
+	}
+
+	if total != written.Load() {
+		t.Errorf("data loss detected: wrote %d, flushed %d", written.Load(), total)
+	}
+}
+
+func TestCount_WithFeatureFlags(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 50*time.Millisecond, 0, rec.record)
+	agg.Start()
+	defer agg.Shutdown()
+
+	tenantID := uuid.New()
+
+	flagA := Properties{"has_priority": true}
+	flagAB := Properties{"has_priority": true, "has_scope": true}
+
+	agg.Count(Event, Create, tenantID, nil, 3, flagA)
+	agg.Count(Event, Create, tenantID, nil, 7, flagAB)
+	agg.Count(Event, Create, tenantID, nil, 2, flagA)
+	agg.Count(Event, Create, tenantID, nil, 5) // no flags
+
+	time.Sleep(120 * time.Millisecond)
+
+	events := rec.getEvents()
+	if len(events) != 3 {
+		t.Fatalf("expected 3 flushed buckets, got %d", len(events))
+	}
+
+	buckets := make(map[string]int64)
+	for _, e := range events {
+		_, hasP := e.Properties["has_priority"]
+		_, hasS := e.Properties["has_scope"]
+		label := fmt.Sprintf("p=%v,s=%v", hasP, hasS)
+		buckets[label] = e.Count
+	}
+
+	if buckets["p=true,s=false"] != 5 {
+		t.Errorf("expected has_priority-only count 5, got %d", buckets["p=true,s=false"])
+	}
+	if buckets["p=true,s=true"] != 7 {
+		t.Errorf("expected has_priority+has_scope count 7, got %d", buckets["p=true,s=true"])
+	}
+	if buckets["p=false,s=false"] != 5 {
+		t.Errorf("expected no-flags count 5, got %d", buckets["p=false,s=false"])
+	}
+}
+
+func TestCount_FlagsPassedToFlush(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 10*time.Second, 0, rec.record)
+	agg.Start()
+
+	tenantID := uuid.New()
+	props := Properties{"has_priority": true, "has_scope": true}
+	agg.Count(Event, Create, tenantID, nil, 10, props)
+
+	agg.Shutdown()
+
+	events := rec.getEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	e := events[0]
+	if e.Properties["has_priority"] != true {
+		t.Errorf("expected has_priority=true, got %v", e.Properties["has_priority"])
+	}
+	if e.Properties["has_scope"] != true {
+		t.Errorf("expected has_scope=true, got %v", e.Properties["has_scope"])
+	}
+}
+
+func TestFlush_FirstAndLastEventAt(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 10*time.Second, 0, rec.record)
+
+	now := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	agg.now = func() time.Time { return now }
+
+	tenantID := uuid.New()
+	props := Properties{"has_priority": true}
+
+	agg.Count(Event, Create, tenantID, nil, 1, props)
+	now = now.Add(2 * time.Minute)
+	agg.Count(Event, Create, tenantID, nil, 1, props)
+	now = now.Add(3 * time.Minute)
+	agg.Count(Event, Create, tenantID, nil, 1, props)
+
+	agg.flush()
+
+	events := rec.getEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 flushed event, got %d", len(events))
+	}
+
+	e := events[0]
+	if e.Count != 3 {
+		t.Errorf("expected count 3, got %d", e.Count)
+	}
+
+	wantFirst := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	wantLast := time.Date(2026, 7, 3, 10, 5, 0, 0, time.UTC)
+	if !e.FirstEventAt.Equal(wantFirst) {
+		t.Errorf("expected first_event_at %v, got %v", wantFirst, e.FirstEventAt)
+	}
+	if !e.LastEventAt.Equal(wantLast) {
+		t.Errorf("expected last_event_at %v, got %v", wantLast, e.LastEventAt)
+	}
+	if e.Properties["has_priority"] != true {
+		t.Errorf("expected has_priority=true, got %v", e.Properties["has_priority"])
+	}
+}
+
+func TestFlush_MarkersResetBetweenWindows(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 10*time.Second, 0, rec.record)
+
+	now := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	agg.now = func() time.Time { return now }
+
+	tenantID := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 1)
+	now = now.Add(time.Minute)
+	agg.Count(Event, Create, tenantID, nil, 1)
+	agg.flush()
+
+	now = now.Add(time.Hour)
+	agg.Count(Event, Create, tenantID, nil, 1)
+	agg.flush()
+
+	events := rec.getEvents()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 flushed events, got %d", len(events))
+	}
+
+	second := events[1]
+	wantSecond := time.Date(2026, 7, 3, 11, 1, 0, 0, time.UTC)
+	if !second.FirstEventAt.Equal(wantSecond) {
+		t.Errorf("expected second window first_event_at %v, got %v", wantSecond, second.FirstEventAt)
+	}
+	if !second.LastEventAt.Equal(wantSecond) {
+		t.Errorf("expected second window last_event_at %v, got %v", wantSecond, second.LastEventAt)
+	}
+	if second.Count != 1 {
+		t.Errorf("expected second window count 1, got %d", second.Count)
+	}
+}
+
+func TestFlush_MarkersPerPropertyBucket(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 10*time.Second, 0, rec.record)
+
+	now := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	agg.now = func() time.Time { return now }
+
+	tenantID := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 1, Properties{"has_priority": true})
+	now = now.Add(30 * time.Minute)
+	agg.Count(Event, Create, tenantID, nil, 1, Properties{"has_scope": true})
+
+	agg.flush()
+
+	events := rec.getEvents()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 flushed buckets, got %d", len(events))
+	}
+
+	byProp := make(map[string]flushedEvent)
+	for _, e := range events {
+		if _, ok := e.Properties["has_priority"]; ok {
+			byProp["priority"] = e
+		}
+		if _, ok := e.Properties["has_scope"]; ok {
+			byProp["scope"] = e
+		}
+	}
+
+	wantPriority := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	wantScope := time.Date(2026, 7, 3, 10, 30, 0, 0, time.UTC)
+	if !byProp["priority"].FirstEventAt.Equal(wantPriority) {
+		t.Errorf("expected priority bucket first_event_at %v, got %v", wantPriority, byProp["priority"].FirstEventAt)
+	}
+	if !byProp["scope"].FirstEventAt.Equal(wantScope) {
+		t.Errorf("expected scope bucket first_event_at %v, got %v", wantScope, byProp["scope"].FirstEventAt)
+	}
+}
+
+func TestFlush_CountWithoutMarkers(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, 10*time.Second, 0, rec.record)
+
+	tenantID := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 1)
+
+	// Construct the boundary state where an event was counted in this
+	// interval but its markers were consumed by the previous flush.
+	agg.counters.Range(func(_, v any) bool {
+		e := v.(*counterEntry)
+		e.firstEventAtNanos.Store(0)
+		e.lastEventAtNanos.Store(0)
+		return true
+	})
+
+	agg.flush()
+
+	events := rec.getEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 flushed event, got %d", len(events))
+	}
+	if events[0].Count != 1 {
+		t.Errorf("expected count 1, got %d", events[0].Count)
+	}
+	if !events[0].FirstEventAt.IsZero() {
+		t.Errorf("expected zero first_event_at, got %v", events[0].FirstEventAt)
+	}
+	if !events[0].LastEventAt.IsZero() {
+		t.Errorf("expected zero last_event_at, got %v", events[0].LastEventAt)
+	}
+}
+
+func TestFlush_ConcurrentCountsKeepMarkerInvariants(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, time.Millisecond, 0, rec.record)
+	agg.Start()
+
+	tenantID := uuid.New()
+	start := time.Now().Add(-time.Millisecond)
+
+	const goroutines = 20
+	const countsPerGoroutine = 500
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < countsPerGoroutine; j++ {
+				agg.Count(Event, Create, tenantID, nil, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	agg.Shutdown()
+
+	end := time.Now().Add(time.Millisecond)
+
+	events := rec.getEvents()
+	var total int64
+	for _, e := range events {
+		total += e.Count
+		if !e.FirstEventAt.IsZero() && !e.LastEventAt.IsZero() && e.LastEventAt.Before(e.FirstEventAt) {
+			t.Errorf("last_event_at %v before first_event_at %v", e.LastEventAt, e.FirstEventAt)
+		}
+		if !e.FirstEventAt.IsZero() && (e.FirstEventAt.Before(start) || e.FirstEventAt.After(end)) {
+			t.Errorf("first_event_at %v outside test window [%v, %v]", e.FirstEventAt, start, end)
+		}
+		if !e.LastEventAt.IsZero() && (e.LastEventAt.Before(start) || e.LastEventAt.After(end)) {
+			t.Errorf("last_event_at %v outside test window [%v, %v]", e.LastEventAt, start, end)
+		}
+	}
+
+	if total != goroutines*countsPerGoroutine {
+		t.Errorf("expected total count %d, got %d", goroutines*countsPerGoroutine, total)
+	}
+}
+
+// barrierTimeout bounds every wait in the deterministic eviction tests. The
+// channels establish the ordering; the bound only turns a regression that
+// stops the writer from reaching a phase into a failure instead of a hang.
+const barrierTimeout = 10 * time.Second
+
+// parkedWriter is one Count running on its own goroutine, parked inside the
+// first now() call, which Count makes between loading an entry and
+// incrementing it. Release is idempotent and also runs at cleanup, so a
+// failed assertion never leaves the writer blocked.
+type parkedWriter struct {
+	parked chan struct{}
+	resume chan struct{}
+	done   chan struct{}
+	once   sync.Once
+}
+
+// parkWriter installs the parking clock on agg, then starts count on a
+// goroutine. Call it after any setup Counts and before any other Count that
+// should run while the writer is parked.
+func parkWriter(t *testing.T, agg *Aggregator, count func()) *parkedWriter {
+	t.Helper()
+	w := &parkedWriter{
+		parked: make(chan struct{}),
+		resume: make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	var calls atomic.Int64
+	agg.now = func() time.Time {
+		if calls.Add(1) == 1 {
+			close(w.parked)
+			<-w.resume
+		}
+		return time.Now()
+	}
+	go func() {
+		defer close(w.done)
+		count()
+	}()
+	t.Cleanup(func() {
+		w.release()
+		select {
+		case <-w.done:
+		case <-time.After(barrierTimeout):
+			t.Error("parked writer did not finish after release")
+		}
+	})
+	return w
+}
+
+func (w *parkedWriter) release() {
+	w.once.Do(func() { close(w.resume) })
+}
+
+// awaitParked blocks until the writer sits between its Load and its Add.
+func (w *parkedWriter) awaitParked(t *testing.T) {
+	t.Helper()
+	select {
+	case <-w.parked:
+	case <-time.After(barrierTimeout):
+		t.Fatal("writer never reached now() between Load and Add")
+	}
+}
+
+// resumeAndJoin lets the writer's Add land and waits for its Count to return.
+func (w *parkedWriter) resumeAndJoin(t *testing.T) {
+	t.Helper()
+	w.release()
+	select {
+	case <-w.done:
+	case <-time.After(barrierTimeout):
+		t.Fatal("writer did not finish its Count after being released")
+	}
+}
+
+func TestCount_RetryAtMaxKeysUsesReplacementEntry(t *testing.T) {
+	rec := &flushRecorder{}
+	// One key and room for exactly one key. A writer that loaded the entry
+	// just before flush evicted it must count into the replacement that
+	// another writer published in the meantime, not be dropped as a new
+	// key at capacity.
+	agg := NewAggregator(&nopLogger, true, time.Hour, 1, rec.record)
+
+	tenantID := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 1)
+	agg.flush()
+
+	w := parkWriter(t, agg, func() { agg.Count(Event, Create, tenantID, nil, 1) })
+	w.awaitParked(t)
+
+	// Evict the idle entry, then republish the key from another writer.
+	agg.flush()
+	agg.Count(Event, Create, tenantID, nil, 1)
+
+	w.resumeAndJoin(t)
+	agg.flush()
+
+	var total int64
+	for _, e := range rec.getEvents() {
+		total += e.Count
+	}
+	if total != 3 {
+		t.Errorf("expected total count 3, got %d (keyCount=%d)", total, agg.keyCount.Load())
+	}
+}
+
+func TestCount_EvictedWriterRetriesIntoFreshEntry(t *testing.T) {
+	rec := &flushRecorder{}
+	agg := NewAggregator(&nopLogger, true, time.Hour, 0, rec.record)
+
+	tenantID := uuid.New()
+	// Leave an idle entry behind so the next flush evicts it.
+	agg.Count(Event, Create, tenantID, nil, 1)
+	agg.flush()
+
+	// Park the writer between its Load of the idle entry and its Add, evict
+	// and seal the entry underneath it, then let the Add land on the sealed
+	// entry. The writer must retry into a fresh entry.
+	w := parkWriter(t, agg, func() { agg.Count(Event, Create, tenantID, nil, 1) })
+	w.awaitParked(t)
+	agg.flush()
+	if got := agg.keyCount.Load(); got != 0 {
+		t.Fatalf("expected the idle entry to be evicted, keyCount=%d", got)
+	}
+	w.resumeAndJoin(t)
+	agg.flush()
+
+	events := rec.getEvents()
+	// The eviction flush emitted nothing, so there is the setup event and
+	// the retried one, each with count 1.
+	if len(events) != 2 || events[1].Count != 1 {
+		t.Fatalf("expected two events of count 1, got %+v", events)
+	}
+	if got := agg.keyCount.Load(); got != 1 {
+		t.Errorf("expected the fresh entry to be counted once, keyCount=%d", got)
+	}
+}
+
+func TestCount_EvictedWriterRepublishesAtMaxKeys(t *testing.T) {
+	rec := &flushRecorder{}
+	var logs bytes.Buffer
+	logger := zerolog.New(&logs)
+	// Room for exactly one key. A writer whose entry is evicted while it is
+	// mid-Count keeps the right to republish its key even if another key
+	// took the slot in the meantime, so the cap is exceeded by one.
+	agg := NewAggregator(&logger, true, time.Hour, 1, rec.record)
+
+	tenantID := uuid.New()
+	otherTenant := uuid.New()
+	agg.Count(Event, Create, tenantID, nil, 1)
+	agg.flush()
+
+	w := parkWriter(t, agg, func() { agg.Count(Event, Create, tenantID, nil, 1) })
+	w.awaitParked(t)
+
+	// Evict the idle entry, then fill the freed slot with a different key.
+	agg.flush()
+	agg.Count(Event, Create, otherTenant, nil, 1)
+	if got := agg.keyCount.Load(); got != 1 {
+		t.Fatalf("expected the other key to hold the only slot, keyCount=%d", got)
+	}
+
+	w.resumeAndJoin(t)
+	agg.flush()
+
+	totals := map[uuid.UUID]int64{}
+	for _, e := range rec.getEvents() {
+		totals[e.TenantID] += e.Count
+	}
+	if totals[tenantID] != 2 || totals[otherTenant] != 1 {
+		t.Errorf("expected tenant=2 other=1, got tenant=%d other=%d", totals[tenantID], totals[otherTenant])
+	}
+	if logs.Len() != 0 {
+		t.Errorf("expected no drop log, got %s", logs.String())
+	}
+	// Both keys were live, so both stayed above the cap. The surplus only
+	// goes away once the keys are idle and a flush evicts them.
+	agg.flush()
+	if got := agg.keyCount.Load(); got != 0 {
+		t.Errorf("expected all keys evicted after an idle flush, keyCount=%d", got)
+	}
+}
+
+func TestProps(t *testing.T) {
+	got := Props(
+		"worker_name", "my-worker",
+		"runtime_language", "go",
+		"has_labels", true,
+		"has_webhook_id", false,
+	)
+	if got["worker_name"] != "my-worker" {
+		t.Errorf("expected worker_name='my-worker', got %v", got["worker_name"])
+	}
+	if got["runtime_language"] != "go" {
+		t.Errorf("expected runtime_language='go', got %v", got["runtime_language"])
+	}
+	if got["has_labels"] != true {
+		t.Error("expected has_labels=true")
+	}
+	if got["has_webhook_id"] != false {
+		t.Errorf("expected has_webhook_id=false, got %v", got["has_webhook_id"])
+	}
+
+	nilResult := Props()
+	if nilResult != nil {
+		t.Errorf("expected nil for empty call, got %v", nilResult)
+	}
+
+	oddResult := Props("a")
+	if oddResult != nil {
+		t.Errorf("expected nil for odd-length call, got %v", oddResult)
+	}
+}
+
+func TestProps_NilValuesOmitted(t *testing.T) {
+	got := Props(
+		"present", "value",
+		"absent", nil,
+	)
+	if got["present"] != "value" {
+		t.Errorf("expected present='value', got %v", got["present"])
+	}
+	if _, ok := got["absent"]; ok {
+		t.Error("expected nil value to be omitted")
+	}
+}
+
+func TestProps_BooleanFlags(t *testing.T) {
+	got := Props(
+		"has_priority", true,
+		"has_scope", false,
+		"has_additional_meta", true,
+	)
+	if got["has_priority"] != true {
+		t.Error("expected has_priority=true")
+	}
+	if got["has_scope"] != false {
+		t.Errorf("expected has_scope=false, got %v", got["has_scope"])
+	}
+	if got["has_additional_meta"] != true {
+		t.Error("expected has_additional_meta=true")
+	}
+}
+
+func TestFlush_EvictionRaceKeepsEveryCount(t *testing.T) {
+	rec := &flushRecorder{}
+	// A long interval keeps the ticker out of the way. The test drives flush
+	// directly so that it laps the writers constantly and the zero-count
+	// eviction branch runs while Count calls are in flight.
+	agg := NewAggregator(&nopLogger, true, time.Hour, 0, rec.record)
+
+	tenantID := uuid.New()
+	const goroutines = 8
+	const countsPerGoroutine = 2000
+
+	stop := make(chan struct{})
+	var flusher sync.WaitGroup
+	flusher.Add(1)
+	go func() {
+		defer flusher.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				agg.flush()
+			}
+		}
+	}()
+
+	var writers sync.WaitGroup
+	writers.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer writers.Done()
+			for j := 0; j < countsPerGoroutine; j++ {
+				agg.Count(Event, Create, tenantID, nil, 1)
+			}
+		}()
+	}
+	writers.Wait()
+	close(stop)
+	flusher.Wait()
+	agg.flush()
+
+	var total int64
+	for _, e := range rec.getEvents() {
+		total += e.Count
+	}
+	if total != goroutines*countsPerGoroutine {
+		t.Errorf("expected total count %d, got %d", goroutines*countsPerGoroutine, total)
+	}
+}

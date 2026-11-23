@@ -1,0 +1,519 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+import { CI_JOBS, PR_JOBS, mergeQueueCi, queuedPull, readReceipt, reusableCi } from "../scripts/reuse-ci.ts";
+
+const repository = "example/qm";
+const release = "a".repeat(40),
+  head = "b".repeat(40),
+  base = "c".repeat(40),
+  tested = "d".repeat(40),
+  tree = "e".repeat(40);
+const now = Date.parse("2026-09-01T12:00:00Z");
+const success = { status: "completed", conclusion: "success" };
+function fixture() {
+  const pull = {
+    number: 7,
+    state: "open",
+    head: { sha: head, ref: "web-fix", repo: { full_name: repository } },
+    base: { ref: "main", repo: { full_name: repository } },
+  };
+  const run = {
+    ...success,
+    id: 10,
+    run_attempt: 2,
+    run_number: 20,
+    head_sha: head,
+    head_branch: "web-fix",
+    repository: { full_name: repository },
+    head_repository: { full_name: repository },
+    path: ".github/workflows/cicd.yml",
+    event: "pull_request",
+    created_at: new Date(now - 3600_000).toISOString(),
+  };
+  const scan = {
+    ...success,
+    id: 30,
+    run_attempt: 1,
+    run_number: 5,
+    head_sha: head,
+    head_branch: "refs/pull/7/head",
+    path: "dynamic/github-code-scanning/codeql",
+    repository: { full_name: repository },
+  };
+  const jobs = PR_JOBS.map((name, index) => ({
+    ...success,
+    id: index + 100,
+    name,
+    run_id: run.id,
+    run_attempt: run.run_attempt,
+    head_sha: head,
+    steps: ["Validate receipt eligibility", "Checkout tested commit", "Record the immutable tested tree"].map(
+      (name) => ({ ...success, name }),
+    ),
+  }));
+  const receipt = { sha: tested, tree, runId: run.id, attempt: run.run_attempt, pr: pull.number };
+  const data: Record<string, any> = {
+    [`commits/${release}`]: { sha: release, parents: [{ sha: base }], commit: { tree: { sha: tree } } },
+    [`pulls/${pull.number}`]: pull,
+    [`contents/.github/workflows/cicd.yml?ref=${base}`]: { type: "file", sha: "f".repeat(40) },
+    [`contents/.github/workflows/cicd.yml?ref=${release}`]: { type: "file", sha: "f".repeat(40) },
+    [`contents/scripts/reuse-ci.ts?ref=${base}`]: { type: "file", sha: "9".repeat(40) },
+    [`contents/scripts/reuse-ci.ts?ref=${release}`]: { type: "file", sha: "9".repeat(40) },
+    [`actions/runs?event=dynamic&head_sha=${head}&per_page=100`]: { total_count: 1, workflow_runs: [scan] },
+    [`actions/workflows/cicd.yml/runs?event=pull_request&head_sha=${head}&per_page=100`]: {
+      total_count: 1,
+      workflow_runs: [run],
+    },
+    [`actions/runs/10/attempts/2/jobs?per_page=100`]: { total_count: jobs.length, jobs },
+    [`commits/${tested}`]: { sha: tested, parents: [{ sha: base }, { sha: head }], commit: { tree: { sha: tree } } },
+    [`actions/runs/10`]: structuredClone(run),
+  };
+  return {
+    data,
+    pull,
+    run,
+    scan,
+    jobs,
+    receipt,
+    async resolve() {
+      return reusableCi(
+        async (path) => {
+          assert.ok(data[path], path);
+          return data[path];
+        },
+        async (id) => {
+          assert.equal(id, jobs.at(-1)!.id);
+          return `2026-09-01T11:00:00Z QM_CI_TREE=${JSON.stringify(receipt)}\n`;
+        },
+        repository,
+        release,
+        pull.number,
+        now,
+      );
+    },
+  };
+}
+
+test("a merge group reuses the PR run that tested its exact tree, not the PR head SHA or an artifact name", async () => {
+  assert.deepEqual(await fixture().resolve(), {
+    sha: release,
+    tree,
+    pr: 7,
+    testedSha: tested,
+    ci: { runId: 10, attempt: 2 },
+    codeql: { runId: 30, attempt: 1 },
+  });
+});
+
+test("changed bases, trees, workflow, producer identity, attempts and missing gates cannot reuse", async () => {
+  for (const change of [
+    (f: any) => {
+      f.data[`commits/${release}`].parents.push({ sha: head });
+    },
+    (f: any) => {
+      f.pull.state = "closed";
+    },
+    (f: any) => {
+      f.jobs.splice(
+        f.jobs.findIndex((job: any) => job.name === "Co-author trailers"),
+        1,
+      );
+    },
+    (f: any) => {
+      f.pull.head.repo.full_name = "fork/qm";
+    },
+    (f: any) => {
+      f.pull.base.ref = "other";
+    },
+    (f: any) => {
+      f.pull.base.repo.full_name = "fork/qm";
+    },
+    (f: any) => {
+      f.data[`contents/.github/workflows/cicd.yml?ref=${release}`].sha = base;
+    },
+    (f: any) => {
+      f.data[`contents/scripts/reuse-ci.ts?ref=${release}`].sha = base;
+    },
+    (f: any) => {
+      f.scan.conclusion = "failure";
+    },
+    (f: any) => {
+      f.scan.head_branch = "refs/pull/8/head";
+    },
+    (f: any) => {
+      f.scan.path = ".github/workflows/fake.yml";
+    },
+    (f: any) => {
+      f.scan.head_sha = release;
+    },
+    (f: any) => {
+      f.scan.repository.full_name = "fork/qm";
+    },
+    (f: any) => {
+      f.data[`actions/runs?event=dynamic&head_sha=${head}&per_page=100`].total_count = 101;
+    },
+    (f: any) => {
+      f.data[`actions/runs?event=dynamic&head_sha=${head}&per_page=100`].workflow_runs.push({
+        ...f.scan,
+        id: 31,
+        run_number: 6,
+        conclusion: "failure",
+      });
+    },
+    (f: any) => {
+      f.run.conclusion = "failure";
+    },
+    (f: any) => {
+      f.run.event = "push";
+    },
+    (f: any) => {
+      f.run.path = ".github/workflows/fake.yml";
+    },
+    (f: any) => {
+      f.run.head_repository.full_name = "fork/qm";
+    },
+    (f: any) => {
+      f.run.repository.full_name = "fork/qm";
+    },
+    (f: any) => {
+      f.run.head_sha = release;
+    },
+    (f: any) => {
+      f.run.head_branch = "other";
+    },
+    (f: any) => {
+      f.run.created_at = new Date(now - 25 * 3600_000).toISOString();
+    },
+    (f: any) => {
+      f.run.created_at = "invalid";
+    },
+    (f: any) => {
+      f.run.created_at = new Date(now + 1).toISOString();
+    },
+    (f: any) => {
+      f.data[`actions/workflows/cicd.yml/runs?event=pull_request&head_sha=${head}&per_page=100`].total_count = 101;
+    },
+    (f: any) => {
+      f.data["actions/runs/10/attempts/2/jobs?per_page=100"].total_count = 101;
+    },
+    (f: any) => {
+      f.jobs[0].conclusion = "skipped";
+    },
+    (f: any) => {
+      f.jobs[0].run_attempt = 1;
+    },
+    (f: any) => {
+      f.jobs[0].run_id = 11;
+    },
+    (f: any) => {
+      f.jobs[0].head_sha = release;
+    },
+    (f: any) => {
+      f.jobs.splice(1, 1);
+    },
+    (f: any) => {
+      f.jobs.push(f.jobs[0]);
+    },
+    (f: any) => {
+      f.jobs.at(-1).steps.pop();
+    },
+    (f: any) => {
+      f.jobs.at(-1).steps[0].conclusion = "skipped";
+    },
+    (f: any) => {
+      f.receipt.runId++;
+    },
+    (f: any) => {
+      f.receipt.attempt--;
+    },
+    (f: any) => {
+      f.receipt.pr++;
+    },
+    (f: any) => {
+      f.receipt.tree = head;
+    },
+    (f: any) => {
+      f.data[`commits/${tested}`].parents[0].sha = head;
+    },
+    (f: any) => {
+      f.data[`commits/${tested}`].parents[1].sha = release;
+    },
+    (f: any) => {
+      f.data[`commits/${tested}`].commit.tree.sha = head;
+    },
+    (f: any) => {
+      f.data[`commits/${release}`].commit.tree.sha = head;
+    },
+    (f: any) => {
+      f.data["actions/runs/10"].run_attempt++;
+    },
+    (f: any) => {
+      f.data["actions/runs/10"].status = "in_progress";
+    },
+  ]) {
+    const f = fixture();
+    change(f);
+    assert.equal(await f.resolve(), undefined, change.toString());
+  }
+});
+
+test("a newer failed run prevents recycling an older green run", async () => {
+  const f = fixture();
+  f.data[`actions/workflows/cicd.yml/runs?event=pull_request&head_sha=${head}&per_page=100`].workflow_runs.push({
+    ...f.run,
+    id: 11,
+    run_number: 21,
+    conclusion: "failure",
+  });
+  assert.equal(await f.resolve(), undefined);
+});
+
+function mergeGroup() {
+  const run = {
+    ...success,
+    id: 40,
+    run_attempt: 1,
+    run_number: 50,
+    head_sha: release,
+    head_branch: `gh-readonly-queue/main/pr-7-${base}`,
+    repository: { full_name: repository },
+    head_repository: { full_name: repository },
+    path: ".github/workflows/cicd.yml",
+    event: "merge_group",
+  };
+  const jobs = CI_JOBS.map((name, index) => ({
+    ...success,
+    id: index + 200,
+    name,
+    run_id: run.id,
+    run_attempt: run.run_attempt,
+    head_sha: release,
+  }));
+  const data: Record<string, any> = {
+    [`actions/workflows/cicd.yml/runs?event=merge_group&head_sha=${release}&per_page=100`]: {
+      total_count: 1,
+      workflow_runs: [run],
+    },
+    [`actions/runs/40/attempts/1/jobs?per_page=100`]: { total_count: jobs.length, jobs },
+  };
+  return {
+    data,
+    run,
+    jobs,
+    resolve: () =>
+      mergeQueueCi(
+        async (path) => {
+          assert.ok(data[path], path);
+          return data[path];
+        },
+        repository,
+        release,
+      ),
+  };
+}
+
+test("a main push reuses the merge group run that tested its exact commit", async () => {
+  assert.deepEqual(await mergeGroup().resolve(), { sha: release, ci: { runId: 40, attempt: 1 } });
+});
+
+test("a main push reuses a merge group run still settling once every quality job has passed", async () => {
+  const f = mergeGroup();
+  f.run.status = "in_progress";
+  delete (f.run as any).conclusion;
+  assert.deepEqual(await f.resolve(), { sha: release, ci: { runId: 40, attempt: 1 } });
+});
+
+test("a merge group without a queued PR runs full checks", async () => {
+  const api = async (value: unknown) => assert.fail(String(value));
+  assert.equal(await reusableCi(api, api, repository, release, undefined, now), undefined);
+});
+
+test("only a queue ref for main names the queued PR", () => {
+  assert.equal(queuedPull(`refs/heads/gh-readonly-queue/main/pr-7-${base}`), 7);
+  for (const ref of [
+    `refs/heads/gh-readonly-queue/other/pr-7-${base}`,
+    `refs/heads/gh-readonly-queue/main/pr-7-${base.slice(1)}`,
+    `refs/heads/gh-readonly-queue/main/pr--${base}`,
+    "refs/heads/main",
+    `refs/pull/7/merge`,
+  ])
+    assert.equal(queuedPull(ref), undefined, ref);
+});
+
+test("a main push without a green merge group run of its exact commit runs full checks", async () => {
+  for (const change of [
+    (f: any) =>
+      (f.data[`actions/workflows/cicd.yml/runs?event=merge_group&head_sha=${release}&per_page=100`].workflow_runs = []),
+    (f: any) => (f.run.conclusion = "failure"),
+    (f: any) => (f.run.conclusion = "cancelled"),
+    (f: any) => (f.run.event = "pull_request"),
+    (f: any) => (f.run.path = ".github/workflows/fake.yml"),
+    (f: any) => {
+      f.run.head_sha = head;
+      for (const job of f.jobs) job.head_sha = head;
+    },
+    (f: any) => (f.run.head_branch = `gh-readonly-queue/other/pr-7-${base}`),
+    (f: any) => (f.run.head_repository.full_name = "fork/qm"),
+    (f: any) => (f.run.repository.full_name = "fork/qm"),
+    (f: any) => {
+      f.data[`actions/workflows/cicd.yml/runs?event=merge_group&head_sha=${release}&per_page=100`].workflow_runs.push({
+        ...f.run,
+        id: 41,
+        run_number: 51,
+        conclusion: "failure",
+      });
+    },
+    (f: any) =>
+      (f.data[`actions/workflows/cicd.yml/runs?event=merge_group&head_sha=${release}&per_page=100`].total_count = 101),
+    (f: any) => (f.jobs[0].conclusion = "skipped"),
+    (f: any) => (f.jobs[0].run_attempt = 2),
+    (f: any) => (f.jobs[0].head_sha = head),
+    (f: any) => f.jobs.splice(1, 1),
+    (f: any) => f.jobs.push(f.jobs[0]),
+    (f: any) => (f.jobs[0].status = "in_progress"),
+  ]) {
+    const f = mergeGroup();
+    change(f);
+    assert.equal(await f.resolve(), undefined, change.toString());
+  }
+});
+
+test("receipt parser rejects missing, multiple and malformed job output", () => {
+  for (const text of ["", "QM_CI_TREE={}", "timestamp QM_CI_TREE={}", "timestamp QM_CI_TREE=nope"])
+    assert.throws(() => readReceipt(text));
+  const f = fixture();
+  const line = `timestamp QM_CI_TREE=${JSON.stringify(f.receipt)}\n`;
+  assert.deepEqual(readReceipt(line), f.receipt);
+  assert.throws(() => readReceipt(line + line));
+});
+
+const workflow = readFileSync(new URL("../.github/workflows/cicd.yml", import.meta.url), "utf8");
+const jobs = Object.fromEntries(
+  [...workflow.split("jobs:\n")[1]!.matchAll(/^ {2}([a-z-]+):\n(.*?)(?=^ {2}[a-z-]+:|$(?![\s\S]))/gms)].map(
+    (match): [string, string] => [match[1]!, match[2]!],
+  ),
+);
+
+test("all quality jobs keep successful names and missing proof or selection runs full checks", () => {
+  assert.ok(workflow.includes("permissions:\n  contents: read"));
+  assert.ok(jobs.core!.includes("if: always() && !cancelled()"));
+  assert.ok(jobs.core!.includes('test "$SELECT" = success && test "$TYPECHECK" = success'));
+  assert.ok(jobs.core!.includes('test "$TESTS" = success || { test "$TESTS" = skipped && test "$SHARDS" = 0; }'));
+  const names = ["Core tests (${{ matrix.shard }}/${{ needs.select.outputs.shard-count }})"];
+  for (const [id, block] of Object.entries(jobs)) {
+    if (["reuse", "certify", "notify-deployments", "core-tests"].includes(id)) continue;
+    const name = block.match(/^ {4}name: (.+)$/m)![1]!;
+    if (id !== "web-ui-checks") names.push(name);
+    if (["select", "core", "web-ui-plugin", "dependency-audit", "coauthor-trailers"].includes(id)) continue;
+    const suite = { cli: "needs.select.outputs.cli", "web-ui-checks": "env.SELECTED" }[id];
+    assert.ok(block.includes(`needs: ${suite ? "[reuse, select]" : "reuse"}\n    if: always() && !cancelled()`), id);
+    const steps = block.split(/(?=^ {6}- (?:name|uses):)/m).slice(1);
+    const run = `needs.reuse.outputs.reusable != 'true'${suite ? ` && ${suite} == 'true'` : ""}`;
+    const skip = `needs.reuse.outputs.reusable == 'true'${suite ? ` || ${suite} != 'true'` : ""}`;
+    assert.ok(steps[0]!.includes(`if: ${skip}\n`), id);
+    for (const step of steps.slice(1)) assert.ok(step.includes(`if: ${run}`), id);
+  }
+  assert.deepEqual(
+    names.filter((name) => !name.startsWith("Core tests")).sort(),
+    PR_JOBS.filter((name) => name !== "Certify tested tree").sort(),
+  );
+  assert.ok(jobs["core-tests"]!.includes("if: always() && !cancelled() && needs.select.result == 'success'"));
+  assert.ok(jobs["core-tests"]!.includes("shard: ${{ fromJSON(needs.select.outputs.shards) }}"));
+  assert.ok(jobs.reuse!.includes("continue-on-error: true"));
+  assert.ok(jobs.reuse!.includes("steps.proof.outcome == 'success' && steps.proof.outputs.reusable == 'true'"));
+  assert.ok(
+    jobs.reuse!.includes("if: github.event_name == 'merge_group' || (github.event_name == 'push' && !inputs.full)\n"),
+  );
+  assert.ok(
+    jobs["web-ui-checks"]!.includes(
+      "SELECTED: ${{ matrix.check == 'core image' && needs.select.outputs.core-image || needs.select.outputs.web-ui }}",
+    ),
+  );
+  assert.ok(
+    jobs.select!.includes("github.event_name == 'pull_request' && 'HEAD^1' || github.event.merge_group.base_sha"),
+  );
+});
+
+test("deployment notice fires only for a fully green main push and holds no repository access", () => {
+  const job = jobs["notify-deployments"]!;
+  assert.ok(
+    job.includes(
+      "if: always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.full",
+    ),
+  );
+  assert.ok(
+    job.includes(
+      "needs: [core, cli, lint, dependency-audit, core-postgres, web-ui-plugin, auth-plugin, portal-plugin]",
+    ),
+  );
+  assert.ok(job.includes("permissions: {}"));
+  assert.ok(job.includes("continue-on-error: true"));
+  assert.ok(!job.includes("exit 1"));
+  assert.ok(job.includes(`all(. == "success")`));
+  assert.equal([...job.matchAll(/^ {6}- /gm)].length, 1);
+  assert.ok(!job.includes("uses: actions/checkout"));
+});
+
+test("receipt is an isolated immutable checkout with no secrets, artifacts, caches or repository scripts", () => {
+  const job = jobs.certify!;
+  assert.ok(job.includes("continue-on-error: true"));
+  assert.ok(job.includes("github.event_name == 'pull_request'"));
+  assert.ok(job.includes("PR_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}"));
+  assert.ok(job.includes('test "$PR_REPOSITORY_ID" = "$GITHUB_REPOSITORY_ID"'));
+  assert.ok(job.includes('if (checks[id]?.result !== "success") throw new Error'));
+  assert.ok(job.includes("always() && !cancelled()"));
+  assert.ok(job.includes("permissions:\n      contents: read"));
+  assert.ok(
+    job.includes(
+      "needs: [core, cli, lint, core-postgres, web-ui-plugin, auth-plugin, portal-plugin, coauthor-trailers]",
+    ),
+  );
+  assert.equal([...job.matchAll(/^ {6}- /gm)].length, 3);
+  assert.ok(job.includes("ref: ${{ github.sha }}\n          persist-credentials: false"));
+  assert.match(job, /uses: actions\/checkout@[a-f0-9]{40}/);
+  assert.ok(job.includes('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"'));
+  assert.ok(job.includes("QM_CI_TREE="));
+  assert.doesNotMatch(job, /secrets\.|npm |scripts\/|artifact|cache|id-token/);
+});
+
+test("inline receipt eligibility rejects missing or failed prerequisites, not an unrelated skipped resolver", () => {
+  const script = jobs
+    .certify!.split("      - name: Validate receipt eligibility")[1]!
+    .split("      - name: Checkout tested commit")[0]!
+    .split("        run: |\n")[1]!
+    .replace(/^ {10}/gm, "");
+  const ids = [
+    "core",
+    "cli",
+    "lint",
+    "core-postgres",
+    "web-ui-plugin",
+    "auth-plugin",
+    "portal-plugin",
+    "coauthor-trailers",
+  ];
+  const checks = Object.fromEntries(ids.map((id) => [id, { result: "success" }]));
+  checks.reuse = { result: "skipped" };
+  const execute = (source = "123", target = "123") =>
+    spawnSync("bash", ["-eo", "pipefail", "-c", script], {
+      env: { ...process.env, PR_REPOSITORY_ID: source, GITHUB_REPOSITORY_ID: target, CHECKS: JSON.stringify(checks) },
+      encoding: "utf8",
+    });
+  assert.equal(execute().status, 0);
+  for (const [source, target] of [
+    ["123", "456"],
+    ["", "123"],
+    ["", ""],
+    ["123", ""],
+  ])
+    assert.notEqual(execute(source, target).status, 0, `${source}/${target}`);
+  for (const id of ids) {
+    checks[id] = { result: "failure" };
+    assert.notEqual(execute().status, 0, id);
+    delete checks[id];
+    assert.notEqual(execute().status, 0, id);
+    checks[id] = { result: "success" };
+  }
+});

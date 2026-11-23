@@ -1,0 +1,1239 @@
+# Changelog
+
+All notable changes to Hatchet's Python SDK will be documented in this changelog.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [2.0.0] - Unreleased
+
+V2 removes everything that was deprecated in V1 and tightens the types that were previously coerced. See the [V2 migration guide](https://docs.hatchet.run/v1/migration-guide-python-v2) for before and after examples of every breaking change, including a quick reference table suitable for handing to a coding agent.
+
+### Removed
+
+- The `run_no_wait`, `aio_run_no_wait`, `run_many_no_wait`, and `aio_run_many_no_wait` methods. Pass `wait_for_result=False` to `run`, `aio_run`, `run_many`, and `aio_run_many` instead.
+- The `options` parameter on `run`, `aio_run`, `schedule`, `aio_schedule`, and `create_bulk_run_item`, and on `events.push` and `events.aio_push`. Pass the fields as keyword arguments instead. `PushEventOptions` and `BulkPushEventOptions` have been removed.
+- The `key` parameter on `create_bulk_run_item`. Use `child_key` instead.
+- The `parent_id`, `parent_step_run_id`, `child_index`, `key`, and `namespace` fields on `TriggerWorkflowOptions` and `ScheduleTriggerWorkflowOptions`, and the `key` field on `WorkflowRunTriggerConfig`.
+- The `desired_worker_id` parameter on `run`, `aio_run`, and `create_bulk_run_item`, and the `desired_worker_id` field on `TriggerWorkflowOptions`. Pass `sticky=True` to run a child on the same worker as the task that triggers it.
+- `EmptyModel`. Tasks and workflows with no input validator now receive `None` as their input, and running a task that returns nothing gives `None`.
+- Every SDK enum. Fixed sets of choices are plain strings typed as `Literal`s: `RunStatus` (`"QUEUED"`, `"RUNNING"`, `"COMPLETED"`, `"CANCELLED"`, `"FAILED"`), `Priority` (`"LOW"`, `"MEDIUM"`, `"HIGH"`), `WorkerLabelComparator` (`"EQUAL"`, `"LESS_THAN"`, ...), `SlotType` (`"default"`, `"durable"`), `HTTPMethod`, `OTelAttribute` (the span attribute name, such as `"step_name"`), and `WorkerStatus`. These names survive as `Literal` type aliases. `ConcurrencyLimitStrategy`, `StickyStrategy`, `RateLimitDuration`, and `MCPProvider` are gone entirely; pass the member name as a string (for example `"CANCEL_IN_PROGRESS"`, `"SOFT"`, `"MINUTE"`, `"CLAUDE"`). `QUEUE_NEWEST` and `QUEUE_OLDEST` have no replacement, since the engine no longer supports them.
+- String durations such as `"10s"`. `execution_timeout`, `schedule_timeout`, `ctx.refresh_timeout`, `ctx.aio_sleep_for`, and `SleepCondition` only accept a `timedelta`.
+- Integer priorities. Every `priority` and `default_priority` parameter and field only accepts `"LOW"`, `"MEDIUM"`, or `"HIGH"`. Use `priority_to_int` from `hatchet_sdk.types.priority` to compare them.
+- `TaskDefaults.priority`, which was never read. Set `default_priority` on the workflow instead.
+- `dict` values for `desired_worker_labels`, and integer `comparator` values on `DesiredWorkerLabel`. Use a `list[DesiredWorkerLabel]` and a comparator name such as `"EQUAL"`.
+- `dict` values for the `labels` argument to `hatchet.worker` and the `Worker` constructor. Use a `list[WorkerLabel]`.
+- Synchronous durable tasks. Declaring one raises a `TypeError`.
+- `ctx.step_run_id`, `ctx.workflow_input`, `ctx.input`, `ctx.done`, `ctx.exit_flag`, `ctx.aio_task_output`, `ctx.fetch_task_run_error`, and `ctx.worker`, along with the `WorkerContext` class. Use `ctx.task_run_id`, the task's `input` argument, `ctx.is_cancelled`, `ctx.task_output`, `ctx.get_task_run_error`, `ctx.worker_id`, `ctx.worker_labels`, and `ctx.upsert_worker_labels`.
+- `ctx.trigger_data`. Use `ctx.filter_payload`, which holds its `filter_payload` entry.
+- The `raise_on_error` parameter on `ctx.log` and `ctx.aio_log`.
+- Internal `Context` properties: `data`, `action`, `dispatcher_client`, `admin_client`, `event_client`, `runs_client`, `log_sender`, and `durable_event_listener`, and `DurableContext.wait_index`.
+- `Hatchet.get_current_context()`. Use the `hatchet.current_context` property.
+- The `debug` and `client` parameters on the `Hatchet` constructor, the `debug` parameter on the `Worker` constructor, and the internal `hatchet_sdk.client.Client` class. Set `HATCHET_CLIENT_DEBUG=true` and pass `config=ClientConfig(...)` instead.
+- The `handle_kill` parameter on the `Worker` constructor. `Worker.start()` returns after a graceful shutdown instead of exiting the process.
+- The `hatchet.listener` and `hatchet.dispatcher` properties, the `log`, `stream`, and `aio_stream` methods and the `token` and `namespace` attributes on the events client, and the `workflow_run_listener`, `workflow_run_event_listener`, and `admin_client` properties on `hatchet.runs`, `WorkflowRunRef`, and `TaskRunRef`.
+- `runs.list_with_pagination` and `runs.aio_list_with_pagination`. `runs.list` and `runs.aio_list` now paginate internally.
+- `workers.update` and `workers.aio_update`. Use `workers.pause` and `workers.unpause`, or their `aio_` variants.
+- The `statuses` parameter on `scheduled.bulk_delete` and `scheduled.aio_bulk_delete`. The API has no status filter for bulk deletes, so it was ignored.
+- The `stream` method on `WorkflowRunRef` and `TaskRunRef`. Use `hatchet.streams`, or the deprecated `hatchet.runs.aio_subscribe_to_stream(ref.workflow_run_id)`.
+- The `create_traceparent`, `parse_carrier_from_metadata`, and `inject_traceparent_into_metadata` functions in `hatchet_sdk.opentelemetry.instrumentor`. `HatchetInstrumentor` has propagated the traceparent automatically since 1.11.0.
+- `WorkerStartOptions` and the `options` parameter on `Worker.start`, and `Worker.register_workflow_from_opts`.
+- Internal `Worker`, `Workflow`, `Task`, and condition attributes and methods, including `worker.config`, `worker.slot_config`, `worker.labels`, `worker.action_registry`, `worker.exit_gracefully`, `workflow.config`, `workflow.client`, `workflow.service_name`, `workflow.create_action_name`, `workflow.to_proto`, `task.fn`, `task.slot_requests`, `task.call`, `task.aio_call`, `task.to_proto`, the task settings (`task.type`, `task.retries`, `task.execution_timeout`, `task.schedule_timeout`, `task.parents`, `task.rate_limits`, `task.desired_worker_labels`, `task.backoff_factor`, `task.backoff_max_seconds`, `task.concurrency`, `task.wait_for`, `task.skip_if`, `task.cancel_if`, `task.batch`, and `task.eviction_policy`), `Standalone.is_async_function`, the `base` attribute and `to_proto` method on conditions, the `hatchet_sdk.conditions.Action` enum, and `Depends(...).fn`. `task.name` is still public.
+- `TaskRunError.serialize`, `TaskRunError.deserialize`, and `TaskRunError.from_exception`. Use `str(error)`, or the `exc`, `exc_type`, and `trace` attributes.
+- The `config`, `tracer_provider`, and `meter_provider` attributes and the `extract_bound_args` method on `HatchetInstrumentor`.
+- The `StepRunEventType` and `WorkflowRunEventType` exports, and the `StepRunEvent` class. `runs.aio_subscribe_to_stream` yields plain `str` chunks, so there are no event types to match on.
+- The `event_timestamp` field on `Event` and its `eventTimestamp` and `additionalMetadata` aliases. Use `seen_at` and `additional_metadata`.
+- The `hatchet_sdk.labels`, `hatchet_sdk.rate_limit`, and `hatchet_sdk.utils.priority` module aliases.
+- The re-exports in the `hatchet_sdk.types` package (`DesiredWorkerLabel`, `WorkerLabelComparator`, `Priority`, `RateLimit`, and `SlotType`). Import them from `hatchet_sdk`.
+- Top-level `hatchet_sdk` exports of the V0 REST models, the pagination wrapper types, and `CreateWorkflowVersionOpts`. Import REST models from `hatchet_sdk.clients.rest.models`.
+- The `PARENT_ID`, `PARENT_STEP_RUN_ID`, `CHILD_INDEX`, and `DESIRED_WORKER_ID` members of `OTelAttribute`. Their values (`parent_id`, `parent_step_run_id`, `child_index`, `desired_worker_id`) are no longer valid entries in `OpenTelemetryConfig.excluded_attributes` or `HATCHET_CLIENT_OPENTELEMETRY_EXCLUDED_ATTRIBUTES`.
+- The `hatchet.namespace` and `hatchet.key` attributes on the run, bulk run, and schedule spans. The child key is still reported as `hatchet.child_key`. The run, bulk run, and durable spawn spans also no longer set `hatchet.desired_worker_id`.
+- The `V1TaskStatus` export from `hatchet_sdk`. Use `RunStatus` instead.
+- `RunStatus.from_proto`, `RunStatus.from_v1_task_status`, and `RunStatus.to_v1_task_status`.
+- `ctx.pause_rate_limit` and `ctx.aio_pause_rate_limit`. Use `hatchet.rate_limits.pause` and `hatchet.rate_limits.aio_pause`.
+- The `ScheduledRunStatus`, `CronWorkflowsOrderByField`, `ScheduledWorkflowsOrderByField`, `RateLimitOrderByField`, `RateLimitOrderByDirection`, `WorkflowRunOrderByDirection`, `V1WebhookSourceName`, `V1WebhookHMACAlgorithm`, `V1WebhookHMACEncoding`, `V1WebhookBasicAuth`, `V1WebhookAPIKeyAuth`, and `V1WebhookHMACAuth` exports from `hatchet_sdk`.
+- The `TriggerWorkflowOptions`, `ScheduleTriggerWorkflowOptions`, `RunEventListener`, and `WorkflowConfig` exports from `hatchet_sdk`. No public method accepts them now that the `options` parameters are gone. To build a `WorkflowRunTriggerConfig`, use `create_bulk_run_item` instead of constructing one by hand.
+
+### Changed
+
+- `aio_result` on `WorkflowRunRef` and `TaskRunRef` raises `CancelledRunError` for a cancelled run, like `result` does. Previously it returned the outputs of the tasks that finished, usually `{}`.
+- Python 3.11 or newer is required.
+- Optional parameters that follow a method's main arguments are keyword-only, so passing them positionally raises a `TypeError`. This covers `run`, `aio_run`, `run_many`, `aio_run_many`, `create_bulk_run_item`, `schedule`, `aio_schedule`, `create_cron`, `aio_create_cron`, `create_filter`, `aio_create_filter`, `list_runs`, `aio_list_runs`, `pause`, `aio_pause`, `mock_run`, and `aio_mock_run` on workflows and tasks; the `task`, `durable_task`, `batch_task`, `on_failure_task`, and `on_success_task` decorators on a workflow (after `name`); `hatchet.worker` and the `Worker` constructor; `poll_interval` on `WorkflowRunRef.result` and `TaskRunRef.result`; `SleepCondition`, `UserEventCondition`, and `ParentCondition`; the `label` parameter on `ctx.aio_sleep_for` and `ctx.aio_sleep_until`; `streams.aio_reset`; every `HatchetInstrumentor` parameter; and, along with their `aio_` variants, `cel.debug`, `crons.create`, `crons.list`, `events.push`, `events.list`, `filters.create`, `filters.list`, `logs.list`, `metrics.get_task_metrics`, `rate_limits.put`, `rate_limits.list`, `runs.list`, `runs.create`, `runs.reset_durable_task`, `scheduled.create`, `scheduled.list`, `streams.topic_metadata`, `webhooks.create`, `webhooks.update`, `webhooks.list`, `workflows.list`, `workflows.get_version`, and `workflows.pause`. Pass these arguments by keyword. `input` and `additional_metadata` on `crons.create` and `scheduled.create` are still required.
+- `hatchet.event` has been renamed to `hatchet.events`, and `hatchet.cron` has been renamed to `hatchet.crons`, consistent with the other (plural) feature clients.
+- `runs.subscribe_to_stream` has been renamed to `runs.aio_subscribe_to_stream`, consistent with the `aio_` prefix on every other async method.
+- `streams.publish` has been renamed to `streams.aio_publish`, and `streams.subscribe` has been renamed to `streams.aio_subscribe`, since both are async.
+- `runs.bulk_replay_by_filters_with_pagination` and `runs.bulk_cancel_by_filters_with_pagination`, and their `aio_` variants, have been renamed to `bulk_replay_by_filters_in_chunks` and `bulk_cancel_by_filters_in_chunks`. Their `sleep_time` parameter (an integer number of seconds) has been renamed to `delay_between_chunks` and takes a `timedelta`.
+- `ConcurrencyExpression` has been renamed to `ConcurrencyStrategy`, and its `limit_strategy` field has been renamed to `strategy`.
+- `TriggerWorkflowOptions.desired_worker_label` has been renamed to `desired_worker_labels` and only accepts a `list[DesiredWorkerLabel]`.
+- Every `list` and `aio_list` method on the feature clients returns a plain `list` instead of a paginated wrapper, so there is no `.rows` to unwrap.
+- `crons.create`, `crons.get`, `crons.list`, their `aio_` variants, and `workflow.create_cron` return the SDK's `CronTrigger` instead of the `CronWorkflows` REST model. Read `cron.id` instead of `cron.metadata.id`, `cron.created_at` and `cron.updated_at` instead of `cron.metadata.created_at` and `cron.metadata.updated_at`, and `cron.expression` instead of `cron.cron`. `input` and `additional_metadata` are empty dictionaries instead of `None` when unset.
+- `scheduled.create`, `scheduled.update`, `scheduled.get`, `scheduled.list`, their `aio_` variants, and `workflow.schedule` and `workflow.aio_schedule` return the SDK's `ScheduledRun`. The `scheduled` client previously returned the `ScheduledWorkflows` REST model, so read `scheduled.id` instead of `scheduled.metadata.id`. `workflow.schedule` previously returned the V0 `WorkflowVersion` protobuf, so read `scheduled.id` instead of `scheduled.scheduled_workflows[0].id`. `ScheduledRun.workflow_run_status` is a `RunStatus`, or `None` before the schedule has triggered: `PENDING`, `QUEUED`, and `BACKOFF` become `QUEUED`, and `SUCCEEDED` becomes `COMPLETED`. `input` and `additional_metadata` are empty dictionaries instead of `None` when unset.
+- `runs.list`, `runs.get_task_run`, their `aio_` variants, and `workflow.list_runs` and `workflow.aio_list_runs` return the SDK's `TaskRunSummary` instead of the `V1TaskSummary` REST model. Read `run.id` instead of `run.metadata.id`, `task_run_id` instead of `task_external_id`, `workflow_run_id` instead of `workflow_run_external_id`, and `parent_task_run_id` instead of `parent_task_external_id`. `duration` is a `timedelta` instead of an integer number of milliseconds, and `additional_metadata` is an empty dictionary instead of `None` when unset. The internal `task_id`, `task_inserted_at`, `step_id`, `action_id`, and `workflow_config` fields have been dropped.
+- The `workflow.id` property has been replaced by `workflow.get_id()` and `workflow.aio_get_id()`, which fetch the ID on the first call and cache it.
+- `filters.update` and `filters.aio_update` take `expression`, `scope`, and `payload` keyword arguments instead of a `V1UpdateFilterRequest`. Fields left as `None` are not changed.
+- `ctx.aio_wait_for` returns a `list[SleepResult | EventWaitResult | OrGroupResult]` instead of a `dict`, and `ctx.aio_wait_for_event` returns an `EventWaitResult` whose `.payload` holds the event data.
+- `ctx.aio_wait_for` no longer takes a signal key as its first argument. Pass the conditions directly, and pass `signal_key=` by keyword if you need a specific key. When it is left out, the key is generated from the order of the wait within the task run, which is stable across replays.
+- `ctx.refresh_timeout`, `ctx.aio_refresh_timeout`, `ctx.put_stream`, and `ctx.aio_put_stream` raise when the request fails, instead of logging the error and returning.
+- `ctx.priority` now returns `"LOW"`, `"MEDIUM"`, `"HIGH"`, or `None` instead of `int | None`.
+- `ctx.worker_labels` is a `list[WorkerLabel]` instead of a `dict`, and `ctx.upsert_worker_labels` and `ctx.aio_upsert_worker_labels` take a `list[WorkerLabel]`, matching the `labels` argument to `hatchet.worker`.
+- The `task_run_errors` parameter on `mock_run` and `aio_mock_run` takes a `dict[str, TaskRunError]` instead of serialized error strings, matching `ctx.task_run_errors`. Their `trigger_data` parameter has been replaced by `filter_payload`, which sets `ctx.filter_payload`.
+- `from hatchet_sdk import Event` now resolves to the SDK's own event class instead of the V0 REST model. Every method on the events client returns it: `push`, `bulk_push`, `get`, and `list`, along with their `aio_` variants. `get` and `list` previously returned the `V1Event` REST model, so read `event.id` instead of `event.metadata.id`.
+- `Event.event_id` has been renamed to `Event.id`.
+- `Event.payload` and `Event.additional_metadata` are now dictionaries instead of JSON strings, so there is no need to call `json.loads` on them. `additional_metadata` is an empty dictionary when the event has none.
+- `BulkPushEventWithMetadata.key` is now required.
+- `workflow.input_validator` and `workflow.input_validator_type` return `None` for a workflow with no input validator.
+- `Worker.register_workflow` now raises on registration failure instead of calling `sys.exit(1)`, and `Worker.start()` raises if the action listener process fails to start, also instead of calling `sys.exit(1)`.
+- `Worker.start()` returns after a graceful shutdown (on `SIGTERM` or `SIGINT`, or after `terminate_worker_after_num_tasks` tasks) instead of calling `sys.exit(0)`, so code after `worker.start()` now runs. A forced shutdown still exits with status 1.
+- `FailedTaskRunExceptionGroup` is now an `ExceptionGroup[TaskRunError]` instead of a `ValueError`. `except ValueError` no longer catches it, and `except* TaskRunError` does. `.exceptions` is a tuple instead of a list, and holds a single `TaskRunError` carrying the message when the run failed without reporting any task errors. `str()` is unchanged, and `.message` now holds the same text, the run's failure message followed by each task error, so `pytest.raises(FailedTaskRunExceptionGroup, match=...)` still matches on task errors.
+- `backoff_max_seconds` (an integer number of seconds) has been renamed to `backoff_max` and takes a `timedelta`, on every task decorator and on `TaskDefaults`. It is sent to the engine as whole seconds.
+- `poll_interval` on `WorkflowRunRef.result` and `TaskRunRef.result` takes a `timedelta` instead of a number of seconds.
+- `ClientConfig.sync_result_poll_interval` is a `timedelta` instead of a `float`. `HATCHET_CLIENT_SYNC_RESULT_POLL_INTERVAL` is still a number of seconds. `DEFAULT_SYNC_RESULT_POLL_INTERVAL_SECONDS` in `hatchet_sdk.config` has been renamed to `DEFAULT_SYNC_RESULT_POLL_INTERVAL` and is a `timedelta`.
+- `ClientConfig.listener_v2_timeout` (an integer number of seconds) has been renamed to `action_listener_timeout` and takes a `timedelta`. Its environment variable is now `HATCHET_CLIENT_ACTION_LISTENER_TIMEOUT`, still a number of seconds.
+- `EmbeddedHatchetConfig.ready_timeout_seconds` has been renamed to `ready_timeout` and takes a `timedelta`. Its environment variable is now `HATCHET_CLIENT_EMBEDDED_READY_TIMEOUT`, still a number of seconds. `DEFAULT_READY_TIMEOUT_SECONDS` in `hatchet_sdk.config` has been renamed to `DEFAULT_EMBEDDED_READY_TIMEOUT` and is a `timedelta`.
+- `OpenTelemetryConfig.include_task_name_in_start_step_run_span_name` has been renamed to `include_task_name_in_span_name`, and its environment variable to `HATCHET_CLIENT_OPENTELEMETRY_INCLUDE_TASK_NAME_IN_SPAN_NAME`.
+- `HealthcheckConfig.event_loop_block_threshold_seconds` has been renamed to `event_loop_block_threshold`, and its environment variable to `HATCHET_CLIENT_WORKER_HEALTHCHECK_EVENT_LOOP_BLOCK_THRESHOLD`.
+- `ClientTLSConfig.strategy` is now typed as `Literal["tls", "mtls", "none"]`.
+- `TaskDefaults` rejects unknown fields, so a leftover field such as `backoff_max_seconds` or `priority` raises a `ValidationError` instead of being ignored.
+- `WorkerLabel.key` is required, and `DesiredWorkerLabel` no longer subclasses `WorkerLabel`.
+- The default `readable_data_key` of a `ParentCondition` is the parent task's name, followed by `:` and the expression when one is set. It previously also included the time the condition was created, so the workflow definition changed every time the worker started. Two `ParentCondition`s on the same task with the same parent and expression now need distinct `readable_data_key` values, or registering the workflow raises a `ValueError`.
+- `RunStatus` is now the only run status type. Every status the SDK accepts or returns is a `RunStatus`, including `TaskRunSummary.status`, `ScheduledRun.workflow_run_status`, the `status` field on REST models, and the `statuses` filters on `runs.list` and `events.list`.
+- The `statuses` filter on `scheduled.list` and `scheduled.aio_list` takes `RunStatus` values, plus `"SCHEDULED"` for schedules that have not triggered yet, instead of `ScheduledRunStatus`.
+- The `order_by_field` and `order_by_direction` parameters on `crons.list`, `scheduled.list`, `rate_limits.list`, and their `aio_` variants take snake_case strings (`"created_at"`, `"trigger_at"`, `"limit_value"`, ...) and `"asc"` or `"desc"`, instead of the REST ordering enums.
+- `webhooks.create` and `webhooks.aio_create` take `WebhookBasicAuth`, `WebhookAPIKeyAuth`, or `WebhookHMACAuth`, with snake_case fields and string HMAC algorithms and encodings, instead of the `V1Webhook*Auth` REST models. `source_name` on `webhooks.create` and `source_names` on `webhooks.list` are strings.
+- `NotFoundException` has been renamed to `NotFoundError`.
+- The events client module has moved from `hatchet_sdk.clients.events` to `hatchet_sdk.features.events`, alongside the other feature clients.
+- The `parent_step_run_id` parameter on `scheduled.bulk_delete` and `scheduled.aio_bulk_delete` has been renamed to `parent_task_run_id`.
+- Worker log messages and error messages refer to tasks instead of steps.
+- `NonRetryableException` has been renamed to `NonRetryableError`, and `RetryAfterException` has been renamed to `RetryAfterError`.
+- `ctx.task_run_errors` returns a `dict[str, TaskRunError]` instead of a dictionary of serialized error strings, and no longer logs an error when there are no upstream errors.
+- `BulkCancelReplayOpts` has been renamed to `BulkCancelReplayOptions`, and the `opts` parameter on `runs.bulk_cancel` and `runs.bulk_replay` has been renamed to `options`.
+- The `run_at` parameter on `schedule` and `aio_schedule` has been renamed to `trigger_at`, matching the scheduled runs client and the `trigger_at` field on scheduled runs.
+- Run ID parameters now use one name per kind of ID. `runs.get_result`, `runs.get_details`, and the `get_run_ref`, `get_result`, and `aio_get_result` methods on a standalone task take `workflow_run_id`. `runs.reset_durable_task` takes `task_run_id` instead of `task_external_id`. `runs.cancel` and `runs.replay` keep `run_id`, since they accept either kind. The `parent_task_external_id` and `triggering_event_external_id` filters on `runs.list`, `metrics.get_task_metrics`, `workflow.list_runs`, and their `aio_` variants have been renamed to `parent_task_run_id` and `triggering_event_id`.
+- `runs.list`, `runs.aio_list`, `workflow.list_runs`, and `workflow.aio_list_runs` page through every result internally, and leaving `limit` unset returns every matching run. In V1, `runs.list` returned the first 50 runs, and `workflow.list_runs` returned up to 100 runs for each day in the range. `limit` and `offset` now apply to the whole time range.
+- `from hatchet_sdk import Workflow` now resolves to the workflow class returned by `hatchet.workflow()` instead of the REST model, and the `WorkflowVersion` REST model is no longer exported from `hatchet_sdk`.
+- Passing an input when running, scheduling, or bulk running a task or workflow that has no `input_validator` raises a `TypeError` instead of silently dropping the input. Declare `input_validator=dict[str, Any]` to accept untyped input.
+- `schedule_timeout`, `execution_timeout`, and `retries` on `Workflow.task`, `Workflow.durable_task`, `Workflow.on_failure_task`, and `Workflow.on_success_task`, and `schedule_timeout` and `execution_timeout` on `Workflow.batch_task`, default to `None`, which falls back to the workflow's `task_defaults` and then to the built-in defaults (5 minutes, 60 seconds, and 0). `on_failure_task` and `on_success_task` previously ignored `task_defaults`, including `backoff_factor` and `backoff_max`. An explicit value that equals a built-in default, such as `retries=0`, is no longer replaced by `task_defaults`.
+- `IdempotencyCollisionError` and `BulkTriggerIdempotencyCollisionError` now carry a message naming the colliding runs.
+- Scheduling a run with a timezone-aware, non-UTC datetime no longer logs a warning. The datetime was already converted correctly.
+- `result` and `aio_result` on `WorkflowRunRef` and `TaskRunRef` raise `RuntimeError` instead of `ValueError` when fetching the run's status fails repeatedly. A cancelled run still raises `ValueError`.
+- `ctx.aio_wait_for_event` raises a `ValueError` if the wait completes without a matching event.
+- `ctx.aio_wait_for` raises a `ValueError` if two of its conditions have the same `readable_data_key`, which includes identical conditions with default keys in different `OrGroup`s. Previously one of their results was silently dropped.
+- `ctx.task_output(parent)` returns a `dict` for a parent task with no return annotation, and running a `hatchet.stubs.task` with no `output_validator` returns the remote task's output as a `dict`, both instead of an `EmptyModel` with attribute access.
+- `hatchet_sdk.types.idempotency.BaseIdemotencyConfig` has been renamed to `BaseIdempotencyConfig`.
+- `hatchet_sdk.runnables.contextvars.ctx_step_run_id` has been renamed to `ctx_task_run_external_id`.
+- The generated REST client packages import their models and APIs on first use, which makes `import hatchet_sdk` faster.
+- An invalid value for a `Literal`-typed argument raises a `ValueError` that names the argument and lists the accepted values. Previously, `priority` on `events.push`, `crons.create`, and `runs.create`, `order_by_field` and `order_by_direction` on `crons.list`, `scheduled.list`, and `rate_limits.list`, and `statuses` on `scheduled.list` (and their `aio_` variants) raised a `KeyError`, and `provider` on `mcp_tool` raised an `AssertionError`.
+
+### Added
+
+- `CancelledRunError`, exported from `hatchet_sdk`, which `result` and `aio_result` raise for a cancelled run. It has a `workflow_run_id` attribute and is a subclass of `ValueError`, which `result` raised for a cancelled run before.
+- `result` and `aio_result` on `WorkflowRunRef` and `TaskRunRef` accept an optional `timeout` (a `timedelta`) and raise `TimeoutError` when it elapses.
+- `CronTrigger`, `ScheduledRun`, and `TaskRunSummary`, the SDK's own models for cron triggers, scheduled runs, and task run summaries.
+- `SleepResult`, `EventWaitResult`, `OrGroupResult`, `HTTPMethod`, `CronTrigger`, `ScheduledRun`, `TaskRunSummary`, `TaskRunDetail`, `WorkflowRunDetail`, `TaskMetrics`, `NotFoundError`, `WebhookBasicAuth`, `WebhookAPIKeyAuth`, `WebhookHMACAuth`, `WebhookSourceName`, `WebhookHMACAlgorithm`, and `WebhookHMACEncoding` are exported from `hatchet_sdk`, so every type a public method accepts or returns can be imported from the top level.
+- `durable_task` decorators accept `slot_cost`, controlling how many durable slots the task consumes.
+- `hatchet.batch_task` accepts `on_events`, `on_crons`, `cron_input`, and `default_additional_metadata`, matching the other standalone task decorators.
+- `hatchet.tenant`, a client for reading details about the current tenant.
+- `Standalone`, the class returned by the `hatchet.task`, `hatchet.durable_task`, and `hatchet.batch_task` decorators, is exported from `hatchet_sdk`.
+
+### Deprecated
+
+- `ctx.put_stream`, `ctx.aio_put_stream`, and `hatchet.runs.aio_subscribe_to_stream`, which now emit a `DeprecationWarning`. Use durable streams (`hatchet.streams.aio_publish` and `hatchet.streams.aio_subscribe`) instead.
+
+### Fixed
+
+- Running a standalone task that returned `{}` or `None` no longer gives the caller a dictionary keyed by the task name. A task annotated to return a `dict` gives `{}`, and a task with no return annotation or one that allows `None` gives `None`.
+- A `hatchet.batch_task` with no `input_validator` now receives `None` for each item, like every other task with no input validator.
+- Passing a tuple of `ConcurrencyStrategy` objects as `concurrency` to `hatchet.task` or `hatchet.durable_task` no longer discards them, and passing a single `ConcurrencyStrategy` to `workflow.task`, `workflow.durable_task`, `workflow.on_failure_task`, or `workflow.on_success_task` no longer fails when the workflow is registered.
+- `mock_run` and `aio_mock_run` now pass a `dict` input through to the task instead of replacing it with `{}`.
+- Cron expressions that use day or month names, or ranges with steps, such as `0 9 * * MON-FRI`, are no longer rejected before they reach the engine.
+- `ctx.aio_sleep_until` with a time in the past completes immediately instead of sleeping for a negative duration.
+- `HATCHET_CLIENT_TENACITY_*` environment variables set after `hatchet_sdk` is imported are now read when a `ClientConfig` is created.
+- `TaskRunError` sets `args`, so it can be pickled.
+- The `hatchet.durable.wait_for` span reports the actual number of conditions in `hatchet.num_conditions` instead of always 2, and leaves out `hatchet.signal_key` when the key was generated.
+- `HatchetInstrumentor.uninstrument()` now also unwraps `events.aio_push` and `events.aio_bulk_push`.
+- The REST client can read task events of type `BATCH_BUFFERED` and the `STREAM_TOPIC`, `STREAM_MESSAGE` and `STREAM_RETENTION` tenant resource limits, which the engine already returns.
+- Pyright no longer reports an error when `create_bulk_run_item`, `schedule`, `aio_schedule`, `mock_run`, or `aio_mock_run` is called without an `input` on a workflow or task that has no `input_validator`.
+- On Python 3.14, `inspect.signature(..., eval_str=True)` and `typing.get_type_hints` no longer raise a `TypeError` for methods on `hatchet.crons`, `hatchet.events`, `hatchet.filters`, `hatchet.logs`, `hatchet.rate_limits`, `hatchet.scheduled`, and `hatchet.workers` whose annotations use `list`.
+- On engines that predate durable task eviction, registering a durable event now waits for the engine to accept it and retries transient failures. Previously the request was sent without waiting, so failures were silently lost.
+- The tasks that shut a worker down after a signal, an unexpected exit of its action listener process, or reaching `terminate_worker_after_num_tasks` are now kept referenced until they finish, so they can no longer be garbage collected partway through.
+- Workflow and task names inferred from a callable with no `__name__`, such as a `functools.partial`, raise a `TypeError` asking for an explicit `name` instead of an `AttributeError`.
+- Retried unary gRPC calls that fail with a `google.rpc.RetryInfo` detail, such as `RESOURCE_EXHAUSTED` when the engine throttles a call, now wait the delay the server asks for instead of the SDK's own backoff. If the call keeps being throttled, the wait doubles with each retry, up to 5 seconds. Each wait is extended by a random amount of up to 20%, so that clients throttled together do not all retry at the same moment. A call the server asks to wait longer than 5 seconds fails at once with the server's error. The attempt limit and which errors are retried are otherwise unchanged.
+- Fixes an issue where a worker would be blocked because the default ThreadPoolExecutor used by calls to `loop.run_in_executor(None, ...)` and `asyncio.to_thread` was exhausted.
+
+## [1.46.0] - 2026-11-12
+
+### Added
+
+- `mock_run` and `aio_mock_run` accept `task_run_errors`, `trigger_data`, `workflow_run_id`, and `task_run_id`, so unit tests can cover on-failure tasks, tasks with `wait_for` conditions, and tasks that read their run ids.
+
+### Fixed
+
+- A dependency used more than once in a task's dependency tree is now resolved once per run and its value is shared, matching FastAPI's `Depends`.
+- Context manager dependencies now receive the task's exception when the task fails, so they can e.g. roll back a transaction. A dependency that catches the exception without re-raising it no longer makes the task succeed or hides the exception from the other dependencies.
+- The REST client can read workflow versions whose concurrency uses `CANCEL_NEWEST`, `CANCEL_QUEUED_EXCEPT_NEWEST`, or `CANCEL_QUEUED_EXCEPT_OLDEST`.
+
+### Removed
+
+- `grpcio-tools` is no longer a runtime dependency, since the SDK only uses it to generate protobuf code. This avoids building it from source on Python 3.15, where the newest `grpcio-tools` versions compatible with `protobuf<7` have no prebuilt wheels.
+
+## [1.45.1] - 2026-11-05
+
+### Added
+
+- `TenantEntitlements.sandbox_operator`, the tenant's sandbox entitlement.
+
+## [1.45.0] - 2026-10-30
+
+### Removed
+
+- Removes the synchronous `hatchet.streams.reset`; use `aio_reset`, which now calls the engine asynchronously instead of from a worker thread.
+
+## [1.44.0] - 2026-10-26
+
+### Added
+
+- Adds `hatchet.streams`, a client for durable streams: topics that store messages independent of any run, which readers can resume from a cursor. `publish` (async) returns once a message is stored, keeps a client's messages to a topic in call order, and batches publishes queued behind an in-flight request (`batch_timeout` holds a message to gather more). Payloads over 4 MiB are uploaded over REST, up to 64 MiB. `subscribe` (an async iterator) reads a topic from the oldest retained message or a `cursor`, resubscribing from the last event read when the connection drops. `reset` / `aio_reset` start new readers after the latest message or a given cursor, and `topic_metadata` / `aio_topic_metadata` describe a topic's retained messages.
+
+## [1.43.3] - 2026-10-27
+
+### Fixed
+
+- Propagate worker registration failures without a secondary cleanup error, and fail the worker when its action listener exits unexpectedly so supervisors can restart it.
+
+## [1.43.2] - 2026-10-27
+
+### Changed
+
+- The REST client deserializes a `429 Too Many Requests` response body as `APIErrors`, which the API now declares on every authenticated operation.
+
+## [1.43.1] - 2026-10-23
+
+### Fixed
+
+- [Durable tasks](https://docs.hatchet.run/v1/durable-tasks) no longer stall after the worker's durable stream reconnects in the middle of a wait. The worker now reports the last completion it received in its status requests, so the engine resumes delivery from there instead of holding later completions until the task is evicted and replayed.
+
+## [1.43.0] - 2026-10-14
+
+### Added
+
+- Adds `hatchet.rate_limits.pause` / `aio_pause` and `Context.pause_rate_limit` / `aio_pause_rate_limit`, which keep queued runs that consume a rate limit key from starting until a given time.
+
+## [1.42.1] - 2026-10-09
+
+### Fixed
+
+- Fixes a memory leak in the log sender, which had stopped respecting `log_queue_size` and would buffer log messages without limit when they were produced faster than they could be sent. Log messages are dropped once the queue is full.
+
+## [1.42.0] - 2026-10-07
+
+### Added
+
+- Adds `RetryAfterException`, which allows for custom retry strategies.
+
+## [1.41.1] - 2026-09-24
+
+### Fixed
+
+- [Durable tasks](https://docs.hatchet.run/v1/durable-tasks) that fan out to thousands of children no longer block the worker's event loop. The durable listener sent one worker status request per awaited child, each listing every pending child, which was quadratic in the fan-out size; it now sends one request per event loop iteration listing only the newly awaited children.
+- Registering an awaited child no longer scans every pending callback to evict older invocations. The callback cache is indexed by task and invocation.
+- The periodic worker status request lists only children that have been pending for more than two seconds, is sent every five seconds instead of every second, and is split into requests of at most 10,000 entries so it stays under the gRPC message size limit.
+- Re-delivered child completions are matched against pending callbacks without scanning the pending queue.
+- The action listener drains every queued step event in one loop iteration instead of paying a thread hop per event, which removed spurious "event loop may be blocked" warnings on bursts of task starts.
+
+## [1.41.0] - 2026-09-22
+
+### Added
+
+- Adds a new `slots` key to the worker's `/health` response and `hatchet_worker_used_slots` and `hatchet_worker_slot_limit` gauges to its `/metrics` response
+
+## [1.40.3] - 2026-09-18
+
+### Added
+
+- The sync `result()` poll interval is configurable via `ClientConfig.sync_result_poll_interval` or the `HATCHET_CLIENT_SYNC_RESULT_POLL_INTERVAL` environment variable, or per call on `WorkflowRunRef.result` / `TaskRunRef.result`. The minimum remains 1 second.
+
+## [1.40.2] - 2026-09-09
+
+### Changed
+
+- Embedded mode now reports first-run progress on stderr: a line when the sidecar download starts (with version and destination) and completes, a notice when a slow release or checksum fetch blocks startup, a startup line before waiting for the engine, and a heartbeat every 30 seconds while the engine is still becoming ready. Warm starts print at most one startup line.
+- `Hatchet.from_embedded()` now warns once when `HATCHET_CLIENT_TOKEN` is set in the environment or in a `.env` file, since Hatchet clients created with the standard constructor in the same process will not use the embedded engine.
+
+## [1.40.1] - 2026-09-09
+
+### Fixed
+
+- Errors if duplicate action ids are present in the action registry, since internally we assume they're unique
+- Raises correctly on errors inside of `aio_start` by handling coroutine callback
+- Raises an error and exists if a task e.g. segfaults instead of orphaning a process and hanging indefinitely
+
+## [1.40.0] - 2026-09-03
+
+### Added
+
+- Added support for tenant-scoped shared concurrency strategies. Declare a `ConcurrencyExpression` with `is_tenant_scoped=True` and a `name`, and reference the same name from the `concurrency` list of tasks in different workflows so they share a single concurrency limit. Tenant-scoped entries can be mixed with ordinary workflow-scoped entries on the same task.
+- `ConcurrencyExpression.max_runs` now accepts `int | str`: a string is a CEL expression over task input computing the max runs for each concurrency group, so different groups (e.g. pricing tiers) can have different limits.
+- Fixes another durable callback ordering bug which would cause NonDeterminismErrors to be raised on replay in the case where e.g. children were spawned recursively, concurrently.
+- Makes workflows register concurrently on `start` to speed up worker boot time
+
+## [1.39.0] - 2026-08-26
+
+### Added
+
+- Added support for `CANCEL_QUEUED_EXCEPT_NEWEST` and `CANCEL_QUEUED_EXCEPT_OLDEST` concurrency strategies.
+
+## [1.38.2] - 2026-08-31
+
+### Changed
+
+- The missing-token configuration error now explains how to run Hatchet embedded for local development, via `Hatchet.from_embedded()`, with a link to the embedded mode docs.
+
+## [1.38.1] - 2026-08-25
+
+### Added
+
+- Adds `Hatchet.stop_embedded()` and `Hatchet.aio_stop_embedded()` to gracefully stop the embedded engine sidecar and wait until it has fully exited, including its bundled Postgres.
+
+## [1.38.0] - 2026-08-24
+
+### Added
+
+- Adds embedded mode: `Hatchet.from_embedded()` runs a full Hatchet engine locally via the `hatchet-embedded-sidecar` binary, downloaded on first use, verified against release checksums on every start, and shut down with your process.
+
+## [1.37.5] - 2026-08-21
+
+### Fixed
+
+- Correctly implements retry behavior on event pushes, which previously were silently ignored by Tenacity
+
+## [1.37.4] - 2026-08-20
+
+### Fixed
+
+- Reverts a broken TLS change from 1.37.3
+
+## [1.37.3] - 2026-08-19
+
+### Fixed
+
+- Correctly passes TLS config through to the API client
+- Passes the configured TLS server name (SNI) through to the REST client
+- Removes a call to `asyncio.to_thread` that was causing durable callback ordering to end up out-of-ordering, causing non-determinism errors.
+- Fixes a possible memory leak with satisfied (pending) durable callbacks not being removed when invocations get stale
+
+## [1.37.2] - 2026-08-12
+
+### Fixed
+
+- Reduces the amount of noise in the logs / Sentry / etc. when action listener reconnects happen and heartbeats fail, as they should auto-recover and can happen on e.g. redeployments.
+
+## [1.37.1] - 2026-08-03
+
+### Fixed
+
+- Fixes a memory leak in the log sender where we'd indefinitely buffer log messages, causing memory to pile up over time.
+
+## [1.37.0] - 2026-07-23
+
+### Changed
+
+- Adds beta `batch_task` methods to both tasks and workflows, allowing for dynamic batching based on either time or batch size.
+
+## [1.36.0] - 2026-07-21
+
+### Added
+
+- Adds support for terminal status-based idempotency keys, which are released when the task holding the key reaches a terminal state (either completed, cancelled, or having failed and exhausted all retries).
+
+## [1.35.1] - 2026-07-20
+
+### Fixed
+
+- Removes a merge conflict that snuck into `main`
+
+## [1.35.0] - 2026-07-16
+
+### Added
+
+- Adds support for defining **idempotency keys** on workflows and standalone tasks, which ensures that they're only run once in a provided time window, based on a CEL expression.
+
+## [1.34.1] - 2026-07-15
+
+### Added
+
+- Adds a `cron_input` option to `workflow`, `task`, and `durable_task` declarations, allowing an input to be supplied to runs triggered by a workflow's `on_crons` schedules. The value is typed against the workflow's input model and serialized onto the workflow version.
+
+## [1.34.0] - 2026-07-09
+
+### Added
+
+- Added `slot_cost` to the `hatchet.task` and `workflow.task` decorators, so a task that needs more memory or CPU can consume more than one worker slot and a worker runs fewer of them at once. On older engines it has no effect. See [Task Slot Cost](https://docs.hatchet.run/v1/advanced-assignment/slot-cost).
+
+## [1.33.18] - 2026-07-08
+
+### Fixed
+
+- Fixes an issue in the action listener which would stop sending heartbeats before all in-flight tasks were completed.
+
+## [1.33.17] - 2026-07-07
+
+### Fixed
+
+- Fixes an issue in the durable event listener where we could hang indefinitely waiting for an ack. Now, we'll time out and allow the task to retry, so it should be able to recover independently.
+- Fixes an issue in the durable execution logic where collisions in id + retry count would cause unexpected behavior - fixed by adding the invocation count to the key, when it's provided.
+- Fixes an issue in the durable execution logic where a listener reconnect could cause messages to be stuck in the old request queue, causing the listener to hang indefinitely. Now, we will shovel messages from the old queue to the new queue on reconnect, so that they can be processed normally.
+
+## [1.33.16] - 2026-07-05
+
+### Fixed
+
+- Fixes the type of `__name__` in the `DependencyFunc` protocol to be a string instead of a method, which was failing on `ty`.
+
+## [1.33.15] - 2026-07-02
+
+### Added
+
+- Adds `oldest_excluding_retries` to the task stats response
+
+### Changed
+
+- Rolled back required SDK dependencies to the state at `v1.29.5`.
+
+## [1.33.14] - 2026-06-26
+
+### Fixed
+
+- Updates the bulk spawn methods on the internal admin client to dynamically chunk bulk-spawned workflows by the protobuf message size, to avoid hitting gRPC limits on large bulk spawns.
+
+## [1.33.13] - 2026-06-26
+
+### Fixed
+
+- Reworks the internals of event pushes and stream event pubs to use `grpc.aio` directly to limit threading overhead on high-throughput workers.
+- Reworks how logs are forwarded to the engine to publish from a thread instead of from an `asyncio.Task` to try to avoid event loop blocking issues.
+
+## [1.33.12] - 2026-06-21
+
+### Fixed
+
+- Fixed a bug where `_aio_memo` crashes on durable task replay when the engine returns `memo_already_existed=True` with an empty payload (`b''`). Proto3 unset bytes fields deserialize to `b''` rather than `None`, slipping past the `is not None` guard and crashing `validate_json(b'')`.
+
+## [1.33.11] - 2026-06-18
+
+### Fixed
+
+- Fixes a bug in the durable event logic where wrapping child spawns `asyncio.gather` causes a race condition with causes a future to hang. Added a lock around various `send_event` calls to synchronize those to prevent the race.
+
+## [1.33.10] - 2026-06-16
+
+### Fixed
+
+- Properly suppresses gRPC fork support log lines on startup when fork support is disabled
+- Improves logging around worker startup and shutdown
+- Improves retry logic around sending step action events to the engine to better handle transient failures and avoid losing events
+
+## [1.33.9] - 2026-06-14
+
+### Fixed
+
+- Fixes a race condition in the durable event listener where an engine restart can cause the listener to get stuck because of the existence of two separate request queues that are not kept in sync, causing requests to hang indefinitely after being added to the old queue in some cases.
+
+## [1.33.8] - 2026-06-12
+
+### Fixed
+
+- Fixed an issue where errors raised by child tasks spawned inside a durable parent task were not propagated back to the parent. The parent can now catch the child's error and handle it gracefully.
+
+## [1.33.7] - 2026-06-09
+
+### Added
+
+- Added an `individual_run_spans_for_bulk_run` OpenTelemetry config option. When enabled, a child `hatchet.run_workflow` span is created for each item in a bulk run (`run_workflows`), nested under the parent `hatchet.run_workflows` span, with each item's traceparent pointing at its own span. Defaults to `false` to preserve the existing span structure.
+
+### Fixed
+
+- Fixed a bug where synchronous log calls via `asyncio.to_thread` (or other threads) could block workers.
+
+## [1.33.6] - 2026-05-27
+
+### Changed
+
+- Refactored worker graceful shutdown to prevent in-flight tasks from being killed.
+
+## [1.33.5] - 2026-05-12
+
+### Security
+
+- Bump urllib to `2.7.0` to address CVE-2026-44432
+
+## [1.33.4] - 2026-05-08
+
+### Changed
+
+- Fixes a bug where TLS credentials are not passed to the OTLP span exporter.
+
+## [1.33.3] - 2026-04-29
+
+### Changed
+
+- Fixes a bug where passing `wait_for_result=False` when spawning children out of a durable task would not be respected, causing unexpected errors and broken functionality.
+
+## [1.33.2] - 2026-04-22
+
+### Added
+
+- Adds `triggering_event_id` and `triggering_event_key` to the `Context`
+
+## [1.33.1] - 2026-04-21
+
+### Changed
+
+- Adds an optional `label` on durable event waits, which will propagate through to the dashboard
+
+## [1.33.0] - 2026-04-16
+
+### Changed
+
+- Adds `wait` and `before_sleep` parameters to `TenacityConfig` to allow custom retry strategies and retry callbacks.
+
+## [1.32.3] - 2026-04-16
+
+### Changed
+
+- Fixes a couple of internal uses of deprecated methods
+
+## [1.32.2] - 2026-04-15
+
+### Changed
+
+- Fixes a bug where failures sending a completed or failed event from the worker to the engine would fail the task and bypass any retries, even if some were configured on the task
+
+## [1.32.1] - 2026-04-09
+
+### Changed
+
+- Fixes a bug in the shutdown handlers that wouldn't correctly trigger graceful shutdown if only the parent process received a shutdown signal like `SIGTERM`, which might often be the case on e.g. Kubernetes.
+- Fixes an issue where we generated protobufs using a more recent grpcio version than the minimum allowed, causing breakages on older versions.
+
+## [1.32.0] - 2026-04-07
+
+### Added
+
+- Adds `scope` and `lookback_window` arguments for the `DurableContext.aio_wait_for_event`, which allows durable tasks to look back in time for events that may have been emitted before the task started.
+
+## [1.31.0] - 2026-04-03
+
+### Added
+
+- Adds `wait_for_result` parameter to `run()`, `aio_run()`, `run_many()`, and `aio_run_many()` on both `Workflow` and `Standalone`. Passing `wait_for_result=False` replaces the `run_no_wait` / `aio_run_no_wait` / `run_many_no_wait` / `aio_run_many_no_wait` methods.
+- Exports `WorkerLabel` from the top-level `hatchet_sdk` package, alongside the existing `DesiredWorkerLabel` and `WorkerLabelComparator`.
+- Exports `Priority`, `ConcurrencyExpression`, `ConcurrencyLimitStrategy`, `RateLimit`, `RateLimitDuration`, `StickyStrategy`, `SlotType`, `BulkPushEventOptions`, `BulkPushEventWithMetadata`, `PushEventOptions`, and `WorkflowRunTriggerConfig` from the top-level `hatchet_sdk` package.
+- Adds a `current_context` property to `Hatchet` as a replacement for the deprecated `get_current_context()` method.
+
+### Changed
+
+- `worker_labels` and `desired_worker_labels` are now stored internally as `list[WorkerLabel]` / `list[DesiredWorkerLabel]` and converted to the protobuf representation at the last moment, rather than eagerly at construction time.
+- Adds top-level parameters to all of the `run`, `schedule`, etc. methods to pass options directly, instead of needing to import e.g. `TriggerWorkflowOptions` which wasn't very Pythonic.
+
+### Deprecated
+
+- `run_no_wait()`, `aio_run_no_wait()`, `run_many_no_wait()`, and `aio_run_many_no_wait()` are deprecated in favor of `run(wait_for_result=False)`, `aio_run(wait_for_result=False)`, `run_many(wait_for_result=False)`, and `aio_run_many(wait_for_result=False)` respectively.
+- Passing duration parameters (e.g. `schedule_timeout`, `execution_timeout`) as strings is deprecated. Use `timedelta` objects instead.
+- Non-async durable tasks are deprecated. Please convert durable task functions to async.
+- Passing `desired_worker_labels` as a `dict` to task decorators (`@workflow.task`, `@hatchet.task`, etc.) is deprecated. Use a `list[DesiredWorkerLabel]` with the `key` field set instead.
+- Passing `desired_worker_label` as a `dict` to `TriggerWorkflowOptions` is deprecated. Use a `list[DesiredWorkerLabel]` with the `key` field set instead.
+- Passing `priority` as an `int` to task and workflow decorators is deprecated. Use `Priority.LOW`, `Priority.MEDIUM`, or `Priority.HIGH` instead.
+- Passing `comparator` as an `int` to `DesiredWorkerLabel` is deprecated. Use `WorkerLabelComparator` enum values instead.
+- The `debug` parameter on `Hatchet()` is deprecated. Set debug mode via the `HATCHET_CLIENT_DEBUG` environment variable instead.
+- The `client` parameter on `Hatchet()` is deprecated and will be removed in v2.0.0.
+- `Hatchet.get_current_context()` is deprecated. Use the `Hatchet.current_context` property instead.
+- `Context.step_run_id` is deprecated. Use `Context.task_run_id` instead.
+- `Context.workflow_input` and `Context.input` are deprecated. Use the input argument passed directly to the task function instead.
+- `Context.aio_task_output()` is deprecated. Use `Context.task_output()` instead.
+- `Context.done` is deprecated. Use `Context.is_cancelled` instead.
+- `Context.fetch_task_run_error()` is deprecated. Use `Context.get_task_run_error()` instead.
+- Deprecates a number of internal properties and methods on the `Worker` and `Context` that are not intended for public use. These will be removed in v2.0.0.
+- Accessing `ctx.worker` is now deprecated. Use the various properties on the context directly, such as `ctx.worker_id` instead of `ctx.worker.id()`.
+
+## [1.30.0] - 2026-03-30
+
+### Changed
+
+- Adds `mcp_tool` methods to Workflows and Standalone tasks providing compatibility with Claude and OpenAI MCP server tools.
+
+## [1.29.5] - 2026-03-25
+
+### Changed
+
+- Event source info (`hatchet__source_workflow_run_id`, `hatchet__source_step_run_id`) is now injected into event metadata at the `EventClient` level, so cross-workflow trace linking works even without the OTel instrumentor enabled.
+
+## [1.29.3] - 2026-03-23
+
+### Changed
+
+- Fixes `aio_memo` wrapping issue in the OTel instrumentor
+
+## [1.29.2] - 2026-03-17
+
+### Added
+
+- Added `list` and `aio_list` method for Rate Limits Client
+- Added `pause`, `unpause`, `aio_pause`, and `aio_unpause` methods for workers client
+
+## [1.29.1] - 2026-03-17
+
+### Changed
+
+- Updates the `DurableTaskRunAckEntry` model to include `workflow_run_external_id` field, to enable spawning children from durable tasks fire-and-forget style.
+
+## [1.29.0] - 2026-03-16
+
+### Added
+
+- Added a `DurableContext.wait_for_event` helper which returns the payload of the awaited event.
+- Added an `EvictionPolicy`, which allows durable tasks to be evicted from the worker when idle.
+
+### Changed
+
+- Makes a bunch of internal-facing changes for new durable execution features
+
+## [1.28.2] - 2026-03-12
+
+### Changed
+
+- Fixes a bug where the literal string (`\u0000`) in task output was incorrectly rejected as null unicode.
+
+## [1.28.1] - 2026-03-05
+
+### Changed
+
+- Fixes a bug where lifespans are shut down eagerly before the worker is drained, causing unexpected behavior in still-running tasks.
+- Cron expressions now support an optional leading seconds field (6-part expressions), e.g. `30 * * * * *` to trigger at 30 seconds past every minute.
+
+## [1.28.0] - 2026-03-02
+
+### Added
+
+- Adds a `desired_worker_labels` parameter to the `TriggerWorkflowOptions` to allow for dynamically routing task runs to a specific worker at trigger time
+
+### Changed
+
+- Adds support for second-level (six-entry) cron expressions (only supported on new engine versions)
+
+## [1.27.2] - 2026-02-28
+
+### Added
+
+- Adds the `worker_id` to the `Context`
+
+### Changed
+
+- Fixes a bug where failed serialization of task outputs causes the task to hang indefinitely.
+
+## [1.27.1] - 2026-02-27
+
+### Changed
+
+- Updated internal dependencies to address security advisories.
+
+## [1.27.0] - 2026-02-27
+
+### Added
+
+- Adds a `get_current_context` helper on the main `Hatchet` client to allow users to get the current `Context` in tasks (generally in functions called from tasks) without needing to drill the `Context` through function parameters.
+
+### Changed
+
+- Significantly improves serialization performance for task inputs and outputs by using the `dump_json` method on the `TypeAdapter` to do serialization in Rust. Mimics a similar [recent change in FastAPI](https://github.com/fastapi/fastapi/pull/14962).
+
+## [1.26.2] - 2026-02-26
+
+### Added
+
+- Adds `retry_transport_errors` and `retry_transport_methods` to `TenacityConfig` to optionally retry REST transport-level failures for configured HTTP methods (default: `GET`, `DELETE`). Default behavior is unchanged.
+
+### Changed
+
+- Uses a structured `http_method` on `RestTransportError` for determining retry eligibility.
+
+## [1.26.1] - 2026-02-25
+
+### Added
+
+- Adds `retry_429` to `TenacityConfig` (default: `False`) to optionally retry REST HTTP 429 responses.
+- Adds `TooManyRequestsException` and maps REST HTTP 429 responses to it.
+
+## [1.26.0] - 2026-02-25
+
+### Fixed
+
+- Fixes dependencies not working when using `type Dependency = Annotated[..., ...]` syntax for annotations on python version 3.12 and 3.13. Adds `typing-inspection` as a dependency.
+
+### Changed
+
+- Changes one function in the python SDK to use `inspect.iscoroutinefunction` instead of `asyncio.iscoroutinefunction` which is deprecated.
+
+## [1.25.2] - 2026-02-19
+
+### Fixed
+
+- Reverts cancellation changes in 1.25.0 that introduced a regression
+
+## [1.25.1] - 2026-02-17
+
+### Fixed
+
+- Fixes internal registration of durable slots
+
+## [1.25.0] - 2026-02-17 **YANKED ON 2/19/26**
+
+### Added
+
+- Adds a `CancellationToken` class for coordinating cancellation across async and sync operations. The token provides both `asyncio.Event` and `threading.Event` primitives, and supports registering child workflow run IDs and callbacks.
+- Adds a `CancellationReason` enum with structured reasons for cancellation (`user_requested`, `timeout`, `parent_cancelled`, `workflow_cancelled`, `token_cancelled`).
+- Adds a `CancelledError` exception (inherits from `BaseException`, mirroring `asyncio.CancelledError`) for sync code paths.
+- Adds `cancellation_grace_period` and `cancellation_warning_threshold` configuration options to `ClientConfig` for controlling cancellation timing behavior.
+- Adds `await_with_cancellation` and `race_against_token` utility functions for racing awaitables against cancellation tokens.
+- The `Context` now exposes a `cancellation_token` property, allowing tasks to observe and react to cancellation signals directly.
+
+### Changed
+
+- The `Context.exit_flag` is now backed by a `CancellationToken` instead of a plain boolean. The property is maintained for backwards compatibility.
+- Durable context `aio_wait_for` now respects the cancellation token, raising `asyncio.CancelledError` if the task is cancelled while waiting.
+
+## [1.24.0] - 2026-02-13
+
+### Added
+
+- Webhooks client for managing incoming webhooks: create, list, get, update, and delete methods for webhooks, so external systems (e.g. GitHub, Stripe) can trigger workflows via HTTP.
+
+## [1.23.4] - 2026-02-13
+
+### Changed
+
+- Fixes cases where raising exception classes or exceptions with no message would cause the whole error including stack trace to be converted to an empty string.
+- When an error is raised because a workflow has no tasks it now includes the workflows name.
+
+## [1.23.3] - 2026-02-12
+
+### Added
+
+- Adds type-hinted `Standalone.output_validator` and `Standalone.output_validator_type` properties to support easier type-safety and match the `input_validator` property pattern on `BaseWorkflow`.
+- Adds type-hinted `Task.output_validator` and `Task.output_validator_type` properties to support easier type-safety and match the patterns on `BaseWorkflow/Standalone`.
+- Adds parameterized unit tests documenting current retry behavior of the Python SDK’s tenacity retry predicate for REST and gRPC errors.
+
+## [1.23.2] - 2026-02-11
+
+### Changed
+
+- Improves error handling for REST transport-level failures by raising typed exceptions for timeouts, connection, TLS, and protocol errors while preserving existing diagnostics.
+
+## [1.23.1] - 2026-02-10
+
+### Changed
+
+- Fixes a bug introduced in v1.21.0 where the `BaseWorkflow.input_validator` class property became incorrectly typed. Now separate properties are available for the type adapter and the underlying type.
+
+## [1.23.0] - 2026-02-05
+
+### Internal Only
+
+- Updated gRPC/REST contract field names to snake_case for consistency across SDKs.
+
+## [1.22.16] - 2026-02-05
+
+### Changed
+
+- Changes the python SDK to use `inspect.iscoroutinefunction` instead of `asyncio.iscoroutinefunction` which is deprecated.
+- Improves error diagnostics for transport-level failures in the REST client, such as SSL, connection, and timeout errors, by surfacing additional context.
+
+## [1.22.15] - 2026-02-02
+
+### Added
+
+- Adds `task_name` and `workflow_name` properties to the `Context` and `DurableContext` classes to allow tasks and lifespans to access their own names.
+
+### Changed
+
+- Fixes a bug to allow `ContextVars` to be used in lifespans
+- Improves worker shutdown + cleanup logic to avoid leaking semaphores in the action listener process.
+
+## [1.22.14] - 2026-01-31
+
+### Changed
+
+- Allows `None` to be sent from `send_step_action_event` to help limit an internal error on the engine.
+
+## [1.22.13] - 2026-01-29
+
+### Added
+
+- Sends the `task_retry_count` when sending logs to the engine to enable filtering on the frontend.
+
+## [1.22.12] - 2026-01-28
+
+### Added
+
+- Adds a `default_additional_metadata` to the `hatchet.workflow`, `hatchet.task`, and `hatchet.durable_task` methods, which allows you to declaratively provide additional metadata that will be attached to each run of the workflow or task by default.
+
+### Internal Only
+
+- Sends a JSON schema to the engine on workflow registration in order to power autocomplete for triggering workflows from the dashboard.
+
+## [1.22.11] - 2026-01-27
+
+### Changed
+
+- Improves handling of cancellations for tasks to limit how often tasks receive a cancellation but then are marked as succeeded anyways.
+
+## [1.22.10] - 2026-01-26
+
+### Added
+
+- `HATCHET_CLIENT_WORKER_HEALTHCHECK_BIND_ADDRESS` now allows configuring the bind address for the worker healthcheck server (default: `0.0.0.0`)
+
+## [1.22.9] - 2026-01-26
+
+### Added
+
+- Adds missing `unwrap` for `schedule_workflow` in OpenTelemetry instrumentor.
+
+## [1.22.8] - 2026-01-20
+
+### Added
+
+- Adds `HATCHET_CLIENT_WORKER_HEALTHCHECK_EVENT_LOOP_BLOCK_THRESHOLD_SECONDS` to configure when the worker healthcheck becomes unhealthy if the listener process event loop is blocked / task runs are not starting promptly.
+
+### Removed
+
+- Removes a bunch of Poetry scripts that were mostly used for local development and are not necessary for end users of the SDK.
+
+### Changed
+
+- The worker healthcheck server (`/health`, `/metrics`) now runs in the spawned action-listener process (non-durable preferred; durable fallback), instead of the main worker process.
+- The worker `/health` endpoint now checks for listener connection status and aio event loop health.
+- The worker `/metrics` endpoint now exposes listener-focused metrics like `hatchet_worker_listener_health_<worker_name>` and `hatchet_worker_event_loop_lag_seconds_<worker_name>`.
+
+## [1.22.7] - 2026-01-19
+
+### Added
+
+- Adds `is_in_hatchet_serialization_context` function which can be used on a Pydantic `ValidationInfo.context` to determine if the validation/serialization is occurring as a part of Hatchet deserializing task input or serializing task outputs.
+
+## [1.22.6] - 2026-01-14
+
+### Added
+
+- Adds `max_attempts: int` (retries + 1) to the Context
+
+## [1.22.5] - 2026-01-09
+
+### Added
+
+- Adds an `additional_metadata` field to the `get_details` response.
+
+## [1.22.4] - 2026-01-08
+
+### Added
+
+- Adds a `get_details` method to the runs client
+
+## [1.22.3] - 2026-01-07
+
+### Changed
+
+- Fixes an issue with the type signature for chained dependencies
+- Truncates log messages to 10,000 characters to avoid issues with overly large logs.
+
+## [1.22.2] - 2025-12-31
+
+### Added
+
+- Crons can now be provided by alias, e.g. `@daily`
+
+### Changed
+
+- Failed workflow logs are only reported at the `exception` level either on the last retry attempt or if the task is marked as `non_retryable`, to avoid spamming e.g. Sentry with exceptions.
+
+## [1.22.1] - 2025-12-30
+
+### Changed
+
+- Regenerates some API signatures after deprecating many v0 routes.
+
+## [1.22.0] - 2025-12-26
+
+### Added
+
+- Dependencies are now chainable, so one dependency can rely on an upstream one, similar to in FastAPI.
+- Dependencies can now be both functions (sync and async) and context managers (sync and async) to allow for cleaning up things like database connections, etc.
+- The `ClientConfig` has a new `Tenacity` object, which allows for specifying retry config.
+- Concurrency limits can now be specified as integers, which will provide behavior equivalent to setting a constant key with a `GROUP_ROUND_ROBIN` strategy.
+
+### Changed
+
+- Improves the errors raised out of the sync `result` method on the `WorkflowRunRef` to be more in line with the async version, raising a `FailedTaskRunExceptionGroup` that contains all of the task run errors instead of just the first one.
+
+### Internal
+
+- Replaces manual validation logic with Pydantic's `TypeAdapter` for improved correctness and flexibility.
+
+## [1.21.8] - 2025-12-26
+
+### Changed
+
+- Fixes a bug where static rate limits reset their own values to zero on task registration.
+
+## [1.21.7] - 2025-12-15
+
+### Added
+
+- Adds a `get` method to the event client
+
+## [1.21.6] - 2025-12-11
+
+### Added
+
+- Adds `get_task_stats` and `aio_get_task_stats` methods to the `metrics` feature client.
+
+### Changed
+
+- Regenerates the REST and gRPC clients to pick up latest API changes.
+
+## [1.21.5] - 2025-12-06
+
+### Changed
+
+- Task outputs that fail to serialize to JSON will now raise an `IllegalTaskOutputError` instead of being stringified. This pulls errors from the engine upstream to the SDK, and will allow users to catch and handle these errors more easily.
+
+## [1.21.4] - 2025-12-05
+
+### Added
+
+- Adds support for dynamic rate limits using CEL expressions (strings) for the `limit` parameter.
+
+### Changed
+
+- Fixes a serialization error caused by Pydantic sometimes being unable to encode bytes, reported here: https://github.com/hatchet-dev/hatchet/issues/2601
+- Fixes a bug where string-based CEL expressions for `limit` were rejected due to the validation logic.
+
+## [1.21.3] - 2025-11-26
+
+### Added
+
+- Adds GZIP compression for gRPC communication between the SDK and the Hatchet engine to reduce bandwidth usage.
+
+## [1.21.2] - 2025-11-13
+
+### Added
+
+- Adds an OTel option to allow you to include the action name in the root span name for task runs.
+
+### Changed
+
+- Span kinds (e.g. producer, consumer) have been added to OpenTelemetry spans created by the SDK to better reflect their roles.
+
+## [1.21.1] - 2025-11-08
+
+### Changed
+
+- The `list` methods for the logs client now allow for pagination via the `limit`, `since`, and `until` params.
+
+## [1.21.0] - 2025-10-31
+
+### Added
+
+- Adds support for dataclasses as input validators for workflows (and tasks), and also as output validators for tasks.
+
+### Changed
+
+- Fixes a bug where an exception in a lifespan would cause the lifespan to hang indefinitely.
+
+## [1.20.2] - 2025-10-15
+
+### Added
+
+- Adds a `include_payloads` parameter to the `list` methods on the runs client (defaults to true, so no change in behavior).
+
+## [1.20.1] - 2025-10-14
+
+### Added
+
+- Adds wrapper methods for bulk cancelling / replaying large numbers of runs with pagination.
+
+## [1.20.0] - 2025-10-3
+
+### Removed
+
+- Removes all references to `get_group_key_*` which is no longer available in V1
+- Removes all checks + references to V0
+
+## [1.19.0] - 2025-09-24
+
+### Removed
+
+- Removed the deprecated `v0` client and all related code.
+- Removed unused dependencies.
+
+## [1.18.1] - 2025-08-26
+
+### Changed
+
+- Fixes an install issue caused by a misnamed optional dependency.
+
+## [1.18.0] - 2025-08-26
+
+### Added
+
+- Adds a `stubs` client on the main `Hatchet` client, which allows for creating typed stub tasks and workflows. These are intended to be used for triggering workflows that are registered on other workers in either other services or other languages.
+- Adds a config option `force_shutdown_on_shutdown_signal` which allows users to forcefully terminate all processes when a shutdown signal is received instead of waiting for them to exit gracefully.
+
+## [1.17.2] - 2025-08-20
+
+### Added
+
+- Adds back an optional `cel-python` dependency for v0 compatibility, allowing users to use the v0 client with the v0-compatible features in the SDK.
+- Adds `dependencies` to the `mock_run` methods on the `Standalone`.
+- Removes `aiostream` dependency that was unused.
+- Removes `aiohttp-retry` dependency that was unused.
+
+## [1.17.1] - 2025-08-18
+
+### Added
+
+- Adds a `HATCHET_CLIENT_LOG_QUEUE_SIZE` environment variable to configure the size of the log queue used for capturing logs and forwarding them to Hatchet
+
+## [1.17.0] - 2025-08-12
+
+### Added
+
+- Adds support for dependency injection in tasks via the `Depends` class.
+- Deprecated `fetch_task_run_error` in favor of `get_task_run_error`, which returns a `TaskRunError` object instead of a string. This allows for better error handling and debugging.
+
+### Changed
+
+- Uses `logger.exception` in place of `logger.error` in the action runner to improve (e.g.) Sentry error reporting
+- Extends the `TaskRunError` to include the `task_run_external_id`, which is useful for debugging and tracing errors in task runs.
+- Fixes an issue with logging which allows log levels to be respected over the API.
+
+### Removed
+
+- Removes the `cel-python` dependency
+
+## [1.16.5] - 2025-08-07
+
+### Changed
+
+- Relaxes constraint on Prometheus dependency
+
+## [1.16.4] - 2025-07-28
+
+### Added
+
+- Adds a new config option `grpc_enable_fork_support` to allow users to enable or disable gRPC fork support. This is useful for environments where gRPC fork support is not needed or causes issues. Previously was set to `False` by default, which would cause issues with e.g. Gunicorn setups. Can also be set with the `HATCHET_CLIENT_GRPC_ENABLE_FORK_SUPPORT` environment variable.
+
+### Changed
+
+- Changes `ValidTaskReturnType` to allow `Mapping[str, Any]` instead of `dict[str, Any]` to allow for more flexible return types in tasks, including using `TypedDict`.
+
+## [1.16.3] - 2025-07-23
+
+### Added
+
+- Adds support for filters and formatters in the logger that's passed to the Hatchet client.
+- Adds a flag to disable log capture.
+
+### Changed
+
+- Fixes a bug in `aio_sleep_for` and the `SleepCondition` that did not allow duplicate sleeps to be awaited correctly.
+- Stops retrying gRPC requests on 4XX failures, since retrying won't help
+
+## [1.16.2] - 2025-07-22
+
+### Added
+
+- Adds an `input_validator` property to `BaseWorkflow` which returns a typechecker-aware version of the validator class.
+
+## [1.16.1] - 2025-07-18
+
+### Added
+
+- Adds a `CEL` feature client for debugging CEL expressions
+
+## [1.16.0] - 2025-07-17
+
+### Added
+
+- Adds new methods for unit testing tasks and standalones, called `mock_run` and `aio_mock_run`, which allow you to run tasks and standalones in a mocked environment without needing to start a worker or connect to the engine.
+- Improves exception logs throughout the SDK to provide more context for what went wrong when an exception is thrown.
+- Adds `create_run_ref`, `get_result`, and `aio_get_result` methods to the `Standalone` class, to allow for getting typed results of a run more easily.
+- Adds `return_exceptions` option to the `run_many` and `aio_run_many` methods to be more similar to e.g. `asyncio.gather`. If `True`, exceptions will be returned as part of the results instead of raising them.
+
+### Changed
+
+- Correctly propagates additional metadata through the various `run` methods to spawned children.
+
+## [1.15.3] - 2025-07-14
+
+### Changed
+
+- `remove_null_unicode_character` now accepts any type of data, not just strings, dictionaries, lists, and tuples. If the data is not one of these types, it's returned as-is.
+
+## [1.15.2] - 2025-07-12
+
+### Changed
+
+- Fixes an issue in `capture_logs` where the `log` call was blocking the event loop.
+
+## [1.15.1] - 2025-07-11
+
+### Added
+
+- Correctly sends SDK info to the engine when a worker is created
+
+## [1.15.0] - 2025-07-10
+
+### Added
+
+- The `Metrics` client now includes a method to scrape Prometheus metrics from the tenant.
+
+### Changed
+
+- The `Metrics` client's `get_task_metrics` and `get_queue_metrics` now return better-shaped, correctly-fetched data from the API.
+
+## [1.14.4] - 2025-07-09
+
+### Added
+
+- Adds `delete` and `aio_delete` methods to the workflows feature client and the corresponding `Workflow` and `Standalone` classes, allowing for deleting workflows and standalone tasks.
+
+## [1.14.3] - 2025-07-07
+
+### Added
+
+- Adds `remove_null_unicode_character` utility function to remove null unicode characters from data structures.
+
+### Changed
+
+- Task outputs that contain a null unicode character (\u0000) will now throw an exception instead of being serialized.
+- OpenTelemetry instrumentor now correctly reports exceptions raised in tasks to the OTel collector.
+
+## [1.14.2] - 2025-07-03
+
+### Added
+
+- The `Runs` client now has `list_with_pagination` and `aio_list_with_pagination` methods that allow for listing workflow runs with internal pagination. The wrappers on the `Standalone` and `Workflow` classes have been updated to use these methods.
+- Added retries with backoff to all of the REST API wrapper methods on the feature clients.
+
+## [1.14.1] - 2025-07-03
+
+### Changed
+
+- `DurableContext.aio_wait_for` can now accept an or group, in addition to sleep and event conditions.
+
+## [1.14.0] - 2025-06-25
+
+### Added
+
+- Adds an `IllegalTaskOutputError` that handles cases where tasks return invalid outputs.
+- Logs `NonRetryableException` as an info-level log so it doesn't get picked up by Sentry and similar tools.
+
+### Changed
+
+- Exports `NonRetryableException` at the top level
+- Fixes an issue with the `status` field throwing a Pydantic error when calling `worker.get`
+- Fixes an issue with duplicate protobufs if you try to import both the v1 and v0 clients.
+
+## [1.13.0] - 2025-06-25
+
+### Added
+
+- Documentation for the `Context` classes
+- Allows for a worker to be terminated after a certain number of tasks by providing the `terminate_worker_after_num_tasks` config option
+
+### Changed
+
+- Adds a number of helpful Ruff linting rules
+- `DedupeViolationErr` is now `DedupeViolationError`
+- Fixed events documentation to correctly have a skipped run example.
+- Changed default arguments to many methods from mutable defaults like `[]` to None
+- Changes `JSONSerializableMapping` from `Mapping` to `dict`
+- Handles some potential bugs related to `asyncio` tasks being garbage collected.
+- Improves exception printing with an `ExceptionGroup` implementation
+- Fixes a bug with namespacing of user event conditions where the namespace was not respected so the task waiting for it would hang
+- Fixes a memory leak in streaming and logging, and fixes some issues with log capture.
+
+## [1.12.3] - 2025-06-25
+
+### Changed
+
+- Fixes a namespacing-related but in the `workflow.id` property that incorrectly (and inconsistently) returned incorrect IDs for namespaced workflows.
+
+## [1.12.2] - 2025-06-17
+
+### Changed
+
+- Fixes a security vulnerability by bumping the `protobuf` library
+
+## [1.12.1] - 2025-06-13
+
+### Added
+
+- Adds corresponding SDK changes from API changes to events (additional parameters to filter events by, additional data returned)
+
+## [1.12.0] - 2025-06-06
+
+### Added
+
+- Adds a warning on client init if the SDK version is not compatible with the tenant (engine) version.
+- Adds a `default_filters` parameter to the `Hatchet.workflow` and `Hatchet.task` methods to allow you to declaratively provide a list of filters that will be applied to the workflow by default when events are pushed.
+- Adds `get_status` and `aio_get_status` methods to the `Runs` feature client, which return a workflow run's status by its ID.
+- Adds a `update` methods to the `Filters` feature client.
+
+### Changed
+
+- Allows the `concurrency` parameter to tasks to be a `list`.
+- Fixes an internal bug with duplicate concurrency expressions being set when using `Hatchet.task`.
+- Modifies existing `datetime` handling to use UTC timestamps everywhere.
+
+## [1.11.1] - 2025-06-05
+
+### Changed
+
+- Fixes a couple of blocking calls buried in the admin client causing loop blockages on child spawning
+
+## [1.11.0] - 2025-05-29
+
+### Changed
+
+- Significant improvements to the OpenTelemetry instrumentor, including:
+  - Traceparents are automatically propagated through the metadata now so the client does not need to provide them manually.
+  - Added a handful of attributes to the `run_workflow`, `push_event`, etc. spans, such as the workflow being run / event being pushed, the metadata, and so on. Ignoring
+  - Added tracing for workflow scheduling
+
+## [1.10.2] - 2025-05-19
+
+### Changed
+
+- Fixing an issue with the spawn index being set at the `workflow_run_id` level and not the `(workflow_run_id, retry_count)` level, causing children to be spawned multiple times on retry.
+
+## [1.10.1] - 2025-05-16
+
+### Added
+
+- Adds an `otel` item to the `ClientConfig` and a `excluded_attributes: list[OTelAttribute]` there to allow users to exclude certain attributes from being sent to the OpenTelemetry collector.
+
+## [1.10.0] - 2025-05-16
+
+### Added
+
+- The main `Hatchet` client now has a `filters` attribute (a `Filters` client) which wraps basic CRUD operations for managing filters.
+- Events can now be pushed with a `priority` attribute, which sets the priority of the runs triggered by the event.
+- There are new `list` and `aio_list` methods for the `Events` client, which allow listing events.
+- Workflow runs can now be filtered by `triggering_event_external_id`, to allow for seeing runs triggered by a specific event.
+- There is now an `id` property on all `Workflow` objects (`Workflow` created by `hatchet.workflow` and `Standalone` created by `hatchet.task`) that returns the ID (UUID) of the workflow.
+- Events can now be pushed with a `scope` parameter, which is required for using filters to narrow down the filters to consider applying when triggering workflows from the event.
+
+### Changed
+
+- The `name` parameter to `hatchet.task` and `hatchet.durable_task` is now optional. If not provided, the task name will be the same as the function name.

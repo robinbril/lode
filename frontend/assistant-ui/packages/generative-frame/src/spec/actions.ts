@@ -1,0 +1,150 @@
+import type { Catalog } from "./catalog";
+import { resolveValue, type ExpressionContext } from "./expressions";
+import { resolvedIssues } from "./resolved";
+import type { SpecStateStore } from "./state";
+import type { ActionBinding } from "./types";
+
+/** Where an action was dispatched from. */
+export type ActionSource = {
+  elementId?: string;
+  /** The event name, or the watched path for `watch`. */
+  trigger?: string;
+  /** Whether a component's event or a `watch` binding dispatched the action. */
+  kind?: "event" | "watch";
+};
+
+export type ActionHandler = (
+  params: Record<string, unknown>,
+  context: ActionSource & { state: SpecStateStore },
+) => unknown;
+
+export type ActionDispatcherOptions = {
+  store: SpecStateStore;
+  catalog?: Catalog;
+  /** Handlers by action name; they take precedence over `onAction`. */
+  handlers?: Record<string, ActionHandler>;
+  /** Decides whether an action marked `confirm: true` in the catalog runs. */
+  confirm?: (request: {
+    action: string;
+    params: Record<string, unknown>;
+    elementId?: string;
+  }) => boolean | Promise<boolean>;
+  /** Called for catalog actions without a handler. */
+  onAction?: (
+    name: string,
+    params: Record<string, unknown>,
+    context: ActionSource & { state: SpecStateStore },
+  ) => unknown;
+  /** Reports actions that fail or are unknown instead of throwing. */
+  onError?: (error: Error, binding: ActionBinding) => void;
+};
+
+export type ActionDispatcher = (
+  bindings: ActionBinding | readonly ActionBinding[] | undefined,
+  context: Omit<ExpressionContext, "state" | "event"> &
+    ActionSource & {
+      /** The payload the event carried, read by `{ $event }`. */
+      payload?: unknown;
+    },
+) => Promise<unknown[]>;
+
+/**
+ * Creates the function elements use to run their bound actions: params are
+ * resolved against current state (and the event payload), `setState` writes
+ * the store, and every other action goes to a host handler. Actions in a list
+ * run in order, see state written by the ones before them, and stop at the
+ * first one that fails.
+ */
+export function createActionDispatcher(
+  options: ActionDispatcherOptions,
+): ActionDispatcher {
+  const report = (error: unknown, binding: ActionBinding) => {
+    const normalized =
+      error instanceof Error ? error : new Error(String(error));
+    if (options.onError) options.onError(normalized, binding);
+    else
+      console.warn(
+        `[generative-frame] action "${binding.action}" failed:`,
+        normalized,
+      );
+  };
+
+  return async (bindings, context) => {
+    const list =
+      bindings === undefined
+        ? []
+        : Array.isArray(bindings)
+          ? bindings
+          : [bindings];
+    const results: unknown[] = [];
+    for (const binding of list as ActionBinding[]) {
+      const { action } = binding;
+      const { payload, elementId, trigger, kind, ...scope } = context;
+      const params = (resolveValue(binding.params ?? {}, {
+        ...scope,
+        state: options.store.getState(),
+        event: payload,
+      }) ?? {}) as Record<string, unknown>;
+      const source = {
+        ...(elementId !== undefined ? { elementId } : {}),
+        ...(trigger !== undefined ? { trigger } : {}),
+        ...(kind !== undefined ? { kind } : {}),
+        state: options.store,
+      };
+      try {
+        // Params written as expressions were not checked when the spec was
+        // validated, so the resolved params are checked before anything runs.
+        const issue = resolvedIssues(
+          options.catalog?.action(action)?.params,
+          params,
+          binding.params ?? {},
+        )[0];
+        if (issue) {
+          throw new Error(
+            `Action "${action}" params ${issue.path === "/" ? "" : `${issue.path.slice(1)} `}${issue.message}`,
+          );
+        }
+        if (options.catalog?.action(action)?.confirm === true) {
+          if (kind === "watch") {
+            throw new Error(
+              `Action "${action}" requires a user event for confirmation`,
+            );
+          }
+          if (!options.confirm) {
+            throw new Error(`Action "${action}" requires the confirm option`);
+          }
+          const confirmed = await options.confirm({
+            action,
+            params,
+            ...(elementId !== undefined ? { elementId } : {}),
+          });
+          if (!confirmed) {
+            results.push(undefined);
+            break;
+          }
+        }
+        const handler = options.handlers?.[action];
+        if (handler) {
+          results.push(await handler(params, source));
+        } else if (action === "setState") {
+          if (typeof params["path"] !== "string") {
+            throw new Error("setState needs a string `path`");
+          }
+          options.store.set(params["path"], params["value"]);
+          results.push(undefined);
+        } else if (options.catalog && !options.catalog.action(action)) {
+          throw new Error(`Unknown action "${action}"`);
+        } else if (options.onAction) {
+          results.push(await options.onAction(action, params, source));
+        } else {
+          throw new Error(`No handler for action "${action}"`);
+        }
+      } catch (error) {
+        report(error, binding);
+        results.push(undefined);
+        break;
+      }
+    }
+    return results;
+  };
+}

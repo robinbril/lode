@@ -1,0 +1,181 @@
+import inspect
+import json
+from collections.abc import Callable, Mapping, Sequence
+from datetime import timedelta
+from enum import StrEnum
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NewType,
+    ParamSpec,
+    TypeAlias,
+    TypeGuard,
+    TypeVar,
+    overload,
+)
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+
+from hatchet_sdk.contracts.v1.workflows_pb2 import DefaultFilter as DefaultFilterProto
+from hatchet_sdk.types.concurrency import (
+    ConcurrencyStrategy,
+)
+from hatchet_sdk.types.idempotency import (
+    StatusBasedIdempotencyConfig,
+    TTLBasedIdempotencyConfig,
+)
+from hatchet_sdk.types.priority import Priority
+from hatchet_sdk.utils.typing import (
+    AwaitableLike,
+    DataclassInstance,
+    JSONSerializableMapping,
+)
+
+if TYPE_CHECKING:
+    from hatchet_sdk.context.context import DurableContext
+
+
+StickyStrategy = Literal["SOFT", "HARD"]
+
+ValidTaskReturnType = BaseModel | Mapping[str, Any] | DataclassInstance | None
+
+R = TypeVar("R", bound=ValidTaskReturnType)
+P = ParamSpec("P")
+
+
+_TWorkflowInputBound: TypeAlias = BaseModel | DataclassInstance | dict[str, Any] | None
+TWorkflowInput = TypeVar("TWorkflowInput", bound=_TWorkflowInputBound)
+
+TWorkflowInput_contra = TypeVar(
+    "TWorkflowInput_contra", bound=_TWorkflowInputBound, contravariant=True
+)
+
+
+class TaskDefaults(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schedule_timeout: timedelta | None = None
+    execution_timeout: timedelta | None = None
+    retries: int | None = None
+    backoff_factor: float | None = None
+    backoff_max: timedelta | None = None
+
+
+class DefaultFilter(BaseModel):
+    expression: str
+    scope: str
+    payload: JSONSerializableMapping = Field(default_factory=dict)
+
+    def to_proto(self) -> DefaultFilterProto:
+        payload_json = json.dumps(self.payload, default=str)
+
+        return DefaultFilterProto(
+            expression=self.expression,
+            scope=self.scope,
+            payload=payload_json.encode("utf-8"),
+        )
+
+
+TaskPayloadForInternalUse: TypeAlias = (
+    BaseModel | DataclassInstance | dict[str, Any] | None
+)
+
+
+class TaskIOValidator:
+    def __init__(
+        self,
+        workflow_input: TypeAdapter[TaskPayloadForInternalUse] | None,
+        task_output: TypeAdapter[TaskPayloadForInternalUse],
+    ) -> None:
+        self.workflow_input = workflow_input
+        self.task_output = task_output
+
+
+class WorkflowConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    name: str
+    description: str | None = None
+    version: str | None = None
+    on_events: list[str] = Field(default_factory=list)
+    on_crons: list[str] = Field(default_factory=list)
+    # An instance of the workflow's input model, passed to runs triggered by the
+    # workflow's `on_crons` schedules. Typed as `Any` because the concrete input
+    # type is generic per-workflow; it is serialized via `input_validator` in
+    # `BaseWorkflow._to_proto`.
+    cron_input: Any = None
+    sticky: StickyStrategy | None = None
+    concurrency: int | ConcurrencyStrategy | Sequence[ConcurrencyStrategy] | None = None
+    input_validator: TypeAdapter[TaskPayloadForInternalUse] | None = None
+    default_priority: Priority | None = None
+    idempotency: TTLBasedIdempotencyConfig | StatusBasedIdempotencyConfig | None = None
+
+    task_defaults: TaskDefaults = TaskDefaults()
+    default_filters: list[DefaultFilter] = Field(default_factory=list[DefaultFilter])
+    default_additional_metadata: JSONSerializableMapping = Field(default_factory=dict)
+
+
+class BatchTaskConfig(BaseModel):
+    batch_max_size: int
+    batch_max_interval: timedelta | None = None
+    batch_group_key: str | None = None
+    batch_group_max_runs: int | None = None
+    broadcast_output: bool = False
+
+
+BatchMemberId = NewType("BatchMemberId", str)
+"""The key identifying a single item within a batch task's input/output dict (its task run external id)."""
+
+
+class TaskType(StrEnum):
+    DEFAULT = "default"
+    ON_FAILURE = "on_failure"
+    ON_SUCCESS = "on_success"
+
+
+DurableAsyncFunc = Callable[[TWorkflowInput, "DurableContext"], AwaitableLike[R]]
+DurableSyncFunc = Callable[[TWorkflowInput, "DurableContext"], R]
+DurableTaskFunc = (
+    DurableAsyncFunc[TWorkflowInput, R] | DurableSyncFunc[TWorkflowInput, R]
+)
+
+
+def is_durable_async_fn(
+    fn: DurableTaskFunc[TWorkflowInput, R],
+) -> TypeGuard[DurableAsyncFunc[TWorkflowInput, R]]:
+    return inspect.iscoroutinefunction(fn)
+
+
+def is_durable_sync_fn(
+    fn: DurableTaskFunc[TWorkflowInput, R],
+) -> TypeGuard[DurableSyncFunc[TWorkflowInput, R]]:
+    return not inspect.iscoroutinefunction(fn)
+
+
+_TModel = TypeVar("_TModel", bound=BaseModel)
+_TDataclass = TypeVar("_TDataclass", bound=DataclassInstance)
+_T = TypeVar("_T")
+
+
+@overload
+def normalize_validator(validator: None) -> type[dict[str, Any]]: ...
+
+
+@overload
+def normalize_validator(validator: type[_TModel]) -> type[_TModel]: ...
+
+
+@overload
+def normalize_validator(validator: type[_TDataclass]) -> type[_TDataclass]: ...
+
+
+@overload
+def normalize_validator(validator: type[_T]) -> type[_T]: ...
+
+
+def normalize_validator(validator: object) -> object:
+    if validator is None or validator is type(None):
+        return dict[str, Any]
+
+    return validator

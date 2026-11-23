@@ -1,0 +1,54 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+import { JSDOM } from "jsdom";
+
+const dom = new JSDOM("<!doctype html><body></body>", { url: "http://localhost/" });
+for (const [key, value] of Object.entries({
+  window: dom.window,
+  document: dom.window.document,
+  HTMLElement: dom.window.HTMLElement,
+  Node: dom.window.Node,
+  customElements: dom.window.customElements,
+}))
+  Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+
+const { html, render } = await import("lit");
+const { Archive, Link, X } = await import("lucide");
+const { icon } = await import("../src/icons.ts");
+const style = document.createElement("style");
+style.textContent = readFileSync(new URL("../src/shell.css", import.meta.url), "utf8");
+document.head.append(style);
+
+for (const [label, glyph] of [
+  ["Archive session", Archive],
+  ["Share session", Link],
+  ["Close pane", X],
+] as const) {
+  test(`${label} keeps pointer targeting on the button across icon redraws`, () => {
+    document.body.innerHTML = `<div class="dockview-theme-qm"><div class="dv-tabs-and-actions-container"><div class="dv-tabs-container"><div class="dv-tab dv-active-tab">`;
+    const host = document.querySelector<HTMLElement>(".dv-tab")!;
+    const view = () =>
+      html`<span class="split-tab-actions"
+        ><button class="icon-btn subtle split-tab-close" type="button" aria-label=${label}>
+          ${icon(glyph, 13)}
+        </button></span
+      >`;
+    render(view(), host);
+    const button = host.querySelector("button")!;
+    button.focus();
+    assert.equal(document.activeElement, button);
+    const before = button.querySelector("svg")!;
+    assert.equal(dom.window.getComputedStyle(before).pointerEvents, "none");
+    render(view(), host);
+    const after = button.querySelector("svg")!;
+    assert.equal(host.querySelector("button"), button);
+    assert.equal(after, before);
+    assert.equal(before.isConnected, true);
+    assert.equal(dom.window.getComputedStyle(after).pointerEvents, "none");
+    for (const child of after.children) assert.equal(dom.window.getComputedStyle(child).pointerEvents, "none");
+    assert.notEqual(dom.window.getComputedStyle(button).pointerEvents, "none");
+    assert.equal(dom.window.getComputedStyle(host.parentElement!).cursor, "pointer", "the gaps between tabs");
+    host.remove();
+  });
+}

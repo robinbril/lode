@@ -1,0 +1,303 @@
+"""Codified built-in skill definitions.
+
+``_REGISTRY`` is the single source of truth: one provider per built-in skill,
+one of two kinds —
+
+- ``SeededBuiltInProvider``: a plain built-in skill whose ``skill`` rows are
+  owned by Alembic migrations.
+- ``ExternalAppBuiltInProvider``: a built-in skill backed by a connectable
+  ``ExternalAppType``; rows are created on demand when an admin adds the app
+  (``onyx.db.external_app.associate_built_in_skill__no_commit``).
+
+Both render through the identical disk-backed push path; the kind only governs
+how the ``skill`` row comes to exist and whether an ``app_type`` connects to it.
+Per-user availability of an external-app skill is gated on credentials by the
+sandbox-injection query, not here.
+
+Everything else is derived from the registry, which validates at import that no
+two providers share a ``skill_id`` or an ``app_type``. Adding a built-in skill
+or external app is a single ``_REGISTRY`` entry plus its on-disk
+``builtin/<skill_id>/`` directory.
+"""
+
+from collections.abc import Callable, Iterable, Iterator
+from functools import cache
+from pathlib import Path
+from typing import Final, Literal
+
+from pydantic import BaseModel, ConfigDict, computed_field, model_validator
+from sqlalchemy.orm import Session
+
+from onyx.db.enums import ExternalAppType
+from onyx.image_gen.generation import is_image_generation_configured
+from onyx.server.features.build.configs import ENABLE_BROWSER
+from onyx.skills.metadata import SKILLS_DIR, parse_skill_document
+from onyx.skills.models import SkillName, SkillUsage
+
+# On-disk root for built-in skill content (one ``<skill_id>/`` dir each). Pushed
+# to sandboxes at session setup; not baked into the sandbox image.
+BUILTIN_SKILLS_PATH: Final[Path] = Path(__file__).parent / "builtin"
+
+
+def iter_builtin_skill_files(source_dir: Path) -> Iterator[Path]:
+    """Yield source files, excluding hidden paths and Python caches."""
+    for path in sorted(source_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(
+            part == "__pycache__" or part.startswith(".")
+            for part in path.relative_to(source_dir).parts
+        ):
+            continue
+        yield path
+
+
+def _always_available(_: Session) -> bool:
+    return True
+
+
+class BuiltInPluginSkill(BaseModel):
+    """``path`` is "" for a one-skill built-in, else ``skills/<folder>``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+    name: str
+    description: str
+
+
+@cache
+def _plugin_skills(source_dir: Path) -> tuple[BuiltInPluginSkill, ...]:
+    for root in (source_dir / "SKILL.md", source_dir / "SKILL.md.template"):
+        if root.is_file():
+            document = parse_skill_document(
+                root.read_bytes(), directory_name=source_dir.name
+            )
+            return (
+                BuiltInPluginSkill(
+                    path="",
+                    name=source_dir.name,
+                    description=document.metadata.description,
+                ),
+            )
+    skills: list[BuiltInPluginSkill] = []
+    skills_dir = source_dir / SKILLS_DIR
+    for folder in sorted(skills_dir.iterdir()) if skills_dir.is_dir() else ():
+        skill_md = folder / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        document = parse_skill_document(
+            skill_md.read_bytes(), directory_name=folder.name
+        )
+        skills.append(
+            BuiltInPluginSkill(
+                path=f"{SKILLS_DIR}/{folder.name}",
+                name=document.metadata.name,
+                description=document.metadata.description,
+            )
+        )
+    return tuple(skills)
+
+
+class BuiltInSkillDefinition(BaseModel):
+    """Runtime behavior for one built-in skill (the resolved view a provider
+    produces). ``built_in_skill_id`` is the stable identifier and on-disk
+    directory name under ``BUILTIN_SKILLS_PATH`` — which fully
+    determines ``source_dir`` and ``has_template``, so both are computed.
+
+    ``extra="forbid"`` makes a stray ``source_dir=`` (e.g. an old test trying to
+    inject one) fail loud rather than be silently dropped; redirect via
+    ``BUILTIN_SKILLS_PATH`` instead.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    built_in_skill_id: SkillName
+    is_available: Callable[[Session], bool] = _always_available
+    unavailable_reason: str | None = None
+
+    @computed_field
+    @property
+    def source_dir(self) -> Path:
+        return BUILTIN_SKILLS_PATH / self.built_in_skill_id
+
+    @property
+    def skills(self) -> tuple[BuiltInPluginSkill, ...]:
+        return _plugin_skills(self.source_dir)
+
+    @computed_field
+    @property
+    def has_template(self) -> bool:
+        # Disk-derived so it can't drift from the actual source layout.
+        return (self.source_dir / "SKILL.md.template").exists()
+
+
+class BuiltInProvider(BaseModel):
+    """Base registry entry with a validated canonical name and directory."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: str
+    skill_id: SkillName
+    is_available: Callable[[Session], bool] = _always_available
+    unavailable_reason: str | None = None
+
+    def to_definition(self) -> BuiltInSkillDefinition:
+        # source_dir is derived by the definition from built_in_skill_id; the
+        # declaration deliberately stays disk-layout-agnostic.
+        return BuiltInSkillDefinition(
+            built_in_skill_id=self.skill_id,
+            is_available=self.is_available,
+            unavailable_reason=self.unavailable_reason,
+        )
+
+
+class SeededBuiltInProvider(BuiltInProvider):
+    """A plain built-in skill whose rows are seeded/managed by migrations."""
+
+    kind: Literal["seeded"] = "seeded"
+
+
+class ExternalAppBuiltInProvider(BuiltInProvider):
+    """A built-in skill backed by a connectable external app."""
+
+    kind: Literal["external_app"] = "external_app"
+    app_type: ExternalAppType
+
+    @model_validator(mode="after")
+    def _reject_custom(self) -> "ExternalAppBuiltInProvider":
+        # CUSTOM apps ship no bundled content — they stay bundle-backed rows.
+        if self.app_type == ExternalAppType.CUSTOM:
+            raise ValueError("CUSTOM apps have no bundled built-in skill content")
+        return self
+
+
+BuiltInProviderEntry = SeededBuiltInProvider | ExternalAppBuiltInProvider
+
+
+class BuiltInSkillRegistry:
+    """Owns the providers and the indices derived from them, failing at import
+    if two providers collide on a ``skill_id`` or an ``app_type``.
+
+    The derived maps are exposed as the same plain dicts the module re-exports:
+    consumers bind ``BUILT_IN_SKILLS`` at import and tests inject temp built-ins
+    via ``monkeypatch.setitem``, so the maps are intentionally mutable in place
+    rather than read-only proxies.
+    """
+
+    def __init__(self, providers: Iterable[BuiltInProviderEntry]) -> None:
+        provider_list = tuple(providers)
+        definitions: dict[str, BuiltInSkillDefinition] = {}
+        external_app_skill_ids: dict[ExternalAppType, str] = {}
+
+        for provider in provider_list:
+            if provider.skill_id in definitions:
+                raise ValueError(f"Duplicate built-in skill_id: {provider.skill_id!r}")
+            definition = provider.to_definition()
+            if not definition.skills:
+                raise ValueError(
+                    f"Built-in {provider.skill_id!r} has no SKILL.md at its root "
+                    f"or in {SKILLS_DIR}/<name>/"
+                )
+            definitions[provider.skill_id] = definition
+
+            if isinstance(provider, ExternalAppBuiltInProvider):
+                existing = external_app_skill_ids.get(provider.app_type)
+                if existing is not None:
+                    raise ValueError(
+                        f"Duplicate built-in external app for {provider.app_type}: "
+                        f"{existing!r} and {provider.skill_id!r}"
+                    )
+                external_app_skill_ids[provider.app_type] = provider.skill_id
+
+        self._definitions = definitions
+        self._external_app_skill_ids = external_app_skill_ids
+
+    @property
+    def definitions_by_skill_id(self) -> dict[str, BuiltInSkillDefinition]:
+        return self._definitions
+
+    @property
+    def external_app_skill_ids(self) -> dict[ExternalAppType, str]:
+        return self._external_app_skill_ids
+
+
+# Single source of truth.
+_REGISTRY: Final = BuiltInSkillRegistry(
+    providers=(
+        SeededBuiltInProvider(skill_id="pptx"),
+        SeededBuiltInProvider(
+            skill_id="image-generation",
+            is_available=is_image_generation_configured,
+            unavailable_reason=(
+                "No image generation provider is configured — an admin can set "
+                "one up at /admin/configuration/image-generation."
+            ),
+        ),
+        SeededBuiltInProvider(skill_id="company-search"),
+        SeededBuiltInProvider(skill_id="craft-documentation"),
+        SeededBuiltInProvider(
+            skill_id="browser",
+            is_available=lambda _: ENABLE_BROWSER,
+            unavailable_reason="Browser runtime is not enabled for this deployment.",
+        ),
+        ExternalAppBuiltInProvider(skill_id="slack", app_type=ExternalAppType.SLACK),
+        ExternalAppBuiltInProvider(skill_id="linear", app_type=ExternalAppType.LINEAR),
+        ExternalAppBuiltInProvider(
+            skill_id="google-calendar", app_type=ExternalAppType.GOOGLE_CALENDAR
+        ),
+        ExternalAppBuiltInProvider(
+            skill_id="google-drive", app_type=ExternalAppType.GOOGLE_DRIVE
+        ),
+        ExternalAppBuiltInProvider(skill_id="gmail", app_type=ExternalAppType.GMAIL),
+        ExternalAppBuiltInProvider(skill_id="github", app_type=ExternalAppType.GITHUB),
+        ExternalAppBuiltInProvider(
+            skill_id="hubspot", app_type=ExternalAppType.HUBSPOT
+        ),
+        ExternalAppBuiltInProvider(skill_id="notion", app_type=ExternalAppType.NOTION),
+        ExternalAppBuiltInProvider(
+            skill_id="zendesk", app_type=ExternalAppType.ZENDESK
+        ),
+    )
+)
+
+# Derived exports. ``Final`` pins the binding; the dicts stay mutable so tests
+# can inject temp built-ins via ``monkeypatch.setitem``.
+BUILT_IN_SKILLS: Final[dict[str, BuiltInSkillDefinition]] = (
+    _REGISTRY.definitions_by_skill_id
+)
+EXTERNAL_APP_BUILT_IN_SKILL_IDS: Final[dict[ExternalAppType, str]] = (
+    _REGISTRY.external_app_skill_ids
+)
+# Inverse of the above: ``built_in_skill_id -> app_type``. Lets the skill push
+# path go from a ``Skill`` row's ``built_in_skill_id`` back to the provider
+# catalog without touching the DB. Skill ids are unique, so the inverse is too.
+EXTERNAL_APP_SKILL_ID_TO_APP_TYPE: Final[dict[str, ExternalAppType]] = {
+    skill_id: app_type for app_type, skill_id in EXTERNAL_APP_BUILT_IN_SKILL_IDS.items()
+}
+
+
+@cache
+def built_in_skills_usage() -> SkillUsage:
+    """Size and file count of every built-in skill's packaged sources, read
+    once on first use. The write limit counts all of them for every user. A
+    template stands for the SKILL.md rendered from it."""
+    paths = [
+        path
+        for definition in BUILT_IN_SKILLS.values()
+        for path in iter_builtin_skill_files(definition.source_dir)
+    ]
+    return SkillUsage(
+        bytes=sum(path.stat().st_size for path in paths), files=len(paths)
+    )
+
+
+# Each must run in the chat VM without Onyx API access and have no template:
+# every chat VM gets the same files.
+CHAT_BUILT_IN_SKILL_IDS: Final[frozenset[str]] = frozenset({"pptx", "browser"})
+CHAT_SKILLS_MOUNT_PATH: Final = "/mnt/skills"
+
+
+# Named handles so callers avoid bare identity literals.
+COMPANY_SEARCH: Final[BuiltInSkillDefinition] = BUILT_IN_SKILLS["company-search"]
+SLACK: Final[BuiltInSkillDefinition] = BUILT_IN_SKILLS["slack"]

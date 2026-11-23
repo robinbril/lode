@@ -1,0 +1,378 @@
+import asyncio
+import random
+import threading
+import time
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Coroutine,
+    Dict,
+    Optional,
+    Sequence,
+    Union,
+)
+
+from dbos._context import DBOSContext, take_assigned_workflow_id
+from dbos._datasource import AsyncSQLAlchemyDatasource, SQLAlchemyDatasource
+from dbos._error import DBOSException
+from dbos._utils import GlobalParams, generate_uuid
+
+from ._sys_db import (
+    SystemDatabase,
+    WorkflowStatus,
+    rewind_targets,
+    rewindable_status,
+)
+
+if TYPE_CHECKING:
+    from ._dbos import DBOS
+
+
+def get_workflow(
+    sys_db: SystemDatabase,
+    workflow_id: str,
+    *,
+    load_input: bool = True,
+    load_output: bool = True,
+) -> Optional[WorkflowStatus]:
+    infos = sys_db.list_workflows(
+        workflow_ids=[workflow_id],
+        load_input=load_input,
+        load_output=load_output,
+        shard_key=sys_db._key_hint(workflow_id),
+    )
+    if not infos:
+        return None
+    return infos[0]
+
+
+def take_fork_workflow_id() -> Optional[str]:
+    """Consume the enclosing SetWorkflowID block's ID for a fork. Callers take it before
+    the fork's step, so a replay consumes it as the first run did."""
+    assigned = take_assigned_workflow_id()
+    return assigned.workflow_id if assigned is not None else None
+
+
+def fork_workflow(
+    sys_db: SystemDatabase,
+    workflow_id: str,
+    start_step: int,
+    *,
+    application_version: Optional[str],
+    queue_name: Optional[str] = None,
+    queue_partition_key: Optional[str] = None,
+    replacement_children: Optional[dict[str, str]] = None,
+    timeout_seconds: Optional[float] = None,
+    forked_workflow_id: Optional[str] = None,
+) -> str:
+    if timeout_seconds is not None and not timeout_seconds > 0:
+        raise Exception(
+            f"Invalid workflow timeout {timeout_seconds}. Timeouts must be positive."
+        )
+    workflow_timeout_ms = (
+        int(timeout_seconds * 1000) if timeout_seconds is not None else None
+    )
+
+    if forked_workflow_id is None:
+        forked_workflow_id = generate_uuid()
+    sys_db.fork_workflow(
+        [workflow_id],
+        [forked_workflow_id],
+        [start_step],
+        application_version=application_version,
+        queue_name=queue_name,
+        queue_partition_key=queue_partition_key,
+        replacement_children=replacement_children,
+        workflow_timeout_ms=workflow_timeout_ms,
+    )
+    return forked_workflow_id
+
+
+def delete_workflow(
+    dbos: "DBOS", workflow_ids: list[str], *, delete_children: bool
+) -> None:
+    """Delete workflows and all their associated data.
+
+    If delete_children is True, also deletes all child workflows recursively.
+    """
+    dbos._sys_db.delete_workflows(workflow_ids, delete_children=delete_children)
+
+
+# Most workflows one sweep transaction cancels; a full batch sweeps again at once.
+_SWEEP_BATCH_SIZE = 1000
+
+# How often one of an application's processes runs its background jobs.
+_BACKGROUND_JOBS_INTERVAL_SEC = 1.0
+# How long a holder keeps one lock transaction before retaking the lock: a peer can win it then.
+_BACKGROUND_JOBS_HOLD_SEC = 60.0
+
+BACKGROUND_JOBS_THREAD_NAME = "dbos-background-jobs"
+
+
+class BackgroundLease:
+    """Whether this process holds the background-jobs lock, until its loop fails to retake
+    it: kept past a stalled hold's idle timeout, as two holders only duplicate work."""
+
+    def __init__(self) -> None:
+        self._held = False
+
+    def renew(self) -> None:
+        self._held = True
+
+    def lose(self) -> None:
+        self._held = False
+
+    def held(self) -> bool:
+        return self._held
+
+
+def _run_background_jobs(
+    stop_event: threading.Event,
+    dbos: "DBOS",
+    lock_name: str,
+    interval_sec: float,
+    jobs: Dict[str, Callable[[], None]],
+    lease: Optional[BackgroundLease] = None,
+    hold_sec: float = _BACKGROUND_JOBS_HOLD_SEC,
+) -> None:
+    """Run jobs once per interval across all of this application's processes: whichever
+    takes their lock runs them, holding it up to hold_sec before retaking it."""
+    try:
+        _hold_background_jobs(
+            stop_event, dbos, lock_name, interval_sec, jobs, lease, hold_sec
+        )
+    finally:
+        if lease is not None:
+            lease.lose()
+
+
+def _hold_background_jobs(
+    stop_event: threading.Event,
+    dbos: "DBOS",
+    lock_name: str,
+    interval_sec: float,
+    jobs: Dict[str, Callable[[], None]],
+    lease: Optional[BackgroundLease],
+    hold_sec: float,
+) -> None:
+    while not stop_event.is_set():
+        held = False
+        try:
+            with dbos._sys_db.background_job_lock(lock_name) as renew:
+                if lease is not None and renew is not None:
+                    lease.renew()
+                elif lease is not None:
+                    lease.lose()
+                if renew is not None:
+                    hold_until = time.monotonic() + hold_sec
+                    while True:
+                        # Timed from the pass's start, so slow jobs can't shorten the interval.
+                        started = time.monotonic()
+                        for job_name, job in jobs.items():
+                            try:
+                                job()
+                            except Exception as e:
+                                dbos.logger.warning(
+                                    f"Exception in background job {job_name}: {e}"
+                                )
+                        if stop_event.wait(
+                            max(0.0, interval_sec - (time.monotonic() - started))
+                        ):
+                            break
+                        if time.monotonic() >= hold_until:
+                            break
+                        # In place, so the lock is never free mid-hold.
+                        renew()
+                    held = True
+        except Exception as e:
+            if lease is not None:
+                lease.lose()
+            dbos.logger.warning(f"Exception taking the {lock_name} lock: {e}")
+        # The holder tries again at once and so keeps the jobs; the rest poll for them.
+        wait = 0.0 if held else interval_sec * random.uniform(0.9, 1.1)
+        if stop_event.wait(timeout=wait):
+            break
+
+
+def background_jobs_thread(stop_event: threading.Event, dbos: "DBOS") -> None:
+    """Enqueue DELAYED workflows whose delay has expired, and cancel this application's
+    active workflows once their deadline passes."""
+
+    def sweep() -> None:
+        while not stop_event.is_set():
+            cancelled = dbos._sys_db.cancel_timed_out_workflows(_SWEEP_BATCH_SIZE)
+            for workflow_id in cancelled:
+                dbos.logger.debug(f"Cancelled workflow {workflow_id}: timed out")
+            if len(cancelled) < _SWEEP_BATCH_SIZE:
+                break
+
+    jobs: Dict[str, Callable[[], None]] = {
+        "delayed_workflows": lambda: dbos._sys_db.transition_delayed_workflows(),
+        "workflow_timeout": sweep,
+    }
+    suspend = dbos._sys_db.suspend
+    if suspend is not None:
+        jobs["suspended_workflows"] = suspend.transition_suspended_workflows
+    _run_background_jobs(
+        stop_event,
+        dbos,
+        # One holder per application version, so the latest code always runs them; they tolerate overlap.
+        f"background_jobs.{GlobalParams.app_version}",
+        _BACKGROUND_JOBS_INTERVAL_SEC,
+        jobs,
+        dbos._background_lease,
+    )
+
+
+Datasource = Union[SQLAlchemyDatasource, AsyncSQLAlchemyDatasource]
+# Runs a coroutine to completion on a loop, bridging an async datasource to sync code.
+CoroutineRunner = Callable[[Coroutine[Any, Any, Any]], Any]
+
+
+def _check_rewindable(
+    sys_db: SystemDatabase, workflow_id: str, start_step: int
+) -> None:
+    """Refuse to touch a datasource's checkpoints for a workflow that is missing or
+    still running. The system database rewind repeats this check under its own
+    transaction; this one only keeps a running workflow's checkpoints intact."""
+    if start_step < 1:
+        raise ValueError(f"start_step must be >= 1, got {start_step}")
+    status = sys_db.get_workflow_status(workflow_id)
+    rewindable_status(workflow_id, status["status"] if status is not None else None)
+
+
+def delete_completed_datasource_checkpoints(dbos: "DBOS", ctx: DBOSContext) -> None:
+    """Drop a finishing sync workflow's datasource checkpoints while it still owns the workflow.
+    Best effort: a leftover checkpoint is harmless, so failures only warn."""
+    for ds in ctx.used_datasources:
+        if isinstance(ds, AsyncSQLAlchemyDatasource):
+            continue  # Its connections belong to an event loop this workflow does not run on.
+        try:
+            # With no token nobody matches, so the delete rolls back.
+            owned = ds._delete_checkpoints_if_owner(
+                ctx.workflow_id, ctx.owner_xid or ""
+            )
+        except Exception as e:
+            dbos.logger.warning(
+                f"Failed to delete datasource checkpoints of workflow {ctx.workflow_id}: {e}"
+            )
+            continue
+        if not owned:
+            return  # Another execution owns the workflow now, and its checkpoints are its own.
+
+
+async def delete_completed_datasource_checkpoints_async(
+    dbos: "DBOS", ctx: DBOSContext
+) -> None:
+    """Async version of delete_completed_datasource_checkpoints, run on the workflow's own loop."""
+    for ds in ctx.used_datasources:
+        try:
+            if isinstance(ds, AsyncSQLAlchemyDatasource):
+                owned = await ds._delete_checkpoints_if_owner(
+                    ctx.workflow_id, ctx.owner_xid or ""
+                )
+            else:
+                owned = await asyncio.to_thread(
+                    ds._delete_checkpoints_if_owner,
+                    ctx.workflow_id,
+                    ctx.owner_xid or "",
+                )
+        except Exception as e:
+            dbos.logger.warning(
+                f"Failed to delete datasource checkpoints of workflow {ctx.workflow_id}: {e}"
+            )
+            continue
+        if not owned:
+            return
+
+
+def rewind_workflow(
+    sys_db: SystemDatabase,
+    datasources: Sequence[Datasource],
+    workflow_id: str,
+    start_step: int,
+    *,
+    application_version: Optional[str] = None,
+    queue_name: Optional[str] = None,
+    queue_partition_key: Optional[str] = None,
+    run_coroutine: Optional[CoroutineRunner] = None,
+) -> None:
+    """Drop the datasources' checkpoints from start_step on, then rewind the
+    workflow in the system database. Best effort: if a step fails the workflow is
+    left as it was and the rewind can be retried, which is safe because the
+    system database checkpoints are touched last. An async datasource needs
+    run_coroutine to bridge to a loop."""
+    _require_coroutine_runner(datasources, run_coroutine)
+    if datasources:
+        _check_rewindable(sys_db, workflow_id, start_step)
+    _delete_datasource_checkpoints(datasources, workflow_id, start_step, run_coroutine)
+    sys_db.rewind_workflow(
+        workflow_id,
+        start_step,
+        application_version=application_version,
+        queue_name=queue_name,
+        queue_partition_key=queue_partition_key,
+    )
+
+
+def rewind_workflows(
+    sys_db: SystemDatabase,
+    datasources: Sequence[Datasource],
+    workflow_ids: Sequence[str],
+    start_steps: Sequence[int],
+    *,
+    application_version: Optional[str] = None,
+    queue_name: Optional[str] = None,
+    queue_partition_key: Optional[str] = None,
+    run_coroutine: Optional[CoroutineRunner] = None,
+) -> None:
+    """rewind_workflow for many workflows, all or nothing in the system database.
+    Every workflow is checked before any datasource checkpoint is deleted, because
+    those deletions can't be rolled back."""
+    targets = rewind_targets(workflow_ids, start_steps)
+    if not targets:
+        return
+    _require_coroutine_runner(datasources, run_coroutine)
+    if datasources:
+        sys_db.check_rewindable(list(targets))
+    for workflow_id, start_step in targets.items():
+        _delete_datasource_checkpoints(
+            datasources, workflow_id, start_step, run_coroutine
+        )
+    sys_db.rewind_workflows(
+        list(targets),
+        list(targets.values()),
+        application_version=application_version,
+        queue_name=queue_name,
+        queue_partition_key=queue_partition_key,
+    )
+
+
+def _require_coroutine_runner(
+    datasources: Sequence[Datasource],
+    run_coroutine: Optional[CoroutineRunner],
+) -> None:
+    """Refuse a rewind that would have to delete an async datasource's checkpoints
+    with no loop to run them on."""
+    for ds in datasources:
+        if isinstance(ds, AsyncSQLAlchemyDatasource) and run_coroutine is None:
+            raise DBOSException(
+                "An async datasource cannot be rewound from sync code; "
+                "use the async rewind"
+            )
+
+
+def _delete_datasource_checkpoints(
+    datasources: Sequence[Datasource],
+    workflow_id: str,
+    start_step: int,
+    run_coroutine: Optional[CoroutineRunner],
+) -> None:
+    """Delete a workflow's checkpoints from start_step on in every datasource."""
+    for ds in datasources:
+        if isinstance(ds, AsyncSQLAlchemyDatasource):
+            assert run_coroutine is not None
+            run_coroutine(ds._delete_checkpoints(workflow_id, start_step))
+        else:
+            ds._delete_checkpoints(workflow_id, start_step)

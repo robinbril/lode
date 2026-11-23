@@ -1,0 +1,46 @@
+import asyncio
+
+import pytest
+
+from examples.concurrency_cancel_in_progress.worker import (
+    WorkflowInput,
+    concurrency_cancel_in_progress_workflow,
+)
+from examples.test_utils import poll_for_runs
+from hatchet_sdk import Hatchet, WorkflowRunRef
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_run(hatchet: Hatchet, test_run_id: str) -> None:
+    refs: list[WorkflowRunRef] = []
+
+    for i in range(10):
+        ref = await concurrency_cancel_in_progress_workflow.aio_run(
+            WorkflowInput(group="A"),
+            additional_metadata={"test_run_id": test_run_id, "i": str(i)},
+            wait_for_result=False,
+        )
+        refs.append(ref)
+        await asyncio.sleep(1)
+
+    for ref in refs:
+        print(f"Waiting for run {ref.workflow_run_id} to complete")
+        try:
+            await ref.aio_result()
+        except Exception:
+            continue
+
+    runs = sorted(
+        await poll_for_runs(
+            hatchet,
+            expected_count=10,
+            additional_metadata={"test_run_id": test_run_id},
+            statuses=["COMPLETED", "CANCELLED"],
+        ),
+        key=lambda r: int((r.additional_metadata or {}).get("i", "0")),
+    )
+
+    assert len(runs) == 10
+    assert (runs[-1].additional_metadata or {}).get("i") == "9"
+    assert runs[-1].status == "COMPLETED"
+    assert all(r.status == "CANCELLED" for r in runs[:-1])

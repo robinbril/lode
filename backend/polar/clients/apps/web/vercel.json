@@ -1,0 +1,54 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd ../.. && turbo run build --filter=web",
+  "git": {
+    "deploymentEnabled": {
+      "main": false
+    }
+  },
+  "redirects": [
+    {
+      "source": "/docs",
+      "destination": "https://polar.sh/docs",
+      "has": [{ "type": "host", "value": "sandbox.polar.sh" }],
+      "permanent": true
+    },
+    {
+      "source": "/docs/:path+",
+      "destination": "https://polar.sh/docs/:path+",
+      "has": [{ "type": "host", "value": "sandbox.polar.sh" }],
+      "permanent": true
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/_mintlify/api/:path+",
+      "destination": "https://polar.mintlify.site/_mintlify/api/:path+"
+    },
+    {
+      "source": "/api/request",
+      "destination": "https://polar.mintlify.site/_mintlify/api/request"
+    },
+    {
+      "source": "/docs",
+      "destination": "https://polar.mintlify.site/docs"
+    },
+    {
+      "source": "/docs/:path*",
+      "destination": "https://polar.mintlify.site/docs/:path*"
+    },
+    {
+      "source": "/mintlify-assets/:path+",
+      "destination": "https://polar.mintlify.site/mintlify-assets/:path+"
+    },
+    {
+      "source": "/ingest/static/(.*)",
+      "destination": "https://us-assets.i.posthog.com/static/$1"
+    },
+    {
+      "source": "/ingest/(.*)",
+      "destination": "https://us.i.posthog.com/$1"
+    }
+  ],
+  "trailingSlash": false
+}

@@ -1,0 +1,21 @@
+version: v2
+name: qm-core
+build:
+  method: docker
+  context: .
+  dockerfile: ./deploy/core/Dockerfile
+services:
+  - name: core
+    type: web
+    run: env PORT=8080 node src/index.ts
+    instances: 1
+    cpuCores: 1
+    ramMegabytes: 2048
+    port: 8000
+    terminationGracePeriodSeconds: 60
+    livenessCheck:
+      enabled: true
+      httpPath: /healthz
+    readinessCheck:
+      enabled: true
+      httpPath: /readyz

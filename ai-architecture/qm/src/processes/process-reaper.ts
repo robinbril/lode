@@ -1,0 +1,116 @@
+import type { ProcessRecord, ProcessRegistry } from "./process-registry.ts";
+import { createSweeper } from "../util/sweeper.ts";
+import type { LeaderLease } from "../persistence/leader-lease.ts";
+import { awaitProcessExit } from "../sandbox/await-process-exit.ts";
+import { ProcessSessionGoneError } from "../sandbox/exec-process-session.ts";
+import type { ProcessSandbox, SandboxHandle } from "../sandbox/sandbox.ts";
+import { errMessage, swallow, swallowAs } from "../util/errors.ts";
+import { claimThenBind, type ClaimedRow } from "../tenants/claim.ts";
+
+const PROCESS_REAPER_LEASE_KEY = "processes:reaper";
+
+export interface ReaperKillHookOptions {
+  termGraceMs?: number;
+  killGraceMs?: number;
+  onExit?: (handle: SandboxHandle, processId: string) => Promise<void>;
+}
+
+export function createReaperKillHook(
+  sandbox: ProcessSandbox,
+  opts?: ReaperKillHookOptions,
+): (rec: ProcessRecord) => Promise<void> {
+  const termGraceMs = opts?.termGraceMs ?? 5_000;
+  const killGraceMs = opts?.killGraceMs ?? 2_000;
+  return async (rec) => {
+    if (!rec.sandboxId) return;
+    const handle = await sandbox.provision(rec.scopeId, {
+      sandboxId: rec.sandboxId,
+    });
+    try {
+      try {
+        await sandbox.signalProcess(handle, rec.processId, "TERM");
+        let status = await awaitProcessExit(sandbox, handle, rec.processId, termGraceMs);
+        if (status.state !== "exited") {
+          await sandbox.signalProcess(handle, rec.processId, "KILL");
+          status = await awaitProcessExit(sandbox, handle, rec.processId, killGraceMs);
+        }
+        if (status.state !== "exited") throw new Error(`process survived TERM+KILL: ${rec.processId}`);
+      } catch (e) {
+        if (!(e instanceof ProcessSessionGoneError)) throw e;
+      }
+      await opts
+        ?.onExit?.(handle, rec.processId)
+        .catch((e) =>
+          console.error(
+            "[process-reaper] credential writeback failed:",
+            errMessage(e),
+            ...(e instanceof AggregateError ? e.errors.map(errMessage) : []),
+          ),
+        );
+    } finally {
+      await sandbox.teardown(handle, { keepWarm: true });
+    }
+  };
+}
+
+export interface ProcessReaper {
+  start(): void;
+  stop(): Promise<void>;
+  sweep(): Promise<{ reaped: number }>;
+  sweepNow(): Promise<{ reaped: number } | null>;
+}
+
+export interface ProcessReaperOptions {
+  intervalMs: number;
+  kill?: (rec: ProcessRecord) => Promise<void>;
+  onReaped?: (rec: ProcessRecord) => Promise<void>;
+  claimOwed?: () => Promise<readonly ClaimedRow[]>;
+  afterSweep?: () => Promise<void>;
+  leaderLease: LeaderLease;
+}
+
+export function createProcessReaper(registry: ProcessRegistry, opts: ProcessReaperOptions): ProcessReaper {
+  const leaderLease = opts.leaderLease;
+  async function sweep(): Promise<{ reaped: number }> {
+    let reaped = 0;
+    await claimThenBind(
+      async () =>
+        (
+          await Promise.all([
+            registry.claimExpired(),
+            opts.claimOwed?.().catch(swallowAs("process reaper: claim owed stops", [])) ?? [],
+          ])
+        ).flat(),
+      async (id) => {
+        const rec = await registry.get(id);
+        if (rec?.status !== "running") return;
+        if (opts.kill) {
+          try {
+            await opts.kill(rec);
+          } catch (error) {
+            swallow(`process reaper: kill ${rec.processId}`, error);
+            return;
+          }
+        }
+        const flipped = await registry.markStatus(rec.processId, "reaped");
+        if (!flipped) return;
+        reaped++;
+        if (opts.onReaped)
+          await opts
+            .onReaped(rec)
+            .catch((err) => console.error("[process-reaper] onReaped hook failed:", errMessage(err)));
+      },
+    );
+    await opts.afterSweep?.();
+    return { reaped };
+  }
+
+  const sweepNow = () => leaderLease.hold(PROCESS_REAPER_LEASE_KEY, sweep);
+  const sweeper = createSweeper(sweepNow, opts.intervalMs);
+  return {
+    start: () => sweeper.start(),
+    stop: () => sweeper.stop(),
+    sweep,
+    sweepNow,
+  };
+}

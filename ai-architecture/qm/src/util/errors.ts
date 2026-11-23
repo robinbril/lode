@@ -1,0 +1,81 @@
+import { REQUEST_ID_HEADERS, reportBackendError } from "../../plugins/chassis/src/error-reporting.ts";
+import { errChain as errMessage, errDetail, failureCode } from "../../plugins/chassis/src/errors.ts";
+import { WorkAdmissionClosed } from "./admitted-work.ts";
+
+export {
+  errChain as errMessage,
+  errMessage as errText,
+  failureCode,
+  swallow,
+  swallowAs,
+} from "../../plugins/chassis/src/errors.ts";
+
+export function asError(e: unknown): Error {
+  return e instanceof Error ? e : new Error(errMessage(e), { cause: e });
+}
+
+const reportedErrors = new WeakSet<object>();
+
+export function markErrorReported(e: unknown): void {
+  if (typeof e === "object" && e !== null) reportedErrors.add(e);
+}
+
+export function errorAlreadyReported(e: unknown): boolean {
+  return typeof e === "object" && e !== null && reportedErrors.has(e);
+}
+
+function isExpectedInterruption(e: unknown): boolean {
+  return (e instanceof Error && e.name === "AbortError") || e instanceof WorkAdmissionClosed;
+}
+
+export function reportFailure(context: string, e: unknown, detail?: string): void {
+  const reportable = !isExpectedInterruption(e) && !errorAlreadyReported(e);
+  if (reportable) markErrorReported(e);
+  const eventId = reportable
+    ? reportBackendError(asError(e), failureCode(context), detail ? { detail } : undefined)
+    : undefined;
+  console.error(
+    `[failed] ${context}${detail ? ` (${detail})` : ""}${eventId ? ` [sentry=${eventId}]` : ""}: ${errDetail(e)}`,
+  );
+}
+
+export function reportFailureAs<T>(context: string, fallback: T, detail?: string): (e: unknown) => T {
+  return (e) => {
+    reportFailure(context, e, detail);
+    return fallback;
+  };
+}
+
+export function withRequestId(message: string, headers: Headers): string {
+  for (const name of REQUEST_ID_HEADERS) {
+    const value = headers.get(name);
+    if (value) return `${message} [request id ${value}]`;
+  }
+  return message;
+}
+
+export async function httpFailure(res: Response): Promise<string> {
+  const body = await res.text().catch(() => "");
+  return withRequestId(`http ${res.status} ${body}`, res.headers);
+}
+
+export async function withCleanup<T>(work: () => Promise<T>, cleanup: () => Promise<void>): Promise<T> {
+  let result: T;
+  try {
+    result = await work();
+  } catch (error) {
+    await cleanup().catch((cleanupError: unknown) => {
+      throw new AggregateError([error, cleanupError], errMessage(error), { cause: error });
+    });
+    throw error;
+  }
+  await cleanup();
+  return result;
+}
+
+export function execFailure(what: string, r: { stdout: string; stderr: string; code: number }): Error {
+  const parts = [`${what} failed (exit ${r.code}${r.code === 124 ? ", timed out" : ""})`];
+  if (r.stderr.trim()) parts.push(`stderr: ${r.stderr.trim()}`);
+  if (r.stdout.trim()) parts.push(`stdout: ${r.stdout.trim()}`);
+  return new Error(parts.join("; "));
+}

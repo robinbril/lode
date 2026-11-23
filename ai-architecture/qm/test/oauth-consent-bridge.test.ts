@@ -1,0 +1,416 @@
+import "./support/auto-fake-sprites.ts";
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import type { AddressInfo } from "node:net";
+import { createServer } from "../src/api/server.ts";
+import { serverDeps, type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
+import { PROVIDERS, type FetchLike } from "../src/connectors/oauth.ts";
+import { signRequest } from "../src/auth/source-auth.ts";
+import { mintCapabilityToken, CAPABILITY_TTL_MS, OAUTH_CONSENT_AUD } from "../src/auth/capability-token.ts";
+import type { TurnRequest } from "../src/types.ts";
+import { testConfig } from "./support/test-config.ts";
+import { selectDefaultSandbox } from "./support/default-sandbox.ts";
+import { liveRunClaims, liveRunStore } from "./support/live-run.ts";
+import { testTenant } from "./support/test-tenant.ts";
+
+const SECRET = "consent-bridge-secret".repeat(3);
+
+async function start(
+  fetchImpl: FetchLike = async () => {
+    throw new Error("must not exchange");
+  },
+  opts: { portalUrl?: string } = { portalUrl: "http://callback.test" },
+): Promise<{ base: string; built: BuiltApp; close: () => Promise<void> }> {
+  const config = testConfig({
+    signingSecret: SECRET,
+    capabilitySecret: SECRET,
+    apiBaseUrl: "https://core.example.com",
+    publicUrl: "http://callback.test",
+    ...(opts.portalUrl ? { publicWebUrl: opts.portalUrl } : {}),
+  });
+  const built = buildApp(config);
+  await built.config.setConnectorClient("org:default-org", "google", { clientId: "gid", clientSecret: "gsecret" });
+  await built.directory.replaceChannels(
+    [
+      { channelId: "C1", name: "consent", isPrivate: false },
+      { channelId: "C9", name: "connectors", isPrivate: false },
+    ],
+    [
+      { channelId: "C1", principalId: "U1" },
+      { channelId: "C9", principalId: "U1" },
+    ],
+  );
+  const runs = liveRunStore(built.runs);
+  const server = createServer(built.app, { ...serverDeps(config, built), runs, oauthFetch: fetchImpl });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  return { base, built, close: () => new Promise<void>((r) => server.close(() => r())) };
+}
+
+const consentTok = async (actorId: string, opts: { scopeId?: string } = {}) => {
+  return await mintCapabilityToken(
+    {
+      actorId,
+      scopeId: opts.scopeId ?? `personal:${actorId}`,
+      aud: OAUTH_CONSENT_AUD,
+      ...liveRunClaims(actorId),
+      exp: Date.now() + CAPABILITY_TTL_MS,
+    },
+    SECRET,
+  );
+};
+
+const coreRedeemPath = (connectPath: string): string =>
+  connectPath.replace(/^\/connect\/redeem\//, "/v1/connectors/oauth/consent/redeem/");
+
+function redeem(base: string, path: string, clicker?: string): Promise<Response> {
+  const ts = Math.floor(Date.now() / 1000);
+  const headers: Record<string, string> = {
+    "x-timestamp": String(ts),
+    "x-signature": signRequest(SECRET, ts, `GET\n${path}\n`),
+    ...(clicker ? { "x-consent-clicker": clicker } : {}),
+  };
+  return fetch(`${base}${path}`, { headers });
+}
+
+async function mint(base: string, cap: string, body: Record<string, unknown>): Promise<Response> {
+  return fetch(`${base}/v1/connectors/oauth/consent/mint`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-capability": cap },
+    body: JSON.stringify(body),
+  });
+}
+
+test("mint → intended teammate redeems → callback connects them; the link is then single-use", async () => {
+  let exchanged = 0;
+  const fetchImpl: FetchLike = async (url, init) => {
+    exchanged++;
+    assert.equal(url, PROVIDERS.google!.tokenUrl);
+    assert.match(init.body, /grant_type=authorization_code/);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ access_token: "at-google", refresh_token: "rt", expires_in: 3600 }),
+    };
+  };
+  const srv = await start(fetchImpl);
+  try {
+    const mintRes = await mint(srv.base, await consentTok("U1"), { provider: "google" });
+    assert.equal(mintRes.status, 200);
+    const { connectPath, connectUrl } = (await mintRes.json()) as { connectPath: string; connectUrl: string };
+    assert.match(connectPath, /^\/connect\/redeem\//);
+    assert.equal(connectUrl, `http://callback.test${connectPath}`);
+
+    const res = await redeem(srv.base, coreRedeemPath(connectPath), "U1");
+    assert.equal(res.status, 200);
+    const decision = (await res.json()) as { status: string; authorizeUrl: string };
+    assert.equal(decision.status, "authorize");
+    const consent = new URL(decision.authorizeUrl);
+    assert.equal(consent.origin + consent.pathname, PROVIDERS.google!.authUrl);
+    assert.equal(consent.searchParams.get("client_id"), "gid");
+
+    const second = await redeem(srv.base, coreRedeemPath(connectPath), "U1");
+    assert.equal(
+      ((await second.json()) as { status: string }).status,
+      "authorize",
+      "a re-click before the user finishes Google still mints",
+    );
+
+    const cb = `/v1/connectors/oauth/google/callback?code=code-1&state=${encodeURIComponent(consent.searchParams.get("state") ?? "")}`;
+    const cbRes = await fetch(`${srv.base}${cb}`, { redirect: "manual" });
+    assert.equal(cbRes.status, 302);
+    assert.match(cbRes.headers.get("location") ?? "", /^\/connectors\?connector=google&status=connected/);
+    assert.equal(exchanged, 1);
+    assert.equal(await srv.built.connectorTokens.connectorAccessToken("gmail.googleapis.com", "U1"), "at-google");
+
+    const third = await redeem(srv.base, coreRedeemPath(connectPath), "U1");
+    assert.equal(
+      ((await third.json()) as { status: string }).status,
+      "invalid",
+      "the link is consumed once the connection completes",
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test("redeem refuses without a verified clicker (the portal's session gate)", async () => {
+  const srv = await start();
+  try {
+    const mintRes = await mint(srv.base, await consentTok("U1"), { provider: "google" });
+    const { connectPath } = (await mintRes.json()) as { connectPath: string };
+    const res = await redeem(srv.base, coreRedeemPath(connectPath));
+    assert.equal(res.status, 401);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("a wrong-recipient click is refused, leaves the link usable, and reports whether they're already connected", async () => {
+  const fetchImpl: FetchLike = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ access_token: "at-google", refresh_token: "rt", expires_in: 3600 }),
+  });
+  const srv = await start(fetchImpl, { portalUrl: "http://callback.test" });
+  try {
+    const cap = await consentTok("U1", { scopeId: "channel:C1" });
+    const mintRes = await mint(srv.base, cap, { provider: "google", intendedPrincipalId: "U1" });
+    const { connectPath } = (await mintRes.json()) as { connectPath: string };
+
+    const wrong = (await (await redeem(srv.base, coreRedeemPath(connectPath), "U2")).json()) as {
+      status: string;
+      provider: string;
+      clickerConnected: boolean;
+    };
+    assert.equal(wrong.status, "wrong_recipient");
+    assert.equal(wrong.provider, "google");
+    assert.equal(wrong.clickerConnected, false);
+
+    await srv.built.connectorTokens.setConnectorToken("gmail.googleapis.com", "U2", {
+      accessToken: "ya29.u2",
+      expiresAt: Date.now() + 3_600_000,
+    });
+    const already = (await (await redeem(srv.base, coreRedeemPath(connectPath), "U2")).json()) as {
+      status: string;
+      clickerConnected: boolean;
+    };
+    assert.equal(already.status, "wrong_recipient");
+    assert.equal(already.clickerConnected, true);
+
+    const ok = (await (await redeem(srv.base, coreRedeemPath(connectPath), "U1")).json()) as { status: string };
+    assert.equal(ok.status, "authorize");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("connecting from a channel never re-grants a previously private connector", async () => {
+  const fetchImpl: FetchLike = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ access_token: "at-google", refresh_token: "rt", expires_in: 3600 }),
+  });
+  const srv = await start(fetchImpl);
+  try {
+    const cap = await consentTok("U1", { scopeId: "channel:C9" });
+    const mintRes = await mint(srv.base, cap, { provider: "google" });
+    const { connectPath } = (await mintRes.json()) as { connectPath: string };
+    const decision = (await (await redeem(srv.base, coreRedeemPath(connectPath), "U1")).json()) as {
+      status: string;
+      authorizeUrl: string;
+    };
+    assert.equal(decision.status, "authorize");
+    const state = new URL(decision.authorizeUrl).searchParams.get("state") ?? "";
+    const cb = `/v1/connectors/oauth/google/callback?code=code-1&state=${encodeURIComponent(state)}`;
+    assert.equal((await fetch(`${srv.base}${cb}`, { redirect: "manual" })).status, 302);
+    assert.equal(await srv.built.connectorTokens.connectorAccessToken("gmail.googleapis.com", "U1"), "at-google");
+    assert.equal((await srv.built.keychain!.materializeStanding("channel:C9")).length, 0);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("mint refuses naming anyone but the actor, and points at the self-connect page", async () => {
+  const srv = await start();
+  try {
+    const cap = await consentTok("U1", { scopeId: "channel:C1" });
+    for (const who of ["U2", "outsider@x"]) {
+      const res = await mint(srv.base, cap, { provider: "google", intendedPrincipalId: who });
+      assert.equal(res.status, 400);
+      const body = (await res.json()) as { message: string };
+      assert.match(body.message, /\/connect\/google\/self-connect/);
+    }
+  } finally {
+    await srv.close();
+  }
+});
+
+test("on an API-only host (no PUBLIC_WEB_URL) the callback does NOT default to the web UI — it falls through to JSON", async () => {
+  const fetchImpl: FetchLike = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ access_token: "at-google", refresh_token: "rt", expires_in: 3600 }),
+  });
+  const srv = await start(fetchImpl, {});
+  try {
+    const mintRes = await mint(srv.base, await consentTok("U1"), { provider: "google" });
+    assert.equal(mintRes.status, 200);
+    const { connectPath } = (await mintRes.json()) as { connectPath: string };
+    const decision = (await (await redeem(srv.base, coreRedeemPath(connectPath), "U1")).json()) as {
+      status: string;
+      authorizeUrl: string;
+    };
+    const consent = new URL(decision.authorizeUrl);
+    const cb = `/v1/connectors/oauth/google/callback?code=code-1&state=${encodeURIComponent(consent.searchParams.get("state") ?? "")}`;
+    const cbRes = await fetch(`${srv.base}${cb}`, { redirect: "manual" });
+    assert.equal(cbRes.status, 200);
+    const body = (await cbRes.json()) as { ok: boolean; provider: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.provider, "google");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("the consent-mint route takes only the oauth-consent token of a running turn with a person at the keyboard", async () => {
+  const srv = await start();
+  try {
+    await selectDefaultSandbox(srv.built, "U1", "channel:C1");
+    await selectDefaultSandbox(srv.built, "release-bot", "personal:release-bot");
+    const outcome = async (cap: string) => {
+      const res = await mint(srv.base, cap, { provider: "google" });
+      return `${res.status} ${((await res.json()) as { error?: string }).error ?? "minted"}`;
+    };
+    const envs: Record<string, string>[] = [];
+    const outcomes: string[] = [];
+    const provision = srv.built.sandbox.provision.bind(srv.built.sandbox);
+    srv.built.sandbox.provision = async (owner, options) => {
+      envs.push(options?.env ?? {});
+      outcomes.push(await outcome(options?.env?.AGENT_OAUTH_CONSENT_TOKEN ?? ""));
+      return provision(owner, options);
+    };
+    const members = [{ externalId: "U1" }];
+    const turns: Partial<TurnRequest>[] = [
+      {},
+      {
+        origin: { kind: "ambient", live: true },
+        conversation: {
+          kind: "channel",
+          threadRef: "ch:C1:ambient",
+          channelRef: "C1",
+          audience: members,
+          publishMembers: members,
+        },
+      },
+      { botActor: true },
+      { actor: { externalId: "release-bot", isBot: true }, botActor: true },
+      { surface: "cron", origin: { kind: "automation", ownerFire: true } },
+    ];
+    for (const [i, extra] of turns.entries()) {
+      await selectDefaultSandbox(srv.built, "U1", "personal:U1");
+      const res = await srv.built.app.turn({
+        surface: "test",
+        actor: { externalId: "U1" },
+        conversation: { kind: "dm", threadRef: `dm:consent:${i}` },
+        text: "!run echo consent",
+        origin: { kind: "human" },
+        ...extra,
+      });
+      assert.equal(res.status, "ok", res.reason);
+    }
+    const audless = await mintCapabilityToken(
+      { actorId: "U1", scopeId: "personal:U1", exp: Date.now() + CAPABILITY_TTL_MS },
+      SECRET,
+    );
+    for (const cap of [envs[0]!.AGENT_API_TOKEN, audless, "", envs[0]!.AGENT_OAUTH_CONSENT_TOKEN])
+      outcomes.push(await outcome(cap!));
+    assert.deepEqual(outcomes, [
+      "200 minted",
+      "200 minted",
+      "403 human_consent_required",
+      "403 human_consent_required",
+      "403 human_consent_required",
+      "403 forbidden",
+      "403 forbidden",
+      "401 unauthorized",
+      "403 human_consent_required",
+    ]);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("removing a connection, a saved login or a persona takes a running turn with a person at the keyboard", async () => {
+  const srv = await start();
+  try {
+    await srv.built.connectorTokens.setConnectorToken("gmail.googleapis.com", "U9", { accessToken: "kept" });
+    await srv.built.featureFlags.setEnabled("personas", "personal:U1", true, "test");
+    const { value } = (await srv.built.app.personas!.create("U1", { name: "Ada" })) as { value: { id: string } };
+    const exp = Date.now() + CAPABILITY_TTL_MS;
+    const send = async (method: string, path: string, claims: object = {}, principalId?: string) => {
+      const cap = await mintCapabilityToken(
+        { ...liveRunClaims("U1"), actorId: "U1", scopeId: "personal:U1", exp, ...claims },
+        SECRET,
+      );
+      const res = await fetch(`${srv.base}${path}`, {
+        method,
+        headers: { "content-type": "application/json", "x-agent-capability": cap },
+        body: method === "DELETE" ? null : JSON.stringify({ provider: "google", principalId, access }),
+      });
+      const json = (await res.json()) as { error?: string; principalId?: string; deleted?: boolean; access?: [] };
+      return `${res.status} ${json.error ?? json.principalId ?? json.deleted ?? json.access?.length}`;
+    };
+    const revoke = "/v1/connectors/oauth/revoke";
+    const login = "/v1/keychain/credentials/x";
+    const grant = "/v1/keychain/grants/x/revoke";
+    const persona = `/v1/personas/${value.id}`;
+    const access = ["personal:U1", "org:acme"].map((scopeId, i) => ({ scopeId, role: i ? "read" : "owner" }));
+    assert.equal(await send("POST", revoke), "200 U1");
+    assert.equal(await send("POST", revoke, { keychainMembers: [{ id: "U2", type: "internal" }] }, "U2"), "200 U2");
+    const [revoked] = await srv.built.auditLog.tail(testTenant, { limit: 1, action: "connector.oauth.revoked" });
+    assert.deepEqual([revoked?.principalId, revoked?.scopeLabel], ["U1", "U2"]);
+    assert.equal(await send("POST", revoke, {}, "U9"), "400 bad_request");
+    assert.equal(await srv.built.connectorTokens.connectorAccessToken("gmail.googleapis.com", "U9"), "kept");
+    assert.equal(await send("POST", revoke, { triggered: true }), "403 human_consent_required");
+    assert.equal(await send("POST", revoke, { botActor: true }), "403 human_consent_required");
+    assert.equal(await send("DELETE", login), "404 not_found");
+    assert.equal(await send("DELETE", login, { triggered: true }), "403 human_consent_required");
+    assert.equal(await send("POST", grant, { botActor: true }), "403 human_consent_required");
+    assert.equal(await send("DELETE", persona, { triggered: true }), "403 human_consent_required");
+    assert.equal(await send("PUT", `${persona}/access`, { triggered: true }), "403 human_consent_required");
+    assert.equal(JSON.stringify(await srv.built.app.personas!.detail("U1", value.id)).includes("org:acme"), false);
+    assert.equal(await send("PUT", `${persona}/access`), "200 2");
+    assert.equal(await send("DELETE", persona), "200 true");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("an oauth-consent token cannot drive control-plane routes (crons)", async () => {
+  const srv = await start();
+  try {
+    const res = await fetch(`${srv.base}/v1/crons`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-capability": await consentTok("U1") },
+      body: JSON.stringify({ schedule: { everyMs: 1000 }, action: "x" }),
+    });
+    assert.equal(res.status, 403);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("mint refuses an unconfigured provider even when PUBLIC_WEB_URL is set", async () => {
+  const srv = await start();
+  try {
+    const res = await mint(srv.base, await consentTok("U1"), { provider: "github" });
+    assert.equal(res.status, 501);
+    const body = (await res.json()) as { error: string };
+    assert.equal(body.error, "oauth_not_configured");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("an expired consent link reports an expiry status", async () => {
+  const srv = await start();
+  try {
+    const { linkId } = await srv.built.consentLinks.mint(
+      {
+        principalId: "U1",
+        provider: "google",
+        accountType: "default",
+        redirectUri: `${srv.base}/v1/connectors/oauth/google/callback`,
+      },
+      Date.now() - 25 * 60 * 60_000,
+    );
+    const res = await redeem(srv.base, `/v1/connectors/oauth/consent/redeem/${linkId}`, "U1");
+    assert.equal(res.status, 200);
+    assert.equal(((await res.json()) as { status: string }).status, "expired");
+  } finally {
+    await srv.close();
+  }
+});

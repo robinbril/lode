@@ -1,0 +1,829 @@
+use std::collections::HashMap;
+
+#[cfg(feature = "kafka")]
+use svix_bridge_plugin_kafka::{KafkaAutoOffsetReset, KafkaInputOpts, KafkaTransformationInput};
+use svix_bridge_plugin_queue::config::RabbitMqInputOpts;
+use svix_bridge_types::{SenderOutputOpts, SvixSenderOutputOpts};
+
+use super::{Config, ReceiverInput, SenderInputOpts};
+use crate::config::{LogFormat, LogLevel, WebhookSenderConfig};
+
+/// This is meant to be a kitchen sink config, hitting as many possible
+/// configuration options as possible to ensure they parse correctly.
+// FIXME: today, largely based on the examples. Should instead focus on coverage.
+const OMNIBUS: &str = r#"
+# Svix Bridge Example Configuration
+
+# Set the log level for the service. Supported: error, info, warn, debug, trace. Default: info
+#log_level: "debug"
+
+# The log format that all output will follow. Supported: default, json
+#log_format: "json"
+
+# Optional: configures an OTEL exporter forwarding spans to the specified collector
+opentelemetry:
+  address: "http://localhost:1234"
+  sample_ratio: 0.5
+  # Optional: default "svix-bridge"
+  service_name: "my-bridge"
+
+
+# The host/port to bind to for incoming HTTP requests.
+# Optional: default 0.0.0.0:5000
+# http_listen_address: "0.0.0.0:5000"
+
+
+# Senders consume JSON from their input, optionally transform, then forward to Svix.
+# Currently supported inputs are various message queue consumers while the sole
+# output is "svix" (which does a Create Message API request)
+senders:
+  # GCP Pub/Sub Consumer
+  - name: "gcp-example"
+    input:
+      type: "gcp-pubsub"
+      subscription_id: "my-subscription"
+      # Optional - will fallback to looking at env vars when left unset.
+      credentials_file: "/path/to/credentials.json"
+    # Optional - when unset, messages from the queue will be sent to Svix as-is.
+    transformation: |
+      function handler(input) {
+        return {
+          appId: input.key,
+          message: {
+            eventType: input.event_type,
+            payload: input.data
+          }
+        };
+      }
+    output:
+      type: "svix"
+      # Required (the Svix token to use when creating messages with this consumer)
+      token: "XYZ"
+
+  # RabbitMQ Consumer
+  - name: "rabbitmq-example"
+    input:
+      type: "rabbitmq"
+      # Required
+      uri: "amqp://guest:guest@localhost:5672/%2f"
+      # Required
+      queue_name: "my-queue"
+      # Optional (default: unset, managed by rabbitmq)
+      consumer_tag: "my-consumer-001"
+      # Optional: default true
+      requeue_on_nack: false
+    # Optional - when unset, messages from the queue will be sent to Svix as-is.
+    transformation: |
+      function handler(input) {
+        return {
+          appId: input.key,
+          message: {
+            eventType: input.event_type,
+            payload: input.data
+          }
+        };
+      }
+    output:
+      type: "svix"
+      # Required (the Svix token to use when creating messages with this consumer)
+      token: "XYZ"
+
+  # Redis Consumer
+  - name: "redis-example"
+    input:
+      type: "redis"
+      # Required
+      dsn: "redis://localhost:6379/"
+      # Required
+      queue_key: "my_queue"
+      # Required
+      consumer_name: "my_consumer"
+      # Required
+      consumer_group: "my_group"
+      # Required
+      max_connections: 4
+      # Optional: default true
+      reinsert_on_nack: true
+    # Optional - when unset, messages from the queue will be sent to Svix as-is.
+    transformation: |
+      function handler(input) {
+        return {
+          appId: input.key,
+          message: {
+            eventType: input.event_type,
+            payload: input.data
+          }
+        };
+      }
+    output:
+      type: "svix"
+      # Required (the Svix token to use when creating messages with this consumer)
+      token: "XYZ"
+
+  # SQS Consumer
+  # Also remember to set your AWS credentials in env vars to use this:
+  # - `AWS_DEFAULT_REGION`
+  # - `AWS_ACCESS_KEY_ID`
+  # - `AWS_SECRET_ACCESS_KEY`
+  - name: "sqs-example"
+    input:
+      type: "sqs"
+      # Required
+      queue_dsn: "http://localhost:19324/000000000000/local"
+      # Optional (default: false)
+      override_endpoint: true
+    # Optional - when unset, messages from the queue will be sent to Svix as-is.
+    transformation: |
+      function handler(input) {
+        return {
+          appId: input.key,
+          message: {
+            eventType: input.event_type,
+            payload: input.data
+          }
+        };
+      }
+    output:
+      type: "svix"
+      # Required (the Svix token to use when creating messages with this consumer)
+      token: "XYZ"
+
+  # Kafka Consumer
+  - name: "kafka-example"
+    input:
+      type: "kafka"
+      kafka_bootstrap_brokers: "localhost:9094"
+      kafka_group_id: "kafka_example_consumer_group"
+      kafka_topic: "foobar"
+      # Other valid values: "plaintext", "ssl"
+      kafka_security_protocol: "sasl_ssl"
+      # Only for SASL
+      kafka_sasl_username: "user"
+      kafka_sasl_password: "pass"
+    # Optional - when unset, messages from the queue will be sent to Svix as-is.
+    transformation: |
+      function handler(input) {
+        return {
+          appId: input.key,
+          message: {
+            eventType: input.event_type,
+            payload: input.data
+          }
+        };
+      }
+    output:
+      type: "svix"
+      # Required (the Svix token to use when creating messages with this consumer)
+      token: "XYZ"
+
+
+# Receivers are HTTP endpoints that can have webhooks sent to them.
+# When a webhook is POST'ed to a matching URL, it is (optionally) verified,
+# (optionally) transformed via a js function, then forwarded to an "output."
+#
+# Inputs types are "webhook" which allows you to configure a verification scheme
+# (either "svix" or "none") or "svix-webhook" which is a shorthand version.
+#
+# ```
+#   input:
+#     type: "webhook"
+#     path_id: "long-hand"
+#     verification:
+#       type: "svix"
+#       endpoint_secret: "whsec_XXXXX="
+#   # same as...
+#   input:
+#     type: "svix-webhook"
+#     path_id: "shorthand"
+#     endpoint_secret: "whsec_XXXXX="
+# ```
+#
+# The `path_id` in webhook and svix-webhook inputs represents the trailing
+# path segment that will connect to the given output.
+# For example, running bridge with the HTTP listen address set to
+# `localhost:5000`, the above examples would map to the following URLS:
+# - http://localhost:5000/webhooks/long-hand
+# - http://localhost:5000/webhooks/shorthand
+#
+receivers:
+  - name: "forward-to-gcp-example"
+    input:
+      type: "webhook"
+      path_id: "gcp"
+      verification:
+        type: "svix"
+        endpoint_secret: "whsec_XXXXX="
+    # Optional - when unset, webhooks received will be forwarded to the output as-is.
+    transformation: |
+      function handler(input) {
+        let event_type = input.eventType;
+        delete input.eventType;
+        return { event_type, ...input };
+      }
+    output:
+      type: "gcp-pubsub"
+      topic: "example"
+      # Optional - falls back to env otherwise, eg.
+      # - `GOOGLE_APPLICATION_CREDENTIALS`
+      # - `GOOGLE_APPLICATION_CREDENTIALS_JSON`
+      credentials_file: "/path/to/creds.json"
+
+  - name: "forward-to-rabbitmq-example"
+    input:
+      type: "webhook"
+      path_id: "rabbit"
+      verification:
+        type: "svix"
+        endpoint_secret: "whsec_XXXXX="
+    output:
+      type: "rabbitmq"
+      uri: "amqp://guest:guest@localhost:5672/%2f"
+      exchange: ""
+      routing_key: "example"
+
+  - name: "forward-to-redis-example"
+    input:
+      type: "webhook"
+      path_id: "redis"
+      verification:
+        type: "svix"
+        endpoint_secret: "whsec_XXXXX="
+    output:
+      type: "redis"
+      dsn: "redis://localhost:1234"
+      max_connections: 4
+      queue_key: "my_queue"
+
+  - name: "forward-to-sqs-example"
+    input:
+      type: "webhook"
+      path_id: "sqs"
+      verification:
+        type: "none"
+    output:
+      # Note that the SQS forwarder requires credentials to be set as environment vars:
+      # - `AWS_DEFAULT_REGION`
+      # - `AWS_ACCESS_KEY_ID`
+      # - `AWS_SECRET_ACCESS_KEY`
+      type: "sqs"
+      queue_dsn: "https://example.aws.com/my-queue"
+
+  - name: "forward-to-kafka-example"
+    input:
+      type: "webhook"
+      path_id: "kafka"
+      verification:
+        type: "none"
+    output:
+      type: "kafka"
+      kafka_bootstrap_brokers: "localhost:9094"
+      kafka_topic: "foobar"
+      # Other valid values: "plaintext", "ssl"
+      kafka_security_protocol: "sasl_ssl"
+      # Only for SASL
+      kafka_sasl_username: "user"
+      kafka_sasl_password: "pass"
+
+"#;
+
+#[test]
+fn test_sender_parses_ok() {
+    let conf: Result<WebhookSenderConfig, _> = serde_saphyr::from_str(
+        r#"
+name: "from-rabbit-local-to-svix"
+input:
+    type: "rabbitmq"
+    queue_name: "local"
+    uri: "amqp://example.com/%2f"
+transformation: |
+    handler = (x) => ({ appId: "app_1234", message: { eventType: "foo.bar", payload: x }})
+output:
+    type: "svix"
+    token: "XXXX"
+    "#,
+    );
+    conf.unwrap();
+}
+
+#[test]
+fn test_senders_parses_ok() {
+    let conf: Result<Vec<WebhookSenderConfig>, _> = serde_saphyr::from_str(
+        r#"
+
+- name: "from-rabbit-local-to-svix"
+  input:
+    type: "rabbitmq"
+    queue_name: "local"
+    uri: "amqp://example.com/%2f"
+  # Implicit json transformation
+  transformation: |
+    handler = (x) => ({ appId: "app_1234", message: { eventType: "foo.bar", payload: x }})
+  output:
+    type: "svix"
+    token: "XXXX"
+- name: "from-SQS-to-svix"
+  input:
+    type: "sqs"
+    queue_dsn: "http://sqs.example.com/foo/bar"
+  # Explicit string transformation
+  transformation:
+    format: string
+    src: |
+        function handler(x) {
+            return { appId: "app_1234", message: { eventType: "foo.bar", payload: x }}
+        }
+  output:
+    type: "svix"
+    token: "YYYY"
+"#,
+    );
+    let conf = conf.unwrap();
+    assert_eq!(conf.len(), 2);
+}
+
+#[test]
+fn test_omnibus_parses_ok() {
+    let conf: Result<Config, _> = serde_saphyr::from_str(OMNIBUS);
+    conf.unwrap();
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn test_kafka_transformation_input_defaults_to_payload() {
+    let config: Config = serde_saphyr::from_str(
+        r#"
+senders:
+  - name: "kafka-example"
+    input:
+      type: "kafka"
+      kafka_bootstrap_brokers: "localhost:9094"
+      kafka_group_id: "kafka_example_consumer_group"
+      kafka_topic: "foobar"
+      kafka_security_protocol: "plaintext"
+    output:
+      type: "svix"
+      token: "XYZ"
+"#,
+    )
+    .unwrap();
+
+    let SenderInputOpts::Kafka(KafkaInputOpts {
+        transformation_input,
+        ..
+    }) = &config.senders[0].input
+    else {
+        panic!("Expected Kafka input");
+    };
+
+    assert!(matches!(
+        transformation_input,
+        KafkaTransformationInput::Payload
+    ));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn test_kafka_auto_offset_reset_parses_ok() {
+    let config: Config = serde_saphyr::from_str(
+        r#"
+senders:
+  - name: "kafka-default"
+    input:
+      type: "kafka"
+      kafka_bootstrap_brokers: "localhost:9094"
+      kafka_group_id: "kafka_example_consumer_group"
+      kafka_topic: "foobar"
+      kafka_security_protocol: "plaintext"
+    output:
+      type: "svix"
+      token: "XYZ"
+  - name: "kafka-earliest"
+    input:
+      type: "kafka"
+      kafka_bootstrap_brokers: "localhost:9094"
+      kafka_group_id: "kafka_example_consumer_group"
+      kafka_topic: "foobar"
+      kafka_auto_offset_reset: "earliest"
+      kafka_security_protocol: "plaintext"
+    output:
+      type: "svix"
+      token: "XYZ"
+"#,
+    )
+    .unwrap();
+
+    let SenderInputOpts::Kafka(KafkaInputOpts {
+        auto_offset_reset: default_auto_offset_reset,
+        ..
+    }) = &config.senders[0].input
+    else {
+        panic!("Expected Kafka input");
+    };
+    let SenderInputOpts::Kafka(KafkaInputOpts {
+        auto_offset_reset: explicit_auto_offset_reset,
+        ..
+    }) = &config.senders[1].input
+    else {
+        panic!("Expected Kafka input");
+    };
+
+    assert_eq!(default_auto_offset_reset, &KafkaAutoOffsetReset::Latest);
+    assert_eq!(explicit_auto_offset_reset, &KafkaAutoOffsetReset::Earliest);
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn test_kafka_auto_offset_reset_rejects_invalid_value() {
+    let config = serde_saphyr::from_str::<KafkaInputOpts>(
+        r#"
+type: "kafka"
+kafka_bootstrap_brokers: "localhost:9094"
+kafka_group_id: "kafka_example_consumer_group"
+kafka_topic: "foobar"
+kafka_auto_offset_reset: "invalid"
+kafka_security_protocol: "plaintext"
+"#,
+    );
+
+    assert!(config.is_err());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn test_kafka_idempotency_namespace_parses_ok() {
+    let config = serde_saphyr::from_str::<KafkaInputOpts>(
+        r#"
+type: "kafka"
+kafka_bootstrap_brokers: "localhost:9094"
+kafka_group_id: "kafka_example_consumer_group"
+kafka_topic: "foobar"
+kafka_idempotency_namespace: "source-a"
+kafka_security_protocol: "plaintext"
+"#,
+    )
+    .unwrap();
+
+    let KafkaInputOpts {
+        idempotency_namespace,
+        ..
+    } = config;
+    assert_eq!(idempotency_namespace.as_deref(), Some("source-a"));
+}
+
+#[test]
+fn test_empty() {
+    let conf: Config = serde_saphyr::from_str("").unwrap();
+    assert!(conf.senders.is_empty());
+    assert!(conf.receivers.is_empty());
+    assert_eq!(conf.http_listen_address, "0.0.0.0:5000".parse().unwrap());
+    assert!(conf.opentelemetry.is_none());
+    assert!(matches!(conf.log_format, LogFormat::Default));
+    assert!(matches!(conf.log_level, LogLevel::Info));
+}
+
+/// Don't particularly care about the parsed specifics here.
+/// This is more about making sure the examples we have in the repo actually parse.
+#[test]
+fn test_receivers_example() {
+    let fp = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../svix-bridge.example.receivers.yaml"
+    );
+    let conf: Config = serde_saphyr::from_slice(&std::fs::read(fp).unwrap()).unwrap();
+    assert!(conf.senders.is_empty());
+    assert!(!conf.receivers.is_empty());
+}
+
+/// Don't particularly care about the parsed specifics here.
+/// This is more about making sure the examples we have in the repo actually parse.
+#[test]
+fn test_senders_example() {
+    let fp = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../svix-bridge.example.senders.yaml"
+    );
+    let conf: Config = serde_saphyr::from_slice(&std::fs::read(fp).unwrap()).unwrap();
+    assert!(!conf.senders.is_empty());
+    assert!(conf.receivers.is_empty());
+}
+
+#[tokio::test]
+async fn test_variable_substitution_missing_vars() {
+    let src = r#"
+    opentelemetry:
+        address: "${OTEL_ADDR}"
+    "#;
+    let vars = HashMap::new();
+    let cfg = Config::from_src(src, Some(&vars)).await.unwrap();
+    let otel = cfg.opentelemetry.unwrap();
+    // when lookups in the vars map fail, the original token text is preserved.
+    assert_eq!(&otel.address, "${OTEL_ADDR}");
+}
+
+#[tokio::test]
+async fn test_variable_substitution_available_vars() {
+    let src = r#"
+    opentelemetry:
+        address: "${OTEL_ADDR}"
+        sample_ratio: ${OTEL_SAMPLE_RATIO}
+    "#;
+    let mut vars = HashMap::new();
+    vars.insert(
+        String::from("OTEL_ADDR"),
+        String::from("http://127.0.0.1:8080"),
+    );
+    vars.insert(String::from("OTEL_SAMPLE_RATIO"), String::from("0.25"));
+    let cfg = Config::from_src(src, Some(&vars)).await.unwrap();
+    // when lookups succeed, the token should be replaced.
+    let otel = cfg.opentelemetry.unwrap();
+    assert_eq!(&otel.address, "http://127.0.0.1:8080");
+    assert_eq!(otel.sample_ratio, Some(0.25));
+}
+
+#[tokio::test]
+async fn test_variable_substitution_braces_optional() {
+    let src = r#"
+    opentelemetry:
+        # Formerly failing to use ${} notation means the port number would not be substituted.
+        # Today, it works. Test that it continues to.
+        address: "${OTEL_SCHEME}://${OTEL_HOST}:$OTEL_PORT"
+    "#;
+    let mut vars = HashMap::new();
+    vars.insert(String::from("OTEL_SCHEME"), String::from("https"));
+    vars.insert(String::from("OTEL_HOST"), String::from("127.0.0.1"));
+    vars.insert(String::from("OTEL_PORT"), String::from("9999"));
+    let cfg = Config::from_src(src, Some(&vars)).await.unwrap();
+    // when lookups succeed, the token should be replaced.
+    let otel = cfg.opentelemetry.unwrap();
+    // Not the user-intended outcome, but it simplifies the parsing requirements.
+    assert_eq!(&otel.address, "https://127.0.0.1:9999");
+}
+
+#[tokio::test]
+async fn test_variable_substitution_missing_numeric_var_is_err() {
+    // Unfortunate side-effect of templating yaml.
+    //
+    // If the variable is missing, usually you've got three options:
+    // - retain the token text that failed the lookup (envsubst-rs does this)
+    // - replace the token with an empty string (the CLI `envsubst` does this)
+    // - mark it an error (neither do this, but we can if we roll our own impl)
+    //
+    // For yaml, the field typings are heavily/poorly inferred so for an optional float like
+    // `sample_ratio` an empty string would parse as a `None`, which could be a bad fallback since
+    // otel considers this a 1.0 ratio (send everything).
+    //
+    // For this specific case, retaining the token text produces an error, which happens to be useful.
+    // For fields that happen to be strings anyway, errors may show up later (after the config parsing).
+    // Ex: using `${QUEUE_NAME}` in a rabbit sender input will surface in logs as an error when we
+    // try to connect: "no such queue '${QUEUE_NAME}'".
+
+    let src = r#"
+    opentelemetry:
+        address: "${OTEL_ADDR}"
+        # This var will be missing, causing the template token to
+        # be retained causing a parse failure :(
+        sample_ratio: ${OTEL_SAMPLE_RATIO}
+    "#;
+    let vars = HashMap::new();
+    let err = Config::from_src(src, Some(&vars)).await.err().unwrap();
+    let want = "Failed to parse config: error: line 6 column 23: invalid floating point";
+    assert!(
+        err.to_string().starts_with(want),
+        "Expected {err:?} to start with {want:?}"
+    )
+}
+
+/// This is probably a given, but we should expect a single variable can be referenced multiple
+/// times within the config.
+/// The concrete use case: auth tokens.
+#[tokio::test]
+async fn test_variable_substitution_repeated_lookups() {
+    let src = r#"
+    senders:
+      - name: "rabbitmq-1"
+        input:
+          type: "rabbitmq"
+          uri: "${RABBIT_URI}"
+          queue_name: "${QUEUE_NAME_1}"
+        output:
+          type: "svix"
+          token: "${SVIX_TOKEN}"
+      - name: "rabbitmq-2"
+        input:
+          type: "rabbitmq"
+          uri: "${RABBIT_URI}"
+          queue_name: "${QUEUE_NAME_2}"
+        output:
+          type: "svix"
+          token: "${SVIX_TOKEN}"
+    "#;
+    let mut vars = HashMap::new();
+    vars.insert(
+        String::from("RABBIT_URI"),
+        String::from("amqp://guest:guest@localhost:5672/%2f"),
+    );
+    vars.insert(String::from("QUEUE_NAME_1"), String::from("one"));
+    vars.insert(String::from("QUEUE_NAME_2"), String::from("two"));
+    vars.insert(String::from("SVIX_TOKEN"), String::from("x"));
+    let cfg = Config::from_src(src, Some(&vars)).await.unwrap();
+
+    if let WebhookSenderConfig {
+        input:
+            SenderInputOpts::RabbitMQ(RabbitMqInputOpts {
+                uri, queue_name, ..
+            }),
+        output: SenderOutputOpts::Svix(SvixSenderOutputOpts { token, .. }),
+        ..
+    } = &cfg.senders[0]
+    {
+        assert_eq!(uri, "amqp://guest:guest@localhost:5672/%2f");
+        assert_eq!(queue_name, "one");
+        assert_eq!(token, "x");
+    } else {
+        panic!("sender did not match expected pattern");
+    }
+
+    if let WebhookSenderConfig {
+        input:
+            SenderInputOpts::RabbitMQ(RabbitMqInputOpts {
+                uri, queue_name, ..
+            }),
+        output: SenderOutputOpts::Svix(SvixSenderOutputOpts { token, .. }),
+        ..
+    } = &cfg.senders[1]
+    {
+        assert_eq!(uri, "amqp://guest:guest@localhost:5672/%2f");
+        assert_eq!(queue_name, "two");
+        assert_eq!(token, "x");
+    } else {
+        panic!("sender did not match expected pattern");
+    }
+}
+
+/// This is to ensure the order of operations.
+/// Variables in js source code fragments could result in invalid JS source.
+/// Now that we are validating transformations parse as JS, this test aims to make sure the
+/// replacements happen before the JS parsing does.
+#[tokio::test]
+async fn test_variable_substitution_in_transformations() {
+    let src = r#"
+    senders:
+      - name: "rabbitmq-1"
+        input:
+          type: "rabbitmq"
+          uri: "${RABBIT_URI}"
+          queue_name: "${QUEUE_NAME}"
+        transformation: |
+          function handler(input) {
+            return {
+                appId: "xxx",
+                message: {
+                  eventType: "queue.message.handled",
+                  payload: {
+                    queueName: "${QUEUE_NAME}",
+                    // Without the substitution for NUMBER, this expression would be invalid syntax.
+                    number: ${NUMBER} - 10,
+                    data: input,
+                  }
+                }
+            };
+          }
+        output:
+          type: "svix"
+          token: "${SVIX_TOKEN}"
+    "#;
+    let mut vars = HashMap::new();
+    vars.insert(String::from("NUMBER"), String::from("123"));
+    vars.insert(String::from("QUEUE_NAME"), String::from("one"));
+    let cfg = Config::from_src(src, Some(&vars)).await.unwrap();
+
+    let xform = cfg.senders[0].transformation().unwrap();
+    xform.source().contains(r#"queueName: "one""#);
+    xform.source().contains(r#"number: 123 - 10,"#);
+}
+
+#[tokio::test]
+async fn test_kafka_sasl_mechanism_default() {
+    // When kafka_sasl_mechanism is omitted, it should default to SCRAM-SHA-512
+    let src = r#"
+    senders:
+      - name: "kafka-sasl-default"
+        input:
+          type: "kafka"
+          kafka_bootstrap_brokers: "localhost:9094"
+          kafka_group_id: "group"
+          kafka_topic: "topic"
+          kafka_security_protocol: "sasl_ssl"
+          kafka_sasl_username: "user"
+          kafka_sasl_password: "pass"
+        output:
+          type: "svix"
+          token: "XYZ"
+    "#;
+    Config::from_src(src, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_kafka_sasl_mechanism_explicit() {
+    for mechanism in ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        let src = format!(
+            r#"
+    senders:
+      - name: "kafka-sasl-explicit"
+        input:
+          type: "kafka"
+          kafka_bootstrap_brokers: "localhost:9094"
+          kafka_group_id: "group"
+          kafka_topic: "topic"
+          kafka_security_protocol: "sasl_ssl"
+          kafka_sasl_username: "user"
+          kafka_sasl_password: "pass"
+          kafka_sasl_mechanism: "{mechanism}"
+        output:
+          type: "svix"
+          token: "XYZ"
+    "#
+        );
+        Config::from_src(&src, None)
+            .await
+            .unwrap_or_else(|e| panic!("failed to parse mechanism {mechanism}: {e}"));
+    }
+}
+
+/// Check that the config parser validates the JS source fragments in it.
+#[tokio::test]
+async fn test_transformation_validation_bad_syntax_is_err() {
+    let src = r#"
+    senders:
+      - name: "bad xform"
+        input:
+          type: "rabbitmq"
+          uri: "xxx"
+          queue_name: "xxx"
+        transformation: |
+          // invalid syntax
+          let 123 = 456
+        output:
+          type: "svix"
+          token: "xxx"
+    "#;
+    let err = Config::from_src(src, None).await.err().unwrap();
+    assert!(
+        err.to_string()
+            .contains("failed to parse transformation for sender `bad xform`")
+    )
+}
+
+#[tokio::test]
+async fn test_var_substitution_json_values_ok() {
+    let src = r#""#;
+    let mut vars = HashMap::new();
+    // GCP credentials is one place where we _expect_ json to be supplied as an env var.
+    // We need to be able to support this.
+    vars.insert(
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON".into(),
+        r#"{"foo": true, "bar": 123}"#.into(),
+    );
+    // Should not be an error
+    let _cfg = Config::from_src(src, Some(&vars)).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_pollers_parse_ok() {
+    let src = r#"
+    receivers:
+      - name: "poller-to-rabbitmq-example"
+        input:
+          type: "svix-message-poller"
+          consumer_id: "my-consumer"
+          app_id: "app_AbCd"
+          sink_id: "poll_aBcD"
+          token: "xxxx"
+        output:
+          type: "rabbitmq"
+          uri: "amqp://guest:guest@localhost:5672/%2f"
+          exchange: ""
+          routing_key: "example"
+          "#;
+    // Should not be an error
+    let cfg = Config::from_src(src, None).await.unwrap();
+    assert_eq!(cfg.receivers.len(), 1);
+    std::assert_matches!(cfg.receivers[0].input, ReceiverInput::SvixMessagePoller(_));
+}
+
+#[tokio::test]
+async fn test_pollers_parse_garbage_token_err() {
+    let src = r#"
+    receivers:
+      - name: "poller-to-rabbitmq-example"
+        input:
+          type: "svix-events"
+          subscription_token: "not a real token"
+        output:
+          type: "rabbitmq"
+          uri: "amqp://guest:guest@localhost:5672/%2f"
+          exchange: ""
+          routing_key: "example"
+          "#;
+    assert!(Config::from_src(src, None).await.is_err());
+}

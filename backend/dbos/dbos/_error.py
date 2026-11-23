@@ -1,0 +1,555 @@
+"""Errors thrown by DBOS."""
+
+from enum import Enum
+from typing import Any, List, Optional, Sequence
+
+
+class DBOSException(Exception):
+    """
+    Base class of DBOS Exceptions.
+
+    Attributes:
+        message(str): The error message string
+        dbos_error_code(DBOSErrorCode): The error code, from the `DBOSErrorCode` enum
+
+    """
+
+    def __init__(self, message: str, dbos_error_code: Optional[int] = None):
+        self.message = message
+        self.dbos_error_code = dbos_error_code
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        if self.dbos_error_code:
+            return f"DBOS Error {self.dbos_error_code}: {self.message}"
+        return f"DBOS Error: {self.message}"
+
+
+class DBOSBaseException(BaseException):
+    """
+    This class is for DBOS exceptions that should not be caught by user code.
+    It inherits from BaseException instead of Exception so it cannot be caught
+    except by code specifically trying to catch it.
+
+    Attributes:
+        message(str): The error message string
+        dbos_error_code(DBOSErrorCode): The error code, from the `DBOSErrorCode` enum
+    """
+
+    def __init__(self, message: str, dbos_error_code: Optional[int] = None):
+        self.message = message
+        self.dbos_error_code = dbos_error_code
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        if self.dbos_error_code:
+            return f"DBOS Error {self.dbos_error_code}: {self.message}"
+        return f"DBOS Error: {self.message}"
+
+
+class DBOSErrorCode(Enum):
+    ConflictingIDError = 1
+    RecoveryError = 2
+    InitializationError = 3
+    WorkflowFunctionNotFound = 4
+    NonExistentWorkflowError = 5
+    MaxRecoveryAttemptsExceeded = 6
+    MaxStepRetriesExceeded = 7
+    NotAuthorized = 8
+    ConflictingWorkflowError = 9
+    WorkflowCancelled = 10
+    UnexpectedStep = 11
+    QueueDeduplicated = 12
+    AwaitedWorkflowCancelled = 13
+    AwaitedWorkflowMaxRecoveryAttemptsExceeded = 14
+    PatchNondeterminism = 15
+    StreamTimeout = 16
+    StreamNondeterminism = 17
+    StepTimeout = 18
+    QueryTimeout = 26
+    WorkflowIDInUse = 27
+    StepNondeterminism = 28
+    WorkflowSuspended = 29
+    ExternalStoreNotConfigured = 30
+    ExternalObjectMissing = 31
+    ExternalObjectIntegrity = 32
+    ExternalStoreFailed = 33
+    WorkflowArchiveNotConfigured = 34
+
+
+#######################################
+## Exception
+#######################################
+
+
+class DBOSQueryTimeoutError(DBOSException):
+    """Exception raised when an observability query exceeds its statement timeout."""
+
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"This query was cancelled after exceeding its {timeout_seconds:g}s statement timeout.",
+            dbos_error_code=DBOSErrorCode.QueryTimeout.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.timeout_seconds,))
+
+
+class DBOSConflictingWorkflowError(DBOSException):
+    """Exception raised different workflows started with the same workflow ID."""
+
+    def __init__(self, workflow_id: str, message: Optional[str] = None):
+        self.workflow_id = workflow_id
+        self.detail = message
+        super().__init__(
+            f"Conflicting workflow invocation with the same ID ({workflow_id}): {message}",
+            dbos_error_code=DBOSErrorCode.ConflictingWorkflowError.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.workflow_id, self.detail))
+
+
+class DBOSRecoveryError(DBOSException):
+    """Exception raised when a workflow recovery fails."""
+
+    def __init__(self, workflow_id: str, message: Optional[str] = None):
+        self.workflow_id = workflow_id
+        self.detail = message
+        super().__init__(
+            f"Recovery error for workflow ID {workflow_id}: {message}",
+            dbos_error_code=DBOSErrorCode.RecoveryError.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.workflow_id, self.detail))
+
+
+class DBOSInitializationError(DBOSException):
+    """Exception raised when DBOS initialization did not complete."""
+
+    def __init__(self, message: str):
+        self.detail = message
+        super().__init__(
+            f"Error initializing DBOS Transact: {message}",
+            DBOSErrorCode.InitializationError.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.detail,))
+
+
+class DBOSWorkflowFunctionNotFoundError(DBOSException):
+    """Exception raised when the database refers to a workflow function that is not registered in the codebase."""
+
+    def __init__(self, workflow_id: str, message: Optional[str] = None):
+        self.workflow_id = workflow_id
+        self.detail = message
+        super().__init__(
+            f"Could not execute workflow {workflow_id}: {message}",
+            dbos_error_code=DBOSErrorCode.WorkflowFunctionNotFound.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.workflow_id, self.detail))
+
+
+class DBOSNonExistentWorkflowError(DBOSException):
+    """Exception raised when a workflow database record does not exist for a given ID."""
+
+    def __init__(self, destination: str, destination_id: str):
+        self.destination = destination
+        self.destination_id = destination_id
+        super().__init__(
+            f"Non-existent {destination} workflow ID: {destination_id}",
+            dbos_error_code=DBOSErrorCode.NonExistentWorkflowError.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.destination, self.destination_id))
+
+
+class DBOSStreamTimeoutError(DBOSException):
+    """Exception raised when no value arrives on a stream within its timeout."""
+
+    def __init__(
+        self, workflow_id: str, key: str, timeout_seconds: Optional[float] = None
+    ):
+        self.workflow_id = workflow_id
+        self.key = key
+        self.timeout_seconds = timeout_seconds
+        # No timeout means the stream ended without reaching the value, so none ever will.
+        within = (
+            f" within {timeout_seconds} seconds" if timeout_seconds is not None else ""
+        )
+        super().__init__(
+            f"No value arrived on stream {key} of workflow {workflow_id}{within}",
+            dbos_error_code=DBOSErrorCode.StreamTimeout.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Pickle rebuilds an exception by calling cls(*args); without this it would pass the
+        # message alone to a three-argument constructor and fail to load.
+        return (self.__class__, (self.workflow_id, self.key, self.timeout_seconds))
+
+
+class DBOSStreamNondeterminismError(DBOSException):
+    """Exception raised when concurrent stream reads would make replay depend on scheduling."""
+
+    def __init__(self, workflow_id: str, key: str):
+        self.workflow_id = workflow_id
+        self.key = key
+        super().__init__(
+            f"Cannot deterministically read stream {key} in workflow {workflow_id}: another "
+            "stream read in the same workflow is still in progress, so which read records which "
+            "value would depend on task scheduling. Read streams from sequential workflow code, "
+            "or read them from a step.",
+            dbos_error_code=DBOSErrorCode.StreamNondeterminism.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Pickle rebuilds an exception by calling cls(*args); see DBOSStreamTimeoutError.
+        return (self.__class__, (self.workflow_id, self.key))
+
+
+class MaxRecoveryAttemptsExceededError(DBOSException):
+    """Exception raised when a workflow exceeds its max recovery attempts."""
+
+    def __init__(self, wf_id: str, max_retries: Optional[int] = None):
+        self.workflow_id = wf_id
+        self.max_retries = max_retries
+        limit = "its maximum" + (
+            f" of {max_retries}" if max_retries is not None else " number of"
+        )
+        super().__init__(
+            f"Workflow {wf_id} has exceeded {limit} execution or recovery attempts. Further attempts to execute or recover it will fail. See documentation for details: https://docs.dbos.dev/python/reference/decorators",
+            dbos_error_code=DBOSErrorCode.MaxRecoveryAttemptsExceeded.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.workflow_id, self.max_retries))
+
+
+class DBOSNotAuthorizedError(DBOSException):
+    """Exception raised by DBOS role-based security when the user is not authorized to access a function."""
+
+    def __init__(self, msg: str):
+        self.msg = msg
+        super().__init__(
+            msg,
+            dbos_error_code=DBOSErrorCode.NotAuthorized.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (self.__class__, (self.msg,))
+
+
+class DBOSMaxStepRetriesExceeded(DBOSException):
+    """Exception raised when a step was retried the maximimum number of times without success."""
+
+    def __init__(
+        self, step_name: str, max_retries: int, errors: list[Exception]
+    ) -> None:
+        self.step_name = step_name
+        self.max_retries = max_retries
+        self.errors = errors
+        super().__init__(
+            f"Step {step_name} has exceeded its maximum of {max_retries} retries",
+            dbos_error_code=DBOSErrorCode.MaxStepRetriesExceeded.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (self.__class__, (self.step_name, self.max_retries, self.errors))
+
+
+class DBOSStepTimeoutError(DBOSException):
+    """Exception raised when a step was cancelled because it exceeded its timeout."""
+
+    def __init__(self, step_name: str, timeout_seconds: float) -> None:
+        self.step_name = step_name
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"Step {step_name} was cancelled after exceeding its timeout of {timeout_seconds} seconds",
+            dbos_error_code=DBOSErrorCode.StepTimeout.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (self.__class__, (self.step_name, self.timeout_seconds))
+
+
+class DBOSUnexpectedStepError(DBOSException):
+    """Exception raised when a step has an unexpected recorded name."""
+
+    def __init__(
+        self, workflow_id: str, step_id: int, expected_name: str, recorded_name: str
+    ) -> None:
+        self.inputs = (workflow_id, step_id, expected_name, recorded_name)
+        super().__init__(
+            f"During execution of workflow {workflow_id} step {step_id}, function {recorded_name} was recorded when {expected_name} was expected. Check that your workflow is deterministic.",
+            dbos_error_code=DBOSErrorCode.UnexpectedStep.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (
+            self.__class__,
+            self.inputs,
+        )
+
+
+class DBOSStepNondeterminismError(DBOSException):
+    """Exception raised when an execution records a step ID that it already recorded differently."""
+
+    def __init__(self, workflow_id: str, step_id: int) -> None:
+        self.inputs = (workflow_id, step_id)
+        super().__init__(
+            f"Step {step_id} of workflow {workflow_id} was recorded twice by the same execution with different results. Check that your workflow is deterministic.",
+            dbos_error_code=DBOSErrorCode.StepNondeterminism.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (
+            self.__class__,
+            self.inputs,
+        )
+
+
+class DBOSPatchNondeterminismError(DBOSException):
+    """Exception raised when patching detects a non-deterministic workflow execution."""
+
+    def __init__(self, workflow_id: str, patch_name: str, details: str) -> None:
+        self.inputs = (workflow_id, patch_name, details)
+        super().__init__(
+            f"Cannot deterministically apply patch {patch_name} in workflow {workflow_id}: {details}. Check that your workflow is deterministic.",
+            dbos_error_code=DBOSErrorCode.PatchNondeterminism.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (
+            self.__class__,
+            self.inputs,
+        )
+
+
+class DBOSQueueDeduplicatedError(DBOSException):
+    """Exception raised when a workflow is deduplicated in the queue."""
+
+    def __init__(
+        self, workflow_id: str, queue_name: str, deduplication_id: str
+    ) -> None:
+        self.workflow_id = workflow_id
+        self.queue_name = queue_name
+        self.deduplication_id = deduplication_id
+        super().__init__(
+            f"Workflow {workflow_id} was deduplicated due to an existing workflow in queue {queue_name} with deduplication ID {deduplication_id}.",
+            dbos_error_code=DBOSErrorCode.QueueDeduplicated.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (
+            self.__class__,
+            (self.workflow_id, self.queue_name, self.deduplication_id),
+        )
+
+
+class DBOSWorkflowIDInUseError(DBOSException):
+    """Exception raised when a workflow_id_reuse_policy 'reject' start finds its workflow ID in use."""
+
+    def __init__(self, workflow_id: str, workflow_status: str, workflow_name: str):
+        self.workflow_id = workflow_id
+        # Not named `status`: portable serialization would record it as the error's code.
+        self.workflow_status = workflow_status
+        self.workflow_name = workflow_name
+        super().__init__(
+            f"Workflow ID {workflow_id} is already in use by workflow {workflow_name} with status {workflow_status}.",
+            dbos_error_code=DBOSErrorCode.WorkflowIDInUse.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (
+            self.__class__,
+            (self.workflow_id, self.workflow_status, self.workflow_name),
+        )
+
+
+def is_workflow_id_in_use_error(e: BaseException) -> bool:
+    """True if `e` is a workflow-ID-in-use rejection, including replayed forms that lost the class."""
+    from dbos._serialization import PortableWorkflowError
+
+    if getattr(e, "dbos_error_code", None) == DBOSErrorCode.WorkflowIDInUse.value:
+        return True
+    return (
+        isinstance(e, PortableWorkflowError)
+        and e.name == DBOSWorkflowIDInUseError.__name__
+    )
+
+
+class DBOSAwaitedWorkflowCancelledError(DBOSException):
+    def __init__(self, workflow_id: str):
+        self.workflow_id = workflow_id
+        super().__init__(
+            f"Awaited workflow {workflow_id} was cancelled",
+            dbos_error_code=DBOSErrorCode.AwaitedWorkflowCancelled.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (self.__class__, (self.workflow_id,))
+
+
+class DBOSAwaitedWorkflowMaxRecoveryAttemptsExceeded(DBOSException):
+    def __init__(self, workflow_id: str):
+        self.workflow_id = workflow_id
+        super().__init__(
+            f"Awaited workflow {workflow_id} exceeded its maximum recovery attempts",
+            dbos_error_code=DBOSErrorCode.AwaitedWorkflowMaxRecoveryAttemptsExceeded.value,
+        )
+
+    def __reduce__(self) -> Any:
+        # Tell pickle how to reconstruct this object
+        return (self.__class__, (self.workflow_id,))
+
+
+class DBOSExternalStoreNotConfiguredError(DBOSException):
+    """Exception raised when no external store is configured, or a ref or store_id names a store that isn't."""
+
+    def __init__(self, store_id: Optional[str], configured_store_ids: List[str]):
+        self.store_id = store_id
+        self.configured_store_ids = configured_store_ids
+        if not configured_store_ids:
+            msg = "External objects require external_stores in the DBOS configuration or DBOSClient"
+        else:
+            msg = f"External store {store_id} is not configured; the configured stores are {', '.join(configured_store_ids)}"
+        super().__init__(
+            msg, dbos_error_code=DBOSErrorCode.ExternalStoreNotConfigured.value
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.store_id, self.configured_store_ids))
+
+
+class DBOSWorkflowArchiveNotConfiguredError(DBOSException):
+    """Exception raised when reading from the workflow archive with none configured."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No workflow archive is configured: set workflow_archive in the DBOS configuration or DBOSClient",
+            dbos_error_code=DBOSErrorCode.WorkflowArchiveNotConfigured.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, ())
+
+
+class DBOSExternalObjectMissingError(DBOSException):
+    """Exception raised when an external object's ref is valid but its object no longer exists."""
+
+    def __init__(self, store_id: str, key: str):
+        self.store_id = store_id
+        self.key = key
+        super().__init__(
+            f"External object {key} no longer exists in store {store_id}",
+            dbos_error_code=DBOSErrorCode.ExternalObjectMissing.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.store_id, self.key))
+
+
+class DBOSExternalObjectIntegrityError(DBOSException):
+    """Exception raised when an external object's stored bytes don't match its ref."""
+
+    def __init__(self, store_id: str, key: str, detail: str):
+        self.store_id = store_id
+        self.key = key
+        self.detail = detail
+        super().__init__(
+            f"External object {key} in store {store_id} does not match its ref: {detail}",
+            dbos_error_code=DBOSErrorCode.ExternalObjectIntegrity.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (self.__class__, (self.store_id, self.key, self.detail))
+
+
+class DBOSExternalStoreError(DBOSException):
+    """Exception raised when an external store call fails after the store's own retries; the store's error is its __cause__."""
+
+    def __init__(self, store_id: str, key: str, operation: str, detail: str):
+        self.store_id = store_id
+        self.key = key
+        self.operation = operation
+        self.detail = detail
+        super().__init__(
+            f"External store {store_id} failed to {operation} {key}: {detail}",
+            dbos_error_code=DBOSErrorCode.ExternalStoreFailed.value,
+        )
+
+    def __reduce__(self) -> Any:
+        return (
+            self.__class__,
+            (self.store_id, self.key, self.operation, self.detail),
+        )
+
+
+#######################################
+## BaseException
+#######################################
+
+
+class DBOSWorkflowCancelledError(DBOSBaseException):
+    """BaseException raised when the workflow has already been cancelled."""
+
+    def __init__(self, msg: str) -> None:
+        super().__init__(
+            msg,
+            dbos_error_code=DBOSErrorCode.WorkflowCancelled.value,
+        )
+
+
+class DBOSWorkflowSuspendedError(DBOSBaseException):
+    """BaseException raised by a suspend-mode recv or sleep once the workflow is parked in
+    the database. The execution must exit: a send on the topic, the recv timeout, or the end
+    of the sleep re-enqueues the workflow.
+    """
+
+    def __init__(
+        self,
+        workflow_id: str,
+        topic: Optional[str],
+        *,
+        awaited_workflow_ids: Sequence[str] = (),
+    ) -> None:
+        if len(awaited_workflow_ids) == 1:
+            waiting = f"awaiting the result of workflow {awaited_workflow_ids[0]}"
+        elif awaited_workflow_ids:
+            waiting = f"awaiting the first of {len(awaited_workflow_ids)} workflows"
+        elif topic is None:
+            waiting = "sleeping"
+        elif topic == "__null__topic__":
+            # A recv with no topic waits on the system database's null topic.
+            waiting = "waiting on a message with no topic"
+        else:
+            waiting = f"waiting on topic {topic}"
+        super().__init__(
+            f"Workflow {workflow_id} suspended {waiting}",
+            dbos_error_code=DBOSErrorCode.WorkflowSuspended.value,
+        )
+
+
+class DBOSWorkflowConflictIDError(DBOSBaseException):
+    """BaseException raised when an execution no longer owns its workflow, so it must stop and adopt the owner's outcome."""
+
+    def __init__(self, workflow_id: str):
+        super().__init__(
+            f"Workflow {workflow_id} is no longer owned by this execution",
+            dbos_error_code=DBOSErrorCode.ConflictingIDError.value,
+        )

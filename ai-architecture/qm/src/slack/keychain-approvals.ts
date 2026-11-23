@@ -1,0 +1,143 @@
+import type { SlackCoreClient } from "../api/slack-core-client.ts";
+import type { KeychainApprovalView } from "../credentials/keychain-approval.ts";
+import type { Directory } from "./directory.ts";
+import { parseBlockAction, parseInteractionBody } from "./payloads.ts";
+import { updateSlackMessage } from "./messaging.ts";
+import { escapeSlackText } from "./mrkdwn.ts";
+import { findPostedByKey, postWithVerify, slackReplyArgs } from "./delivery.ts";
+import { errMessage, swallowAs } from "../util/errors.ts";
+import { trimTrailingSlashes } from "../util/text.ts";
+import { slackButton } from "./approval-cards.ts";
+import {
+  KEYCHAIN_ACTION_IDS,
+  keychainButtons,
+  keychainCardWording,
+  keychainDecision,
+} from "../surfaces/approval-cards.ts";
+
+export function keychainApprovalMessage(
+  view: KeychainApprovalView,
+  originUrl?: string,
+): { text: string; blocks: Array<Record<string, unknown>> } {
+  const { ask } = view;
+  const place = `in ${escapeSlackText(view.conversation).replaceAll("|", "&#124;")}`;
+  const origin =
+    originUrl && /^https?:\/\//.test(originUrl)
+      ? `<${originUrl.replaceAll("|", "%7C").replaceAll(">", "%3E")}|${place}>`
+      : place;
+  const { pending, duration, status } = keychainCardWording(view);
+  const summary = `Use your *${escapeSlackText(view.service.slice(0, 150))}* credential ${origin}${duration}.`;
+  const text = pending
+    ? `Approval needed: use your ${view.service} credential in ${view.conversation}${duration}.`
+    : status;
+  const blocks: Array<Record<string, unknown>> = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `${pending ? ":lock: *Approval needed.*" : `*${status}*`}\n${summary}`,
+      },
+    },
+  ];
+  if (pending) {
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "Forwarded copy? Click the original message's timestamp above to approve or deny. Buttons only work on the original message.",
+        },
+      ],
+    });
+    blocks.push({
+      type: "actions",
+      block_id: `keychain_ask:${ask.id}`,
+      elements: keychainButtons(ask).map(slackButton),
+    });
+  }
+  return { text, blocks };
+}
+
+export async function keychainApprovalOrigin(
+  view: KeychainApprovalView,
+  client: any,
+  webUrl?: string,
+): Promise<string | undefined> {
+  if (view.slack) {
+    const result = await client.chat
+      .getPermalink({ channel: view.slack.channel, message_ts: view.slack.ts })
+      .catch(swallowAs("slack: approval origin link", null));
+    if (typeof result?.permalink === "string") return result.permalink;
+  }
+  if (!webUrl || !view.sessionId) return undefined;
+  const url = new URL(`${trimTrailingSlashes(webUrl)}/s/${encodeURIComponent(view.sessionId)}`);
+  if (view.seq !== undefined) url.searchParams.set("seq", String(view.seq));
+  return url.toString();
+}
+
+export async function deliverKeychainCard(
+  core: SlackCoreClient,
+  client: any,
+  delivery: { idempotencyKey?: string; destination: { keychainAskId?: string } },
+  channel: string,
+  threadTs: string | undefined,
+  webUrl?: string,
+): Promise<void> {
+  const id = delivery.destination.keychainAskId!;
+  const view = await core.keychainApprovals?.card(id);
+  if (!view) return;
+  const card = keychainApprovalMessage(view, await keychainApprovalOrigin(view, client, webUrl));
+  const key = `ask:${id}:notice`;
+  if (delivery.idempotencyKey === key) {
+    await postWithVerify(client, { ...slackReplyArgs(channel, card.text, threadTs), blocks: card.blocks }, key, {
+      verifyFirst: true,
+    });
+    return;
+  }
+  const where = { channel, ...(threadTs ? { thread_ts: threadTs } : {}) };
+  const posted = await findPostedByKey(client, where, key, String((view.ask.createdAt - 60_000) / 1000));
+  if (posted) await updateSlackMessage(client, channel, posted.ts, card.text, card.blocks);
+}
+
+export function registerKeychainApprovalActions(
+  app: { action(pattern: RegExp, handler: (args: any) => Promise<void>): void },
+  deps: { core: SlackCoreClient; directory: Directory; webUiPublicUrl?: string },
+): void {
+  app.action(/^keychain_/, async ({ ack, body, action, client }) => {
+    await ack();
+    const parsed = parseBlockAction(action, KEYCHAIN_ACTION_IDS);
+    const { clickerId, channel, messageTs } = parseInteractionBody(body);
+    if (!parsed || !clickerId) return;
+    const tell = async (text: string) => {
+      const sent = channel
+        ? await client.chat
+            .postEphemeral({ channel, user: clickerId, text })
+            .then(() => true)
+            .catch(swallowAs("slack: credential approval notice", false))
+        : false;
+      if (!sent) {
+        await client.chat
+          .postMessage({ channel: clickerId, text })
+          .catch(swallowAs("slack: credential approval notice dm", undefined));
+      }
+    };
+    if (!deps.core.keychainApprovals) {
+      await tell("Couldn't complete this approval: approvals aren't available right now. Try again shortly.");
+      return;
+    }
+    try {
+      const actor = await deps.directory.classifyActor(client, clickerId);
+      const decision = keychainDecision(parsed.actionId);
+      const view = await deps.core.keychainApprovals.decide(parsed.value, actor, decision);
+      const origin = await keychainApprovalOrigin(view, client, deps.webUiPublicUrl);
+      const card = keychainApprovalMessage(view, origin);
+      if (channel && messageTs) {
+        await updateSlackMessage(client, channel, messageTs, card.text, card.blocks);
+      } else {
+        await tell(card.text);
+      }
+    } catch (error) {
+      await tell(`Couldn't complete this approval: ${errMessage(error)} You can try the button again.`);
+    }
+  });
+}

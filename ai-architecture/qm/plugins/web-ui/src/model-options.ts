@@ -1,0 +1,149 @@
+import { getRuntimeConfig, type RuntimeConfig } from "./runtime-config-cache.ts";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { getBaseModel, type ModelMetadata } from "./pi-models.ts";
+
+export type ModelOptionValue = string;
+
+export function migrateStoredModelValue(value: string): string {
+  for (const prefix of ["pi:", "claude:"]) {
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
+  }
+  return value;
+}
+
+export interface ModelOption {
+  value: ModelOptionValue;
+  model: Model<Api>;
+  label: string;
+  buttonLabel: string;
+  groupLabel: string;
+  displayProvider?: string;
+}
+
+const PROVIDER_LABELS: Record<string, string> = {
+  "qm:gateway": "Gateway",
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  openrouter: "OpenRouter",
+  google: "Google",
+  "arcee-ai": "Arcee AI",
+  "meta-llama": "Meta",
+  mistralai: "Mistral AI",
+};
+
+function providerLabel(id: string, name: string, provider: string): string {
+  if (provider === "openrouter") {
+    const namedProvider = /^([^:]{2,40}):\s/.exec(name)?.[1]?.trim();
+    if (namedProvider) return namedProvider;
+  }
+  const key = provider === "openrouter" ? (id.split("/", 1)[0] ?? provider) : provider;
+  return (
+    PROVIDER_LABELS[key] ??
+    key
+      .split(/[-_]/)
+      .filter(Boolean)
+      .map((part) => part[0]!.toUpperCase() + part.slice(1))
+      .join(" ")
+  );
+}
+
+function gatewayPresentation(id: string, provider: string): { label: string; provider: string } | null {
+  if (provider !== "qm:gateway" || !id.startsWith("gateway/")) return null;
+  const name = id.split("/").at(-1)!;
+  const family = /^(claude|gpt|gemini)-(.+)$/.exec(name);
+  if (!family) return null;
+  const words = family[2]!.replace(/^((?:[a-z]+-)*)(\d+)-(\d+)(?=-|$)/, "$1$2.$3").split("-");
+  const title = words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+  const brand = {
+    claude: { prefix: "", provider: "anthropic" },
+    gpt: { prefix: "GPT-", provider: "openai" },
+    gemini: { prefix: "Gemini ", provider: "google" },
+  }[family[1] as "claude" | "gpt" | "gemini"];
+  return {
+    label: brand.prefix + title,
+    provider: brand.provider,
+  };
+}
+
+function buildOption(id: string, catalog: Readonly<Record<string, ModelMetadata>> = {}): ModelOption | null {
+  try {
+    const dynamic = catalog[id];
+    const meta = dynamic ? { label: dynamic.label, buttonLabel: dynamic.buttonLabel } : null;
+    if (!meta) return null;
+    const model = getBaseModel(id, dynamic);
+    const presentation = gatewayPresentation(id, String(model.provider));
+    return {
+      value: id,
+      model,
+      ...meta,
+      ...(presentation
+        ? {
+            label: [id, id.slice("gateway/".length)].includes(meta.label) ? presentation.label : meta.label,
+            buttonLabel: [id, id.slice("gateway/".length)].includes(meta.buttonLabel)
+              ? presentation.label
+              : meta.buttonLabel,
+            displayProvider: presentation.provider,
+          }
+        : {}),
+      groupLabel: providerLabel(
+        id,
+        meta.label,
+        presentation?.provider ?? dynamic?.provider ?? String(model?.provider ?? model?.api ?? "other"),
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function runtimeModelOptions(
+  ids: readonly string[],
+  catalog: Readonly<Record<string, ModelMetadata>> = {},
+): ModelOption[] {
+  const seen = new Set<string>();
+  const out: ModelOption[] = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const opt = buildOption(id, catalog);
+    if (opt) out.push(opt);
+  }
+  return out;
+}
+
+interface RuntimeOptions {
+  options: ModelOption[];
+  defaultValue: string | null;
+}
+
+const FALLBACK: RuntimeOptions = { options: [], defaultValue: null };
+const derived = new WeakMap<RuntimeConfig, RuntimeOptions>();
+
+function runtimeFor(scopeKey?: string | null): RuntimeOptions {
+  const config = getRuntimeConfig(scopeKey);
+  if (!config) return FALLBACK;
+  let options = derived.get(config);
+  if (!options) {
+    options = {
+      options: runtimeModelOptions(config.models, config.modelCatalog),
+      defaultValue: config.effective.modelId,
+    };
+    derived.set(config, options);
+  }
+  return options;
+}
+
+export function getModelOptions(scopeKey?: string | null): ModelOption[] {
+  return runtimeFor(scopeKey).options;
+}
+
+export function defaultModelValue(scopeKey?: string | null): ModelOptionValue {
+  return runtimeFor(scopeKey).defaultValue ?? "";
+}
+
+export function transcriptModel(scopeKey?: string | null): Model<Api> | undefined {
+  const { options, defaultValue } = runtimeFor(scopeKey);
+  return options.find((o) => o.value === defaultValue)?.model;
+}
+
+export { EFFORT_LEVELS, defaultEffortForModel, effortLabel, type EffortLevel } from "./runtime-capabilities.ts";

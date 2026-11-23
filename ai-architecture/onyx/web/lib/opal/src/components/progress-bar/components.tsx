@@ -1,0 +1,65 @@
+"use client";
+
+import "@opal/components/progress-bar/styles.css";
+import { cn } from "@opal/utils";
+import { useOpalStrings } from "@opal/strings";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type ProgressBarColor = "blue" | "green" | "amber" | "red" | "purple";
+
+const FILL_COLORS: Record<ProgressBarColor, string> = {
+  blue: "bg-theme-blue-05",
+  green: "bg-theme-green-05",
+  amber: "bg-theme-amber-05",
+  red: "bg-status-error-05",
+  purple: "bg-theme-purple-05",
+};
+
+interface ProgressBarProps {
+  value: number;
+  /** @default 100 */
+  max?: number;
+  /** @default "blue" */
+  color?: ProgressBarColor;
+  /** Accessible label. Defaults to the Opal progress label. */
+  "aria-label"?: string;
+  ref?: React.Ref<HTMLDivElement>;
+}
+
+// ---------------------------------------------------------------------------
+// ProgressBar
+// ---------------------------------------------------------------------------
+
+/** Determinate progress bar; fill fraction = value / max, clamped to [0, 1]. */
+function ProgressBar({
+  value,
+  max = 100,
+  color = "blue",
+  "aria-label": ariaLabel,
+  ref,
+}: ProgressBarProps) {
+  const strings = useOpalStrings();
+  const fraction = max > 0 ? Math.min(1, Math.max(0, value / max)) : 0;
+
+  return (
+    <div
+      ref={ref}
+      className="opal-progress-bar bg-background-tint-02"
+      role="progressbar"
+      aria-label={ariaLabel ?? strings.progress}
+      aria-valuenow={value}
+      aria-valuemin={0}
+      aria-valuemax={max}
+    >
+      <div
+        className={cn("opal-progress-bar-fill", FILL_COLORS[color])}
+        style={{ width: `${fraction * 100}%` }}
+      />
+    </div>
+  );
+}
+
+export { ProgressBar, type ProgressBarProps, type ProgressBarColor };

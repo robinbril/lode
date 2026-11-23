@@ -1,0 +1,1266 @@
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/hatchet-dev/hatchet/pkg/cleanup"
+	hatchetprom "github.com/hatchet-dev/hatchet/pkg/integrations/metrics/prometheus"
+
+	"github.com/hatchet-dev/hatchet/internal/msgqueue"
+	"github.com/hatchet-dev/hatchet/internal/services/admin"
+	adminv1 "github.com/hatchet-dev/hatchet/internal/services/admin/v1"
+	metricscontroller "github.com/hatchet-dev/hatchet/internal/services/controllers/metrics"
+	"github.com/hatchet-dev/hatchet/internal/services/controllers/olap"
+	"github.com/hatchet-dev/hatchet/internal/services/controllers/retention"
+	"github.com/hatchet-dev/hatchet/internal/services/controllers/task"
+	"github.com/hatchet-dev/hatchet/internal/services/dispatcher"
+	"github.com/hatchet-dev/hatchet/internal/services/grpc"
+	"github.com/hatchet-dev/hatchet/internal/services/grpcoperator"
+	"github.com/hatchet-dev/hatchet/internal/services/health"
+	"github.com/hatchet-dev/hatchet/internal/services/ingestor"
+	"github.com/hatchet-dev/hatchet/internal/services/otelcol"
+	"github.com/hatchet-dev/hatchet/internal/services/partition"
+	schedulerv1 "github.com/hatchet-dev/hatchet/internal/services/scheduler/v1"
+	streamssvc "github.com/hatchet-dev/hatchet/internal/services/streams"
+	"github.com/hatchet-dev/hatchet/internal/services/ticker"
+	"github.com/hatchet-dev/hatchet/pkg/config/loader"
+	"github.com/hatchet-dev/hatchet/pkg/config/server"
+	"github.com/hatchet-dev/hatchet/pkg/o11yusage"
+	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
+	"github.com/hatchet-dev/hatchet/pkg/repository/cache"
+	"github.com/hatchet-dev/hatchet/pkg/telemetry"
+
+	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
+)
+
+type Teardown struct {
+	Name string
+	Fn   func() error
+}
+
+func init() {
+	svcName := os.Getenv("SERVER_OTEL_SERVICE_NAME")
+	collectorURL := os.Getenv("SERVER_OTEL_COLLECTOR_URL")
+	insecure := os.Getenv("SERVER_OTEL_INSECURE")
+	traceIdRatio := os.Getenv("SERVER_OTEL_TRACE_ID_RATIO")
+	collectorAuth := os.Getenv("SERVER_OTEL_COLLECTOR_AUTH")
+
+	var insecureBool bool
+
+	if insecureStr := strings.ToLower(strings.TrimSpace(insecure)); insecureStr == "t" || insecureStr == "true" {
+		insecureBool = true
+	}
+
+	// we do this to we get the tracer set globally, which is needed by some of the otel
+	// integrations for the database before start
+	_, err := telemetry.InitTracer(&telemetry.TracerOpts{
+		ServiceName:   svcName,
+		CollectorURL:  collectorURL,
+		TraceIdRatio:  traceIdRatio,
+		Insecure:      insecureBool,
+		CollectorAuth: collectorAuth,
+	})
+
+	if err != nil {
+		panic(fmt.Errorf("could not initialize tracer: %w", err))
+	}
+
+	// Initialize the meter provider for metrics
+	_, err = telemetry.InitMeter(&telemetry.TracerOpts{
+		ServiceName:   svcName,
+		CollectorURL:  collectorURL,
+		Insecure:      insecureBool,
+		CollectorAuth: collectorAuth,
+	})
+
+	if err != nil {
+		panic(fmt.Errorf("could not initialize meter: %w", err))
+	}
+}
+
+func Run(
+	ctx context.Context,
+	cf *loader.ConfigLoader,
+	version string,
+	overrides ...loader.ServerConfigFileOverride,
+) error {
+
+	serverCleanup, server, err := cf.CreateServerFromConfig(version, overrides...)
+	if err != nil {
+		return fmt.Errorf("could not load server config: %w", err)
+	}
+
+	var l = server.Logger
+	cleanup := cleanup.New(l)
+
+	err = RunWithConfig(ctx, server, &cleanup)
+	cleanup.Add(serverCleanup, "server")
+	cleanup.Add(server.Disconnect, "database")
+
+	if err != nil {
+		// a start step failed, or observed the context being cancelled while
+		// the engine was still starting. Run the cleanups registered so far
+		// before reporting the error; otherwise the pools, queue channels and
+		// background goroutines of a partially started engine outlive Run. A
+		// component whose own Start failed registered nothing and is left to
+		// the process exit
+		return errors.Join(fmt.Errorf("could not run with config: %w", err), cleanup.Run())
+	}
+
+	l.Debug().Msgf("interrupt received, shutting down")
+
+	err = cleanup.Run()
+	if err != nil {
+		return err
+	}
+
+	l.Debug().Msgf("successfully shutdown")
+
+	return nil
+}
+
+func RunWithConfig(ctx context.Context, sc *server.ServerConfig, cleanup *cleanup.Cleanup) error {
+	if err := syncEventKeyWorkflows(sc, cleanup); err != nil {
+		return err
+	}
+
+	isV1 := sc.HasService("all") || sc.HasService("scheduler") || sc.HasService("controllers") || sc.HasService("grpc-api")
+
+	if isV1 {
+		return runV1Config(ctx, sc, cleanup)
+	}
+	return runV0Config(ctx, sc, cleanup)
+}
+
+// syncEventKeyWorkflows keeps each engine's cached lists of the workflows an event key triggers
+// in step with workflow versions created on any engine. This engine announces every version it
+// creates, and drops a tenant's cached lists whenever any engine announces one for the tenant.
+func syncEventKeyWorkflows(sc *server.ServerConfig, cleanup *cleanup.Cleanup) error {
+	sc.V1.Workflows().RegisterVersionCreatedCallback(func(ctx context.Context, tenantId uuid.UUID) {
+		msg := &msgqueue.Message{ID: msgqueue.MsgIDWorkflowVersionCreated, TenantID: tenantId}
+
+		// Off the registration request: a stalled broker can block a publish past its context,
+		// and other engines receive the announcement asynchronously either way.
+		go func() {
+			pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+
+			if err := sc.PubSubV1.Pub(pubCtx, msgqueue.WorkflowVersionCreatedTopic(), msg); err != nil {
+				sc.Logger.Warn().Ctx(pubCtx).Err(err).Msg("could not announce new workflow version")
+			}
+		}()
+	})
+
+	unsub, err := sc.PubSubV1.Sub(msgqueue.WorkflowVersionCreatedTopic(), func(msg *msgqueue.Message) error {
+		sc.V1.Triggers().InvalidateEventKeyWorkflows(msg.TenantID)
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("could not subscribe to new workflow versions: %w", err)
+	}
+
+	cleanup.Add(unsub, "workflow version subscription")
+
+	return nil
+}
+
+// startO11yUsage returns a func, for the caller to defer, that registers the final flush after
+// every cleanup the caller registers, since the services stopped by those still add bytes.
+func startO11yUsage(sc *server.ServerConfig, cleanup *cleanup.Cleanup) (*o11yusage.Aggregator, func()) {
+	if sc.O11yUsageFlush == nil {
+		return nil, func() {}
+	}
+
+	agg := o11yusage.NewAggregator(sc.Logger, sc.Runtime.O11yUsageFlushInterval, sc.O11yUsageFlush)
+	agg.Start()
+
+	return agg, func() { cleanup.Add(agg.Shutdown, "o11y-usage") }
+}
+
+func runV0Config(ctx context.Context, sc *server.ServerConfig, cleanup *cleanup.Cleanup) (err error) {
+	var l = sc.Logger
+	o11yUsage, registerO11yUsageShutdown := startO11yUsage(sc, cleanup)
+	defer registerO11yUsageShutdown()
+
+	telemetryShutdown, err := telemetry.InitTracer(&telemetry.TracerOpts{
+		ServiceName:   sc.OpenTelemetry.ServiceName,
+		CollectorURL:  sc.OpenTelemetry.CollectorURL,
+		TraceIdRatio:  sc.OpenTelemetry.TraceIdRatio,
+		Insecure:      sc.OpenTelemetry.Insecure,
+		CollectorAuth: sc.OpenTelemetry.CollectorAuth,
+	})
+	if err != nil {
+		return fmt.Errorf("could not initialize tracer: %w", err)
+	}
+
+	var healthCleanup func() error
+
+	// On a successful start the health and telemetry cleanups are registered
+	// last, so that probes report not-ready for the whole teardown. A start
+	// that fails after they are up never reaches that registration, so it is
+	// done here; otherwise the health listener outlives the engine and holds
+	// its port against the next engine to start.
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		if healthCleanup != nil {
+			cleanup.Add(healthCleanup, "health")
+		}
+
+		cleanup.Add(telemetryShutdown, "telemetry")
+	}()
+
+	if sc.Prometheus.Enabled {
+		cleanup.Add(
+			hatchetprom.StartServer(l, sc.Prometheus.Address, sc.Prometheus.Path),
+			"prometheus",
+		)
+	}
+
+	p, err := partition.NewPartition(l, sc.V1.Tenant())
+
+	if err != nil {
+		return fmt.Errorf("could not create partitioner: %w", err)
+	}
+
+	p.AddCleanupMethods(cleanup)
+
+	var h *health.Health
+	healthProbes := sc.HasService("health")
+	if healthProbes {
+		h = health.New(sc.V1.Health(), sc.MessageQueueV1, sc.Version, l)
+		cleanupHealth, err := h.Start(sc.Runtime.HealthcheckPort)
+		if err != nil {
+			return fmt.Errorf("could not start health: %w", err)
+		}
+		healthCleanup = cleanupHealth
+	}
+
+	var localScheduler *schedulerv1.Scheduler
+
+	// FIXME: jobscontroller and workflowscontroller are deprecated service names, but there's not a clear upgrade
+	// path for old config files.
+	if sc.HasService("queue") || sc.HasService("jobscontroller") || sc.HasService("workflowscontroller") || sc.HasService("retention") || sc.HasService("ticker") {
+		partitionCleanup, err := p.StartControllerPartition(ctx)
+		if err != nil {
+			return fmt.Errorf("could not create rebalance controller partitions job: %w", err)
+		}
+
+		cleanup.Add(
+			partitionCleanup,
+			"controller partition",
+		)
+
+		schedulePartitionCleanup, err := p.StartSchedulerPartition(ctx)
+
+		if err != nil {
+			return fmt.Errorf("could not create create scheduler partition: %w", err)
+		}
+
+		cleanup.Add(
+			schedulePartitionCleanup,
+			"scheduler partition",
+		)
+
+		sv1, err := schedulerv1.New(
+			schedulerv1.WithAlerter(sc.Alerter),
+			schedulerv1.WithMessageQueue(sc.MessageQueueV1),
+			schedulerv1.WithPubSub(sc.PubSubV1),
+			schedulerv1.WithRepository(sc.V1),
+			schedulerv1.WithLogger(sc.Logger),
+			schedulerv1.WithPartition(p),
+			schedulerv1.WithQueueLoggerConfig(&sc.AdditionalLoggers.Queue),
+			schedulerv1.WithSchedulerPool(sc.SchedulingPoolV1),
+			schedulerv1.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create scheduler (v1): %w", err)
+		}
+
+		cleanupScheduler, err := sv1.Start()
+
+		if err != nil {
+			return fmt.Errorf("could not start scheduler (v1): %w", err)
+		}
+
+		cleanup.Add(
+			cleanupScheduler,
+			"schedulerv1",
+		)
+
+		localScheduler = sv1
+	}
+
+	if sc.HasService("ticker") {
+		t, err := ticker.New(
+			ticker.WithMessageQueueV1(sc.MessageQueueV1),
+			ticker.WithPubSub(sc.PubSubV1),
+			ticker.WithRepositoryV1(sc.V1),
+			ticker.WithLogger(sc.Logger),
+			ticker.WithTenantAlerter(sc.TenantAlerter),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create ticker: %w", err)
+		}
+
+		cleanupTicker, err := t.Start()
+		if err != nil {
+			return fmt.Errorf("could not start ticker: %w", err)
+		}
+		cleanup.Add(
+			cleanupTicker,
+			"ticker",
+		)
+	}
+
+	if sc.HasService("queue") || sc.HasService("jobscontroller") || sc.HasService("workflowscontroller") {
+		retention, err := corePartitionRetention(sc)
+
+		if err != nil {
+			return err
+		}
+
+		tasks, err := task.New(
+			task.WithAlerter(sc.Alerter),
+			task.WithMessageQueue(sc.MessageQueueV1),
+			task.WithPubSub(sc.PubSubV1),
+			task.WithV1Repository(sc.V1),
+			task.WithLogger(sc.Logger),
+			task.WithPartition(p),
+			task.WithQueueLoggerConfig(&sc.AdditionalLoggers.Queue),
+			task.WithPgxStatsLoggerConfig(&sc.AdditionalLoggers.PgxStats),
+			task.WithMaxRetryAfter(retention),
+			task.WithAnalyzeCronInterval(sc.CronOperations.TaskAnalyzeCronInterval),
+			task.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create tasks controller: %w", err)
+		}
+
+		cleanupTasks, err := tasks.Start()
+
+		if err != nil {
+			return fmt.Errorf("could not start tasks controller: %w", err)
+		}
+
+		cleanup.Add(
+			cleanupTasks,
+			"tasks controller",
+		)
+
+		sizeLimits := v1.StatusUpdateBatchSizeLimits{
+			Task: int32(sc.OLAPStatusUpdates.TaskBatchSizeLimit), // #nosec G115 -- admin-configured server setting, not attacker-controlled
+			DAG:  int32(sc.OLAPStatusUpdates.DagBatchSizeLimit),  // #nosec G115 -- admin-configured server setting, not attacker-controlled
+		}
+
+		olap, err := olap.New(
+			olap.WithAlerter(sc.Alerter),
+			olap.WithMessageQueue(sc.MessageQueueV1),
+			olap.WithPubSub(sc.PubSubV1),
+			olap.WithRepository(sc.V1),
+			olap.WithLogger(sc.Logger),
+			olap.WithPartition(p),
+			olap.WithTenantAlertManager(sc.TenantAlerter),
+			olap.WithSamplingConfig(sc.Sampling),
+			olap.WithOperationsConfig(sc.Operations),
+			olap.WithAnalyzeCronInterval(sc.CronOperations.OLAPAnalyzeCronInterval),
+			olap.WithOLAPStatusUpdateBatchSizeLimits(sizeLimits),
+			olap.WithMQQos(sc.Operations.OLAPMQQos),
+			olap.WithMaxRequeueCount(sc.MQMaxDeathCount),
+			olap.WithPrometheusGate(sc.PrometheusGate),
+			olap.WithAuditLogOutbox(sc.AuditLogOutbox),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create olap controller: %w", err)
+		}
+
+		cleanupOlap, err := olap.Start()
+
+		if err != nil {
+			return fmt.Errorf("could not start olap controller: %w", err)
+		}
+
+		cleanup.Add(
+			cleanupOlap,
+			"olap controller",
+		)
+	}
+
+	if sc.HasService("retention") {
+		rc, err := retention.New(
+			retention.WithAlerter(sc.Alerter),
+			retention.WithRepository(sc.V1),
+			retention.WithLogger(sc.Logger),
+			retention.WithTenantAlerter(sc.TenantAlerter),
+			retention.WithPartition(p),
+			retention.WithDataRetention(sc.EnableDataRetention),
+			retention.WithWorkerRetention(sc.EnableWorkerRetention),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create retention controller: %w", err)
+		}
+
+		cleanupRetention, err := rc.Start()
+		if err != nil {
+			return fmt.Errorf("could not start retention controller: %w", err)
+		}
+
+		cleanup.Add(
+			cleanupRetention,
+			"retention controller",
+		)
+	}
+
+	if sc.HasService("grpc") {
+		cacheInstance := cache.New(10 * time.Second)
+
+		// create the dispatcher
+		d, err := dispatcher.New(
+			dispatcher.WithAlerter(sc.Alerter),
+			dispatcher.WithMessageQueueV1(sc.MessageQueueV1),
+			dispatcher.WithPubSub(sc.PubSubV1),
+			dispatcher.WithRepositoryV1(sc.V1),
+			dispatcher.WithLogger(sc.Logger),
+			dispatcher.WithCache(cacheInstance),
+			dispatcher.WithPayloadSizeThreshold(sc.Runtime.GRPCMaxMsgSize),
+			dispatcher.WithDefaultMaxWorkerLockAcquisitionTime(sc.Runtime.GRPCMaxWorkerLockAcquisitionTime),
+			dispatcher.WithWorkflowRunBufferSize(sc.Runtime.WorkflowRunBufferSize),
+			dispatcher.WithStreamEventBufferTimeout(sc.Runtime.StreamEventBufferTimeout),
+			dispatcher.WithVersion(sc.Version),
+			dispatcher.WithAnalytics(sc.Analytics),
+			dispatcher.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create dispatcher: %w", err)
+		}
+
+		dispatcherCleanup, err := d.Start()
+		if err != nil {
+			return fmt.Errorf("could not start dispatcher: %w", err)
+		}
+
+		// create the event ingestor
+		ei, err := ingestor.NewIngestor(
+			ingestor.WithMessageQueueV1(sc.MessageQueueV1),
+			ingestor.WithPubSub(sc.PubSubV1),
+			ingestor.WithRepositoryV1(sc.V1),
+			ingestor.WithLogIngestionEnabled(sc.Runtime.LogIngestionEnabled),
+			ingestor.WithLocalScheduler(localScheduler),
+			ingestor.WithLocalDispatcher(d),
+			ingestor.WithOptimisticSchedulingEnabled(sc.Runtime.OptimisticSchedulingEnabled),
+			ingestor.WithGrpcTriggersEnabled(sc.Runtime.GRPCTriggerWritesEnabled),
+			ingestor.WithGrpcTriggerSlots(sc.Runtime.GRPCTriggerWriteSlots),
+			ingestor.WithAnalytics(sc.Analytics),
+			ingestor.WithPrometheusGate(sc.PrometheusGate),
+			ingestor.WithO11yUsage(o11yUsage),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create ingestor: %w", err)
+		}
+
+		adminSvc, err := admin.NewAdminService(
+			admin.WithRepositoryV1(sc.V1),
+			admin.WithMessageQueueV1(sc.MessageQueueV1),
+			admin.WithPubSub(sc.PubSubV1),
+			admin.WithLocalScheduler(localScheduler),
+			admin.WithLocalDispatcher(d),
+			admin.WithOptimisticSchedulingEnabled(sc.Runtime.OptimisticSchedulingEnabled),
+			admin.WithGrpcTriggersEnabled(sc.Runtime.GRPCTriggerWritesEnabled),
+			admin.WithGrpcTriggerSlots(sc.Runtime.GRPCTriggerWriteSlots),
+			admin.WithAnalytics(sc.Analytics),
+			admin.WithPrometheusGate(sc.PrometheusGate),
+		)
+		if err != nil {
+			return fmt.Errorf("could not create admin service: %w", err)
+		}
+
+		adminv1Svc, err := adminv1.NewAdminService(
+			adminv1.WithRepository(sc.V1),
+			adminv1.WithMessageQueue(sc.MessageQueueV1),
+			adminv1.WithPubSub(sc.PubSubV1),
+			adminv1.WithAnalytics(sc.Analytics),
+			adminv1.WithLocalScheduler(localScheduler),
+			adminv1.WithLocalDispatcher(d),
+			adminv1.WithOptimisticSchedulingEnabled(sc.Runtime.OptimisticSchedulingEnabled),
+			adminv1.WithGrpcTriggersEnabled(sc.Runtime.GRPCTriggerWritesEnabled),
+			adminv1.WithGrpcTriggerSlots(sc.Runtime.GRPCTriggerWriteSlots),
+			adminv1.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create admin service (v1): %w", err)
+		}
+
+		// the operators this dispatcher claims are hosted in process, on the local
+		// dispatcher, from here; the v0 engine serves no durable streams
+		operators, err := startOperatorClaimer(sc, d, adminv1Svc, nil)
+
+		if err != nil {
+			return fmt.Errorf("could not start operator claimer: %w", err)
+		}
+
+		grpcOpts := []grpc.ServerOpt{
+			grpc.WithConfig(sc),
+			grpc.WithIngestor(ei),
+			grpc.WithDispatcher(d),
+			grpc.WithDispatcherV1(d.V1()),
+			grpc.WithAdmin(adminSvc),
+			grpc.WithAdminV1(adminv1Svc),
+			grpc.WithLogger(sc.Logger),
+			grpc.WithAlerter(sc.Alerter),
+			grpc.WithTLSConfig(sc.TLSConfig),
+			grpc.WithPort(sc.Runtime.GRPCPort),
+			grpc.WithBindAddress(sc.Runtime.GRPCBindAddress),
+			grpc.WithShutdownTimeout(sc.Runtime.GRPCShutdownTimeout),
+		}
+
+		if sc.Observability.Enabled {
+			oc, err := otelcol.NewOTelCollector(
+				otelcol.WithRepository(sc.V1),
+				otelcol.WithLogger(sc.Logger),
+				otelcol.WithMaxBatchSize(sc.Observability.MaxBatchSize),
+				otelcol.WithAnalytics(sc.Analytics),
+				otelcol.WithO11yUsage(o11yUsage),
+			)
+
+			if err != nil {
+				return fmt.Errorf("could not create otel collector: %w", err)
+			}
+
+			grpcOpts = append(grpcOpts, grpc.WithOTelCollector(oc))
+		}
+
+		if sc.Runtime.GRPCInsecure {
+			grpcOpts = append(grpcOpts, grpc.WithInsecure())
+		}
+
+		var operatorSvc *grpcoperator.OperatorServiceImpl
+
+		if sc.Runtime.GRPCOperatorsEnabled {
+			operatorSvc, err = grpcoperator.New(
+				grpcoperator.WithDispatcher(d),
+				grpcoperator.WithRepository(sc.V1),
+				grpcoperator.WithLogger(sc.Logger),
+				grpcoperator.WithAnalytics(sc.Analytics),
+				grpcoperator.WithValidator(sc.Validator),
+				grpcoperator.WithMaxListenStreamsPerOperator(sc.Runtime.GRPCOperatorMaxListenStreamsPerOperator),
+				grpcoperator.WithMaxActionsPerOperator(sc.Runtime.GRPCOperatorMaxActionsPerOperator),
+			)
+
+			if err != nil {
+				return fmt.Errorf("could not create grpc operator service: %w", err)
+			}
+
+			grpcOpts = append(grpcOpts, grpc.WithOperatorService(operatorSvc))
+		}
+
+		// the in-engine serverless operator opens its sessions on the same in-process host; it
+		// is a no-op unless enabled
+		stopServerlessOperator, err := startServerlessOperator(sc, d, operators.host)
+
+		if err != nil {
+			return fmt.Errorf("could not start serverless operator: %w", err)
+		}
+
+		// create the grpc server
+		s, err := grpc.NewServer(
+			grpcOpts...,
+		)
+		if err != nil {
+			return fmt.Errorf("could not create grpc server: %w", err)
+		}
+
+		grpcServerCleanup, err := s.Start()
+		if err != nil {
+			return fmt.Errorf("could not start grpc server: %w", err)
+		}
+
+		cleanupGrpcApi := func() error {
+			// flag this dispatcher as leaving first, so other dispatchers start claiming its
+			// operators now rather than after the drain, and it claims nothing more itself
+			if err := d.MarkDraining(context.Background()); err != nil {
+				l.Error().Err(err).Msg("could not mark dispatcher as draining; its operators are handed over when it is deleted instead")
+			}
+
+			// the serverless operator closes its registrations (and deactivates their workers)
+			// before the dispatcher drains, while events can still be reported
+			if err := stopServerlessOperator(); err != nil {
+				return err
+			}
+
+			// the claimed operators are paused, drained and closed next, for the same reason
+			if err := operators.stop(); err != nil {
+				return err
+			}
+
+			// hang up long-lived subscriber streams first so that GracefulStop does not
+			// block on them until the pod is killed
+			d.CancelStreamSessions()
+
+			g := new(errgroup.Group)
+
+			g.Go(func() error {
+				err := dispatcherCleanup()
+				if err != nil {
+					return fmt.Errorf("failed to cleanup dispatcher: %w", err)
+				}
+
+				cacheInstance.Stop()
+				return nil
+			})
+
+			g.Go(func() error {
+				if err := adminSvc.Cleanup(); err != nil {
+					return fmt.Errorf("failed to cleanup admin service: %w", err)
+				}
+				if err := adminv1Svc.Cleanup(); err != nil {
+					return fmt.Errorf("failed to cleanup adminv1 service: %w", err)
+				}
+				if operatorSvc != nil {
+					if err := operatorSvc.Cleanup(); err != nil {
+						return fmt.Errorf("failed to cleanup grpc operator service: %w", err)
+					}
+				}
+				if err := ei.Cleanup(); err != nil {
+					return fmt.Errorf("failed to cleanup ingestor: %w", err)
+				}
+				return nil
+			})
+
+			g.Go(func() error {
+				err := grpcServerCleanup()
+				if err != nil {
+					return fmt.Errorf("failed to cleanup GRPC server: %w", err)
+				}
+				return nil
+			})
+
+			if err := g.Wait(); err != nil {
+				return fmt.Errorf("could not teardown grpc dispatcher: %w", err)
+			}
+
+			return nil
+		}
+
+		cleanup.Add(
+			cleanupGrpcApi,
+			"grpc",
+		)
+	}
+
+	// the health server is shut down as late as possible so that readiness and
+	// liveness probes (and the load balancer health check) observe the not-ready
+	// state for the entire teardown
+	if healthCleanup != nil {
+		cleanup.Add(healthCleanup, "health")
+	}
+
+	cleanup.Add(
+		telemetryShutdown,
+		"telemetry",
+	)
+
+	l.Debug().Msgf("engine has started")
+
+	<-ctx.Done()
+
+	if healthProbes {
+		h.SetShuttingDown(true)
+	}
+
+	return nil
+}
+
+func runV1Config(ctx context.Context, sc *server.ServerConfig, cleanup *cleanup.Cleanup) (err error) {
+	var l = sc.Logger
+	o11yUsage, registerO11yUsageShutdown := startO11yUsage(sc, cleanup)
+	defer registerO11yUsageShutdown()
+
+	telemetryShutdown, err := telemetry.InitTracer(&telemetry.TracerOpts{
+		ServiceName:   sc.OpenTelemetry.ServiceName,
+		CollectorURL:  sc.OpenTelemetry.CollectorURL,
+		TraceIdRatio:  sc.OpenTelemetry.TraceIdRatio,
+		Insecure:      sc.OpenTelemetry.Insecure,
+		CollectorAuth: sc.OpenTelemetry.CollectorAuth,
+	})
+	if err != nil {
+		return fmt.Errorf("could not initialize tracer: %w", err)
+	}
+
+	var healthCleanup func() error
+
+	// On a successful start the health and telemetry cleanups are registered
+	// last, so that probes report not-ready for the whole teardown. A start
+	// that fails after they are up never reaches that registration, so it is
+	// done here; otherwise the health listener outlives the engine and holds
+	// its port against the next engine to start.
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		if healthCleanup != nil {
+			cleanup.Add(healthCleanup, "health")
+		}
+
+		cleanup.Add(telemetryShutdown, "telemetry")
+	}()
+
+	if sc.Prometheus.Enabled {
+		cleanup.Add(hatchetprom.StartServer(l, sc.Prometheus.Address, sc.Prometheus.Path), "prometheus")
+	}
+
+	p, err := partition.NewPartition(l, sc.V1.Tenant())
+
+	if err != nil {
+		return fmt.Errorf("could not create partitioner: %w", err)
+	}
+
+	p.AddCleanupMethods(cleanup)
+
+	healthProbes := sc.Runtime.Healthcheck
+	var h *health.Health
+
+	if healthProbes {
+		h = health.New(sc.V1.Health(), sc.MessageQueueV1, sc.Version, l)
+
+		clean, err := h.Start(sc.Runtime.HealthcheckPort)
+
+		if err != nil {
+			return fmt.Errorf("could not start health: %w", err)
+		}
+		healthCleanup = clean
+	}
+
+	if sc.HasService("all") || sc.HasService("controllers") {
+		partitionCleanup, err := p.StartControllerPartition(ctx)
+
+		if err != nil {
+			return fmt.Errorf("could not create rebalance controller partitions job: %w", err)
+		}
+
+		cleanup.Add(partitionCleanup, "partition controller")
+
+		t, err := ticker.New(
+			ticker.WithMessageQueueV1(sc.MessageQueueV1),
+			ticker.WithPubSub(sc.PubSubV1),
+			ticker.WithRepositoryV1(sc.V1),
+			ticker.WithLogger(sc.Logger),
+			ticker.WithTenantAlerter(sc.TenantAlerter),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create ticker: %w", err)
+		}
+
+		clean, err := t.Start()
+
+		if err != nil {
+			return fmt.Errorf("could not start ticker: %w", err)
+		}
+
+		cleanup.Add(clean, "ticker")
+
+		rc, err := retention.New(
+			retention.WithAlerter(sc.Alerter),
+			retention.WithRepository(sc.V1),
+			retention.WithLogger(sc.Logger),
+			retention.WithTenantAlerter(sc.TenantAlerter),
+			retention.WithPartition(p),
+			retention.WithDataRetention(sc.EnableDataRetention),
+			retention.WithWorkerRetention(sc.EnableWorkerRetention),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create retention controller: %w", err)
+		}
+
+		cleanupRetention, err := rc.Start()
+
+		if err != nil {
+			return fmt.Errorf("could not start retention controller: %w", err)
+		}
+		cleanup.Add(
+			cleanupRetention,
+			"retention controller",
+		)
+
+		if isControllerActive(sc.PausedControllers, TaskController) {
+			retention, err := corePartitionRetention(sc)
+
+			if err != nil {
+				return err
+			}
+
+			tasks, err := task.New(
+				task.WithAlerter(sc.Alerter),
+				task.WithMessageQueue(sc.MessageQueueV1),
+				task.WithPubSub(sc.PubSubV1),
+				task.WithV1Repository(sc.V1),
+				task.WithLogger(sc.Logger),
+				task.WithPartition(p),
+				task.WithQueueLoggerConfig(&sc.AdditionalLoggers.Queue),
+				task.WithPgxStatsLoggerConfig(&sc.AdditionalLoggers.PgxStats),
+				task.WithOpsPoolJitter(sc.Operations),
+				task.WithReplayEnabled(sc.Runtime.ReplayEnabled),
+				task.WithMaxRetryAfter(retention),
+				task.WithAnalyzeCronInterval(sc.CronOperations.TaskAnalyzeCronInterval),
+				task.WithPrometheusGate(sc.PrometheusGate),
+			)
+
+			if err != nil {
+				return fmt.Errorf("could not create tasks controller: %w", err)
+			}
+
+			cleanupTasks, err := tasks.Start()
+
+			if err != nil {
+				return fmt.Errorf("could not start tasks controller: %w", err)
+			}
+			cleanup.Add(
+				cleanupTasks,
+				"task controller",
+			)
+		}
+
+		if isControllerActive(sc.PausedControllers, OLAPController) {
+			sizeLimits := v1.StatusUpdateBatchSizeLimits{
+				Task: int32(sc.OLAPStatusUpdates.TaskBatchSizeLimit), // #nosec G115 -- admin-configured server setting, not attacker-controlled
+				DAG:  int32(sc.OLAPStatusUpdates.DagBatchSizeLimit),  // #nosec G115 -- admin-configured server setting, not attacker-controlled
+			}
+
+			olap, err := olap.New(
+				olap.WithAlerter(sc.Alerter),
+				olap.WithMessageQueue(sc.MessageQueueV1),
+				olap.WithPubSub(sc.PubSubV1),
+				olap.WithRepository(sc.V1),
+				olap.WithLogger(sc.Logger),
+				olap.WithPartition(p),
+				olap.WithTenantAlertManager(sc.TenantAlerter),
+				olap.WithSamplingConfig(sc.Sampling),
+				olap.WithOperationsConfig(sc.Operations),
+				olap.WithPrometheusMetricsEnabled(sc.Prometheus.Enabled),
+				olap.WithAnalyzeCronInterval(sc.CronOperations.OLAPAnalyzeCronInterval),
+				olap.WithOLAPStatusUpdateBatchSizeLimits(sizeLimits),
+				olap.WithMQQos(sc.Operations.OLAPMQQos),
+				olap.WithMaxRequeueCount(sc.MQMaxDeathCount),
+				olap.WithPrometheusGate(sc.PrometheusGate),
+				olap.WithAuditLogOutbox(sc.AuditLogOutbox),
+			)
+
+			if err != nil {
+				return fmt.Errorf("could not create olap controller: %w", err)
+			}
+
+			cleanupOlap, err := olap.Start()
+
+			if err != nil {
+				return fmt.Errorf("could not start olap controller: %w", err)
+			}
+
+			cleanup.Add(
+				cleanupOlap,
+				"olap controller",
+			)
+		}
+
+		cleanupTenantWorkerPartition, err := p.StartTenantWorkerPartition(ctx)
+
+		if err != nil {
+			return fmt.Errorf("could not create rebalance controller partitions job: %w", err)
+		}
+		cleanup.Add(
+			cleanupTenantWorkerPartition,
+			"tenant worker partition",
+		)
+
+		if sc.OpenTelemetry.MetricsEnabled && sc.OpenTelemetry.CollectorURL != "" {
+			mc, err := metricscontroller.New(
+				metricscontroller.WithLogger(sc.Logger),
+				metricscontroller.WithRepository(sc.V1),
+				metricscontroller.WithAlerter(sc.Alerter),
+				metricscontroller.WithPartition(p),
+				metricscontroller.WithIntervals(sc.CronOperations),
+			)
+			if err != nil {
+				return fmt.Errorf("could not create metrics collector: %w", err)
+			}
+
+			cleanupMetrics, err := mc.Start()
+			if err != nil {
+				return fmt.Errorf("could not start metrics collector: %w", err)
+			}
+			cleanup.Add(
+				cleanupMetrics,
+				"metrics collector",
+			)
+
+			l.Info().Msg("metrics collector started")
+		}
+	}
+
+	var localScheduler *schedulerv1.Scheduler
+
+	if sc.HasService("all") || sc.HasService("scheduler") {
+		partitionCleanup, err := p.StartSchedulerPartition(ctx)
+
+		if err != nil {
+			return fmt.Errorf("could not create create scheduler partition: %w", err)
+		}
+
+		cleanup.Add(
+			partitionCleanup,
+			"scheduler partition",
+		)
+
+		sv1, err := schedulerv1.New(
+			schedulerv1.WithAlerter(sc.Alerter),
+			schedulerv1.WithMessageQueue(sc.MessageQueueV1),
+			schedulerv1.WithPubSub(sc.PubSubV1),
+			schedulerv1.WithRepository(sc.V1),
+			schedulerv1.WithLogger(sc.Logger),
+			schedulerv1.WithPartition(p),
+			schedulerv1.WithQueueLoggerConfig(&sc.AdditionalLoggers.Queue),
+			schedulerv1.WithSchedulerPool(sc.SchedulingPoolV1),
+			schedulerv1.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create scheduler (v1): %w", err)
+		}
+
+		schedulerCleanup, err := sv1.Start()
+
+		if err != nil {
+			return fmt.Errorf("could not start scheduler (v1): %w", err)
+		}
+
+		cleanup.Add(
+			schedulerCleanup,
+			"schedulerv1",
+		)
+
+		localScheduler = sv1
+	}
+
+	if sc.HasService("all") || sc.HasService("grpc-api") {
+		cacheInstance := cache.New(10 * time.Second)
+
+		// create the dispatcher
+		d, err := dispatcher.New(
+			dispatcher.WithAlerter(sc.Alerter),
+			dispatcher.WithMessageQueueV1(sc.MessageQueueV1),
+			dispatcher.WithPubSub(sc.PubSubV1),
+			dispatcher.WithRepositoryV1(sc.V1),
+			dispatcher.WithLogger(sc.Logger),
+			dispatcher.WithCache(cacheInstance),
+			dispatcher.WithPayloadSizeThreshold(sc.Runtime.GRPCMaxMsgSize),
+			dispatcher.WithDefaultMaxWorkerLockAcquisitionTime(sc.Runtime.GRPCMaxWorkerLockAcquisitionTime),
+			dispatcher.WithWorkflowRunBufferSize(sc.Runtime.WorkflowRunBufferSize),
+			dispatcher.WithStreamEventBufferTimeout(sc.Runtime.StreamEventBufferTimeout),
+			dispatcher.WithVersion(sc.Version),
+			dispatcher.WithAnalytics(sc.Analytics),
+			dispatcher.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create dispatcher: %w", err)
+		}
+
+		dispatcherCleanup, err := d.Start()
+
+		if err != nil {
+			return fmt.Errorf("could not start dispatcher: %w", err)
+		}
+
+		// create the event ingestor
+		ei, err := ingestor.NewIngestor(
+			ingestor.WithMessageQueueV1(sc.MessageQueueV1),
+			ingestor.WithPubSub(sc.PubSubV1),
+			ingestor.WithRepositoryV1(sc.V1),
+			ingestor.WithLogIngestionEnabled(sc.Runtime.LogIngestionEnabled),
+			ingestor.WithLocalScheduler(localScheduler),
+			ingestor.WithLocalDispatcher(d),
+			ingestor.WithOptimisticSchedulingEnabled(sc.Runtime.OptimisticSchedulingEnabled),
+			ingestor.WithGrpcTriggersEnabled(sc.Runtime.GRPCTriggerWritesEnabled),
+			ingestor.WithGrpcTriggerSlots(sc.Runtime.GRPCTriggerWriteSlots),
+			ingestor.WithAnalytics(sc.Analytics),
+			ingestor.WithPrometheusGate(sc.PrometheusGate),
+			ingestor.WithO11yUsage(o11yUsage),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create ingestor: %w", err)
+		}
+
+		adminSvc, err := admin.NewAdminService(
+			admin.WithRepositoryV1(sc.V1),
+			admin.WithMessageQueueV1(sc.MessageQueueV1),
+			admin.WithPubSub(sc.PubSubV1),
+			admin.WithLocalScheduler(localScheduler),
+			admin.WithLocalDispatcher(d),
+			admin.WithOptimisticSchedulingEnabled(sc.Runtime.OptimisticSchedulingEnabled),
+			admin.WithGrpcTriggersEnabled(sc.Runtime.GRPCTriggerWritesEnabled),
+			admin.WithGrpcTriggerSlots(sc.Runtime.GRPCTriggerWriteSlots),
+			admin.WithAnalytics(sc.Analytics),
+			admin.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create admin service: %w", err)
+		}
+
+		adminv1Svc, err := adminv1.NewAdminService(
+			adminv1.WithRepository(sc.V1),
+			adminv1.WithMessageQueue(sc.MessageQueueV1),
+			adminv1.WithPubSub(sc.PubSubV1),
+			adminv1.WithAnalytics(sc.Analytics),
+			adminv1.WithLocalScheduler(localScheduler),
+			adminv1.WithLocalDispatcher(d),
+			adminv1.WithOptimisticSchedulingEnabled(sc.Runtime.OptimisticSchedulingEnabled),
+			adminv1.WithGrpcTriggersEnabled(sc.Runtime.GRPCTriggerWritesEnabled),
+			adminv1.WithGrpcTriggerSlots(sc.Runtime.GRPCTriggerWriteSlots),
+			adminv1.WithPrometheusGate(sc.PrometheusGate),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create admin service (v1): %w", err)
+		}
+
+		streamsSvc, err := streamssvc.NewService(
+			streamssvc.WithPubSub(sc.PubSubV1),
+			streamssvc.WithRepositoryV1(sc.V1),
+			streamssvc.WithLogger(sc.Logger),
+			streamssvc.WithUsage(o11yUsage),
+			streamssvc.WithAnalytics(sc.Analytics),
+		)
+
+		if err != nil {
+			return fmt.Errorf("could not create streams service: %w", err)
+		}
+
+		// the operators this dispatcher claims are hosted in process, on the local
+		// dispatcher and streams service, from here
+		operators, err := startOperatorClaimer(sc, d, adminv1Svc, streamsSvc)
+
+		if err != nil {
+			return fmt.Errorf("could not start operator claimer: %w", err)
+		}
+
+		grpcOpts := []grpc.ServerOpt{
+			grpc.WithConfig(sc),
+			grpc.WithIngestor(ei),
+			grpc.WithDispatcher(d),
+			grpc.WithDispatcherV1(d.V1()),
+			grpc.WithAdmin(adminSvc),
+			grpc.WithAdminV1(adminv1Svc),
+			grpc.WithStreamsV1(streamsSvc),
+			grpc.WithLogger(sc.Logger),
+			grpc.WithAlerter(sc.Alerter),
+			grpc.WithTLSConfig(sc.TLSConfig),
+			grpc.WithPort(sc.Runtime.GRPCPort),
+			grpc.WithBindAddress(sc.Runtime.GRPCBindAddress),
+			grpc.WithShutdownTimeout(sc.Runtime.GRPCShutdownTimeout),
+		}
+
+		if sc.Observability.Enabled {
+			oc, err := otelcol.NewOTelCollector(
+				otelcol.WithRepository(sc.V1),
+				otelcol.WithLogger(sc.Logger),
+				otelcol.WithMaxBatchSize(sc.Observability.MaxBatchSize),
+				otelcol.WithAnalytics(sc.Analytics),
+				otelcol.WithO11yUsage(o11yUsage),
+			)
+
+			if err != nil {
+				return fmt.Errorf("could not create otel collector: %w", err)
+			}
+
+			grpcOpts = append(grpcOpts, grpc.WithOTelCollector(oc))
+		}
+
+		if sc.Runtime.GRPCInsecure {
+			grpcOpts = append(grpcOpts, grpc.WithInsecure())
+		}
+
+		var operatorSvc *grpcoperator.OperatorServiceImpl
+
+		if sc.Runtime.GRPCOperatorsEnabled {
+			operatorSvc, err = grpcoperator.New(
+				grpcoperator.WithDispatcher(d),
+				grpcoperator.WithRepository(sc.V1),
+				grpcoperator.WithLogger(sc.Logger),
+				grpcoperator.WithAnalytics(sc.Analytics),
+				grpcoperator.WithValidator(sc.Validator),
+				grpcoperator.WithMaxListenStreamsPerOperator(sc.Runtime.GRPCOperatorMaxListenStreamsPerOperator),
+				grpcoperator.WithMaxActionsPerOperator(sc.Runtime.GRPCOperatorMaxActionsPerOperator),
+			)
+
+			if err != nil {
+				return fmt.Errorf("could not create grpc operator service: %w", err)
+			}
+
+			grpcOpts = append(grpcOpts, grpc.WithOperatorService(operatorSvc))
+		}
+
+		// the in-engine serverless operator opens its sessions on the same in-process host; it
+		// is a no-op unless enabled
+		stopServerlessOperator, err := startServerlessOperator(sc, d, operators.host)
+
+		if err != nil {
+			return fmt.Errorf("could not start serverless operator: %w", err)
+		}
+
+		// create the grpc server
+		s, err := grpc.NewServer(
+			grpcOpts...,
+		)
+		if err != nil {
+			return fmt.Errorf("could not create grpc server: %w", err)
+		}
+
+		grpcServerCleanup, err := s.Start()
+		if err != nil {
+			return fmt.Errorf("could not start grpc server: %w", err)
+		}
+
+		grpcApiCleanup := func() error {
+			// flag this dispatcher as leaving first, so other dispatchers start claiming its
+			// operators now rather than after the drain, and it claims nothing more itself
+			if err := d.MarkDraining(context.Background()); err != nil {
+				l.Error().Err(err).Msg("could not mark dispatcher as draining; its operators are handed over when it is deleted instead")
+			}
+
+			// the serverless operator closes its registrations (and deactivates their workers)
+			// before the dispatcher drains, while events can still be reported
+			if err := stopServerlessOperator(); err != nil {
+				return err
+			}
+
+			// the claimed operators are paused, drained and closed next, for the same reason
+			if err := operators.stop(); err != nil {
+				return err
+			}
+
+			// hang up long-lived subscriber streams first so that GracefulStop does not
+			// block on them until the pod is killed
+			d.CancelStreamSessions()
+			streamsSvc.CancelStreamSessions()
+
+			g := new(errgroup.Group)
+
+			g.Go(func() error {
+				err := dispatcherCleanup()
+				if err != nil {
+					return fmt.Errorf("failed to cleanup dispatcher: %w", err)
+				}
+
+				cacheInstance.Stop()
+				return nil
+			})
+
+			g.Go(func() error {
+				if err := adminSvc.Cleanup(); err != nil {
+					return fmt.Errorf("failed to cleanup admin service: %w", err)
+				}
+				if err := adminv1Svc.Cleanup(); err != nil {
+					return fmt.Errorf("failed to cleanup adminv1 service: %w", err)
+				}
+				if operatorSvc != nil {
+					if err := operatorSvc.Cleanup(); err != nil {
+						return fmt.Errorf("failed to cleanup grpc operator service: %w", err)
+					}
+				}
+				if err := ei.Cleanup(); err != nil {
+					return fmt.Errorf("failed to cleanup ingestor: %w", err)
+				}
+				if err := streamsSvc.Cleanup(); err != nil {
+					return fmt.Errorf("failed to cleanup streams service: %w", err)
+				}
+				return nil
+			})
+
+			g.Go(func() error {
+				err := grpcServerCleanup()
+				if err != nil {
+					return fmt.Errorf("failed to cleanup GRPC server: %w", err)
+				}
+				return nil
+			})
+
+			if err := g.Wait(); err != nil {
+				return fmt.Errorf("could not teardown grpc dispatcher: %w", err)
+			}
+
+			return nil
+		}
+		cleanup.Add(
+			grpcApiCleanup,
+			"grpc",
+		)
+	}
+
+	// the health server is shut down as late as possible so that readiness and
+	// liveness probes (and the load balancer health check) observe the not-ready
+	// state for the entire teardown
+	if healthCleanup != nil {
+		cleanup.Add(healthCleanup, "health")
+	}
+
+	cleanup.Add(
+		telemetryShutdown,
+		"telemetry",
+	)
+
+	l.Debug().Msgf("engine has started")
+
+	<-ctx.Done()
+
+	if healthProbes {
+		h.SetShuttingDown(true)
+	}
+
+	return nil
+}
+
+type ControllerName string
+
+const (
+	OLAPController ControllerName = "olap"
+	TaskController ControllerName = "task"
+)
+
+func isControllerActive(pausedControllers map[string]bool, controllerName ControllerName) bool {
+	if isPaused, ok := pausedControllers[string(controllerName)]; !ok || !isPaused {
+		return true
+	}
+
+	return false
+}
+
+// corePartitionRetention caps task-requested retry delays, since a task's rows are dropped once its partition ages out.
+func corePartitionRetention(sc *server.ServerConfig) (time.Duration, error) {
+	retention, err := time.ParseDuration(sc.Runtime.Limits.CorePartitionRetentionOrDefault())
+
+	if err != nil {
+		return 0, fmt.Errorf("could not parse core partition retention: %w", err)
+	}
+
+	return retention, nil
+}

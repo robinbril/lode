@@ -1,0 +1,161 @@
+import json
+import re
+
+import httpx2
+import pytest
+from pytest_mock import MockerFixture
+
+from pydantic_ai import Agent
+from pydantic_ai._json_schema import InlineDefsJsonSchemaTransformer
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.profiles.deepseek import deepseek_model_profile
+from pydantic_ai.profiles.google import GoogleJsonSchemaTransformer, google_model_profile
+from pydantic_ai.profiles.meta import meta_model_profile
+from pydantic_ai.profiles.mistral import mistral_model_profile
+from pydantic_ai.profiles.openai import OpenAIJsonSchemaTransformer
+from pydantic_ai.profiles.qwen import qwen_model_profile
+
+from ..conftest import TestEnv, try_import
+
+with try_import() as imports_successful:
+    import openai
+
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.together import TogetherProvider
+
+
+pytestmark = [
+    pytest.mark.skipif(not imports_successful(), reason='openai not installed'),
+    pytest.mark.vcr,
+]
+
+
+def test_together_provider():
+    provider = TogetherProvider(api_key='api-key')
+    assert provider.name == 'together'
+    assert provider.base_url == 'https://api.together.xyz/v1'
+    assert isinstance(provider.client, openai.AsyncOpenAI)
+    assert provider.client.api_key == 'api-key'
+
+
+def test_together_provider_need_api_key(env: TestEnv) -> None:
+    env.remove('TOGETHER_API_KEY')
+    with pytest.raises(
+        UserError,
+        match=re.escape(
+            'Set the `TOGETHER_API_KEY` environment variable or pass it via `TogetherProvider(api_key=...)`'
+            ' to use the Together AI provider.'
+        ),
+    ):
+        TogetherProvider()
+
+
+def test_together_pass_openai_client() -> None:
+    openai_client = openai.AsyncOpenAI(api_key='api-key')
+    provider = TogetherProvider(openai_client=openai_client)
+    assert provider.client == openai_client
+
+
+def test_together_provider_model_profile(mocker: MockerFixture):
+    provider = TogetherProvider(api_key='api-key')
+
+    family_profiles = 'pydantic_ai.profiles._family._VENDOR_FAMILY_PROFILES'
+    deepseek_model_profile_mock = mocker.MagicMock(wraps=deepseek_model_profile)
+    meta_model_profile_mock = mocker.MagicMock(wraps=meta_model_profile)
+    qwen_model_profile_mock = mocker.MagicMock(wraps=qwen_model_profile)
+    mistral_model_profile_mock = mocker.MagicMock(wraps=mistral_model_profile)
+    google_model_profile_mock = mocker.MagicMock(wraps=google_model_profile)
+    mocker.patch.dict(
+        family_profiles,
+        {
+            'deepseek-ai': deepseek_model_profile_mock,
+            'meta-llama': meta_model_profile_mock,
+            'qwen': qwen_model_profile_mock,
+            'mistralai': mistral_model_profile_mock,
+            'google': google_model_profile_mock,
+        },
+    )
+
+    deepseek_profile = provider.model_profile('deepseek-ai/DeepSeek-R1')
+    deepseek_model_profile_mock.assert_called_with('deepseek-r1')
+    assert deepseek_profile is not None
+    assert deepseek_profile.get('json_schema_transformer', None) == OpenAIJsonSchemaTransformer
+    assert deepseek_profile.get('supports_forced_tool_choice', True) is True
+
+    deepseek_v4_profile = provider.model_profile('deepseek-ai/DeepSeek-V4-Flash-0731')
+    deepseek_model_profile_mock.assert_called_with('deepseek-v4-flash-0731')
+    assert deepseek_v4_profile is not None
+    assert deepseek_v4_profile.get('supports_forced_tool_choice', True) is False
+
+    meta_profile = provider.model_profile('meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8')
+    meta_model_profile_mock.assert_called_with('llama-4-maverick-17b-128e-instruct-fp8')
+    assert meta_profile is not None
+    assert meta_profile.get('json_schema_transformer', None) == InlineDefsJsonSchemaTransformer
+
+    qwen_profile = provider.model_profile('Qwen/QwQ-32B')
+    qwen_model_profile_mock.assert_called_with('qwq-32b')
+    assert qwen_profile is not None
+    assert qwen_profile.get('json_schema_transformer', None) == InlineDefsJsonSchemaTransformer
+
+    mistral_profile = provider.model_profile('mistralai/Devstral-Small-2505')
+    mistral_model_profile_mock.assert_called_with('devstral-small-2505')
+    assert mistral_profile is not None
+    assert mistral_profile.get('json_schema_transformer', None) == OpenAIJsonSchemaTransformer
+
+    google_profile = provider.model_profile('google/gemma-3-27b-it')
+    google_model_profile_mock.assert_called_with('gemma-3-27b-it')
+    assert google_profile is not None
+    assert google_profile.get('json_schema_transformer', None) == GoogleJsonSchemaTransformer
+
+    unknown_profile = provider.model_profile('unknown/model')
+    assert unknown_profile is not None
+    assert unknown_profile.get('json_schema_transformer', None) == OpenAIJsonSchemaTransformer
+
+    # A model name without a `/` must not crash (regression for the unguarded `split('/', 1)`
+    # unpack); it falls back to the OpenAI-compatible default like the other providers.
+    no_slash_profile = provider.model_profile('gpt-4o-mini')
+    assert no_slash_profile is not None
+    assert no_slash_profile.get('json_schema_transformer', None) == OpenAIJsonSchemaTransformer
+
+
+@pytest.mark.vcr(ignore_hosts=['api.together.xyz'])
+async def test_together_deepseek_v4_1_output_tool_forcing_falls_back_to_auto(allow_model_requests: None):
+    """Together restricts forcing for V4.1 as for V4, so the resolved output-tool forcing goes out as `'auto'`.
+
+    No Together key is available to record a cassette, so a mock transport answers and the request body is captured.
+    """
+    requests: list[httpx2.Request] = []
+    completion = {
+        'id': 'chatcmpl-1',
+        'object': 'chat.completion',
+        'created': 1700000000,
+        'model': 'deepseek-ai/DeepSeek-V4.1-Flash',
+        'choices': [
+            {
+                'index': 0,
+                'finish_reason': 'tool_calls',
+                'message': {
+                    'role': 'assistant',
+                    'tool_calls': [
+                        {
+                            'id': 'call_1',
+                            'type': 'function',
+                            'function': {'name': 'final_result', 'arguments': '{"response": 1}'},
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(200, json=completion)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        provider = TogetherProvider(api_key='test', http_client=http_client)
+        agent = Agent(OpenAIChatModel('deepseek-ai/DeepSeek-V4.1-Flash', provider=provider), output_type=int)
+        result = await agent.run('hi')
+
+    assert result.output == 1
+    assert json.loads(requests[0].content)['tool_choice'] == 'auto'

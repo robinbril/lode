@@ -1,0 +1,374 @@
+import {
+  keyKey,
+  workflowKey,
+  statusKey,
+  metadataKey,
+  idKey,
+  scopeKey,
+} from '../components/event-columns';
+import {
+  FilterOption,
+  TimeRangeConfig,
+} from '@/components/v1/molecules/data-table/data-table-toolbar';
+import { useRefetchInterval } from '@/contexts/refetch-interval-context';
+import useControlPlane from '@/hooks/use-control-plane';
+import { usePagination } from '@/hooks/use-pagination';
+import { useRetentionGate } from '@/hooks/use-retention-gate';
+import { useTenantDetails } from '@/hooks/use-tenant';
+import { useZodColumnFilters } from '@/hooks/use-zod-column-filters';
+import api, { queries, V1TaskStatus } from '@/lib/api';
+import { withPolling } from '@/lib/api/polling';
+import { useSearchParams } from '@/lib/router-helpers';
+import {
+  defaultTimeWindowForRetention,
+  getRetentionBoundary,
+  isBeforeRetention,
+  isTimeWindowOutsideRetention,
+  largestAllowedTimeWindow,
+  TIME_WINDOW_HOURS,
+  TIME_WINDOW_PRESETS,
+  type TimeWindowPreset,
+} from '@/lib/utils/retention';
+import { appRoutes } from '@/router';
+import { useQuery } from '@tanstack/react-query';
+import { useParams } from '@tanstack/react-router';
+import { useCallback, useEffect, useMemo } from 'react';
+import { z } from 'zod';
+
+const eventStatusFilters: FilterOption[] = [
+  { value: V1TaskStatus.COMPLETED, label: 'Succeeded' },
+  { value: V1TaskStatus.FAILED, label: 'Failed' },
+  { value: V1TaskStatus.RUNNING, label: 'Running' },
+  { value: V1TaskStatus.QUEUED, label: 'Queued' },
+  { value: V1TaskStatus.CANCELLED, label: 'Cancelled' },
+];
+
+type UseEventsProps = {
+  key: string;
+};
+
+type TimeWindow = TimeWindowPreset;
+
+const TIME_KEY = 'events-time';
+
+const timeSchema = z.object({
+  tw: z.enum(TIME_WINDOW_PRESETS).default('1d'),
+  since: z.string().optional(),
+  until: z.string().optional(),
+});
+
+type TimeState = z.infer<typeof timeSchema>;
+
+function getSinceFromTimeWindow(tw: TimeWindow): string {
+  return new Date(
+    Date.now() - TIME_WINDOW_HOURS[tw] * 60 * 60 * 1000,
+  ).toISOString();
+}
+
+const eventFilterSchema = z
+  .object({
+    k: z.array(z.string()).default([]), // keys
+    w: z.array(z.string()).default([]), // workflow ids
+    s: z.array(z.string()).default([]), // scopes
+    st: z.array(z.nativeEnum(V1TaskStatus)).default([]), // statuses
+    m: z.array(z.string()).default([]), // metadata
+    i: z.array(z.string()).default([]), // event ids
+  })
+  .default({});
+
+export const useEvents = ({ key }: UseEventsProps) => {
+  const { tenant: tenantId } = useParams({ from: appRoutes.tenantRoute.to });
+  const { tenant } = useTenantDetails();
+  const retentionPeriod = tenant?.dataRetentionPeriod;
+  const retentionGate = useRetentionGate(retentionPeriod);
+  const { refetchInterval } = useRefetchInterval();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Time range state
+  const timeState = useMemo<TimeState>(() => {
+    const raw = searchParams.get(TIME_KEY);
+    try {
+      return timeSchema.parse(raw ? JSON.parse(raw) : {});
+    } catch {
+      return timeSchema.parse({});
+    }
+  }, [searchParams]);
+
+  const setTimeState = useCallback(
+    (update: Partial<TimeState>) => {
+      setSearchParams((prev) => ({
+        ...Object.fromEntries(prev.entries()),
+        [TIME_KEY]: JSON.stringify({ ...timeState, ...update }),
+      }));
+    },
+    [timeState, setSearchParams],
+  );
+
+  const timeWindow = timeState.tw;
+  const isCustomTimeRange = !!timeState.since;
+
+  const since = useMemo(
+    () => timeState.since ?? getSinceFromTimeWindow(timeState.tw),
+    [timeState.since, timeState.tw],
+  );
+
+  const until = timeState.until;
+
+  const setTimeWindow = useCallback(
+    (tw: TimeWindow) => {
+      retentionGate.tryTimeWindow(tw, () => {
+        setSearchParams((prev) => ({
+          ...Object.fromEntries(prev.entries()),
+          [TIME_KEY]: JSON.stringify({
+            tw,
+            since: undefined,
+            until: undefined,
+          }),
+        }));
+      });
+    },
+    [setSearchParams, retentionGate],
+  );
+
+  const setCustomTimeRange = useCallback(
+    (newSince: string, newUntil: string) => {
+      retentionGate.trySince(newSince, () => {
+        setTimeState({ since: newSince, until: newUntil });
+      });
+    },
+    [setTimeState, retentionGate],
+  );
+
+  useEffect(() => {
+    if (!retentionPeriod) {
+      return;
+    }
+    if (
+      timeState.since &&
+      isBeforeRetention(timeState.since, retentionPeriod)
+    ) {
+      const boundary = getRetentionBoundary(retentionPeriod);
+      if (boundary) {
+        setTimeState({ since: boundary.toISOString() });
+      }
+      return;
+    }
+    if (
+      !timeState.since &&
+      isTimeWindowOutsideRetention(timeState.tw, retentionPeriod)
+    ) {
+      const next = largestAllowedTimeWindow(retentionPeriod);
+      setSearchParams((prev) => ({
+        ...Object.fromEntries(prev.entries()),
+        [TIME_KEY]: JSON.stringify({
+          tw: next,
+          since: undefined,
+          until: undefined,
+        }),
+      }));
+    }
+  }, [
+    retentionPeriod,
+    timeState.since,
+    timeState.tw,
+    setTimeState,
+    setSearchParams,
+  ]);
+
+  const clearTimeRange = useCallback(() => {
+    setSearchParams((prev) => {
+      const next = Object.fromEntries(prev.entries());
+      delete next[TIME_KEY];
+      return next;
+    });
+  }, [setSearchParams]);
+
+  const paramKey = `events-${key}`;
+  const {
+    state: {
+      k: selectedKeys,
+      w: selectedWorkflowIds,
+      s: selectedScopes,
+      st: selectedStatuses,
+      m: selectedMetadata,
+      i: selectedEventIds,
+    },
+    columnFilters,
+    setColumnFilters,
+    resetFilters: resetColumnFilters,
+  } = useZodColumnFilters(eventFilterSchema, paramKey, {
+    k: keyKey,
+    w: workflowKey,
+    s: scopeKey,
+    st: statusKey,
+    m: metadataKey,
+    i: idKey,
+  });
+
+  const resetFilters = useCallback(() => {
+    resetColumnFilters();
+    clearTimeRange();
+  }, [resetColumnFilters, clearTimeRange]);
+
+  const hasActiveColumnFilters = columnFilters.length > 0;
+  const hasActiveFilters =
+    hasActiveColumnFilters || isCustomTimeRange || timeWindow !== '1d';
+  const isDefaultOneDayWindow =
+    !isCustomTimeRange &&
+    timeWindow === defaultTimeWindowForRetention(retentionPeriod);
+
+  const timeRangeConfig: TimeRangeConfig = useMemo(
+    () => ({
+      onTimeWindowChange: (value: string) => {
+        if (value !== 'custom') {
+          setTimeWindow(value as TimeWindow);
+        } else {
+          setCustomTimeRange(since, new Date().toISOString());
+        }
+      },
+      onCreatedAfterChange: (date?: string) => {
+        if (isCustomTimeRange && until) {
+          setCustomTimeRange(date ?? getSinceFromTimeWindow('1d'), until);
+        }
+      },
+      onFinishedBeforeChange: (date?: string) => {
+        if (isCustomTimeRange && since) {
+          setCustomTimeRange(since, date ?? new Date().toISOString());
+        }
+      },
+      onClearTimeRange: clearTimeRange,
+      onRetentionBlocked: retentionGate.blockSince,
+      currentTimeWindow: timeWindow,
+      isCustomTimeRange,
+      createdAfter: isCustomTimeRange ? since : undefined,
+      finishedBefore: until,
+      retentionPeriod,
+    }),
+    [
+      timeWindow,
+      isCustomTimeRange,
+      since,
+      until,
+      setTimeWindow,
+      setCustomTimeRange,
+      clearTimeRange,
+      retentionGate.blockSince,
+      retentionPeriod,
+    ],
+  );
+
+  const { limit, offset, pagination, setPagination, setPageSize } =
+    usePagination({
+      key,
+      resetPageOnChange: [
+        selectedKeys,
+        selectedWorkflowIds,
+        selectedScopes,
+        selectedStatuses,
+        selectedMetadata,
+        selectedEventIds,
+        since,
+        until,
+      ],
+    });
+
+  const { isSelfHosted } = useControlPlane();
+
+  const { data, isLoading, refetch, error, isRefetching, isPlaceholderData } =
+    useQuery({
+      ...withPolling(
+        queries.v1Events.list(
+          tenantId,
+          {
+            offset,
+            limit,
+            keys: selectedKeys,
+            since,
+            until,
+            eventIds: selectedEventIds,
+            workflowRunStatuses: selectedStatuses,
+            additionalMetadata: selectedMetadata,
+            workflowIds: selectedWorkflowIds,
+            scopes: selectedScopes,
+          },
+          isSelfHosted,
+        ),
+        selectedEventIds?.length ? false : refetchInterval,
+      ),
+      placeholderData: (prev) => prev,
+    });
+
+  const fetchTimedOut = data === 'timeout';
+  const events = (data !== 'timeout' ? data?.rows : undefined) ?? [];
+  const numEvents =
+    (data !== 'timeout' ? data?.pagination?.num_pages : undefined) ?? 1;
+
+  const { data: eventKeys, error: eventKeysError } = useQuery({
+    queryKey: ['v1:events:listKeys', tenantId],
+    queryFn: async () => {
+      const response = await api.v1EventKeyList(tenantId);
+      return response.data;
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const eventKeyFilters = useMemo((): FilterOption[] => {
+    return (
+      eventKeys?.rows?.map((key) => ({
+        value: key,
+        label: key,
+      })) || []
+    );
+  }, [eventKeys]);
+
+  const { data: workflowKeys, error: workflowKeysError } = useQuery({
+    ...queries.workflows.list(tenantId, { limit: 200 }),
+  });
+
+  const workflowKeyFilters = useMemo((): FilterOption[] => {
+    return (
+      workflowKeys?.rows?.map((key) => ({
+        value: key.metadata.id,
+        label: key.name,
+      })) || []
+    );
+  }, [workflowKeys]);
+
+  return {
+    events,
+    numEvents,
+    fetchTimedOut,
+    isLoading,
+    refetch,
+    error: error || eventKeysError || workflowKeysError,
+    pagination,
+    setPagination,
+    setPageSize,
+    columnFilters,
+    setColumnFilters,
+    selectedKeys,
+    selectedWorkflowIds,
+    selectedScopes,
+    selectedStatuses,
+    selectedMetadata,
+    selectedEventIds,
+    eventKeyFilters,
+    workflowKeyFilters,
+    workflowRunStatusFilters: eventStatusFilters,
+    isRefetching,
+    isPlaceholderData,
+    resetFilters,
+    // time range
+    since,
+    timeWindow,
+    isCustomTimeRange,
+    timeRangeConfig,
+    hasActiveFilters,
+    isDefaultOneDayWindow,
+    setTimeWindow,
+    searchAllRetainedHistory: () =>
+      setTimeWindow(largestAllowedTimeWindow(retentionPeriod)),
+    retentionPeriod,
+    retentionGate,
+  };
+};

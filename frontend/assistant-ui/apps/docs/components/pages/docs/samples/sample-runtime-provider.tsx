@@ -1,0 +1,86 @@
+"use client";
+
+import { useEffect, useRef, type ReactNode } from "react";
+import {
+  AssistantRuntimeProvider,
+  useAui,
+  type ChatModelAdapter,
+  type CreateAttachment,
+  type LocalRuntimeOptions,
+  type ThreadMessageLike,
+} from "@assistant-ui/react";
+import { SampleScope } from "./sample-scope";
+import { useSampleRuntime } from "./use-sample-runtime";
+
+const noOpAdapter: ChatModelAdapter = {
+  async *run() {
+    yield { content: [{ type: "text", text: "This is a demo." }] };
+  },
+};
+
+const CREATED_AT = new Date("2026-09-26T12:00:00Z");
+
+const defaultMessages: ThreadMessageLike[] = [
+  { role: "user", content: "What is assistant-ui?" },
+  {
+    role: "assistant",
+    content:
+      "assistant-ui is a set of React components for building AI chat interfaces. It provides unstyled primitives that handle state management, streaming, and accessibility; you bring the design.",
+  },
+];
+
+function useSeedAttachments(attachments: CreateAttachment[]) {
+  const aui = useAui();
+  const initialAttachments = useRef(attachments).current;
+  useEffect(() => {
+    for (const attachment of initialAttachments) {
+      aui.composer.addAttachment(attachment).catch(console.error);
+    }
+    return () => {
+      aui.composer.clearAttachments().catch(console.error);
+    };
+  }, [aui, initialAttachments]);
+}
+
+function SeedAttachments({ attachments }: { attachments: CreateAttachment[] }) {
+  useSeedAttachments(attachments);
+  return null;
+}
+
+type SampleRuntimeProviderProps = {
+  messages?: ThreadMessageLike[];
+  adapters?: LocalRuntimeOptions["adapters"];
+  initialAttachments?: CreateAttachment[];
+  children: ReactNode;
+};
+
+export function SampleRuntimeProvider(props: SampleRuntimeProviderProps) {
+  return (
+    <SampleScope>
+      <SampleRuntime {...props} />
+    </SampleScope>
+  );
+}
+
+function SampleRuntime({
+  messages = defaultMessages,
+  adapters,
+  initialAttachments,
+  children,
+}: SampleRuntimeProviderProps) {
+  const runtime = useSampleRuntime(noOpAdapter, {
+    initialMessages: messages.map((message) => ({
+      ...message,
+      createdAt: message.createdAt ?? CREATED_AT,
+    })),
+    adapters,
+  });
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      {initialAttachments && (
+        <SeedAttachments attachments={initialAttachments} />
+      )}
+      {children}
+    </AssistantRuntimeProvider>
+  );
+}

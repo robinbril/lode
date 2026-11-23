@@ -1,0 +1,90 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
+  "agentGuidance": false,
+  "globalPassThroughEnv": ["ENABLE_EXPERIMENTAL_COREPACK"],
+  "globalDependencies": [
+    "packages/x-buildutils/bin/**",
+    "packages/x-buildutils/package.json",
+    "packages/x-buildutils/src/**",
+    "!packages/x-buildutils/src/**/*.test.{ts,tsx}",
+    "packages/x-buildutils/ts/*.json",
+    "packages/x-buildutils/types/**"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        ".env*",
+        "!**/*.test.{ts,tsx}",
+        "!**/*.spec.{ts,tsx}",
+        "!**/__tests__/**",
+        "!vitest.peer-*.config.ts",
+        "!$TURBO_ROOT$/packages/*/README.md",
+        "!$TURBO_ROOT$/packages/*/CHANGELOG.md"
+      ],
+      "outputs": [
+        "dist/**",
+        ".next/**",
+        "!.next/cache/**",
+        "!.next/dev/**",
+        "generated/**",
+        ".output/**",
+        "build/**"
+      ],
+      "env": [
+        "OPENAI_*",
+        "ASSISTANT_*",
+        "JWT_*",
+        "ENTELLIGENCE_*",
+        "KV_*",
+        "SENTRY_*",
+        "ASSISTANT_*",
+        "AUIX_*"
+      ]
+    },
+    "lint": {},
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/vitest-waitfor-interval.mjs"
+      ]
+    },
+    "test:coverage": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/vitest-waitfor-interval.mjs"
+      ],
+      "outputs": ["coverage/**"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "test:peer-react18": {
+      "dependsOn": ["^build", "build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/vitest-waitfor-interval.mjs"
+      ]
+    },
+    "test:types:peer-react18": {
+      "dependsOn": ["^build", "build"]
+    },
+    "test:react-compiler": {
+      "dependsOn": ["build"]
+    },
+    "deploy": {
+      "dependsOn": ["build", "lint", "test"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "//#docs-source-inputs": {
+      "inputs": ["$TURBO_DEFAULT$"]
+    }
+  }
+}

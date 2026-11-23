@@ -1,0 +1,17 @@
+# Run the project's own black and isort, so commits format exactly as `pdm run black .` does.
+repos:
+  - repo: local
+    hooks:
+      - id: black
+        name: black
+        entry: pdm run black
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: isort
+        name: isort
+        entry: pdm run isort
+        language: system
+        types_or: [cython, pyi, python]
+        args: ["--filter-files"]
+        require_serial: true

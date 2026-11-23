@@ -1,0 +1,254 @@
+import "./support/auto-fake-sprites.ts";
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AddressInfo } from "node:net";
+import { createServer } from "../src/api/server.ts";
+import { buildApp } from "./support/build-app.ts";
+import { scopeId, type ScopeId } from "../src/types.ts";
+import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
+import { testConfig } from "./support/test-config.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+
+const SECRET = "discovery-test-secret".repeat(3);
+const ORG = scopeId("org", "default-org");
+
+async function start(swarmsEnabled = true) {
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "agent-apis-")),
+      signingSecret: SECRET,
+      swarmsEnabled,
+    }),
+  );
+  const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+    admin: built.admin,
+    memory: built.memory,
+    auditLog: built.auditLog,
+    signingSecret: SECRET,
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  return { base, built, close: () => new Promise<void>((r) => server.close(() => r())) };
+}
+
+const capFor = (
+  actorId: string,
+  opts: {
+    memory?: { write?: ScopeId; orgWrite?: ScopeId; read: ScopeId[] };
+    liveActor?: boolean;
+    liveAuthor?: boolean;
+    triggered?: boolean;
+    botActor?: boolean;
+  } = {},
+) =>
+  mintCapabilityToken(
+    {
+      actorId,
+      scopeId: scopeId("personal", actorId),
+      exp: Date.now() + CAPABILITY_TTL_MS,
+      ...(opts.memory ? { memory: opts.memory } : {}),
+      ...(opts.liveActor ? { liveActor: true } : {}),
+      ...(opts.liveAuthor ? { liveAuthor: true } : {}),
+      ...(opts.triggered ? { triggered: true } : {}),
+      ...(opts.botActor ? { botActor: true } : {}),
+    },
+    SECRET,
+  );
+
+const listApis = async (base: string, cap: string) => {
+  const res = await fetch(`${base}/v1/apis`, { headers: { "x-agent-capability": cap } });
+  return { status: res.status, body: (await res.json()) as any };
+};
+const paths = (body: any): string[] => body.endpoints.map((e: any) => e.path);
+
+test("discovery for a regular user: base surface + whoami, no admin rows, no memory rows without claims", async () => {
+  const s = await start();
+  try {
+    const { status, body } = await listApis(s.base, await capFor("U1"));
+    assert.equal(status, 200);
+    assert.deepEqual(body.admin, { isAdmin: false });
+    const p = paths(body);
+    assert.ok(p.includes("/v1/apis"));
+    assert.ok(!p.includes("/v1/crons"), "cron is a typed tool now, not a discovery row");
+    assert.ok(!p.includes("/v1/webhooks"), "webhook is a typed tool now, not a discovery row");
+    assert.ok(!p.includes("/v1/soul"), "soul is a typed tool now, not a discovery row");
+    assert.ok(p.includes("/v1/skills"), "saving a personal skill is a discoverable self-API endpoint");
+    assert.ok(p.includes("/v1/keychain/overview"), "the keychain overview gate is represented in discovery");
+    assert.ok(p.includes("/v1/admin/whoami"), "everyone can ask whether the user is an admin");
+    assert.ok(!p.includes("/v1/admin/scopes"), "admin rows must not render for a non-admin");
+    assert.ok(!p.some((x: string) => x.startsWith("/v1/memory")), "no memory rows without memory claims");
+    assert.doesNotMatch(JSON.stringify(body), /auto-grant/i);
+    assert.match(
+      body.endpoints.find((endpoint: any) => endpoint.path === "/v1/connectors/oauth/consent/mint")?.summary ?? "",
+      /stays private.*explicit credential grant/i,
+    );
+    assert.match(
+      body.endpoints.find((endpoint: any) => endpoint.path === "/v1/loops")?.summary ?? "",
+      /governor.*staleFireMs/,
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("discovery follows the token's memory claims, including the org selector", async () => {
+  const s = await start();
+  try {
+    const U1 = scopeId("personal", "U1");
+    const hasOrgSelector = (body: any) => body.endpoints.some((e: any) => e.summary.includes('"scope":"org"'));
+    const plain = await listApis(s.base, await capFor("U1", { memory: { write: U1, read: [U1] } }));
+    assert.ok(paths(plain.body).includes("/v1/memory/self"));
+    assert.ok(!hasOrgSelector(plain.body), "no org selector without orgWrite");
+
+    const org = await listApis(
+      s.base,
+      await capFor("admin-alice", {
+        memory: { write: scopeId("personal", "admin-alice"), orgWrite: ORG, read: [ORG] },
+      }),
+    );
+    assert.ok(hasOrgSelector(org.body), "orgWrite tokens see the org selector row");
+  } finally {
+    await s.close();
+  }
+});
+
+test("discovery for an org admin's LIVE turn includes the admin plane (live grant check), with guidance", async () => {
+  const s = await start();
+  try {
+    const { body } = await listApis(s.base, await capFor("admin-alice", { liveActor: true }));
+    assert.deepEqual(body.admin, { isAdmin: true, role: "org_admin" });
+    const p = paths(body);
+    assert.ok(p.includes("/v1/admin/scopes"));
+    assert.ok(p.includes("/v1/admin/users"));
+    assert.ok(!p.includes("/v1/admin/grants"), "grant management is portal-only and must not be advertised");
+    assert.ok(body.guidance.some((g: string) => g.includes("confirm before any mutation")));
+    assert.doesNotMatch(JSON.stringify(body), /DM only|only from a DM|bulk config imports require/);
+    assert.equal(p.filter((x: string) => x === "/v1/admin/whoami").length, 1, "whoami listed once, not duplicated");
+  } finally {
+    await s.close();
+  }
+});
+
+test("an admin's token carrying no person's authority is shown no admin plane — matching what the gate enforces", async () => {
+  const s = await start();
+  try {
+    for (const opts of [{}, { liveActor: true, botActor: true }]) {
+      const { body } = await listApis(s.base, await capFor("admin-alice", opts));
+      assert.equal(body.admin.isAdmin, true, "status is still reported truthfully");
+      const p = paths(body);
+      assert.ok(
+        !p.includes("/v1/admin/scopes"),
+        `no admin rows without a person's authority (${JSON.stringify(opts)})`,
+      );
+      assert.ok(p.includes("/v1/admin/whoami"), "introspection stays available");
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test("a cron fire (liveActor + triggered) discovers the full admin plane", async () => {
+  const s = await start();
+  try {
+    const cap = await capFor("admin-alice", { liveActor: true, triggered: true });
+    const { body } = await listApis(s.base, cap);
+    assert.deepEqual(body.admin, { isAdmin: true, role: "org_admin" });
+    const p = paths(body);
+    assert.ok(p.includes("/v1/admin/scopes"));
+    assert.ok(p.includes("/v1/admin/users"));
+    assert.ok(!p.includes("/v1/admin/grants"), "grant management stays portal-only");
+    assert.equal(p.filter((x: string) => x === "/v1/admin/whoami").length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test("discovery requires a capability token", async () => {
+  const s = await start();
+  try {
+    assert.equal((await fetch(`${s.base}/v1/apis`)).status, 401);
+  } finally {
+    await s.close();
+  }
+});
+
+test("discovery advertises the deployment share endpoint, with guidance", async () => {
+  const s = await start();
+  try {
+    const { body } = await listApis(s.base, await capFor("U1"));
+    const p = paths(body);
+    assert.ok(p.includes("/v1/shares/:type/:id"), "the share endpoint is discoverable");
+    assert.ok(p.includes("/v1/apps/:id/git-url"), "git-url stays discoverable");
+    assert.ok(p.includes("/v1/apps/:id"), "deployment detail is discoverable");
+    assert.ok(p.includes("/v1/apps/:id/restore"), "restore is discoverable");
+    assert.ok(
+      body.guidance.some((g: string) => g.includes("POST /v1/shares/deploy/:id") && g.includes('scope:"org"')),
+      "share guidance is present",
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("discovery includes admin routes for a verified human thread reply", async () => {
+  const s = await start();
+  try {
+    const { body } = await listApis(s.base, await capFor("admin-alice", { liveAuthor: true }));
+    const p = paths(body);
+    assert.ok(p.includes("/v1/admin/scopes/:scopeId/:resource"));
+    assert.equal(p.filter((path) => path === "/v1/admin/whoami").length, 1);
+    assert.equal(p.filter((path) => path === "/v1/admin/scopes").length, 1);
+    assert.ok(body.guidance.some((g: string) => g.includes("confirm before any mutation")));
+    assert.doesNotMatch(JSON.stringify(body), /DM only|only from a DM|bulk config imports require/);
+    const member = await listApis(s.base, await capFor("U1", { liveAuthor: true }));
+    assert.ok(!paths(member.body).includes("/v1/admin/scopes"));
+  } finally {
+    await s.close();
+  }
+});
+
+test("disabled swarms are absent from discovery and reject direct API calls", async () => {
+  const { base, built, close } = await start(false);
+  try {
+    assert.equal(built.app.swarms, undefined);
+    const token = await capFor("U1");
+    const { status, body } = await listApis(base, token);
+    assert.equal(status, 200);
+    assert.ok(!paths(body).includes("/v1/swarm"));
+    assert.ok(body.guidance.every((line: string) => !line.includes("Swarm")));
+    for (const method of ["GET", "POST"]) {
+      const response = await fetch(`${base}/v1/swarm`, {
+        method,
+        headers: { "x-agent-capability": token, "content-type": "application/json" },
+        ...(method === "POST"
+          ? { body: JSON.stringify({ action: "spawn", requestId: "disabled", text: "work" }) }
+          : {}),
+      });
+      assert.equal(response.status, 503);
+      assert.deepEqual(await response.json(), { error: "swarm service unavailable" });
+    }
+  } finally {
+    await close();
+  }
+});
+
+test("swarm routes are listed for internal people and hidden from callers the swarm API refuses", async () => {
+  const { base, built, close } = await start();
+  try {
+    const internal = await listApis(base, await capFor("U1"));
+    assert.ok(paths(internal.body).includes("/v1/swarm"));
+    await built.identity.deactivate("U2");
+    const refused = await listApis(base, await capFor("U2"));
+    assert.equal(refused.status, 200);
+    assert.ok(!paths(refused.body).includes("/v1/swarm"));
+    assert.ok(refused.body.guidance.every((line: string) => !line.includes("Swarm")));
+  } finally {
+    await close();
+  }
+});

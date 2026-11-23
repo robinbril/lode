@@ -1,0 +1,283 @@
+from typing import cast
+from unittest.mock import MagicMock, patch
+
+from onyx.access.models import DocumentAccess
+from onyx.configs.constants import DocumentSource
+from onyx.connectors.models import Document, TextSection
+from onyx.document_index.interfaces import IndexingMetadata, TenantState
+from onyx.document_index.opensearch.opensearch_document_index import (
+    OpenSearchDocumentIndex,
+)
+from onyx.indexing.models import ChunkEmbedding, DocMetadataAwareIndexChunk
+
+
+def _make_chunk(
+    doc_id: str,
+    chunk_id: int,
+) -> DocMetadataAwareIndexChunk:
+    """Creates a minimal DocMetadataAwareIndexChunk for testing."""
+    doc = Document(
+        id=doc_id,
+        sections=[TextSection(text="test", link="http://test.com")],
+        source=DocumentSource.FILE,
+        semantic_identifier="test_doc",
+        metadata={},
+    )
+    access = DocumentAccess.build(
+        user_emails=[],
+        user_groups=[],
+        external_user_emails=[],
+        external_user_group_ids=[],
+        is_public=True,
+    )
+    return DocMetadataAwareIndexChunk(
+        chunk_id=chunk_id,
+        blurb="test",
+        content="test content",
+        source_links={0: "http://test.com"},
+        image_file_id=None,
+        section_continuation=False,
+        source_document=doc,
+        title_prefix="",
+        metadata_suffix_semantic="",
+        metadata_suffix_keyword="",
+        mini_chunk_texts=None,
+        large_chunk_id=None,
+        doc_summary="",
+        chunk_context="",
+        contextual_rag_reserved_tokens=0,
+        embeddings=ChunkEmbedding(full_embedding=[0.1] * 10, mini_chunk_embeddings=[]),
+        tenant_id="test_tenant",
+        access=access,
+        document_sets=set(),
+        user_project=[],
+        personas=[],
+        boost=0,
+        aggregated_chunk_boost_factor=1.0,
+        ancestor_hierarchy_node_ids=[],
+    )
+
+
+def _make_index() -> tuple[OpenSearchDocumentIndex, MagicMock]:
+    """Creates an OpenSearchDocumentIndex with a mocked client.
+    Returns the index and the mock for bulk_index_documents."""
+    mock_client = MagicMock()
+    mock_bulk = MagicMock()
+    mock_client.bulk_index_documents = mock_bulk
+    mock_client.delete_by_query.return_value = 0
+
+    tenant_state = TenantState(tenant_id="test_tenant", multitenant=False)
+
+    index = OpenSearchDocumentIndex.__new__(OpenSearchDocumentIndex)
+    index._index_name = "test_index"
+    index._client = mock_client
+    index._tenant_state = tenant_state
+
+    return index, mock_bulk
+
+
+def _make_metadata(doc_id: str, chunk_count: int) -> IndexingMetadata:
+    return IndexingMetadata(
+        doc_id_to_chunk_cnt_diff={
+            doc_id: IndexingMetadata.ChunkCounts(
+                old_chunk_cnt=0,
+                new_chunk_cnt=chunk_count,
+            ),
+        },
+    )
+
+
+@patch(
+    "onyx.document_index.opensearch.opensearch_document_index.MAX_CHUNKS_PER_DOC_BATCH",
+    100,
+)
+def test_single_doc_under_batch_limit_flushes_once() -> None:
+    """A document with fewer chunks than MAX_CHUNKS_PER_DOC_BATCH should flush once."""
+    index, mock_bulk = _make_index()
+    doc_id = "doc_1"
+    num_chunks = 50
+    chunks = [_make_chunk(doc_id, i) for i in range(num_chunks)]
+    metadata = _make_metadata(doc_id, num_chunks)
+
+    index.index(chunks, metadata)
+
+    assert mock_bulk.call_count == 1
+    batch_arg = mock_bulk.call_args_list[0]
+    assert len(batch_arg.kwargs["documents"]) == num_chunks
+
+
+@patch(
+    "onyx.document_index.opensearch.opensearch_document_index.MAX_CHUNKS_PER_DOC_BATCH",
+    100,
+)
+def test_single_doc_over_batch_limit_flushes_multiple_times() -> None:
+    """A document with more chunks than MAX_CHUNKS_PER_DOC_BATCH should flush multiple times."""
+    index, mock_bulk = _make_index()
+    doc_id = "doc_1"
+    num_chunks = 250
+    chunks = [_make_chunk(doc_id, i) for i in range(num_chunks)]
+    metadata = _make_metadata(doc_id, num_chunks)
+
+    index.index(chunks, metadata)
+
+    # 250 chunks / 100 per batch = 3 flushes (100 + 100 + 50)
+    assert mock_bulk.call_count == 3
+    batch_sizes = [len(call.kwargs["documents"]) for call in mock_bulk.call_args_list]
+    assert batch_sizes == [100, 100, 50]
+
+
+@patch(
+    "onyx.document_index.opensearch.opensearch_document_index.MAX_CHUNKS_PER_DOC_BATCH",
+    100,
+)
+def test_single_doc_exactly_at_batch_limit() -> None:
+    """A document with exactly MAX_CHUNKS_PER_DOC_BATCH chunks should flush once
+    (the flush happens on the next chunk, not at the boundary)."""
+    index, mock_bulk = _make_index()
+    doc_id = "doc_1"
+    num_chunks = 100
+    chunks = [_make_chunk(doc_id, i) for i in range(num_chunks)]
+    metadata = _make_metadata(doc_id, num_chunks)
+
+    index.index(chunks, metadata)
+
+    # 100 chunks hit the >= check on chunk 101 which doesn't exist,
+    # so final flush handles all 100
+    # Actually: the elif fires when len(current_chunks) >= 100, which happens
+    # when current_chunks has 100 items and the 101st chunk arrives.
+    # With exactly 100 chunks, the 100th chunk makes len == 99, then appended -> 100.
+    # No 101st chunk arrives, so the final flush handles all 100.
+    assert mock_bulk.call_count == 1
+
+
+@patch(
+    "onyx.document_index.opensearch.opensearch_document_index.MAX_CHUNKS_PER_DOC_BATCH",
+    100,
+)
+def test_single_doc_one_over_batch_limit() -> None:
+    """101 chunks for one doc: first 100 flushed when the 101st arrives, then
+    the 101st is flushed at the end."""
+    index, mock_bulk = _make_index()
+    doc_id = "doc_1"
+    num_chunks = 101
+    chunks = [_make_chunk(doc_id, i) for i in range(num_chunks)]
+    metadata = _make_metadata(doc_id, num_chunks)
+
+    index.index(chunks, metadata)
+
+    assert mock_bulk.call_count == 2
+    batch_sizes = [len(call.kwargs["documents"]) for call in mock_bulk.call_args_list]
+    assert batch_sizes == [100, 1]
+
+
+@patch(
+    "onyx.document_index.opensearch.opensearch_document_index.MAX_CHUNKS_PER_DOC_BATCH",
+    100,
+)
+def test_multiple_docs_under_limit_share_one_delete_and_one_bulk() -> None:
+    """Documents that fit in one group share one delete and one bulk call."""
+    index, mock_bulk = _make_index()
+    chunks = []
+    for doc_idx in range(3):
+        doc_id = f"doc_{doc_idx}"
+        chunks.extend(_make_chunk(doc_id, chunk_idx) for chunk_idx in range(30))
+
+    metadata = IndexingMetadata(
+        doc_id_to_chunk_cnt_diff={
+            f"doc_{i}": IndexingMetadata.ChunkCounts(old_chunk_cnt=0, new_chunk_cnt=30)
+            for i in range(3)
+        },
+    )
+
+    results = index.index(chunks, metadata)
+
+    assert mock_bulk.call_count == 1
+    assert len(mock_bulk.call_args.kwargs["documents"]) == 90
+    cast(MagicMock, index._client).delete_by_query.assert_called_once()
+    assert [r.document_id for r in results] == ["doc_0", "doc_1", "doc_2"]
+
+
+@patch(
+    "onyx.document_index.opensearch.opensearch_document_index.MAX_CHUNKS_PER_DOC_BATCH",
+    100,
+)
+def test_delete_called_once_per_document() -> None:
+    """Even with multiple flushes for a single document, delete should only be
+    called once per document."""
+    index, _mock_bulk = _make_index()
+    doc_id = "doc_1"
+    num_chunks = 250
+    chunks = [_make_chunk(doc_id, i) for i in range(num_chunks)]
+    metadata = _make_metadata(doc_id, num_chunks)
+
+    index.index(chunks, metadata)
+
+    mock_delete: MagicMock = cast(MagicMock, index._client).delete_by_query
+    mock_delete.assert_called_once()
+    query = mock_delete.call_args.args[0]
+    assert {"terms": {"document_id": [doc_id]}} in query["query"]["bool"]["filter"]
+
+
+def test_index_writes_all_enriched_source_types() -> None:
+    index, mock_bulk = _make_index()
+    chunk = _make_chunk("doc_1", 0).model_copy(
+        update={
+            "source_types": (
+                DocumentSource.WEB,
+                DocumentSource.GOOGLE_DRIVE,
+            )
+        }
+    )
+
+    index.index([chunk], _make_metadata("doc_1", 1))
+
+    indexed_chunk = mock_bulk.call_args.kwargs["documents"][0]
+    assert indexed_chunk.model_dump()["source_type"] == [
+        DocumentSource.GOOGLE_DRIVE.value,
+        DocumentSource.WEB.value,
+    ]
+
+
+@patch(
+    "onyx.document_index.opensearch.opensearch_document_index.MAX_CHUNKS_PER_DOC_BATCH",
+    100,
+)
+def test_doc_split_across_groups_is_deleted_once_before_its_first_write() -> None:
+    """A doc that spans two groups is deleted with the first group only, so
+    the second delete cannot remove the chunks the first bulk call wrote."""
+    index, mock_bulk = _make_index()
+    doc_ids = ["doc_0", "doc_1", "doc_2"]
+    chunks = [
+        _make_chunk(doc_id, chunk_idx) for doc_id in doc_ids for chunk_idx in range(60)
+    ]
+    metadata = IndexingMetadata(
+        doc_id_to_chunk_cnt_diff={
+            doc_id: IndexingMetadata.ChunkCounts(old_chunk_cnt=0, new_chunk_cnt=60)
+            for doc_id in doc_ids
+        },
+    )
+
+    results = index.index(chunks, metadata)
+
+    batch_sizes = [len(call.kwargs["documents"]) for call in mock_bulk.call_args_list]
+    assert batch_sizes == [100, 80]
+    mock_delete: MagicMock = cast(MagicMock, index._client).delete_by_query
+    deleted_per_call = [
+        next(
+            f["terms"]["document_id"]
+            for f in call.args[0]["query"]["bool"]["filter"]
+            if "terms" in f
+        )
+        for call in mock_delete.call_args_list
+    ]
+    # doc_1 is split: chunks 0-39 go in the first group, 40-59 in the second.
+    assert deleted_per_call == [["doc_0", "doc_1"], ["doc_2"]]
+    written = [
+        (chunk.document_id, chunk.chunk_index)
+        for call in mock_bulk.call_args_list
+        for chunk in call.kwargs["documents"]
+    ]
+    assert sorted(written) == sorted(
+        (doc_id, chunk_idx) for doc_id in doc_ids for chunk_idx in range(60)
+    )
+    assert [r.document_id for r in results] == doc_ids

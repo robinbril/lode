@@ -1,0 +1,78 @@
+import { NewOrganizationSaverForm } from '@/components/forms/new-organization-saver-form';
+import { SetupCard, SetupScreen } from '@/components/layout/setup-card';
+import { Button } from '@/components/v1/ui/button';
+import { queries } from '@/lib/api';
+import { useUserApi } from '@/lib/api/user-wrapper';
+import freeEmailDomains from '@/lib/free-email-domains.json';
+import { reloadToLogin, useRedirectOrNavigate } from '@/lib/redirect';
+import { useAppContext } from '@/providers/app-context';
+import queryClient from '@/query-client';
+import { appRoutes } from '@/router';
+import { useMutation } from '@tanstack/react-query';
+
+const FREE_EMAIL_DOMAIN_SET = new Set(freeEmailDomains);
+
+function deriveDefaultOrgName(user: { name?: string; email: string }): string {
+  const domain = user.email.split('@')[1]?.toLowerCase();
+
+  if (domain && !FREE_EMAIL_DOMAIN_SET.has(domain)) {
+    return domain.toLowerCase();
+  }
+
+  return user.name || '';
+}
+
+export default function CreateOrganization() {
+  const redirectOrNavigate = useRedirectOrNavigate();
+  const { userUpdateLogoutMutation } = useUserApi();
+  const { user, isUserLoaded } = useAppContext();
+
+  const logoutMutation = useMutation({
+    ...userUpdateLogoutMutation(),
+    onSettled: () => {
+      reloadToLogin();
+    },
+  });
+
+  if (!isUserLoaded) {
+    return <></>;
+  }
+
+  return (
+    <SetupScreen
+      topRight={
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => logoutMutation.mutate()}
+          disabled={logoutMutation.isPending}
+        >
+          Sign out
+        </Button>
+      }
+    >
+      <SetupCard
+        title="Set up your workspace"
+        description="Create your organization and first workspace to get started with Hatchet."
+      >
+        <NewOrganizationSaverForm
+          askAttribution
+          defaultOrganizationName={user ? deriveDefaultOrgName(user) : ''}
+          defaultTenantName="development"
+          afterSave={({ tenant }) => {
+            void queryClient
+              .prefetchQuery(queries.controlPlane.subscriptionPlans())
+              .catch(() => {
+                // Ignore prefetch errors; subscription plans will be fetched on demand if needed.
+              });
+            return redirectOrNavigate({
+              to: appRoutes.tenantOnboardingRoute.to,
+              params: { tenant: tenant.id },
+              replace: true,
+            });
+          }}
+        />
+      </SetupCard>
+    </SetupScreen>
+  );
+}

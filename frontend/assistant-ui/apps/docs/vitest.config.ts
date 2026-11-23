@@ -1,0 +1,116 @@
+import { fileURLToPath } from "node:url";
+import { existsSync, readdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { defaultExclude } from "vitest/config";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// The tsconfig paths resolve `@/components/ui/*` to base first and radix second.
+const uiRoot = resolve(__dirname, "../../packages/ui/src/components/react/ui");
+const radixOnlyUi = Object.fromEntries(
+  readdirSync(resolve(uiRoot, "radix"))
+    .map((file) => file.replace(/\.tsx?$/, ""))
+    .filter(
+      (name) =>
+        !existsSync(resolve(uiRoot, "base", `${name}.tsx`)) &&
+        !existsSync(resolve(uiRoot, "base", `${name}.ts`)),
+    )
+    .map((name) => [`@/components/ui/${name}`, resolve(uiRoot, "radix", name)]),
+);
+
+export default {
+  // Vite rejects Next's string-valued PostCSS plugins; DOM tests do not assert transformed styles.
+  css: { postcss: { plugins: [] } },
+  test: {
+    coverage: {
+      include: [
+        "app/**/*.{ts,tsx}",
+        "components/**/*.{ts,tsx}",
+        "hooks/**/*.{ts,tsx}",
+        "lib/**/*.{ts,tsx,mjs}",
+        "runtimes/**/*.{ts,tsx}",
+        "instrumentation.ts",
+        "instrumentation-client.ts",
+        "proxy.ts",
+        "mdx-components.tsx",
+      ],
+      exclude: [
+        "lib/xulux/learn/courses/*/shared/**",
+        "lib/xulux/learn/courses/*/stages/**",
+      ],
+      thresholds: {
+        lines: 35,
+        functions: 27,
+        branches: 31,
+        statements: 34,
+        autoUpdate: (threshold: number, previous: number) =>
+          Math.max(previous, Math.floor(threshold) - 1),
+      },
+    },
+    environment: "node",
+    pool: "threads",
+    fsModuleCache: true,
+    globals: true,
+    setupFiles: ["./test/setup.ts"],
+    // The generated repo source tree is a verbatim copy of the monorepo, and
+    // vitest discovers dotted directories, so its tests would be collected here.
+    exclude: [...defaultExclude, "generated/.repo-source/**"],
+    // Extensionless next imports in aui-auth's ESM build only resolve once vitest transforms it.
+    server: { deps: { inline: ["aui-auth"] } },
+  },
+  resolve: {
+    alias: {
+      "@assistant-ui/ui": resolve(__dirname, "../../packages/ui/src"),
+      "server-only": resolve(__dirname, "./test/server-only"),
+      // Keep in step with the tsconfig paths: packages/ui ships stock shadcn
+      // sidebars importing this bare alias, and it resolves outside this app.
+      "@/hooks/use-copy-to-clipboard": resolve(
+        __dirname,
+        "../../packages/ui/src/hooks/use-copy-to-clipboard",
+      ),
+      "@/hooks/use-mobile": resolve(
+        __dirname,
+        "../../packages/ui/src/hooks/use-mobile",
+      ),
+      "@/hooks/use-attachment-src": resolve(
+        __dirname,
+        "../../packages/ui/src/hooks/use-attachment-src",
+      ),
+      "@/components/ui/context-menu": resolve(
+        __dirname,
+        "../../packages/ui/src/components/react/ui/radix/context-menu",
+      ),
+      "@/components/ui/hover-card": resolve(
+        __dirname,
+        "../../packages/ui/src/components/react/ui/radix/hover-card",
+      ),
+      ...radixOnlyUi,
+      "@/components/ui": resolve(
+        __dirname,
+        "../../packages/ui/src/components/react/ui/base",
+      ),
+      "@/components/assistant-ui/markdown-text": resolve(
+        __dirname,
+        "./components/assistant-ui/markdown-text",
+      ),
+      "@/components/assistant-ui": resolve(
+        __dirname,
+        "../../packages/ui/src/components/react/assistant-ui",
+      ),
+      "@/components/icons/discord": resolve(
+        __dirname,
+        "../../packages/ui/src/components/react/icons/discord",
+      ),
+      "@/components/icons/github": resolve(
+        __dirname,
+        "../../packages/ui/src/components/react/icons/github",
+      ),
+      "@/components/icons/grok": resolve(
+        __dirname,
+        "../../packages/ui/src/components/react/icons/grok",
+      ),
+      "@/lib/utils": resolve(__dirname, "../../packages/ui/src/lib/utils"),
+      "@": resolve(__dirname),
+    },
+  },
+};

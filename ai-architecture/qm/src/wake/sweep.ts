@@ -1,0 +1,43 @@
+import { createSweeper, type Sweeper } from "../util/sweeper.ts";
+import type { LeaderLease } from "../persistence/leader-lease.ts";
+import { type Tenant, withTenant } from "../tenants/context.ts";
+import type { EngagedSession } from "./engaged-registry.ts";
+
+const SWEEP_LEASE_KEY = "wake:sweep";
+
+export interface SweepSource {
+  engagedSessions(): Promise<EngagedSession[]>;
+  sweepSession(threadRef: string, tenant: Tenant): Promise<number>;
+}
+
+export interface WakeSweepOptions {
+  intervalMs: number;
+  leaderLease: LeaderLease;
+}
+
+export interface WakeSweep {
+  start(): void;
+  stop(): Promise<void>;
+  sweep(): Promise<{ swept: number; fresh: number }>;
+}
+
+export function createWakeSweep(source: SweepSource, opts: WakeSweepOptions): WakeSweep {
+  const leaderLease = opts.leaderLease;
+
+  const sweep = async (): Promise<{ swept: number; fresh: number }> => {
+    const targets = await source.engagedSessions();
+    let fresh = 0;
+    for (const { tenantId, threadRef } of targets)
+      fresh += await withTenant(tenantId, (tenant) => source.sweepSession(threadRef, tenant));
+    return { swept: targets.length, fresh };
+  };
+
+  const runPass = (): Promise<unknown> => leaderLease.hold(SWEEP_LEASE_KEY, sweep);
+
+  const sweeper: Sweeper = createSweeper(runPass, opts.intervalMs, { label: "wake-sweep" });
+  return {
+    start: () => sweeper.start(),
+    stop: () => sweeper.stop(),
+    sweep,
+  };
+}

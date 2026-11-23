@@ -1,0 +1,232 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { createRuntimeService } from "../src/agent/runtime-control.ts";
+import { recoveredRuntime } from "../src/agent/runtime-recovery.ts";
+import type { CapabilityClaims } from "../src/auth/capability-token.ts";
+import type { RuntimeChoice } from "../src/agent/agent.ts";
+import { randomUUID } from "node:crypto";
+import { storedItem } from "../src/sessions/items.ts";
+import { testConfigStore } from "./support/test-database.ts";
+
+const active: RuntimeChoice = { modelId: "claude-opus-5", effortLevel: "high", fastMode: false };
+const claims: CapabilityClaims = {
+  actorId: "alice",
+  scopeId: "personal:alice",
+  liveActor: true,
+  exp: Date.now() + 60000,
+};
+async function setup(allowed = true) {
+  const config = testConfigStore("default-org");
+  await config.setRuntimeSelection("org:default-org", active);
+  const service = createRuntimeService(
+    { config, baseModelDefault: active.modelId },
+    {
+      authorizesCapabilityScope: async () => allowed,
+    },
+  );
+  return { config, service };
+}
+
+test("runtime exposes actual dispatch separately from saved defaults and resolves Astra without losing settings", async () => {
+  const { config, service } = await setup();
+  const running = { ...active, modelId: "claude-sonnet-5" };
+  const state = await service(claims, running, { action: "get" });
+  assert.equal(state.ok, true);
+  assert.deepEqual(state.active, running);
+  assert.equal((state.effective as RuntimeChoice).modelId, active.modelId);
+  const result = await service(claims, running, { action: "set", model: "Astra" });
+  assert.deepEqual(result, { ok: true, handoff: { lifetime: "task", choice: { ...running, modelId: "gpt-6-astra" } } });
+  assert.equal(await config.getRuntimeSelectionDurable(claims.scopeId), null);
+});
+
+test("scope defaults persist", async () => {
+  const { config, service } = await setup();
+  const result = await service(claims, active, { action: "set", model: "Astra", lifetime: "scope" });
+  assert.equal(result.ok, true);
+  assert.equal((await config.getRuntimeSelectionDurable(claims.scopeId))?.modelId, "gpt-6-astra");
+});
+
+test("runtime changes reject revoked access, bots, triggers and foreign personal scopes", async () => {
+  const denied = await setup(false);
+  assert.deepEqual(await denied.service(claims, active, { action: "get" }), { ok: false, error: "forbidden" });
+  const { service } = await setup();
+  for (const extra of [{ botActor: true }, { triggered: true }, { liveActor: false }]) {
+    assert.deepEqual(await service({ ...claims, ...extra }, active, { action: "set", model: "Astra" }), {
+      ok: false,
+      error: "live_actor_required",
+    });
+  }
+  assert.deepEqual(await service({ ...claims, scopeId: "personal:bob" }, active, { action: "set", model: "Astra" }), {
+    ok: false,
+    error: "forbidden",
+  });
+});
+
+test("runtime rejects unsupported effort and fast mode instead of silently dropping them", async () => {
+  const { service } = await setup();
+  assert.deepEqual(await service(claims, active, { action: "set", effort: "extreme" }), {
+    ok: false,
+    error: "effort_not_supported",
+  });
+  assert.deepEqual(await service(claims, active, { action: "set", model: "claude-sonnet-5", fastMode: true }), {
+    ok: false,
+    error: "fast_mode_not_supported",
+  });
+});
+
+test("account preflight failure cannot change a scope default", async () => {
+  const { service, config } = await setup();
+  const result = await service(
+    claims,
+    active,
+    { action: "set", model: "Astra", lifetime: "scope" },
+    async () => "account does not support this runtime",
+  );
+  assert.equal(result.ok, false);
+  assert.equal(await config.getRuntimeSelectionDurable(claims.scopeId), null);
+});
+
+test("runtime recovery uses only durable decisions belonging to the same run and actor", () => {
+  const run = randomUUID();
+  const item = (turnId: string, actorId: string, modelId: string) =>
+    storedItem(
+      {
+        kind: "ToolResult",
+        tool: "runtime",
+        callId: "c",
+        body: { actorId, runtimeHandoff: { choice: { ...active, modelId }, lifetime: "task" } },
+      },
+      { sessionId: "s", seq: 1, createdAt: 1, turnId },
+    );
+  const items = [
+    item(run, "alice", "gpt-6-astra"),
+    item(randomUUID(), "alice", "claude-sonnet-5"),
+    item(run, "bob", "claude-opus-5"),
+  ];
+  assert.equal(recoveredRuntime(items, run, "alice")?.choice.modelId, "gpt-6-astra");
+  assert.equal(recoveredRuntime(items, randomUUID(), "alice"), undefined);
+});
+
+test("individual-account availability does not depend on organization provider keys", async () => {
+  const { config } = await setup();
+  const service = createRuntimeService(
+    { config, providerKeys: { anthropic: false, openai: false, openrouter: false } },
+    { authorizesCapabilityScope: async () => true },
+  );
+  const ownRuntime = { ...active, modelId: "gpt-6-astra" };
+  const result = await service(
+    claims,
+    ownRuntime,
+    { action: "set", effort: "xhigh" },
+    async (choice) => (choice.modelId === "gpt-6-astra" ? null : "no account"),
+    true,
+  );
+  assert.deepEqual(result, {
+    ok: true,
+    handoff: { lifetime: "task", choice: { ...ownRuntime, effortLevel: "xhigh" } },
+  });
+});
+
+test("a saved override removed from the model picker cannot be newly selected", async () => {
+  const { config, service } = await setup();
+  await config.setRuntimeSelection(claims.scopeId, { ...active, modelId: "gpt-6-astra" });
+  await config.setWebuiModels("org:default-org", ["claude-sonnet-5"]);
+  assert.equal((await service(claims, active, { action: "set", model: "Astra" })).error, "model_unavailable");
+});
+
+test("cancellation during validation prevents a scope write", async () => {
+  const { config, service } = await setup();
+  const controller = new AbortController();
+  const result = await service(
+    claims,
+    active,
+    { action: "set", model: "Astra", lifetime: "scope" },
+    async () => {
+      controller.abort();
+      return null;
+    },
+    false,
+    controller.signal,
+  );
+  assert.deepEqual(result, { ok: false, error: "cancelled" });
+  assert.equal(await config.getRuntimeSelectionDurable(claims.scopeId), null);
+});
+
+test("cron fires may change their task runtime without changing saved defaults", async () => {
+  const { service, config } = await setup();
+  const cronClaims = { ...claims, liveActor: false, triggered: true };
+  const result = await service(
+    cronClaims,
+    active,
+    { action: "set", model: "Astra" },
+    undefined,
+    false,
+    undefined,
+    true,
+  );
+  assert.deepEqual(result, { ok: true, handoff: { lifetime: "task", choice: { ...active, modelId: "gpt-6-astra" } } });
+  assert.equal(await config.getRuntimeSelectionDurable(claims.scopeId), null);
+  assert.deepEqual(
+    await service(
+      cronClaims,
+      active,
+      { action: "set", model: "Astra", lifetime: "scope" },
+      undefined,
+      false,
+      undefined,
+      true,
+    ),
+    { ok: false, error: "live_actor_required" },
+  );
+  assert.equal(await config.getRuntimeSelectionDurable(claims.scopeId), null);
+});
+
+test("cron task handoffs still enforce actor, access, model and account policy", async () => {
+  const { service, config } = await setup();
+  const cronClaims = { ...claims, liveActor: false, triggered: true };
+  assert.deepEqual(
+    await service(
+      { ...cronClaims, botActor: true },
+      active,
+      { action: "set", model: "Astra" },
+      undefined,
+      false,
+      undefined,
+      true,
+    ),
+    { ok: false, error: "live_actor_required" },
+  );
+  assert.deepEqual(
+    await service(
+      { ...cronClaims, scopeId: "personal:bob" },
+      active,
+      { action: "set", model: "Astra" },
+      undefined,
+      false,
+      undefined,
+      true,
+    ),
+    { ok: false, error: "forbidden" },
+  );
+  const denied = await setup(false);
+  assert.deepEqual(
+    await denied.service(cronClaims, active, { action: "set", model: "Astra" }, undefined, false, undefined, true),
+    { ok: false, error: "forbidden" },
+  );
+  const result = await service(
+    cronClaims,
+    active,
+    { action: "set", model: "Astra" },
+    async () => "unavailable account",
+    true,
+    undefined,
+    true,
+  );
+  assert.equal(result.ok, false);
+  await config.setRuntimeSelection(claims.scopeId, { ...active, modelId: "gpt-6-astra" });
+  await config.setWebuiModels("org:default-org", ["claude-sonnet-5"]);
+  assert.deepEqual(
+    await service(cronClaims, active, { action: "set", model: "Astra" }, undefined, false, undefined, true),
+    { ok: false, error: "model_unavailable", candidates: ["claude-sonnet-5", "claude-opus-5"] },
+  );
+});

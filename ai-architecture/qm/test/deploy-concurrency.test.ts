@@ -1,0 +1,212 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createDeployStore, type DeployStore } from "../src/deploy/deploy-store.ts";
+import { createDeployService } from "../src/deploy/deploy-service.ts";
+import { createAclStore } from "../src/acl/acl-store.ts";
+import type { LeaderLease } from "../src/persistence/leader-lease.ts";
+import { createNoopAdvisoryLock, type AdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import type { DeployProvider } from "../src/deploy/deploy-provider.ts";
+import { scopeId } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testDeployBackings, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+
+const nonLeaderLease: LeaderLease = {
+  async hold() {
+    return null;
+  },
+};
+
+function svc(opts: { lease?: LeaderLease; lock?: AdvisoryLock; managed?: boolean } = {}) {
+  const deployStore = createDeployStore(testDeployBackings());
+  let destroys = 0;
+  const provider: DeployProvider = {
+    profile: { managedScaleToZero: opts.managed ?? false },
+    apply: async () => ({ host: "127.0.0.1", port: 5000 }),
+    destroy: async () => {
+      destroys++;
+    },
+  };
+  const deploy = createDeployService({
+    ...singleProcessDeps(),
+    deployStore,
+    provider,
+    auditLog: { record() {}, events: async () => [], tail: async () => [] },
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+    deployDir: mkdtempSync(join(tmpdir(), "concurrency-")),
+    ...(opts.lease ? { leaderLease: opts.lease } : {}),
+    ...(opts.lock ? { advisoryLock: opts.lock } : {}),
+  });
+  return {
+    deploy,
+    deployStore,
+    get destroys() {
+      return destroys;
+    },
+  };
+}
+
+const future = Date.now() + 1_000_000;
+
+test("reaper: a non-leader skips the sweep — returns 0 and destroys nothing", async () => {
+  const { deploy, deployStore, destroys } = svc({ lease: nonLeaderLease });
+  const d = await deploy.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "x",
+    files: [],
+  });
+  const stopped = await deploy.reapIdleApps(60_000, future);
+  assert.equal(stopped, 0, "non-leader returns 0");
+  assert.equal(destroys, 0, "non-leader destroyed nothing");
+  assert.equal((await deployStore.get(d.id))!.status, "running", "the app stays running");
+});
+
+test("reaper: the leader (default no-op lease) reaps as before", async () => {
+  const { deploy, deployStore } = svc();
+  const d = await deploy.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "x",
+    files: [],
+  });
+  const stopped = await deploy.reapIdleApps(60_000, future);
+  assert.equal(stopped, 1, "the leader reaps the idle app");
+  assert.equal((await deployStore.get(d.id))!.status, "stopped");
+  assert.equal((await deployStore.get(d.id))!.endpoint, null);
+});
+
+function spyLock(): { lock: AdvisoryLock; keys: string[] } {
+  const keys: string[] = [];
+  const lock: AdvisoryLock = {
+    ...createNoopAdvisoryLock(),
+    async withLock(key, fn) {
+      keys.push(key);
+      return fn();
+    },
+  };
+  return { lock, keys };
+}
+
+test("withDeployLock: redeploy/rollback/archive each acquire the advisory mutex keyed deploy:<id>", async () => {
+  const { lock, keys } = spyLock();
+  const { deploy } = svc({ lock });
+  const d = await deploy.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "x",
+    files: [],
+  });
+  assert.deepEqual(keys, [], "the initial create takes no deploy lock");
+
+  await deploy.redeploy(d.id, { entrypoint: "y", files: [] });
+  await deploy.rollbackApp(d.id, 1);
+  await deploy.archiveApp(d.id);
+
+  const want = `deploy:${d.id}`;
+  assert.deepEqual(keys, [want, want, want], "redeploy, rollback, archive each lock deploy:<id>");
+});
+
+test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)", async () => {
+  const deployStore = createDeployStore(testDeployBackings());
+  let active = 0;
+  let maxActive = 0;
+  const provider: DeployProvider = {
+    profile: { managedScaleToZero: false },
+    apply: async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 30));
+      active--;
+      return { host: "127.0.0.1", port: 5000 };
+    },
+    destroy: async () => {},
+  };
+  const deploy = createDeployService({
+    ...singleProcessDeps(),
+    deployStore,
+    provider,
+    auditLog: { record() {}, events: async () => [], tail: async () => [] },
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+    deployDir: mkdtempSync(join(tmpdir(), "serialize-")),
+  });
+  const d = await deploy.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "x",
+    files: [],
+  });
+  await Promise.all([
+    deploy.redeploy(d.id, { entrypoint: "a", files: [] }),
+    deploy.redeploy(d.id, { entrypoint: "b", files: [] }),
+  ]);
+  assert.equal(maxActive, 1, "two redeploys on one app never ran apply() concurrently");
+});
+
+function copyingDeployStore(): DeployStore {
+  return createDeployStore(testDeployBackings());
+}
+
+for (const [visit, stop, status] of [
+  ["reach", "archive", "archived"],
+  ["reach", "idle reap", "stopped"],
+  ["keep-warm", "archive", "archived"],
+] as const) {
+  test(`withDeployLock: a ${visit} waiting on the ${stop} leaves the app ${status} and never re-applies it`, async () => {
+    const deployStore = copyingDeployStore();
+    let applies = 0;
+    const destroying = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const resolving = Promise.withResolvers<void>();
+    const provider: DeployProvider = {
+      profile: { managedScaleToZero: false },
+      apply: async () => {
+        applies++;
+        return { host: "127.0.0.1", port: 5000 };
+      },
+      resolveEndpoint: async () => {
+        resolving.resolve();
+        return null;
+      },
+      destroy: async () => {
+        destroying.resolve();
+        await release.promise;
+      },
+    };
+    const deploy = createDeployService({
+      ...singleProcessDeps(),
+      deployStore,
+      provider,
+      auditLog: { record() {}, events: async () => [], tail: async () => [] },
+      acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+      deployDir: mkdtempSync(join(tmpdir(), "reach-stop-")),
+    });
+    const d = await deploy.deploy({
+      ownerScopeId: scopeId("personal", "U1"),
+      createdBy: "U1",
+      entrypoint: "x",
+      files: [],
+      alwaysOn: visit === "keep-warm",
+    });
+    const stopping = stop === "archive" ? deploy.archiveApp(d.id) : deploy.reapIdleApps(60_000, future);
+    await destroying.promise;
+    let settled = false;
+    const visiting = (visit === "reach" ? deploy.reachApp(d.id, "U1") : deploy.maintainApps()).finally(() => {
+      settled = true;
+    });
+    await resolving.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, `the ${visit} waits while the ${stop} holds the deploy lock`);
+    release.resolve();
+    await stopping;
+    const result = await visiting;
+    assert.equal(applies, 1, `the waiting ${visit} does not re-apply the ${status} app`);
+    const after = (await deployStore.get(d.id))!;
+    assert.equal(after.status, status, `the app stays ${status}`);
+    assert.equal(after.endpoint, null);
+    assert.deepEqual(result, visit === "reach" ? { status: "not_found" } : 0);
+  });
+}

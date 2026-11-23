@@ -1,0 +1,192 @@
+import "./support/auto-fake-sprites.ts";
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildApp } from "./support/build-app.ts";
+import { createGoalRecord, openGoal } from "../src/agent/goal.ts";
+import { reconstructMessagesFromHistory } from "../src/agent/replay.ts";
+import type { Principal } from "../src/types.ts";
+import type { OrchestratorInput } from "../src/core/orchestrator.ts";
+import { testConfig } from "./support/test-config.ts";
+import { settle } from "./support/settle.ts";
+
+const asU1 = { actorId: "U1" };
+
+function freshApp() {
+  return buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "goal-cancel-")) }));
+}
+
+function runRequest(): OrchestratorInput {
+  const principal: Principal = { id: "internal:U1", type: "internal" };
+  return {
+    actor: principal,
+    conversation: { kind: "dm", threadRef: "t", audience: [principal] },
+    origin: { kind: "direct" },
+    text: "keep going",
+  };
+}
+
+async function sessionWithGoal(built: ReturnType<typeof freshApp>, ref: string, status: "active" | "paused") {
+  const { sessions } = built;
+  const session = await sessions.getOrCreateByThread(ref, "dm", "personal:U1");
+  await sessions.addParticipant(session.id, "U1");
+  const goal = createGoalRecord({ objective: "old outreach goal", floor: { minTurns: 40 } });
+  goal.status = status;
+  const writer = { sessionId: session.id };
+  await sessions.setGoal(writer, goal);
+  return session;
+}
+
+async function sessionGoal(built: ReturnType<typeof freshApp>, sessionId: string) {
+  return (await built.sessions.goals([sessionId])).get(sessionId) ?? null;
+}
+
+for (const status of ["active", "paused"] as const) {
+  test(`the owner cancels an idle ${status} goal; it closes for good and frees the session for a new goal`, async () => {
+    const built = freshApp();
+    const session = await sessionWithGoal(built, `web:U1:${status}`, status);
+
+    assert.equal(await built.app.cancelSessionGoal(session.id, "U2"), null, "a non-participant cannot cancel");
+    await built.sessions.addParticipant(session.id, "U2");
+    assert.equal(
+      await built.app.cancelSessionGoal(session.id, "U2"),
+      null,
+      "a participant who cannot write to the owner's personal scope cannot cancel",
+    );
+    assert.equal(openGoal(await sessionGoal(built, session.id))?.status, status);
+    assert.equal(
+      (await built.app.getSessionForViewer(session.id, asU1))?.goal?.status,
+      status,
+      "the chat's goal bar reads the open goal from the session",
+    );
+
+    assert.deepEqual(await built.app.cancelSessionGoal(session.id, "U1"), { cancelled: true });
+
+    const entries = await built.sessions.getItems(session.id);
+    const last = entries.at(-1)!;
+    assert.deepEqual(
+      { kind: last.kind, wakeCause: last.wakeCause, body: last.body },
+      {
+        kind: "Wake",
+        wakeCause: "system",
+        body: { kind: "goal_cancelled", objective: "old outreach goal", cancelledBy: "U1" },
+      },
+    );
+    const goal = await sessionGoal(built, session.id);
+    assert.equal(goal?.status, "cancelled");
+    assert.equal(goal?.completionNote, undefined, "cancelling is not completing");
+    assert.equal(openGoal(goal), null, "later turns start with no goal to enforce");
+    assert.match(
+      JSON.stringify(reconstructMessagesFromHistory(entries)),
+      /The user cancelled this goal/,
+      "the model is told the goal was cancelled",
+    );
+    assert.ok(!(await built.app.listSessions(asU1)).find((s) => s.id === session.id)?.goal);
+    assert.equal((await built.app.getSessionForViewer(session.id, asU1))?.goal, undefined, "the goal bar closes");
+    assert.deepEqual(await built.app.cancelSessionGoal(session.id, "U1"), {
+      cancelled: false,
+      reason: "no_open_goal",
+    });
+  });
+}
+
+for (const status of ["active", "paused"] as const) {
+  test(`cancelling a ${status} goal while a turn runs lands after that turn's own final goal save`, async () => {
+    const built = freshApp();
+    const ref = `web:U1:running-${status}`;
+    const session = await sessionWithGoal(built, ref, status);
+    await built.runs.enqueue({ sessionId: ref, request: runRequest() });
+    const run = (await built.runs.claim("w1", 60_000))[0] ?? null;
+    assert.equal(run?.sessionId, ref);
+    const writer = { sessionId: session.id };
+
+    const cancelling = built.app.cancelSessionGoal(session.id, "U1");
+    await new Promise((r) => setTimeout(r, 200));
+    await settle(async () => status !== "active" || (await built.signals.pending(run!.id)).length > 0);
+    assert.deepEqual(
+      (await built.signals.pending(run!.id)).map((p) => p.signal.kind),
+      status === "active" ? ["abort"] : [],
+      status === "active"
+        ? "a turn pursuing the goal is stopped"
+        : "an unrelated reply is left to finish while the goal is paused",
+    );
+
+    const final = (await sessionGoal(built, session.id))!;
+    final.status = "paused";
+    final.tokensUsed = 77;
+    await built.sessions.setGoal(writer, final);
+    await built.runs.complete(run!.id, run!.leaseToken ?? "", { status: "ok", reply: "done" });
+
+    assert.deepEqual(await cancelling, { cancelled: true });
+    const goal = await sessionGoal(built, session.id);
+    assert.equal(goal?.status, "cancelled");
+    assert.equal(goal?.tokensUsed, 77, "the cancel builds on the turn's final save");
+    assert.deepEqual(
+      (await built.sessions.getItems(session.id)).map((e) => e.body.kind),
+      ["goal_cancelled"],
+    );
+  });
+}
+
+test("cancelling with no open goal touches nothing", async () => {
+  const built = freshApp();
+  const ref = "web:U1:none";
+  const session = await built.sessions.getOrCreateByThread(ref, "dm", "personal:U1");
+  await built.sessions.addParticipant(session.id, "U1");
+  await built.runs.enqueue({ sessionId: ref, request: runRequest() });
+  const run = (await built.runs.claim("w1", 60_000))[0] ?? null;
+  assert.deepEqual(await built.app.cancelSessionGoal(session.id, "U1"), {
+    cancelled: false,
+    reason: "no_open_goal",
+  });
+  assert.deepEqual(await built.signals.pending(run!.id), []);
+});
+
+test("a run holding a stale active copy cannot write a cancelled goal back to active; a new goal still replaces it", async () => {
+  const built = freshApp();
+  const session = await sessionWithGoal(built, "web:U1:stale", "active");
+  const stale = await sessionGoal(built, session.id);
+  assert.ok(stale);
+  assert.ok(await built.app.cancelSessionGoal(session.id, "U1"));
+
+  await built.sessions.setGoal({ sessionId: session.id }, { ...stale, tokensUsed: 99, updatedAt: Date.now() });
+  assert.equal((await sessionGoal(built, session.id))?.status, "cancelled");
+
+  const next = createGoalRecord({ objective: "old outreach goal", now: stale.createdAt + 1 });
+  await built.sessions.setGoal({ sessionId: session.id }, next);
+  assert.equal((await sessionGoal(built, session.id))?.status, "active");
+});
+
+test("the owner resumes a paused goal from the goal bar; a running reply or a closed goal refuses", async () => {
+  const built = freshApp();
+  const ref = "web:U1:resume";
+  const session = await sessionWithGoal(built, ref, "paused");
+  const paused = (await sessionGoal(built, session.id))!;
+  paused.pauseReason = "needs the user";
+  await built.sessions.setGoal({ sessionId: session.id }, paused);
+
+  assert.equal(await built.app.resumeSessionGoal(session.id, "U2"), null, "a non-participant cannot resume");
+
+  const out = await built.app.resumeSessionGoal(session.id, "U1");
+  assert.equal(out?.resumed && out.goal.status, "active");
+  const goal = await sessionGoal(built, session.id);
+  assert.equal(goal?.status, "active");
+  assert.equal(goal?.pauseReason, undefined, "the pause reason goes with the pause");
+  assert.equal((await built.app.getSessionForViewer(session.id, asU1))?.goal?.status, "active");
+  assert.equal(
+    (await built.app.resumeSessionGoal(session.id, "U1"))?.resumed,
+    true,
+    "resuming an already active goal is a no-op the bar can follow with a message",
+  );
+
+  await built.runs.enqueue({ sessionId: ref, request: runRequest() });
+  const run = (await built.runs.claim("w1", 60_000))[0]!;
+  assert.deepEqual(await built.app.resumeSessionGoal(session.id, "U1"), { resumed: false, reason: "busy" });
+  await built.runs.complete(run.id, run.leaseToken ?? "", { status: "ok", reply: "done" });
+
+  assert.deepEqual(await built.app.cancelSessionGoal(session.id, "U1"), { cancelled: true });
+  assert.deepEqual(await built.app.resumeSessionGoal(session.id, "U1"), { resumed: false, reason: "no_open_goal" });
+});

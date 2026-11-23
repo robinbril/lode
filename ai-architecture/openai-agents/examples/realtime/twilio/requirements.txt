@@ -1,0 +1,14 @@
+openai-agents
+httpx2>=2.13.1; python_version < "3.11"
+httpx2>=2.16.0; python_version >= "3.11"
+pyjwt>=2.15.1
+python-multipart>=0.0.32; python_version < "3.11"
+python-multipart>=0.0.33; python_version >= "3.11"
+urllib3>=2.8.0
+fastapi
+starlette>=1.7.0; python_version < "3.11"
+starlette>=1.10.0; python_version >= "3.11"
+uvicorn[standard]
+websockets
+python-dotenv>=1.2.4
+twilio>=9.13.0,<10

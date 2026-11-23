@@ -1,0 +1,309 @@
+import type { SlackRateLimitNotice } from "./rate-limit-notice.ts";
+import { SHARED_SLACK_HISTORY_LIMIT, slackHistoryRateLimitMessage } from "./history-rate-limit.ts";
+import type { SlackHistoryReader } from "./history.ts";
+import { errText, swallow, swallowAs } from "../util/errors.ts";
+import { WebClient } from "@slack/web-api";
+import {
+  type RecentMessage,
+  type SlackFile,
+  buildContextWindow,
+  isExternallyShared,
+  openConversationFor,
+  parseDeliveryTarget,
+  slackFileName,
+  stageSlackFiles,
+} from "./lib.ts";
+import { SLACK_AUTH_ERRORS, type SlackHistoryMessage, parseMessageList, slackErrorCode } from "./payloads.ts";
+import type { SlackCoreClient, SurfaceContextRequest } from "../api/slack-core-client.ts";
+import type { Directory } from "./directory.ts";
+import { slackMessageContent } from "./message-content.ts";
+import {
+  type ConversationSerializer,
+  type SlackPeople,
+  RECENT_HISTORY_LIMIT,
+  RECENT_THREAD_LIMIT,
+} from "./conversation-view.ts";
+
+export function createSurfaceContextFulfiller(deps: {
+  rateLimitNotice?: SlackRateLimitNotice;
+  core: SlackCoreClient;
+  directory: Directory;
+  serializer: ConversationSerializer;
+  botToken: string;
+  trustedFileHost?: string;
+  userToken?: string;
+  clientOptions: Record<string, unknown>;
+  readHistory?: SlackHistoryReader;
+  historyClient?: any;
+  historyLimit?: number;
+  historyRateLimitOptions?: { managed?: boolean; setupUrl?: string };
+}): { fulfillSurfaceContext(client: any, r: SurfaceContextRequest): Promise<void> } {
+  const { core, directory, serializer, botToken, trustedFileHost, userToken, clientOptions } = deps;
+
+  const managed = deps.historyRateLimitOptions?.managed === true;
+
+  async function fulfillLiveSearch(
+    query: string,
+    count: number,
+    post: (body: unknown) => Promise<void>,
+    viewerToken?: string,
+  ): Promise<void> {
+    const token = viewerToken || userToken;
+    if (!token) {
+      await post({ messages: [], liveSearch: "unconnected" });
+      return;
+    }
+    try {
+      const userClient = new WebClient(token, { ...clientOptions });
+      const res = await userClient.search.messages({ query, count: Math.min(count, 100) });
+      const matches = res.messages?.matches ?? [];
+      const shaped: RecentMessage[] = matches
+        .map((m) => ({
+          ts: String(m?.ts ?? ""),
+          name: String(m?.username || m?.user || "someone"),
+          text: slackMessageContent(m ?? {}).text,
+          ...(m?.user ? { authorId: String(m.user) } : {}),
+        }))
+        .filter((m) => m.ts);
+      await post(buildContextWindow(shaped, { count }));
+    } catch (err) {
+      if (viewerToken && SLACK_AUTH_ERRORS.has(slackErrorCode(err) ?? "")) {
+        await post({ messages: [], liveSearch: "unconnected" });
+        return;
+      }
+      await post({ error: `Slack search failed: ${errText(err)}` });
+    }
+  }
+
+  async function fetchContextHistory(
+    client: any,
+    channel: string,
+    threadTs: string | undefined,
+    before: string | undefined,
+    live: boolean,
+  ): Promise<{ raw: SlackHistoryMessage[]; hasMore: boolean; note?: string }> {
+    if (deps.readHistory) return deps.readHistory(client, channel, threadTs, before, false, live);
+    if (live) throw new Error("Live Slack history is unavailable.");
+    const page = before ? { latest: before, inclusive: false } : {};
+    if (threadTs) {
+      const { messages, hasMore } = parseMessageList(
+        await client.conversations.replies({
+          channel,
+          ts: threadTs,
+          limit: managed ? SHARED_SLACK_HISTORY_LIMIT : (deps.historyLimit ?? RECENT_THREAD_LIMIT),
+          ...page,
+        }),
+      );
+      return { raw: messages, hasMore };
+    }
+    const { messages, hasMore } = parseMessageList(
+      await client.conversations.history({
+        channel,
+        limit: managed ? SHARED_SLACK_HISTORY_LIMIT : (deps.historyLimit ?? RECENT_HISTORY_LIMIT),
+        ...page,
+      }),
+    );
+    return { raw: messages.slice().reverse(), hasMore };
+  }
+
+  async function findMessageAt(
+    client: any,
+    channel: string,
+    ts: string,
+    threadTs: string | undefined,
+  ): Promise<SlackHistoryMessage | undefined> {
+    client = deps.historyClient ?? client;
+    if (threadTs) {
+      const res = await client.conversations.replies({ channel, ts: threadTs, oldest: ts, inclusive: true, limit: 2 });
+      const hit = parseMessageList(res).messages.find((m) => m?.ts === ts);
+      if (hit) return hit;
+    }
+    const res = await client.conversations.history({ channel, latest: ts, inclusive: true, limit: 1 });
+    return parseMessageList(res).messages.find((m) => m?.ts === ts);
+  }
+
+  async function fetchSurfaceFile(
+    client: any,
+    channel: string,
+    conversationThreadTs: string | undefined,
+    ref: { ts: string; threadTs?: string; name?: string },
+  ): Promise<Record<string, unknown>> {
+    const threadTs = typeof ref.threadTs === "string" && ref.threadTs ? ref.threadTs : conversationThreadTs;
+    const msg = await findMessageAt(client, channel, ref.ts, threadTs);
+    if (!msg) {
+      return {
+        error: "I couldn't find that message — if it's a thread reply, pass its threadTs (the parent message's ts) too",
+      };
+    }
+    const files = (msg.files ?? []).filter((f) => f?.id);
+    if (!files.length) return { error: "that message has no files attached" };
+    let file: SlackFile | undefined;
+    if (ref.name) {
+      const want = ref.name.toLowerCase();
+      file =
+        files.find((f) => slackFileName(f).toLowerCase() === want) ??
+        files.find((f) => slackFileName(f).toLowerCase().includes(want));
+      if (!file)
+        return {
+          error: `that message has no file matching "${ref.name}" — it carries: ${files.map(slackFileName).join(", ")}`,
+        };
+    } else if (files.length === 1) {
+      file = files[0]!;
+    } else {
+      return {
+        error: `that message carries ${files.length} files — pass a name: ${files.map(slackFileName).join(", ")}`,
+      };
+    }
+    const {
+      attachments: [staged],
+      issues,
+    } = await stageFiles(client, [file]);
+    if (!staged) return { error: issues.join("; ") };
+    return { attachments: [staged] };
+  }
+
+  function stageFiles(client: any, files: SlackFile[]) {
+    return stageSlackFiles(client, files, {
+      token: botToken,
+      ...(trustedFileHost ? { trustedHost: trustedFileHost } : {}),
+      core,
+      directory,
+    });
+  }
+
+  async function openGroupDm(client: any, participants: readonly string[]): Promise<Record<string, unknown>> {
+    const people = [...new Set(participants.filter(Boolean))];
+    if (people.length < 2) return { error: "a group DM needs at least two people besides me" };
+    let groupId: string;
+    try {
+      groupId = await openConversationFor(client, people);
+    } catch (err) {
+      const code = slackErrorCode(err);
+      if (code === "method_not_supported_for_channel_type" || code === "missing_scope")
+        return { error: "I'm not allowed to open group DMs in this workspace (the app needs the mpim:write scope)" };
+      return { error: `I couldn't open that group DM: ${errText(err)}` };
+    }
+    try {
+      void directory.forceDirectorySync(client).catch(swallowAs("slack: sync after opening a group DM", undefined));
+    } catch (err) {
+      swallow("slack: sync after opening a group DM", err);
+    }
+    return { group: { groupId } };
+  }
+
+  async function fulfillSurfaceContext(client: any, r: SurfaceContextRequest): Promise<void> {
+    const post = async (body: unknown): Promise<void> => {
+      const { error, ...rest } = (body ?? {}) as { error?: string; messages?: unknown[] } & Record<string, unknown>;
+      await core.fulfillContextRequest(
+        r.id,
+        typeof error === "string" ? { error } : { result: { ...rest, messages: rest.messages ?? [] } },
+      );
+    };
+    try {
+      const q = r.query ?? {};
+      if (q.syncDirectory) {
+        await directory.forceDirectorySync(client).catch(swallowAs("slack: on-demand directory sync", undefined));
+        return await post({ messages: [] });
+      }
+      if (q.openGroup) return await post(await openGroupDm(client, q.openGroup.participants ?? []));
+      if (typeof q.searchAll === "string" && q.searchAll) {
+        return fulfillLiveSearch(
+          q.searchAll,
+          Math.max(1, Math.min(RECENT_THREAD_LIMIT, Number(q.count) || 100)),
+          post,
+          typeof q.viewerToken === "string" && q.viewerToken ? q.viewerToken : undefined,
+        );
+      }
+      let channel: string;
+      let threadTs: string | undefined;
+      if (typeof q.conversationTarget === "string" && q.conversationTarget) {
+        ({ channel, threadTs } = parseDeliveryTarget(q.conversationTarget));
+      } else if (typeof q.channelId === "string" && q.channelId) {
+        channel = q.channelId;
+        const info = await directory.getChannelInfo(client, channel);
+        if (!info) return post({ error: "I can't see that channel" });
+        if (isExternallyShared(info)) return post({ error: "that channel is externally shared, so I won't read it" });
+        if (info.is_member === false)
+          return post({ error: "I'm not a member of that channel — ask someone to /invite me there" });
+      } else {
+        return post({ error: "malformed context request" });
+      }
+      if (q.file && typeof q.file.ts === "string" && q.file.ts) {
+        return await post(await fetchSurfaceFile(client, channel, threadTs, q.file));
+      }
+      if (q.fileIds?.length)
+        return await post(
+          await stageFiles(
+            client,
+            q.fileIds.map((id) => ({ id })),
+          ),
+        );
+      const count = Math.max(
+        1,
+        Math.min(
+          RECENT_THREAD_LIMIT,
+          Number(q.count) || (managed ? SHARED_SLACK_HISTORY_LIMIT : (deps.historyLimit ?? 100)),
+        ),
+      );
+      const before = typeof q.before === "string" && q.before ? q.before : undefined;
+      const outcomes = await Promise.allSettled([
+        fetchContextHistory(client, channel, undefined, before, q.live === true),
+        threadTs
+          ? fetchContextHistory(client, channel, threadTs, before, q.live === true)
+          : Promise.resolve<{ raw: SlackHistoryMessage[]; hasMore: boolean }>({ raw: [], hasMore: false }),
+      ]);
+      const byTs = new Map<string, SlackHistoryMessage>();
+      const notes = new Set<string>();
+      let hasMore = false;
+      for (const outcome of outcomes) {
+        if (outcome.status === "rejected") {
+          hasMore = true;
+          notes.add(
+            slackHistoryRateLimitMessage(outcome.reason, deps.historyRateLimitOptions) ??
+              "Some Slack context could not be read; earlier messages may be missing.",
+          );
+          continue;
+        }
+        for (const message of outcome.value.raw) if (message.ts) byTs.set(message.ts, message);
+        hasMore ||= outcome.value.hasMore;
+        if ("note" in outcome.value && outcome.value.note) notes.add(outcome.value.note);
+      }
+      const raw = [...byTs.values()];
+      const failure = outcomes.find((outcome) => outcome.status === "rejected");
+      if (q.live === true && failure?.status === "rejected") throw failure.reason;
+      if (q.live === true && threadTs && outcomes[0]?.status === "fulfilled" && outcomes[0].value.hasMore)
+        throw new Error("Live Slack thread context includes truncated channel history; read the channel separately.");
+      if (!raw.length && failure?.status === "rejected") throw failure.reason;
+      const note = [...notes].join(" ");
+      const people: SlackPeople = { names: new Map(), principals: new Map() };
+      const shaped = await serializer.shapeRecentMessages(client, raw, "", people);
+      if (q.live === true && hasMore && !shaped.length)
+        throw new Error("Live Slack history contains only filtered messages; an earlier page could not be located.");
+      if (q.live === true) for (const message of shaped) message.reactions ??= [];
+      await post({
+        ...buildContextWindow(shaped, {
+          count,
+          ...(typeof q.match === "string" && q.match ? { match: q.match } : {}),
+          scanHasMore: hasMore,
+          nameById: people.names,
+        }),
+        ...(note ? { note } : {}),
+      });
+    } catch (err) {
+      const code = slackErrorCode(err);
+      let msg = slackHistoryRateLimitMessage(err, deps.historyRateLimitOptions) ?? `Slack read failed: ${errText(err)}`;
+      if (code === "not_in_channel") msg = "I'm not a member of that channel — ask someone to /invite me there";
+      else if (code === "channel_not_found") msg = "I can't see that channel";
+      await post({ error: msg });
+    }
+  }
+
+  return {
+    fulfillSurfaceContext: (client, request) =>
+      deps.rateLimitNotice
+        ? deps.rateLimitNotice.run(client, request.query.rateLimitRecipient, () =>
+            fulfillSurfaceContext(client, request),
+          )
+        : fulfillSurfaceContext(client, request),
+  };
+}

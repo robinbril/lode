@@ -1,0 +1,104 @@
+import {
+  handleNotesRequest,
+  readJsonBody,
+  type AllowedHosts,
+} from "./server/handler";
+import { peerTag } from "./server/peer";
+
+const MOUNT = "/__variants";
+
+async function* chunks(body: ReadableStream<Uint8Array> | null) {
+  if (!body) return;
+  const reader = body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
+
+export type VariantsRouteOptions = {
+  /**
+   * Hosts besides loopback that may reach the endpoints, with Vite's
+   * `server.allowedHosts` semantics: `.example.test` also allows subdomains.
+   */
+  allowedHosts?: AllowedHosts | undefined;
+  /**
+   * Admits clients outside loopback, for a dev server reached through a
+   * container or VM port mapping. The Host check still applies.
+   */
+  allowRemoteClients?: boolean | undefined;
+};
+
+const handle = async (
+  request: Request,
+  options: VariantsRouteOptions,
+): Promise<Response> => {
+  const url = new URL(request.url);
+  const at = url.pathname.indexOf(MOUNT);
+  const path = `${at === -1 ? url.pathname : url.pathname.slice(at + MOUNT.length) || "/"}${url.search}`;
+  const dev = process.env.NODE_ENV === "development";
+  // Subscribed on the first development request only, so production requests
+  // never gain the address header.
+  const remoteAddress = dev
+    ? (request.headers.get(peerTag().header) ?? undefined)
+    : undefined;
+  const { status, body } =
+    dev && remoteAddress === undefined && !options.allowRemoteClients
+      ? {
+          // The request that first loads this module arrives before the
+          // address tag exists; the client retries once on this status.
+          status: 503,
+          body: { error: "client address unknown; retry", retry: true },
+        }
+      : await handleNotesRequest(
+          {
+            method: request.method,
+            path,
+            remoteAddress,
+            header: (name) => request.headers.get(name),
+            json: () => readJsonBody(chunks(request.body)),
+          },
+          {
+            root: process.cwd(),
+            dev,
+            allowedHosts: options.allowedHosts,
+            allowRemoteClients: options.allowRemoteClients,
+          },
+        );
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    },
+  });
+};
+
+/**
+ * Route handlers for the note endpoints. Mount them once, at
+ * `app/%5F_variants/[...path]/route.ts` (the encoded underscore keeps the
+ * folder routable at `/__variants`):
+ *
+ * ```ts
+ * export { GET, POST, DELETE } from "@assistant-ui/variants/next";
+ * ```
+ *
+ * They answer 404 unless `NODE_ENV` is `development`, and 403 unless both the
+ * client address and the `Host` are loopback. The first request after the
+ * route loads arrives before the address hook exists and gets a 503 with
+ * `retry: true`; the sidebar asks again once. For another dev host, or a
+ * client outside loopback, use `createVariantsRoutes`.
+ * `next dev` listens on all network interfaces by default. On an untrusted
+ * network, start it with `next dev -H 127.0.0.1`.
+ */
+export const createVariantsRoutes = (options: VariantsRouteOptions = {}) => {
+  const route = (request: Request) => handle(request, options);
+  return { GET: route, POST: route, DELETE: route };
+};
+
+export const { GET, POST, DELETE } = createVariantsRoutes();

@@ -1,0 +1,270 @@
+import { useEffect, useRef, type ComponentProps } from "react";
+
+import { Box, Text, useFocus, useInput } from "ink";
+import stringWidth from "string-width";
+import {
+  getGraphemeAt,
+  textBufferReducer,
+  useTextBuffer,
+} from "./useTextBuffer";
+
+export type TextInputProps = ComponentProps<typeof Box> & {
+  value: string;
+  onChange: (text: string) => void;
+  onSubmit?: ((text: string) => void) | undefined;
+  submitOnEnter?: boolean | undefined;
+  placeholder?: string | undefined;
+  autoFocus?: boolean | undefined;
+  multiLine?: boolean | undefined;
+};
+
+type TextInputInternalProps = TextInputProps & {
+  isDisabled: boolean;
+};
+
+const TextInputInternal = ({
+  value,
+  onChange,
+  onSubmit,
+  submitOnEnter = false,
+  placeholder = "",
+  autoFocus = true,
+  multiLine = false,
+  isDisabled,
+  ...boxProps
+}: TextInputInternalProps) => {
+  const { isFocused } = useFocus({ autoFocus });
+  const { text, cursorOffset, preferredColumn, dispatchAction, setText } =
+    useTextBuffer(value);
+  const bufferStateRef = useRef({ text, cursorOffset, preferredColumn });
+  const lastEmittedValueRef = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (value === lastEmittedValueRef.current) {
+      if (text === value) lastEmittedValueRef.current = undefined;
+      return;
+    }
+
+    const isCorrection = lastEmittedValueRef.current !== undefined;
+    lastEmittedValueRef.current = undefined;
+    if (value === bufferStateRef.current.text) return;
+    const previousCursorOffset = bufferStateRef.current.cursorOffset;
+    let nextState = textBufferReducer(bufferStateRef.current, {
+      type: "set-text",
+      text: value,
+    });
+    let restoreCursor: { type: "set-cursor"; cursorOffset: number } | undefined;
+    if (isCorrection) {
+      restoreCursor = {
+        type: "set-cursor",
+        cursorOffset: previousCursorOffset,
+      };
+      nextState = textBufferReducer(nextState, restoreCursor);
+    }
+    bufferStateRef.current = nextState;
+    setText(value);
+    if (restoreCursor) dispatchAction(restoreCursor);
+  });
+
+  const commitAction = (
+    action: Parameters<typeof textBufferReducer>[1],
+    options?: { syncText?: boolean },
+  ) => {
+    const currentState = bufferStateRef.current;
+    // run the reducer eagerly so submit-after-edit sees post-action state before react commits
+    const nextState = textBufferReducer(currentState, action);
+    bufferStateRef.current = nextState;
+    dispatchAction(action);
+
+    if (options?.syncText !== false && nextState.text !== currentState.text) {
+      lastEmittedValueRef.current = nextState.text;
+      onChange(nextState.text);
+    }
+  };
+
+  const submit = () => {
+    if (isDisabled) return;
+    onSubmit?.(bufferStateRef.current.text);
+  };
+
+  useInput(
+    (input, key) => {
+      if (isDisabled) return;
+
+      const extendedKey = key as typeof key & {
+        home?: boolean;
+        end?: boolean;
+        shift?: boolean;
+      };
+      const lowerInput = input.toLowerCase();
+
+      if (key.ctrl) {
+        // ctrl+j may also report key.return; swallow so single-line never submits
+        if (lowerInput === "j") {
+          if (multiLine) {
+            commitAction({ type: "insert", text: "\n" });
+          }
+          return;
+        }
+        if (lowerInput === "a") {
+          commitAction({ type: "move-home", multiLine }, { syncText: false });
+          return;
+        }
+        if (lowerInput === "e") {
+          commitAction({ type: "move-end", multiLine }, { syncText: false });
+          return;
+        }
+        if (lowerInput === "w") {
+          commitAction({ type: "kill-word-backward" });
+          return;
+        }
+        if (lowerInput === "u") {
+          commitAction({ type: "kill-start", multiLine });
+          return;
+        }
+        if (lowerInput === "k") {
+          commitAction({ type: "kill-end", multiLine });
+          return;
+        }
+        if (lowerInput === "d") {
+          commitAction({ type: "delete-forward" });
+          return;
+        }
+      }
+
+      if (key.meta) {
+        if (lowerInput === "b") {
+          commitAction({ type: "move-word-left" }, { syncText: false });
+          return;
+        }
+        if (lowerInput === "f") {
+          commitAction({ type: "move-word-right" }, { syncText: false });
+          return;
+        }
+        if (lowerInput === "d") {
+          commitAction({ type: "kill-word-forward" });
+          return;
+        }
+      }
+
+      if (key.return) {
+        const shouldInsertNewline =
+          multiLine && (!submitOnEnter || extendedKey.shift);
+        if (shouldInsertNewline) {
+          commitAction({ type: "insert", text: "\n" });
+          return;
+        }
+
+        if (submitOnEnter) {
+          submit();
+        }
+        return;
+      }
+
+      if (key.leftArrow) {
+        commitAction({ type: "move-left" }, { syncText: false });
+        return;
+      }
+
+      if (key.rightArrow) {
+        commitAction({ type: "move-right" }, { syncText: false });
+        return;
+      }
+
+      if (multiLine && key.upArrow && !key.meta) {
+        commitAction({ type: "move-up" }, { syncText: false });
+        return;
+      }
+
+      if (multiLine && key.downArrow && !key.meta) {
+        commitAction({ type: "move-down" }, { syncText: false });
+        return;
+      }
+
+      if (extendedKey.home) {
+        commitAction({ type: "move-home", multiLine }, { syncText: false });
+        return;
+      }
+
+      if (extendedKey.end) {
+        commitAction({ type: "move-end", multiLine }, { syncText: false });
+        return;
+      }
+
+      if (key.backspace) {
+        commitAction({ type: "delete-backward" });
+        return;
+      }
+
+      if (key.delete) {
+        commitAction({ type: "delete-forward" });
+        return;
+      }
+
+      if (input && !key.ctrl && !key.meta) {
+        // pasted input can carry newlines that bypass the Enter guard; a single-line field never holds them
+        const insertText = multiLine ? input : input.replace(/[\r\n]+/g, "");
+        if (insertText) commitAction({ type: "insert", text: insertText });
+      }
+    },
+    { isActive: isFocused },
+  );
+
+  const hasText = text.length > 0;
+  const isShowingPlaceholder = !hasText && placeholder.length > 0;
+  const before = hasText ? text.slice(0, cursorOffset) : "";
+  const charAtCursor = hasText ? getGraphemeAt(text, cursorOffset) : "";
+  const isOnNewline = charAtCursor === "\n" || charAtCursor === "\r\n";
+  const atCursor =
+    charAtCursor === "" || isOnNewline || stringWidth(charAtCursor) === 0
+      ? " "
+      : charAtCursor;
+  const after = hasText
+    ? isOnNewline
+      ? text.slice(cursorOffset)
+      : text.slice(cursorOffset + charAtCursor.length)
+    : placeholder;
+
+  return (
+    <Box {...boxProps}>
+      {!isFocused || isDisabled ? (
+        <Text dimColor={isShowingPlaceholder}>
+          {hasText ? text : placeholder}
+        </Text>
+      ) : (
+        <Text dimColor={isShowingPlaceholder}>
+          {before}
+          <Text inverse>{atCursor}</Text>
+          {after}
+        </Text>
+      )}
+    </Box>
+  );
+};
+
+export const TextInput = ({
+  value,
+  onChange,
+  onSubmit,
+  submitOnEnter = false,
+  placeholder = "",
+  autoFocus = true,
+  multiLine = false,
+  ...boxProps
+}: TextInputProps) => (
+  <TextInputInternal
+    value={value}
+    onChange={onChange}
+    onSubmit={onSubmit}
+    submitOnEnter={submitOnEnter}
+    placeholder={placeholder}
+    autoFocus={autoFocus}
+    multiLine={multiLine}
+    {...boxProps}
+    isDisabled={false}
+  />
+);
+
+export const ComposerTextInput = (
+  props: TextInputProps & { isDisabled: boolean },
+) => <TextInputInternal {...props} />;

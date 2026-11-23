@@ -1,0 +1,620 @@
+import {
+  externalSlackNamespace,
+  extractPrivateContinuation,
+  PRIVATE_CONTINUATION_INSTRUCTION,
+  type ExternalSlackAccess,
+} from "./external-access.ts";
+import type { SlackRateLimitNotice } from "./rate-limit-notice.ts";
+import type { SlackHistoryReader } from "./history.ts";
+import type { SlackIdentityMode } from "./identity.ts";
+import { errMessage, reportFailure, reportFailureAs, swallowAs } from "../util/errors.ts";
+import {
+  type ActorAssertion,
+  type ChannelMeta,
+  type ConversationTurn,
+  type OverheardMessage,
+  type ReactionTally,
+  type SlackFile,
+  DEFAULT_ACK_REACTIONS,
+  REACTION_DETECT_GUIDANCE,
+  REACTION_INSTRUCTION,
+  buildReactionTurnText,
+  createDeduper,
+  createThreadTracker,
+  decodeSlackEntities,
+  dedupeKey,
+  dedupedRun,
+  deliveryCandidatesFor,
+  channelThreadRef,
+  dmThreadRef,
+  encodeDeliveryTarget,
+  groupDmDisplayName,
+  hasContent,
+  isExternallyShared,
+  isMpim,
+  type SurfaceHeaderClient,
+  renderConversationView,
+  resolveMentions,
+  shouldSurfaceReaction,
+  threadHasBotStake,
+  stageSlackFiles,
+} from "./lib.ts";
+import { isOwnSlackMessage } from "./message-gating.ts";
+import type { GatewayContext } from "../types.ts";
+import type { AckGate } from "./deferred-ack.ts";
+import type { SlackCoreClient } from "../api/slack-core-client.ts";
+import type { TurnFlow } from "../surfaces/turn-flow.ts";
+import { HANDOFF_INSTRUCTION, runSurfaceTurn, type SurfaceTurnBody } from "../surfaces/turn-driver.ts";
+import { createSlackTurnTransport } from "./turn-transport.ts";
+import type { BotIdentity, Directory } from "./directory.ts";
+import type { Mirror } from "./mirror.ts";
+import type { ConversationSerializer } from "./conversation-view.ts";
+import { reactionTallies } from "./conversation-view.ts";
+import type { SlackMessageEvent, SlackReactionEvent } from "./payloads.ts";
+import { slackMessageContent } from "./message-content.ts";
+import type { AckEmojiPicker } from "./ack-emoji.ts";
+import { slackSurfaceOrigin } from "../surfaces/slack/adapter.ts";
+import { type SlackConversationKind, conversationPlaceLabel } from "./messaging.ts";
+
+interface Incoming {
+  kind: "dm" | "channel";
+  channel: string;
+  userId: string | undefined;
+  actor?: ActorAssertion;
+  authorName?: string;
+  botId?: string;
+  rawText: string;
+  subtype?: string;
+  files: SlackFile[];
+  threadTs?: string;
+  ts: string;
+  unprompted?: boolean;
+  botAuthored?: boolean;
+  synthetic?: boolean;
+  message?: Partial<SlackMessageEvent>;
+  ackGate?: AckGate;
+  prefetched?: {
+    actor: ActorAssertion;
+    timezone?: string;
+    info: ChannelMeta | undefined;
+    audience: ActorAssertion[];
+    publishMembers?: ActorAssertion[];
+    slackIdsByPrincipal?: Map<string, string>;
+  };
+}
+
+export interface TurnHandler {
+  handleIncoming(inc: Incoming, client: any): Promise<void>;
+  dispatch(key: string, inc: Incoming, client: any): Promise<void>;
+  handleReactionEvent(evt: SlackReactionEvent, eventId: string | undefined, client: any, added: boolean): Promise<void>;
+  botHasStakeInThread(client: any, channel: string, threadTs: string, before?: string): Promise<boolean>;
+}
+
+export function botAuthoredActor(
+  actor: ActorAssertion,
+  inc: { botAuthored?: boolean; userId: string | undefined },
+  identityMode: SlackIdentityMode,
+): ActorAssertion {
+  const unresolved = identityMode === "email" && !!inc.userId && actor.externalId === inc.userId;
+  return inc.botAuthored && unresolved && !actor.isBot ? { ...actor, isBot: true } : actor;
+}
+
+function channelType(kind: SlackConversationKind, conversationKind: SlackConversationKind): string {
+  if (kind === "dm") return "im";
+  return conversationKind === "group" ? "mpim" : "channel";
+}
+
+function channelLocation(
+  conversationKind: SlackConversationKind,
+  channelName: string | undefined,
+  channel: string,
+): string {
+  if (conversationKind === "group") return "a group direct message";
+  return channelName ? `#${channelName}` : `channel ${channel}`;
+}
+
+export function createTurnHandler(deps: {
+  accountId?: string;
+  externalAccess?: ExternalSlackAccess;
+  continuePrivate?: (runId: string, task: string) => Promise<void>;
+  rateLimitNotice?: SlackRateLimitNotice;
+  onEngaged?: (runId: string, channel: string, threadTs?: string) => void;
+  onSettled?: () => void;
+  core: SlackCoreClient;
+  flow: TurnFlow;
+  directory: Directory;
+  mirror: Mirror;
+  readHistory?: SlackHistoryReader;
+  serializer: ConversationSerializer;
+  ackEmoji: AckEmojiPicker;
+  ackEmojiCandidates?: () => readonly string[] | null;
+  ids: BotIdentity;
+  threads: ReturnType<typeof createThreadTracker>;
+  deduper: ReturnType<typeof createDeduper>;
+  externalParticipantsEnabled(): Promise<boolean>;
+  allowActor?: (actor: ActorAssertion) => boolean;
+  markEvent?: () => void;
+  botToken: string;
+  trustedFileHost?: string;
+  webUiPublicUrl?: string;
+  ensureHeader?: (
+    client: SurfaceHeaderClient,
+    channel: string,
+    scopeId: string,
+    kind: "dm" | "channel",
+    ensureOpts?: { pinNew?: boolean },
+  ) => void;
+}): TurnHandler {
+  const { core, flow, directory, mirror, serializer, ackEmoji, ids, threads, deduper, externalParticipantsEnabled } =
+    deps;
+  const { classifyUserCached, classifyActor, getChannelInfo, channelMembership } = directory;
+  const { mirrorMessageEvent } = mirror;
+
+  const reactionsInFlight = new Set<string>();
+
+  async function botHasStakeInThread(
+    client: any,
+    channel: string,
+    threadTs: string,
+    before?: string,
+  ): Promise<boolean> {
+    const cached = threads.get(channel, threadTs);
+    if (cached !== undefined) return cached;
+    try {
+      const messages = deps.readHistory
+        ? (await deps.readHistory(client, channel, threadTs, before)).raw
+        : ((
+            await client.conversations.replies({
+              channel,
+              ts: threadTs,
+              limit: 200,
+              ...(before ? { latest: before, inclusive: false } : {}),
+            })
+          ).messages ?? []);
+      const present = threadHasBotStake(messages, ids.botUserId, ids.ownBotId);
+      threads.mark(channel, threadTs, present);
+      return present;
+    } catch {
+      return false;
+    }
+  }
+
+  async function handleIncoming(inc: Incoming, client: any): Promise<void> {
+    deps.markEvent?.();
+    let classified: { actor: ActorAssertion; timezone?: string };
+    if (inc.actor) classified = { actor: inc.actor };
+    else if (inc.prefetched)
+      classified = {
+        actor: inc.prefetched.actor,
+        ...(inc.prefetched.timezone ? { timezone: inc.prefetched.timezone } : {}),
+      };
+    else classified = await classifyUserCached(client, inc.userId);
+    if (
+      deps.externalAccess &&
+      (classified.actor.isExternalGuest || classified.actor.isBot || !inc.userId || inc.synthetic)
+    )
+      return;
+    if (deps.externalAccess && inc.unprompted) inc = { ...inc, unprompted: false };
+    if (deps.allowActor && !deps.allowActor(classified.actor)) return;
+    const actor = botAuthoredActor(classified.actor, inc, ids.identityMode);
+    const timezone = classified.timezone;
+    const text = resolveMentions(
+      decodeSlackEntities(inc.rawText).trim(),
+      ids.botUserId && ids.botHandle ? new Map([[ids.botUserId, ids.botHandle]]) : undefined,
+    );
+    if (!hasContent(text, inc.files)) return;
+
+    let audience: ActorAssertion[] = [actor];
+    let channelRef: string | undefined;
+    let channelName: string | undefined;
+    let threadRef: string;
+    let replyThreadTs: string | undefined;
+    let isPrivate: boolean | undefined;
+    let isMpimChannel: boolean | undefined;
+    let publishMembers: ActorAssertion[] | undefined;
+    let channelInfo: ChannelMeta | undefined;
+    let channelObservedAt: number | undefined;
+    let slackIdsByPrincipal: Map<string, string> | undefined;
+    let conversationKind: SlackConversationKind = inc.kind;
+    let allowedTs: Set<string> = new Set();
+
+    if (inc.kind === "dm") {
+      threadRef = dmThreadRef(inc.channel, inc.threadTs);
+      if (deps.externalAccess) threadRef = `slack-account:${ids.ownTeamId}:${threadRef}`;
+      replyThreadTs = inc.threadTs;
+      if (!actor.isBot && !actor.isExternalGuest)
+        deps.ensureHeader?.(client, inc.channel, `personal:${actor.externalId}`, "dm");
+    } else {
+      channelRef = inc.channel;
+      channelObservedAt = Date.now();
+      const info = inc.prefetched ? inc.prefetched.info : await getChannelInfo(client, inc.channel);
+      channelInfo = info;
+      isPrivate = info?.is_private;
+      isMpimChannel = isMpim(info);
+      if (isMpimChannel) conversationKind = "group";
+      channelName = info?.name;
+      if (!isMpimChannel && !isExternallyShared(info) && !actor.isBot && !actor.isExternalGuest)
+        deps.ensureHeader?.(client, inc.channel, `channel:${inc.channel}`, "channel");
+      const root = inc.threadTs ?? inc.ts;
+      threadRef = channelThreadRef(conversationKind, inc.channel, root);
+      replyThreadTs = root;
+    }
+
+    const transport = createSlackTurnTransport({
+      client,
+      blobs: core,
+      kind: inc.kind,
+      channel: inc.channel,
+      userId: inc.userId,
+      triggerTs: inc.ts,
+      threadTs: replyThreadTs,
+      reactable: () => allowedTs,
+      ...(deps.webUiPublicUrl ? { webUiPublicUrl: deps.webUiPublicUrl } : {}),
+      ...(deps.onEngaged ? { onEngaged: deps.onEngaged } : {}),
+      ...(deps.onSettled ? { onSettled: deps.onSettled } : {}),
+    });
+
+    if (inc.kind === "channel") {
+      const membership = inc.prefetched
+        ? {
+            audience: inc.prefetched.audience,
+            publishMembers: inc.prefetched.publishMembers,
+            slackIdsByPrincipal: inc.prefetched.slackIdsByPrincipal,
+          }
+        : await channelMembership(client, inc.channel, actor, inc.userId, channelInfo, channelObservedAt);
+      audience = membership.audience;
+      publishMembers = membership.publishMembers;
+      slackIdsByPrincipal = membership.slackIdsByPrincipal;
+      if (conversationKind === "group") channelName = groupDmDisplayName(audience) ?? channelName;
+    }
+
+    if (deps.externalAccess && inc.kind === "channel") {
+      const namespace = externalSlackNamespace(ids.ownTeamId, deps.externalAccess);
+      threadRef = `${namespace}:${threadRef}`;
+      channelRef = `${namespace}:${inc.channel}`;
+      publishMembers = undefined;
+      audience = [...audience, { externalId: "slack-external", isExternalGuest: true }];
+    }
+
+    const gatewayContext: GatewayContext =
+      inc.kind === "dm"
+        ? {
+            location: "a direct message with the user",
+            hostIds: { channel: inc.channel, ...(inc.threadTs ? { thread_ts: inc.threadTs } : {}) },
+            instructions: REACTION_INSTRUCTION,
+            reactionGuidance: REACTION_DETECT_GUIDANCE,
+            ...(ids.botHandle ? { botHandle: ids.botHandle } : {}),
+          }
+        : {
+            location: channelLocation(conversationKind, channelName, inc.channel),
+            hostIds: { channel: inc.channel, ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}) },
+            ...(channelName
+              ? { details: { channel_name: conversationPlaceLabel(conversationKind, channelName, inc.channel) } }
+              : {}),
+            instructions: `${REACTION_INSTRUCTION}\n\n${HANDOFF_INSTRUCTION}`,
+            reactionGuidance: REACTION_DETECT_GUIDANCE,
+            ...(ids.botHandle ? { botHandle: ids.botHandle } : {}),
+          };
+
+    if (deps.externalAccess && inc.kind === "channel") gatewayContext.instructions = PRIVATE_CONTINUATION_INSTRUCTION;
+
+    if (audience.some((a) => a.isExternalGuest) && !(await externalParticipantsEnabled())) {
+      if (!inc.unprompted) {
+        await transport.postPrivate(
+          "I can't respond here — this conversation isn't fully internal. Try a DM or a fully-internal channel.",
+        );
+      }
+      return;
+    }
+
+    const pickAckEmoji = (): Promise<string | undefined> =>
+      ackEmoji.requestAckEmoji(text, ackEmoji.ackPickCandidates(client), { channel: inc.channel, ts: inc.ts });
+    const taskAcks = !inc.unprompted && !actor.isBot && inc.kind === "dm" ? core.taskAcknowledgements : undefined;
+    const continuePrivate = deps.externalAccess && inc.kind === "channel" ? deps.continuePrivate : undefined;
+
+    const prepare = async (): Promise<SurfaceTurnBody | undefined> => {
+      if (inc.message) {
+        const containerName = inc.kind === "dm" ? actor.displayName?.trim() || undefined : channelName;
+        await mirrorMessageEvent(
+          { ...inc.message, channel: inc.channel, ts: inc.ts, channel_type: channelType(inc.kind, conversationKind) },
+          client,
+          { partial: true, kind: conversationKind, handled: true, ...(containerName ? { containerName } : {}) },
+        );
+      }
+
+      if (inc.kind === "channel" && replyThreadTs) threads.mark(inc.channel, replyThreadTs, true);
+
+      let conversationHeader: string | undefined;
+      let priorTurns: ConversationTurn[] | undefined;
+      let overheard: OverheardMessage[] | undefined;
+      let detectContext: string | undefined;
+      let detectOpener: string | undefined;
+      if (inc.kind === "channel" || (inc.kind === "dm" && inc.threadTs)) {
+        const serialize = () =>
+          serializer.serializeSlackConversation(client, inc, {
+            audience,
+            ...(isPrivate !== undefined ? { isPrivate } : {}),
+            kind: conversationKind,
+            ...(slackIdsByPrincipal ? { slackIdsByPrincipal } : {}),
+          });
+        const serialized = deps.rateLimitNotice
+          ? await deps.rateLimitNotice.run(
+              client,
+              !inc.unprompted && !inc.synthetic && !actor.isBot && inc.userId
+                ? { target: encodeDeliveryTarget(inc.channel, replyThreadTs), user: inc.userId }
+                : undefined,
+              serialize,
+            )
+          : await serialize();
+        const rendered = renderConversationView(serialized.view);
+        if (rendered.header) conversationHeader = rendered.header;
+        if (rendered.priorTurns.length) priorTurns = rendered.priorTurns;
+        if (rendered.overheard.length) overheard = rendered.overheard;
+        if (rendered.detectContext) detectContext = rendered.detectContext;
+        if (rendered.detectOpener) detectOpener = rendered.detectOpener;
+        allowedTs = rendered.allowedTs;
+      }
+
+      const ownFiles = inc.files.map((f) => (f.user || !inc.userId ? f : { ...f, user: inc.userId }));
+      const { attachments, issues } = await stageSlackFiles(client, ownFiles, {
+        token: deps.botToken,
+        ...(deps.trustedFileHost ? { trustedHost: deps.trustedFileHost } : {}),
+        core,
+        directory,
+      });
+
+      if (inc.unprompted && !text.trim() && attachments.length === 0) return;
+
+      const turn: SurfaceTurnBody = {
+        actor,
+        ...(inc.userId
+          ? {
+              surfaceOrigin: slackSurfaceOrigin({
+                accountId: deps.accountId ?? "default",
+                teamId: ids.ownTeamId,
+                userId: inc.userId,
+                ...(deps.externalAccess
+                  ? { policyNamespace: externalSlackNamespace(ids.ownTeamId, deps.externalAccess) }
+                  : {}),
+                ...(replyThreadTs ? { replyThreadTs } : {}),
+                ...(deps.externalAccess && inc.kind === "channel" ? { external: deps.externalAccess } : {}),
+              }),
+            }
+          : {}),
+        conversation: {
+          kind: conversationKind,
+          threadRef,
+          ...(channelRef ? { channelRef } : {}),
+          ...(channelName ? { channelName } : {}),
+          audience,
+          ...(isPrivate !== undefined ? { isPrivate } : {}),
+          ...(isMpimChannel !== undefined ? { isMpim: isMpimChannel } : {}),
+          ...(publishMembers ? { publishMembers } : {}),
+        },
+        deliveryTarget: encodeDeliveryTarget(inc.channel, replyThreadTs),
+        ...(() => {
+          const candidates = deliveryCandidatesFor(conversationKind, inc.channel, replyThreadTs, channelName);
+          return candidates ? { deliveryCandidates: candidates } : {};
+        })(),
+        text,
+        gatewayContext,
+        ...(actor.isBot ? { botActor: true } : {}),
+        ...(conversationHeader ? { conversationHeader } : {}),
+        ...(priorTurns ? { priorTurns } : {}),
+        ...(overheard ? { overheard } : {}),
+        ...(detectContext ? { detectContext } : {}),
+        ...(detectOpener ? { detectOpener } : {}),
+        ...(attachments.length ? { attachments } : {}),
+        ...(issues.length ? { inboundNotes: issues } : {}),
+        ...(timezone ? { timezone } : {}),
+        ...(inc.ts && !inc.synthetic
+          ? { redeliveryKey: `slack:${ids.botUserId || "bot"}:${inc.channel}:${inc.ts}` }
+          : {}),
+      };
+      return turn;
+    };
+
+    await runSurfaceTurn(
+      { flow, label: "slack", reportEditRef: (runId, ref) => core.reportRunEditRef(runId, ref) },
+      transport,
+      {
+        kind: inc.kind,
+        trigger: inc.ts,
+        where: `ch=${inc.channel} ts=${inc.ts}`,
+        ...(inc.unprompted ? { unprompted: true } : {}),
+        ...(inc.synthetic ? { synthetic: true } : {}),
+        ...(actor.isBot || inc.botAuthored ? { fromBot: true } : {}),
+        prepare,
+        ackEmoji: {
+          candidates: () => {
+            const override = deps.ackEmojiCandidates?.();
+            return override?.length ? override : DEFAULT_ACK_REACTIONS;
+          },
+          pick: pickAckEmoji,
+        },
+        ...(taskAcks
+          ? {
+              taskAck: {
+                move: (runId, first) =>
+                  taskAcks
+                    .move(client, runId, inc.channel, inc.ts, first ? pickAckEmoji : undefined)
+                    .catch(swallowAs("slack: task ack move", undefined)),
+                finish: (runId) => taskAcks.finish(client, runId),
+              },
+            }
+          : {}),
+        ...(continuePrivate
+          ? {
+              handOff: async (runId, reply) => {
+                const task = extractPrivateContinuation(reply).task;
+                if (task) await continuePrivate(runId, task);
+                return !!task;
+              },
+            }
+          : {}),
+        onAccepted: () => inc.ackGate?.persisted(),
+        onRejected: (reason) => inc.ackGate?.failed(reason),
+      },
+    );
+  }
+
+  async function dispatch(key: string, inc: Incoming, client: any): Promise<void> {
+    const gate = inc.ackGate;
+    const stamped: Incoming = {
+      ...inc,
+      ...(gate
+        ? {
+            ackGate: {
+              persisted: () => gate.persisted(),
+              failed: (reason?: string) => {
+                deduper.forget(key);
+                gate.failed(reason);
+              },
+            },
+          }
+        : {}),
+    };
+    const ran = await dedupedRun(
+      deduper,
+      key,
+      () => handleIncoming(stamped, client),
+      (err) => {
+        stamped.ackGate?.failed(errMessage(err));
+        reportFailure("slack: incoming handler", err);
+      },
+    );
+    if (!ran) gate?.failed("already in flight on this instance");
+  }
+
+  async function getReactedMessage(
+    client: any,
+    channel: string,
+    ts: string,
+    full: boolean,
+  ): Promise<
+    { text: string; threadTs?: string; reactions: ReactionTally[]; authorId?: string; own: boolean } | undefined
+  > {
+    try {
+      const res = await client.reactions.get({ channel, timestamp: ts, full });
+      const m = res?.message;
+      if (!m) return undefined;
+      return {
+        own: isOwnSlackMessage(m, ids.botUserId, ids.ownBotId),
+        text: decodeSlackEntities(slackMessageContent(m).text.trim()),
+        ...(m.thread_ts && m.thread_ts !== ts ? { threadTs: String(m.thread_ts) } : {}),
+        reactions: reactionTallies(m.reactions),
+        ...(m.user ? { authorId: String(m.user) } : {}),
+      };
+    } catch (error) {
+      return swallowAs("slack: reacted message read", undefined)(error);
+    }
+  }
+
+  async function handleReactionEvent(
+    evt: SlackReactionEvent,
+    eventId: string | undefined,
+    client: any,
+    added: boolean,
+  ): Promise<void> {
+    const reactorId = evt.user;
+    const channel = evt.item?.channel;
+    const messageTs = evt.item?.ts;
+    const emoji = evt.reaction;
+    if (!reactorId || !channel || !messageTs || !emoji) return;
+
+    const isDM = channel.startsWith("D");
+    const onFollowedRoot = threads.get(channel, messageTs) === true;
+    const surfaces = (onBotMessage: boolean) =>
+      shouldSurfaceReaction({
+        itemType: evt.item?.type,
+        reactorId,
+        botUserId: ids.botUserId,
+        isDM,
+        onBotMessage,
+        onFollowedRoot,
+      });
+    if (!surfaces(true)) return;
+    const reacted = evt.item_user ? undefined : getReactedMessage(client, channel, messageTs, added);
+    const onBotMessage = evt.item_user
+      ? Boolean(ids.botUserId && evt.item_user === ids.botUserId)
+      : Boolean((await reacted)?.own);
+    if (!surfaces(onBotMessage)) return;
+
+    const flightKey = `${channel}:${messageTs}:${emoji}:${reactorId}:${added ? "+" : "-"}`;
+    if (reactionsInFlight.has(flightKey)) return;
+    reactionsInFlight.add(flightKey);
+    try {
+      const key = dedupeKey({
+        event_id: eventId,
+        channel,
+        ts: `${messageTs}:${emoji}:${added ? "+" : "-"}:${reactorId}:${evt.event_ts ?? ""}`,
+      });
+      await dedupedRun(
+        deduper,
+        key,
+        async () => {
+          const reactorUser = await classifyUserCached(client, reactorId);
+          const reactor = reactorUser.actor;
+          if (reactor.isExternalGuest) return;
+          if (deps.allowActor && !deps.allowActor(reactor)) return;
+          let prefetched: Incoming["prefetched"];
+          if (!isDM) {
+            const observedAt = Date.now();
+            const info = await getChannelInfo(client, channel);
+            const membership = await channelMembership(client, channel, reactor, reactorId, info, observedAt);
+            if (membership.audience.some((a) => a.isExternalGuest) && !(await externalParticipantsEnabled())) return;
+            prefetched = {
+              actor: reactor,
+              ...(reactorUser.timezone ? { timezone: reactorUser.timezone } : {}),
+              info,
+              audience: membership.audience,
+              ...(membership.publishMembers ? { publishMembers: membership.publishMembers } : {}),
+              ...(membership.slackIdsByPrincipal ? { slackIdsByPrincipal: membership.slackIdsByPrincipal } : {}),
+            };
+          }
+          const reactorName = reactor.displayName || "Someone";
+
+          const msg = await (reacted ?? getReactedMessage(client, channel, messageTs, added));
+          let authorName: string | undefined;
+          if (!onBotMessage && msg?.authorId && msg.authorId !== reactorId) {
+            authorName = (await classifyActor(client, msg.authorId)).displayName;
+          }
+
+          const inc: Incoming = {
+            kind: isDM ? "dm" : "channel",
+            channel,
+            userId: reactorId,
+            rawText: buildReactionTurnText({
+              surfaceLabel: "Slack",
+              reactorName,
+              emoji,
+              added,
+              onBotMessage,
+              ...(authorName ? { authorName } : {}),
+              ...(msg?.text ? { messageText: msg.text } : {}),
+              ...(msg?.reactions?.length ? { reactions: msg.reactions } : {}),
+            }),
+            files: [],
+            ...(msg?.threadTs ? { threadTs: msg.threadTs } : {}),
+            ts: messageTs,
+            unprompted: true,
+            synthetic: true,
+            ...(prefetched ? { prefetched } : {}),
+          };
+          let heardWhere = "followed thread";
+          if (isDM) heardWhere = "dm";
+          else if (onBotMessage) heardWhere = "on my message";
+          console.log(
+            `[slack-plugin] heard reaction ${added ? "+" : "-"}:${emoji}: from ${reactorName} (${heardWhere}) → turn`,
+          );
+          await handleIncoming(inc, client);
+        },
+        reportFailureAs("slack: reaction handler", undefined),
+      );
+    } finally {
+      reactionsInFlight.delete(flightKey);
+    }
+  }
+
+  return { handleIncoming, dispatch, handleReactionEvent, botHasStakeInThread };
+}

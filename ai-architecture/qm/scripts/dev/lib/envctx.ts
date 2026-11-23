@@ -1,0 +1,156 @@
+import { spawnSync } from "node:child_process";
+import { appendFileSync, chmodSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { liveEnvPath } from "./pool.ts";
+import { readEnvFile } from "../../../cli/src/util.ts";
+import { bestEffort, sha256Hex } from "./util.ts";
+import { run } from "./proc.ts";
+
+export interface AssembledEnv {
+  env: Record<string, string>;
+  anthropicKeySource: string;
+  openaiKeySource: string;
+  liveEnvFile: string;
+  warnings: string[];
+}
+
+const DEV_SECURITY_SECRET_KEYS = [
+  "CORE_SIGNING_SECRET",
+  "CAPABILITY_SECRET",
+  "PORTAL_IDENTITY_SECRET",
+  "CONNECTOR_SECRET_KEY",
+  "PORTAL_SESSION_SECRET",
+] as const;
+
+export function completeDevSecuritySecrets(env: Record<string, string>, seed: string): void {
+  for (const key of DEV_SECURITY_SECRET_KEYS) {
+    if (!env[key]) env[key] = sha256Hex(`qm-dev\0${seed}\0${key}`);
+  }
+  const seen = new Set(DEV_SECURITY_SECRET_KEYS.map((key) => env[key]));
+  if (seen.size !== DEV_SECURITY_SECRET_KEYS.length) {
+    throw new Error(`${DEV_SECURITY_SECRET_KEYS.join(", ")} must be distinct`);
+  }
+}
+
+export function repoRoot(cwd = process.cwd()): string {
+  const res = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" });
+  if (res.status !== 0) throw new Error("not inside a git worktree");
+  return res.stdout.trim();
+}
+
+export function currentBranch(cwd: string): string {
+  const res = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, encoding: "utf8" });
+  return res.status === 0 ? res.stdout.trim() : "?";
+}
+
+export function gitHead(cwd: string): string {
+  const res = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  return res.status === 0 ? res.stdout.trim().slice(0, 12) : "?";
+}
+
+function mainRepoRoot(worktree: string): string | null {
+  const res = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    cwd: worktree,
+    encoding: "utf8",
+  });
+  if (res.status !== 0) return null;
+  return dirname(res.stdout.trim());
+}
+
+export function seedEnvFromMain(worktree: string, log: (msg: string) => void): void {
+  const mainRoot = mainRepoRoot(worktree);
+  if (!mainRoot || mainRoot === worktree) return;
+  const mainEnv = join(mainRoot, ".env");
+  if (!existsSync(mainEnv)) return;
+  const wtEnvPath = join(worktree, ".env");
+  const existing = readEnvFile(wtEnvPath);
+  const main = readEnvFile(mainEnv);
+  const added: string[] = [];
+  for (const [k, v] of main) {
+    if (existing.has(k)) continue;
+    appendFileSync(wtEnvPath, `${k}=${v}\n`);
+    added.push(k);
+  }
+  if (added.length) {
+    bestEffort(() => chmodSync(wtEnvPath, 0o600));
+    log(`seeded ${added.length} env key(s) for auth from the main checkout's .env: ${added.join(" ")}`);
+  }
+}
+
+async function anthropicKeyFromLoginShell(): Promise<string> {
+  const shell = process.env.SHELL && existsSync(process.env.SHELL) ? process.env.SHELL : "/bin/zsh";
+  const res = await run(shell, ["-lic", 'printf "__AKB__%s__AKE__" "${ANTHROPIC_API_KEY:-}"'], { timeoutMs: 15_000 });
+  const out = res.stdout ?? "";
+  const start = out.indexOf("__AKB__");
+  const end = out.indexOf("__AKE__");
+  if (start === -1 || end === -1 || end <= start) return "";
+  return out.slice(start + 7, end);
+}
+
+export async function assembleEnv(opts: {
+  worktree: string;
+  callerEnv: Record<string, string>;
+  log: (msg: string) => void;
+  probeLoginShell?: () => Promise<string>;
+}): Promise<AssembledEnv> {
+  const warnings: string[] = [];
+  const liveEnvFile = liveEnvPath();
+  const env: Record<string, string> = { ...opts.callerEnv };
+  for (const [k, v] of readEnvFile(liveEnvFile)) {
+    if (!env[k]) env[k] = v;
+  }
+  const wtEnv = Object.fromEntries(readEnvFile(join(opts.worktree, ".env")));
+
+  let anthropicKeySource = "";
+  if (opts.callerEnv.ANTHROPIC_API_KEY) anthropicKeySource = "your shell export";
+  else {
+    const shellKey = await (opts.probeLoginShell ?? anthropicKeyFromLoginShell)();
+    if (shellKey) {
+      env.ANTHROPIC_API_KEY = shellKey;
+      anthropicKeySource = "your login-shell profile";
+    } else if (env.ANTHROPIC_API_KEY) {
+      anthropicKeySource = liveEnvFile;
+    }
+  }
+  if (!env.ANTHROPIC_API_KEY && wtEnv.ANTHROPIC_API_KEY) {
+    env.ANTHROPIC_API_KEY = wtEnv.ANTHROPIC_API_KEY;
+    anthropicKeySource = "the worktree .env";
+  }
+  let openaiKeySource = "";
+  if (opts.callerEnv.OPENAI_API_KEY) openaiKeySource = "your shell export";
+  else if (env.OPENAI_API_KEY) openaiKeySource = liveEnvFile;
+  if (!env.OPENAI_API_KEY && wtEnv.OPENAI_API_KEY) {
+    env.OPENAI_API_KEY = wtEnv.OPENAI_API_KEY;
+    openaiKeySource = "the worktree .env";
+  }
+
+  if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY) {
+    if (!env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY && !env.MODEL_PROVIDER) env.MODEL_PROVIDER = "openai";
+    if (!env.PI_CAPTURE_REQUESTS) env.PI_CAPTURE_REQUESTS = "1";
+  } else {
+    throw new Error(
+      `ANTHROPIC_API_KEY or OPENAI_API_KEY is required: dev instances exercise real LLM calls by default. Export a key or add one to ${liveEnvFile}.`,
+    );
+  }
+
+  for (const key of DEV_SECURITY_SECRET_KEYS) {
+    if (!env[key] && wtEnv[key]) env[key] = wtEnv[key];
+  }
+  for (const k of ["SURFACE_DEBUG_FOOTER"]) {
+    if (!env[k] && wtEnv[k]) env[k] = wtEnv[k];
+  }
+
+  return { env, anthropicKeySource, openaiKeySource, liveEnvFile, warnings };
+}
+
+export function envFileGet(path: string, key: string): string {
+  return readEnvFile(path).get(key) ?? "";
+}
+
+export function callerEnvSnapshot(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") out[k] = v;
+  }
+  return out;
+}

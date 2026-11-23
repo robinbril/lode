@@ -1,0 +1,42 @@
+.prose-blog {
+  font-size: 0.9375rem;
+  line-height: 1.75;
+
+  & :where(code):not(:where(pre code)) {
+    font-size: 0.8125rem;
+    font-weight: 500;
+    padding: 0.125rem 0.3125rem;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: color-mix(in oklab, var(--foreground) 6%, transparent);
+  }
+}
+
+/* Content inside tabs */
+[role="tabpanel"] {
+  & > :first-child {
+    margin-top: 0;
+  }
+  & > :last-child {
+    margin-bottom: 0;
+  }
+}
+
+/* A Callout (or any not-prose block) inside a tab owns its own link styling.
+   The tab's [&_a] color/weight would otherwise bleed in, turning callout links
+   foreground-white and medium-weight. Let them inherit, like .docs-prose does. */
+[role="tabpanel"] :where([class~="not-prose"], [class~="not-prose"] *) a {
+  color: inherit;
+  font-weight: inherit;
+}
+
+/* PreviewCode component - remove nested SampleFrame styling */
+.preview-code-preview > div > .not-prose {
+  margin: 0;
+}
+
+.preview-code-preview > div > .not-prose > div {
+  border: none;
+  border-radius: 0;
+  height: auto;
+}

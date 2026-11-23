@@ -1,0 +1,164 @@
+import { createPgPool } from "../persistence/pg-pool.ts";
+import type { ScopeId } from "../types.ts";
+import type { AuditEvent, AuditLog } from "../audit/audit-log.ts";
+import { reportFailureAs } from "../util/errors.ts";
+import { likeContains } from "../persistence/like.ts";
+import { tenantTables } from "../tenants/migrations.ts";
+
+function rowToEvent(r: Record<string, unknown>): AuditEvent {
+  return {
+    at: Number(r.at),
+    principalId: String(r.principal_id),
+    action: String(r.action),
+    resource: String(r.resource),
+    scopeLabel: r.scope_label as ScopeId,
+    ...(r.status == null ? {} : { status: String(r.status) }),
+    ...(r.detail == null ? {} : { detail: String(r.detail) }),
+    ...(r.impersonated_by == null ? {} : { impersonatedBy: String(r.impersonated_by) }),
+  };
+}
+
+const COLS = "at, principal_id, action, resource, scope_label, status, detail, impersonated_by";
+const MAX = 50000;
+
+export function createPostgresAuditLog(connectionString: string): AuditLog {
+  const pg = createPgPool(connectionString, [
+    {
+      id: "admin/audit-log/0001",
+      expectedChecksum: "542f2a64d2814b329f2c1ad2eb8ed2728e8044b78efa6343eafb5598bc83cb1d",
+      statements: [
+        `CREATE TABLE IF NOT EXISTS audit_log(
+        id BIGSERIAL PRIMARY KEY,
+        at BIGINT NOT NULL,
+        principal_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        scope_label TEXT NOT NULL,
+        status TEXT,
+        detail TEXT
+      )`,
+        `ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS idempotency_key TEXT`,
+        `CREATE INDEX IF NOT EXISTS audit_log_by_at ON audit_log(at DESC)`,
+        `CREATE INDEX IF NOT EXISTS audit_log_by_scope_at ON audit_log(scope_label, at DESC)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS audit_log_by_idempotency_key ON audit_log(idempotency_key) WHERE idempotency_key IS NOT NULL`,
+        `DO $$
+      BEGIN
+        PERFORM pg_advisory_xact_lock(hashtext('agent-platform:audit-log-migrate'));
+        IF to_regclass('public.audit_events') IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM audit_log LIMIT 1) THEN
+          INSERT INTO audit_log (at, principal_id, action, resource, scope_label, status, detail)
+          SELECT (json->>'at')::bigint, json->>'principalId', json->>'action', json->>'resource',
+                 json->>'scopeLabel', json->>'status', json->>'detail'
+          FROM audit_events
+          WHERE json ? 'at'
+          ORDER BY (json->>'at')::bigint ASC;
+        END IF;
+      END $$`,
+      ],
+    },
+    {
+      id: "admin/audit-log/0002",
+      statements: [`CREATE INDEX IF NOT EXISTS audit_log_by_action ON audit_log(action, at DESC)`],
+    },
+    ...tenantTables("admin/audit-log/0003-tenants", [
+      {
+        table: "audit_log",
+        primaryKey: "id",
+        unique: [
+          { name: "audit_log_by_idempotency_key", columns: "idempotency_key", where: "idempotency_key IS NOT NULL" },
+        ],
+      },
+    ]),
+    {
+      id: "admin/audit-log/0004-impersonated-by",
+      statements: [`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS impersonated_by TEXT`],
+    },
+  ]);
+
+  const pendingWrites = new Set<Promise<void>>();
+  const log: AuditLog = {
+    record(tenant, e) {
+      const write = pg
+        .forTenant(tenant)
+        .q(`INSERT INTO audit_log(${COLS}, tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [
+          e.at,
+          e.principalId,
+          e.action,
+          e.resource,
+          e.scopeLabel,
+          e.status ?? null,
+          e.detail ?? null,
+          e.impersonatedBy ?? null,
+          tenant.id,
+        ])
+        .then(() => undefined)
+        .catch(reportFailureAs("audit: persist event", undefined));
+      pendingWrites.add(write);
+      void write.finally(() => pendingWrites.delete(write));
+    },
+    async recordOnce(tenant, key, e) {
+      await pg.forTenant(tenant).q(
+        `INSERT INTO audit_log(${COLS}, idempotency_key, tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+        [
+          e.at,
+          e.principalId,
+          e.action,
+          e.resource,
+          e.scopeLabel,
+          e.status ?? null,
+          e.detail ?? null,
+          e.impersonatedBy ?? null,
+          key,
+          tenant.id,
+        ],
+      );
+    },
+    async events(tenant) {
+      await Promise.allSettled(pendingWrites);
+      const rows = await pg
+        .forTenant(tenant)
+        .q(`SELECT ${COLS} FROM audit_log WHERE tenant_id = $1 ORDER BY at DESC, id DESC LIMIT $2`, [tenant.id, MAX]);
+      return rows.map(rowToEvent).reverse();
+    },
+    async tail(tenant, { limit, scopeLabel, action, since, resourceContains }) {
+      await Promise.allSettled(pendingWrites);
+      if (Array.isArray(action) && action.length !== 1) {
+        const batches = await Promise.all(
+          action.map((a) => log.tail(tenant, { limit, scopeLabel, action: a, since, resourceContains })),
+        );
+        return batches
+          .flat()
+          .sort((a, b) => b.at - a.at)
+          .slice(0, limit);
+      }
+      const params: unknown[] = [tenant.id];
+      const conds: string[] = ["tenant_id = $1"];
+      if (scopeLabel !== undefined) {
+        params.push(scopeLabel);
+        conds.push(`scope_label = $${params.length}`);
+      }
+      if (action !== undefined) {
+        params.push(typeof action === "string" ? action : action[0]);
+        conds.push(`action = $${params.length}`);
+      }
+      if (since !== undefined) {
+        params.push(since);
+        conds.push(`at >= $${params.length}`);
+      }
+      if (resourceContains !== undefined) {
+        params.push(likeContains(resourceContains));
+        conds.push(`resource LIKE $${params.length} ESCAPE '\\'`);
+      }
+      params.push(limit);
+      const rows = await pg
+        .forTenant(tenant)
+        .q(
+          `SELECT ${COLS} FROM audit_log WHERE ${conds.join(" AND ")} ORDER BY at DESC, id DESC LIMIT $${params.length}`,
+          params,
+        );
+      return rows.map(rowToEvent);
+    },
+  };
+  return log;
+}

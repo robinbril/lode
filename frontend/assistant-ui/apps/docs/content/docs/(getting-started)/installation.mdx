@@ -1,0 +1,40 @@
+---
+title: Installation
+description: Tell your coding agent to install and set up assistant-ui.
+platforms: ["react"]
+---
+
+All you need to do is ask your coding agent:
+
+<AgentSetupPrompt />
+
+That's it. The agent runs `npx assistant-ui@latest setup`, which guides the install and opens your browser when it needs your input. You pick a runtime, a backend and the components you want, and the agent installs them and wires them into your project.
+
+It works with Claude Code, Codex, Cursor and any other agent that can run shell commands.
+
+Prefer to do it yourself? Follow the [manual installation](/docs/manual-installation) steps.
+
+## What's Next?
+
+<Cards>
+  <Card
+    title="Pick a Runtime"
+    description="Choose the right runtime for your needs"
+    href="/docs/runtimes/pick-a-runtime"
+  />
+  <Card
+    title="Generative UI"
+    description="Let the model compose UI from a component vocabulary you ship"
+    href="/docs/tools/generative-ui"
+  />
+  <Card
+    title="Add Persistence"
+    description="Save and restore chat conversations"
+    href="/docs/cloud"
+  />
+  <Card
+    title="Examples"
+    description="Explore full implementations and demos"
+    href="https://github.com/assistant-ui/assistant-ui/tree/main/examples"
+  />
+</Cards>

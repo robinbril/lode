@@ -1,0 +1,1382 @@
+package olap
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"math"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-co-op/gocron/v2"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/hatchet-dev/hatchet/internal/datautils"
+	"github.com/hatchet-dev/hatchet/internal/enumerables"
+	"github.com/hatchet-dev/hatchet/internal/gocronutils"
+	"github.com/hatchet-dev/hatchet/internal/integrations/alerting"
+	"github.com/hatchet-dev/hatchet/internal/msgqueue"
+	"github.com/hatchet-dev/hatchet/internal/queueutils"
+	"github.com/hatchet-dev/hatchet/internal/services/partition"
+	"github.com/hatchet-dev/hatchet/internal/services/shared/recoveryutils"
+	tasktypes "github.com/hatchet-dev/hatchet/internal/services/shared/tasktypes/v1"
+	"github.com/hatchet-dev/hatchet/pkg/analytics"
+	"github.com/hatchet-dev/hatchet/pkg/config/server"
+	"github.com/hatchet-dev/hatchet/pkg/enums"
+	hatcheterrors "github.com/hatchet-dev/hatchet/pkg/errors"
+	"github.com/hatchet-dev/hatchet/pkg/integrations/metrics/prometheus"
+	"github.com/hatchet-dev/hatchet/pkg/logger"
+	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
+	"github.com/hatchet-dev/hatchet/pkg/repository/sqlchelpers"
+	"github.com/hatchet-dev/hatchet/pkg/repository/sqlcv1"
+	"github.com/hatchet-dev/hatchet/pkg/telemetry"
+)
+
+type OLAPController interface {
+	Start(ctx context.Context) error
+}
+
+const (
+	// maxLockAttempts is the number of times we retry acquiring locks before
+	// republishing the remaining items to the message queue.
+	maxLockAttempts = 10
+
+	// requeueErrorLogThreshold is the requeue count at which republish logging
+	// escalates from warn to error level.
+	requeueErrorLogThreshold = 50
+)
+
+// logRepublish emits the standard "failed to acquire locks" log line, escalating to
+// error level once items have been requeued many times.
+func (tc *OLAPControllerImpl) logRepublish(ctx context.Context, entity string, count, attempts, maxRequeueCount int) {
+	logger := tc.l.Warn()
+
+	if maxRequeueCount >= requeueErrorLogThreshold {
+		logger = tc.l.Error()
+	}
+
+	logger.Ctx(ctx).
+		Int("count", count).
+		Int("attempts", attempts).
+		Int("requeue_count", maxRequeueCount).
+		Msgf("failed to acquire locks for %s, republishing to MQ", entity)
+}
+
+type OLAPControllerImpl struct {
+	mq                           msgqueue.MessageQueue
+	pubsub                       msgqueue.PubSub
+	l                            *zerolog.Logger
+	repo                         v1.Repository
+	dv                           datautils.DataDecoderValidator
+	a                            *hatcheterrors.Wrapped
+	p                            *partition.Partition
+	s                            gocron.Scheduler
+	ta                           *alerting.TenantAlertManager
+	processTenantAlertOperations *queueutils.OperationPool
+	samplingHashThreshold        *int64
+	olapConfig                   *server.ConfigFileOperations
+	maxRequeueCount              int
+	prometheusMetricsEnabled     bool
+	analyzeCronInterval          time.Duration
+	taskPrometheusUpdateCh       chan taskPrometheusUpdate
+	taskPrometheusWorkerCtx      context.Context
+	taskPrometheusWorkerCancel   context.CancelFunc
+	dagPrometheusUpdateCh        chan dagPrometheusUpdate
+	dagPrometheusWorkerCtx       context.Context
+	dagPrometheusWorkerCancel    context.CancelFunc
+	statusUpdateBatchSizeLimits  v1.StatusUpdateBatchSizeLimits
+	mqQos                        int
+	promGate                     *prometheus.Gate
+	auditLogs                    *v1.AuditLogOutbox
+}
+
+type OLAPControllerOpt func(*OLAPControllerOpts)
+
+type OLAPControllerOpts struct {
+	mq                          msgqueue.MessageQueue
+	pubsub                      msgqueue.PubSub
+	l                           *zerolog.Logger
+	repo                        v1.Repository
+	dv                          datautils.DataDecoderValidator
+	alerter                     hatcheterrors.Alerter
+	p                           *partition.Partition
+	ta                          *alerting.TenantAlertManager
+	samplingHashThreshold       *int64
+	olapConfig                  *server.ConfigFileOperations
+	maxRequeueCount             int
+	prometheusMetricsEnabled    bool
+	analyzeCronInterval         time.Duration
+	statusUpdateBatchSizeLimits v1.StatusUpdateBatchSizeLimits
+	mqQos                       int
+	promGate                    *prometheus.Gate
+	auditLogs                   *v1.AuditLogOutbox
+}
+
+func defaultOLAPControllerOpts() *OLAPControllerOpts {
+	l := logger.NewDefaultLogger("olap-controller")
+	alerter := hatcheterrors.NoOpAlerter{}
+
+	return &OLAPControllerOpts{
+		l:                        &l,
+		dv:                       datautils.NewDataDecoderValidator(),
+		alerter:                  alerter,
+		prometheusMetricsEnabled: false,
+		analyzeCronInterval:      3 * time.Hour,
+		maxRequeueCount:          5,
+	}
+}
+
+func WithMessageQueue(mq msgqueue.MessageQueue) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.mq = mq
+	}
+}
+
+func WithPubSub(pubsub msgqueue.PubSub) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.pubsub = pubsub
+	}
+}
+
+func WithLogger(l *zerolog.Logger) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.l = l
+	}
+}
+
+func WithAlerter(a hatcheterrors.Alerter) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.alerter = a
+	}
+}
+
+func WithRepository(r v1.Repository) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.repo = r
+	}
+}
+
+func WithPartition(p *partition.Partition) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.p = p
+	}
+}
+
+func WithDataDecoderValidator(dv datautils.DataDecoderValidator) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.dv = dv
+	}
+}
+
+func WithTenantAlertManager(ta *alerting.TenantAlertManager) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.ta = ta
+	}
+}
+
+func WithSamplingConfig(c server.ConfigFileSampling) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		if c.Enabled && c.SamplingRate != 1.0 {
+			// convert the rate into a hash threshold
+			hashThreshold := int64(c.SamplingRate * 100)
+
+			opts.samplingHashThreshold = &hashThreshold
+		}
+	}
+}
+
+func WithOperationsConfig(c server.ConfigFileOperations) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.olapConfig = &c
+	}
+}
+
+func WithPrometheusMetricsEnabled(enabled bool) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.prometheusMetricsEnabled = enabled
+	}
+}
+
+func WithAnalyzeCronInterval(interval time.Duration) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.analyzeCronInterval = interval
+	}
+}
+
+func WithOLAPStatusUpdateBatchSizeLimits(limits v1.StatusUpdateBatchSizeLimits) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.statusUpdateBatchSizeLimits = limits
+	}
+}
+
+func WithMQQos(qos int) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.mqQos = qos
+	}
+}
+
+func WithMaxRequeueCount(count int) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		if count <= 0 {
+			return
+		}
+
+		opts.maxRequeueCount = count
+	}
+}
+
+func WithPrometheusGate(gate *prometheus.Gate) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.promGate = gate
+	}
+}
+
+// WithAuditLogOutbox makes the controller copy queued audit log entries into the OLAP database.
+func WithAuditLogOutbox(auditLogs *v1.AuditLogOutbox) OLAPControllerOpt {
+	return func(opts *OLAPControllerOpts) {
+		opts.auditLogs = auditLogs
+	}
+}
+
+func New(fs ...OLAPControllerOpt) (*OLAPControllerImpl, error) {
+	opts := defaultOLAPControllerOpts()
+
+	for _, f := range fs {
+		f(opts)
+	}
+
+	if opts.mq == nil {
+		return nil, fmt.Errorf("task queue is required. use WithMessageQueue")
+	}
+
+	if opts.pubsub == nil {
+		return nil, fmt.Errorf("pubsub is required. use WithPubSub")
+	}
+
+	if opts.repo == nil {
+		return nil, fmt.Errorf("repository is required. use WithRepository")
+	}
+
+	if opts.p == nil {
+		return nil, errors.New("partition is required. use WithPartition")
+	}
+
+	if opts.ta == nil {
+		return nil, errors.New("tenant alerter is required. use WithTenantAlertManager")
+	}
+
+	newLogger := opts.l.With().Str("service", "olap-controller").Logger()
+	opts.l = &newLogger
+
+	s, err := gocron.NewScheduler(gocron.WithLocation(time.UTC))
+
+	if err != nil {
+		return nil, fmt.Errorf("could not create scheduler: %w", err)
+	}
+
+	a := hatcheterrors.NewWrapped(opts.alerter)
+	a.WithData(map[string]interface{}{"service": "olap-controller"})
+
+	// Channel size = 2 * batch_size * num_partitions for overhead
+	// batch_size = 1000, num_partitions from partition config
+	numPartitions := 4
+	prometheusChannelSize := 2 * 1000 * numPartitions
+
+	taskPrometheusUpdateCh := make(chan taskPrometheusUpdate, prometheusChannelSize)
+	dagPrometheusUpdateCh := make(chan dagPrometheusUpdate, prometheusChannelSize)
+
+	o := &OLAPControllerImpl{
+		mq:                          opts.mq,
+		pubsub:                      opts.pubsub,
+		l:                           opts.l,
+		s:                           s,
+		p:                           opts.p,
+		repo:                        opts.repo,
+		dv:                          opts.dv,
+		a:                           a,
+		ta:                          opts.ta,
+		samplingHashThreshold:       opts.samplingHashThreshold,
+		olapConfig:                  opts.olapConfig,
+		maxRequeueCount:             opts.maxRequeueCount,
+		prometheusMetricsEnabled:    opts.prometheusMetricsEnabled,
+		analyzeCronInterval:         opts.analyzeCronInterval,
+		taskPrometheusUpdateCh:      taskPrometheusUpdateCh,
+		dagPrometheusUpdateCh:       dagPrometheusUpdateCh,
+		statusUpdateBatchSizeLimits: opts.statusUpdateBatchSizeLimits,
+		mqQos:                       opts.mqQos,
+		promGate:                    opts.promGate,
+		auditLogs:                   opts.auditLogs,
+	}
+
+	// Default jitter value
+	jitter := 1500 * time.Millisecond
+
+	// Override with config value if available
+	if o.olapConfig != nil && o.olapConfig.Jitter > 0 {
+		jitter = time.Duration(o.olapConfig.Jitter) * time.Millisecond
+	}
+
+	// Default timeout
+	timeout := 15 * time.Second
+
+	o.processTenantAlertOperations = queueutils.NewOperationPool(
+		opts.l,
+		timeout,
+		"process tenant alerts",
+		o.processTenantAlerts,
+	).WithJitter(jitter)
+
+	return o, nil
+}
+
+func (o *OLAPControllerImpl) Start() (func() error, error) {
+	cleanupHeavyReadMQ, heavyReadMQ, err := o.mq.Clone()
+
+	if err != nil {
+		return nil, err
+	}
+	heavyReadMQ.SetQOS(o.mqQos)
+
+	o.s.Start()
+
+	mqBuffer := msgqueue.NewMQSubBuffer(msgqueue.OLAP_QUEUE, heavyReadMQ, o.handleBufferedMsgs)
+
+	wg := sync.WaitGroup{}
+
+	startupPartitionCtx, cancelStartupPartition := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelStartupPartition()
+
+	// always create table partition on startup
+	if err := o.createTablePartition(startupPartitionCtx); err != nil {
+		return nil, fmt.Errorf("could not create table partition: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Start prometheus workers if metrics are enabled
+	if o.prometheusMetricsEnabled {
+		o.taskPrometheusWorkerCtx, o.taskPrometheusWorkerCancel = context.WithCancel(context.Background())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			o.runTaskPrometheusUpdateWorker()
+		}()
+
+		o.dagPrometheusWorkerCtx, o.dagPrometheusWorkerCancel = context.WithCancel(context.Background())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			o.runDAGPrometheusUpdateWorker()
+		}()
+	}
+
+	_, err = gocronutils.NewJitteredDurationJob(
+		o.s,
+		time.Minute*15,
+		gocron.NewTask(
+			o.runOLAPTablePartition(ctx),
+		),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
+	)
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("could not schedule task table partition: %w", err)
+	}
+
+	_, err = gocronutils.NewJitteredDurationJob(
+		o.s,
+		time.Hour,
+		gocron.NewTask(
+			o.runArchiveAuditLogs(ctx),
+		),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
+	)
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("could not schedule audit log archive: %w", err)
+	}
+
+	// Default poll interval
+	pollIntervalSec := 2
+
+	// Override with config value if available
+	if o.olapConfig != nil && o.olapConfig.PollInterval > 0 {
+		pollIntervalSec = o.olapConfig.PollInterval
+	}
+
+	_, err = gocronutils.NewJitteredDurationJob(
+		o.s,
+		time.Second*time.Duration(pollIntervalSec),
+		gocron.NewTask(
+			o.runTaskStatusUpdates(ctx),
+		),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
+	)
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("could not schedule task status updates: %w", err)
+	}
+
+	_, err = gocronutils.NewJitteredDurationJob(
+		o.s,
+		time.Second*time.Duration(pollIntervalSec),
+		gocron.NewTask(
+			o.runDAGStatusUpdates(ctx),
+		),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
+	)
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("could not schedule dag status updates: %w", err)
+	}
+
+	_, err = gocronutils.NewJitteredDurationJob(
+		o.s,
+		time.Second*60,
+		gocron.NewTask(
+			o.runTenantProcessAlerts(ctx),
+		),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
+	)
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("could not schedule process tenant alerts: %w", err)
+	}
+
+	_, err = gocronutils.NewJitteredDurationJob(
+		o.s,
+		o.analyzeCronInterval,
+		gocron.NewTask(
+			o.runAnalyze(ctx),
+		),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
+	)
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("could not run analyze: %w", err)
+	}
+
+	if o.auditLogs != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			if err := o.auditLogs.Run(ctx, o.repo.OLAP()); err != nil && !errors.Is(err, context.Canceled) {
+				o.l.Error().Err(err).Msg("audit log outbox flusher stopped")
+			}
+		}()
+	}
+
+	stopAggregates := o.repo.OLAP().Aggregates().Start()
+
+	cleanupBuffer, err := mqBuffer.Start()
+
+	if err != nil {
+		cancel()
+		stopAggregates()
+		return nil, fmt.Errorf("could not start message queue buffer: %w", err)
+	}
+
+	cleanup := func() error {
+		cancel()
+		stopAggregates()
+
+		// Stop prometheus workers if running
+		if o.taskPrometheusWorkerCancel != nil {
+			o.taskPrometheusWorkerCancel()
+		}
+		if o.dagPrometheusWorkerCancel != nil {
+			o.dagPrometheusWorkerCancel()
+		}
+
+		if err := cleanupBuffer(); err != nil {
+			return err
+		}
+
+		if err := cleanupHeavyReadMQ(); err != nil {
+			return err
+		}
+
+		if err := o.s.Shutdown(); err != nil {
+			return err
+		}
+
+		wg.Wait()
+
+		// Close prometheus channels after all workers are done
+		if o.taskPrometheusUpdateCh != nil {
+			close(o.taskPrometheusUpdateCh)
+		}
+		if o.dagPrometheusUpdateCh != nil {
+			close(o.dagPrometheusUpdateCh)
+		}
+
+		return nil
+	}
+
+	return cleanup, nil
+}
+
+func (tc *OLAPControllerImpl) handleBufferedMsgs(tenantId uuid.UUID, msgId string, payloads [][]byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			recoverErr := recoveryutils.RecoverWithAlert(tc.l, tc.a, r)
+
+			if recoverErr != nil {
+				err = recoverErr
+			}
+		}
+	}()
+
+	ctx := context.WithValue(context.Background(), analytics.TenantIDKey, tenantId)
+
+	switch msgId {
+	case "created-task":
+		return tc.handleCreatedTask(ctx, tenantId, payloads)
+	case "created-dag":
+		return tc.handleCreatedDAG(ctx, tenantId, payloads)
+	case "create-monitoring-event":
+		return tc.handleCreateMonitoringEvent(ctx, tenantId, payloads)
+	case "created-event-trigger":
+		return tc.handleCreateEventTriggers(ctx, tenantId, payloads)
+	case "failed-webhook-validation":
+		return tc.handleFailedWebhookValidation(ctx, tenantId, payloads)
+	case "cel-evaluation-failure":
+		return tc.handleCelEvaluationFailure(ctx, tenantId, payloads)
+	}
+
+	return fmt.Errorf("unknown message id: %s", msgId)
+}
+
+func (tc *OLAPControllerImpl) handleCelEvaluationFailure(ctx context.Context, tenantId uuid.UUID, payloads [][]byte) error {
+	failures := make([]v1.CELEvaluationFailure, 0)
+
+	msgs := msgqueue.JSONConvert[tasktypes.CELEvaluationFailures](payloads)
+
+	for _, msg := range msgs {
+		for _, failure := range msg.Failures {
+			if !tc.sample(failure.ErrorMessage) {
+				tc.l.Debug().Ctx(ctx).Msgf("skipping CEL evaluation failure %s for source %s", failure.ErrorMessage, failure.Source)
+				continue
+			}
+
+			failures = append(failures, failure)
+		}
+	}
+
+	return tc.repo.OLAP().StoreCELEvaluationFailures(ctx, tenantId, failures)
+}
+
+// handleCreatedTask is responsible for flushing a created task to the OLAP repository
+func (tc *OLAPControllerImpl) handleCreatedTask(ctx context.Context, tenantId uuid.UUID, payloads [][]byte) error {
+	ctx, span := telemetry.NewSpan(ctx, "OLAPControllerImpl.handleCreatedTask")
+	defer span.End()
+
+	createTaskOpts := make([]*tasktypes.CreatedTaskPayload, 0)
+
+	msgs := msgqueue.JSONConvert[tasktypes.CreatedTaskPayload](payloads)
+
+	for _, msg := range msgs {
+		if !tc.sample(msg.WorkflowRunID.String()) {
+			tc.l.Debug().Ctx(ctx).Msgf("skipping task %d for workflow run %s", msg.ID, msg.WorkflowRunID.String())
+			continue
+		}
+
+		createTaskOpts = append(createTaskOpts, msg)
+	}
+
+	attempts := 0
+	for len(createTaskOpts) > 0 {
+		if attempts >= maxLockAttempts {
+			maxRequeueCount := enumerables.MaxOf(createTaskOpts, func(o *tasktypes.CreatedTaskPayload) int { return o.RequeueCount })
+			tc.logRepublish(ctx, "tasks", len(createTaskOpts), attempts, maxRequeueCount)
+			return tc.republishCreatedTasks(ctx, tenantId, createTaskOpts)
+		}
+
+		attempts++
+
+		result, workflowRunIdsOfLocksNotAcquired, err := tc.repo.OLAP().CreateTasks(ctx, tenantId, extractCreatedTaskData(createTaskOpts))
+
+		if err != nil {
+			return fmt.Errorf("failed to create tasks: %w", err)
+		}
+
+		if err := tc.notifyStatusUpdates(ctx, result); err != nil {
+			return fmt.Errorf("failed to notify status updates: %w", err)
+		}
+
+		failedOpts := make([]*tasktypes.CreatedTaskPayload, 0)
+		succeededOpts := make([]*tasktypes.CreatedTaskPayload, 0)
+
+		for _, opt := range createTaskOpts {
+			if _, notAcquired := workflowRunIdsOfLocksNotAcquired[opt.WorkflowRunID]; notAcquired {
+				failedOpts = append(failedOpts, opt)
+			} else {
+				succeededOpts = append(succeededOpts, opt)
+			}
+		}
+
+		createTaskOpts = failedOpts
+		tc.emitStandaloneTaskRootSpans(ctx, tenantId, extractCreatedTaskData(succeededOpts))
+
+		if len(failedOpts) > 0 && attempts < maxLockAttempts {
+			tc.sleepWithBackoff(attempts)
+		}
+	}
+
+	span.SetAttributes(
+		attribute.Int("attempts", attempts),
+	)
+
+	return nil
+}
+
+func (oc *OLAPControllerImpl) sleepWithBackoff(attempt int) {
+	backoffFactor := math.Exp2(float64(attempt))
+	time.Sleep(time.Duration(backoffFactor) * time.Millisecond)
+}
+
+func (tc *OLAPControllerImpl) emitStandaloneTaskRootSpans(ctx context.Context, tenantId uuid.UUID, tasks []*v1.V1TaskWithPayload) {
+	var spans []*v1.SpanData
+
+	for _, task := range tasks {
+		if task.DagID.Valid {
+			continue
+		}
+
+		insertedAt := time.Now()
+		if task.InsertedAt.Valid {
+			insertedAt = task.InsertedAt.Time
+		}
+
+		spans = append(spans, buildWorkflowRunRootSpan(
+			tenantId,
+			task.WorkflowRunID,
+			task.WorkflowID,
+			task.DisplayName,
+			insertedAt,
+			task.AdditionalMetadata,
+		))
+	}
+
+	tc.writeEngineSpans(ctx, tenantId, spans, "standalone-task-root")
+}
+
+// handleCreatedDAG is responsible for flushing a created DAG to the OLAP repository
+func (tc *OLAPControllerImpl) handleCreatedDAG(ctx context.Context, tenantId uuid.UUID, payloads [][]byte) error {
+	ctx, span := telemetry.NewSpan(ctx, "OLAPControllerImpl.handleCreatedDAG")
+	defer span.End()
+
+	createDAGOpts := make([]*tasktypes.CreatedDAGPayload, 0)
+
+	msgs := msgqueue.JSONConvert[tasktypes.CreatedDAGPayload](payloads)
+
+	for _, msg := range msgs {
+		if !tc.sample(msg.ExternalID.String()) {
+			tc.l.Debug().Ctx(ctx).Msgf("skipping dag %s", msg.ExternalID.String())
+			continue
+		}
+
+		createDAGOpts = append(createDAGOpts, msg)
+	}
+
+	attempts := 0
+	for len(createDAGOpts) > 0 {
+		if attempts >= maxLockAttempts {
+			maxRequeueCount := enumerables.MaxOf(createDAGOpts, func(o *tasktypes.CreatedDAGPayload) int { return o.RequeueCount })
+			tc.logRepublish(ctx, "DAGs", len(createDAGOpts), attempts, maxRequeueCount)
+			return tc.republishCreatedDAGs(ctx, tenantId, createDAGOpts)
+		}
+
+		attempts++
+
+		workflowRunIdsOfLocksNotAcquired, err := tc.repo.OLAP().CreateDAGs(ctx, tenantId, extractCreatedDAGData(createDAGOpts))
+
+		if err != nil {
+			return fmt.Errorf("failed to create DAGs: %w", err)
+		}
+
+		failedOpts := make([]*tasktypes.CreatedDAGPayload, 0)
+		succeededOpts := make([]*tasktypes.CreatedDAGPayload, 0)
+
+		for _, opt := range createDAGOpts {
+			if _, notAcquired := workflowRunIdsOfLocksNotAcquired[opt.ExternalID]; notAcquired {
+				failedOpts = append(failedOpts, opt)
+			} else {
+				succeededOpts = append(succeededOpts, opt)
+			}
+		}
+
+		createDAGOpts = failedOpts
+		tc.emitWorkflowRunRootSpans(ctx, tenantId, extractCreatedDAGData(succeededOpts))
+
+		if len(failedOpts) > 0 && attempts < maxLockAttempts {
+			tc.sleepWithBackoff(attempts)
+		}
+	}
+
+	span.SetAttributes(
+		attribute.Int("attempts", attempts),
+	)
+
+	return nil
+}
+
+func (tc *OLAPControllerImpl) emitWorkflowRunRootSpans(ctx context.Context, tenantId uuid.UUID, dags []*v1.DAGWithData) {
+	spans := make([]*v1.SpanData, 0, len(dags))
+
+	for _, dag := range dags {
+		insertedAt := time.Now()
+		if dag.InsertedAt.Valid {
+			insertedAt = dag.InsertedAt.Time
+		}
+
+		spans = append(spans, buildWorkflowRunRootSpan(
+			tenantId,
+			dag.ExternalID,
+			dag.WorkflowID,
+			dag.DisplayName,
+			insertedAt,
+			dag.AdditionalMetadata,
+		))
+	}
+
+	tc.writeEngineSpans(ctx, tenantId, spans, "dag-root")
+}
+
+// eventPayloadCopy is empty when the message carries no event payload, which is how engines that read event
+// payloads from the core payload store publish it.
+func eventPayloadCopy(payload tasktypes.CreatedEventTriggerPayloadSingleton) v1.StoreOLAPPayloadOpts {
+	payloadCopy := v1.StoreOLAPPayloadOpts{
+		ExternalId: payload.EventExternalId,
+		InsertedAt: sqlchelpers.TimestamptzFromTime(payload.EventSeenAt),
+	}
+
+	if len(payload.EventPayload) > 0 {
+		payloadCopy.Payload = v1.NewPayload[v1.UserEventInputShape](payload.EventPayload)
+	}
+
+	return payloadCopy
+}
+
+func (tc *OLAPControllerImpl) handleCreateEventTriggers(ctx context.Context, tenantId uuid.UUID, payloads [][]byte) error {
+	msgs := msgqueue.JSONConvert[tasktypes.CreatedEventTriggerPayload](payloads)
+
+	seenEventKeysSet := make(map[uuid.UUID]bool)
+
+	type triggerKey struct {
+		runId           int64
+		runInsertedAt   int64
+		eventExternalId uuid.UUID
+		eventSeenAt     int64
+	}
+
+	seenTriggerKeysSet := make(map[triggerKey]bool)
+
+	bulkCreateTriggersParams := make([]v1.EventTriggersFromExternalId, 0)
+
+	tenantIds := make([]uuid.UUID, 0)
+	externalIds := make([]uuid.UUID, 0)
+	seenAts := make([]pgtype.Timestamptz, 0)
+	keys := make([]string, 0)
+	payloadReferenceIds := make([]*uuid.UUID, 0)
+	eventPayloadCopies := make([]v1.StoreOLAPPayloadOpts, 0)
+	additionalMetadatas := make([][]byte, 0)
+	scopes := make([]pgtype.Text, 0)
+	triggeringWebhookNames := make([]pgtype.Text, 0)
+
+	for _, msg := range msgs {
+		for _, payload := range msg.Payloads {
+			if payload.MaybeRunId != nil && payload.MaybeRunInsertedAt != nil {
+				tKey := triggerKey{
+					runId:           *payload.MaybeRunId,
+					runInsertedAt:   payload.MaybeRunInsertedAt.UnixNano(),
+					eventExternalId: payload.EventExternalId,
+					eventSeenAt:     payload.EventSeenAt.UnixNano(),
+				}
+
+				if !seenTriggerKeysSet[tKey] {
+					seenTriggerKeysSet[tKey] = true
+
+					bulkCreateTriggersParams = append(bulkCreateTriggersParams, v1.EventTriggersFromExternalId{
+						RunID:           *payload.MaybeRunId,
+						RunInsertedAt:   sqlchelpers.TimestamptzFromTime(*payload.MaybeRunInsertedAt),
+						EventExternalId: payload.EventExternalId,
+						EventSeenAt:     sqlchelpers.TimestamptzFromTime(payload.EventSeenAt),
+						FilterId:        payload.FilterId,
+					})
+				}
+			}
+
+			eventAlreadySeen := enumerables.HasKey(seenEventKeysSet, payload.EventExternalId)
+
+			if eventAlreadySeen {
+				continue
+			}
+
+			seenEventKeysSet[payload.EventExternalId] = true
+			tenantIds = append(tenantIds, tenantId)
+			externalIds = append(externalIds, payload.EventExternalId)
+			seenAts = append(seenAts, sqlchelpers.TimestamptzFromTime(payload.EventSeenAt))
+			keys = append(keys, payload.EventKey)
+			payloadReferenceIds = append(payloadReferenceIds, payload.PayloadReferenceId)
+			eventPayloadCopies = append(eventPayloadCopies, eventPayloadCopy(payload))
+			additionalMetadatas = append(additionalMetadatas, payload.EventAdditionalMetadata)
+			scopes = append(scopes, sqlchelpers.TextFromMaybeStr(payload.EventScope))
+			triggeringWebhookNames = append(triggeringWebhookNames, sqlchelpers.TextFromMaybeStr(payload.TriggeringWebhookName))
+		}
+	}
+
+	bulkCreateEventParams := sqlcv1.BulkCreateEventsOLAPParams{
+		Tenantids:              tenantIds,
+		Externalids:            externalIds,
+		Seenats:                seenAts,
+		Keys:                   keys,
+		Additionalmetadatas:    additionalMetadatas,
+		Scopes:                 scopes,
+		TriggeringWebhookNames: triggeringWebhookNames,
+		PayloadReferenceIds:    payloadReferenceIds,
+	}
+
+	if err := tc.repo.OLAP().BulkCreateEventsAndTriggers(
+		ctx,
+		bulkCreateEventParams,
+		eventPayloadCopies,
+		bulkCreateTriggersParams,
+	); err != nil {
+		return err
+	}
+
+	tc.emitEventSpans(ctx, tenantId, msgs)
+
+	return nil
+}
+
+func (tc *OLAPControllerImpl) emitEventSpans(ctx context.Context, tenantId uuid.UUID, msgs []*tasktypes.CreatedEventTriggerPayload) {
+	var spans []*v1.SpanData
+
+	type sourceKey struct {
+		sourceWfRunID uuid.UUID
+		eventExtID    uuid.UUID
+	}
+	emittedBySource := make(map[sourceKey]*eventEmittedAccumulator)
+
+	for _, msg := range msgs {
+		for _, p := range msg.Payloads {
+			if p.MaybeRunExternalId == nil {
+				continue
+			}
+			runExtID := *p.MaybeRunExternalId
+
+			srcWfID, srcStepID, ok := parseSourceInfo(p.EventAdditionalMetadata)
+
+			if !ok {
+				spans = append(spans, buildEventSpan(tenantId, p.EventExternalId, p.EventKey, p.EventSeenAt, runExtID, p.EventAdditionalMetadata))
+				tc.l.Debug().Ctx(ctx).Str("event_key", p.EventKey).Msg("event payload missing source info")
+				continue
+			}
+
+			// When the SDK injected a traceparent, also create a bridge
+			// event span in the triggered workflow's trace so the
+			// workflow_run root span can parent to it.
+			if traceIDFromTraceparent(p.EventAdditionalMetadata) != nil {
+				spans = append(spans, buildEventSpan(tenantId, p.EventExternalId, p.EventKey, p.EventSeenAt, runExtID, p.EventAdditionalMetadata))
+			}
+
+			sk := sourceKey{srcWfID, p.EventExternalId}
+			acc, exists := emittedBySource[sk]
+			if !exists {
+				acc = &eventEmittedAccumulator{
+					sourceWorkflowRunExternalID: srcWfID,
+					sourceStepRunExternalID:     srcStepID,
+					eventExternalID:             p.EventExternalId,
+					eventKey:                    p.EventKey,
+					eventSeenAt:                 p.EventSeenAt,
+				}
+				emittedBySource[sk] = acc
+			}
+			acc.triggeredRunExternalIDs = append(acc.triggeredRunExternalIDs, runExtID.String())
+		}
+	}
+
+	for _, acc := range emittedBySource {
+		spans = append(spans, buildEventEmittedSpan(
+			tenantId,
+			acc.sourceWorkflowRunExternalID, acc.sourceStepRunExternalID,
+			acc.eventExternalID, acc.eventKey, acc.eventSeenAt,
+			acc.triggeredRunExternalIDs,
+		))
+	}
+
+	tc.writeEngineSpans(ctx, tenantId, spans, "event")
+}
+
+func olapEventTypeToReadableStatus(eventType enums.V1EventTypeOlap) enums.V1ReadableStatusOlap {
+	switch eventType {
+	case enums.V1EventTypeOlapRETRYING:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapREASSIGNED:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapRETRIEDBYUSER:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapCREATED:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapQUEUED:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapREQUEUEDNOWORKER:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapREQUEUEDRATELIMIT:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapASSIGNED:
+		return enums.V1ReadableStatusOlapRUNNING
+	case enums.V1EventTypeOlapACKNOWLEDGED:
+		return enums.V1ReadableStatusOlapRUNNING
+	case enums.V1EventTypeOlapSENTTOWORKER:
+		return enums.V1ReadableStatusOlapRUNNING
+	case enums.V1EventTypeOlapSLOTRELEASED:
+		return enums.V1ReadableStatusOlapRUNNING
+	case enums.V1EventTypeOlapSTARTED:
+		return enums.V1ReadableStatusOlapRUNNING
+	case enums.V1EventTypeOlapTIMEOUTREFRESHED:
+		return enums.V1ReadableStatusOlapRUNNING
+	case enums.V1EventTypeOlapSCHEDULINGTIMEDOUT:
+		return enums.V1ReadableStatusOlapFAILED
+	case enums.V1EventTypeOlapFINISHED:
+		return enums.V1ReadableStatusOlapCOMPLETED
+	case enums.V1EventTypeOlapFAILED:
+		return enums.V1ReadableStatusOlapFAILED
+	case enums.V1EventTypeOlapCANCELLED:
+		return enums.V1ReadableStatusOlapCANCELLED
+	case enums.V1EventTypeOlapTIMEDOUT:
+		return enums.V1ReadableStatusOlapFAILED
+	case enums.V1EventTypeOlapRATELIMITERROR:
+		return enums.V1ReadableStatusOlapFAILED
+	case enums.V1EventTypeOlapSKIPPED:
+		return enums.V1ReadableStatusOlapCOMPLETED
+	case enums.V1EventTypeOlapCOULDNOTSENDTOWORKER:
+		return enums.V1ReadableStatusOlapFAILED
+	case enums.V1EventTypeOlapDURABLEEVICTED:
+		return enums.V1ReadableStatusOlapEVICTED
+	case enums.V1EventTypeOlapDURABLERESTORING:
+		return enums.V1ReadableStatusOlapRUNNING
+	case enums.V1EventTypeOlapBATCHBUFFERED:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapWAITINGFORBATCH:
+		return enums.V1ReadableStatusOlapQUEUED
+	case enums.V1EventTypeOlapBATCHFLUSHED:
+		// Running until the individual tasks are completed
+		return enums.V1ReadableStatusOlapRUNNING
+	default:
+		return enums.V1ReadableStatusOlapQUEUED
+	}
+}
+
+// handleCreateMonitoringEvent is responsible for sending a group of monitoring events to the OLAP repository
+func (tc *OLAPControllerImpl) handleCreateMonitoringEvent(ctx context.Context, tenantId uuid.UUID, payloads [][]byte) error {
+	ctx, span := telemetry.NewSpan(ctx, "OLAPControllerImpl.handleCreateMonitoringEvent")
+	defer span.End()
+
+	msgs := msgqueue.JSONConvert[tasktypes.CreateMonitoringEventPayload](payloads)
+
+	taskIdsToLookup := make([]int64, len(msgs))
+
+	for i, msg := range msgs {
+		taskIdsToLookup[i] = msg.TaskId
+	}
+
+	metas, err := tc.repo.Tasks().ListTaskMetas(ctx, tenantId, taskIdsToLookup)
+
+	if err != nil {
+		return err
+	}
+
+	taskIdsToMetas := enumerables.KeyBy(metas, func(taskMeta *sqlcv1.ListTaskMetasRow) int64 {
+		return taskMeta.ID
+	})
+
+	taskIds := make([]int64, 0)
+	taskInsertedAts := make([]pgtype.Timestamptz, 0)
+	retryCounts := make([]int32, 0)
+	durableInvocationCounts := make([]int32, 0)
+	workerIds := make([]uuid.UUID, 0)
+	workflowIds := make([]uuid.UUID, 0)
+	eventExternalIdToWorkflowRunId := make(map[uuid.UUID]uuid.UUID)
+	externalIdToMsg := make(map[uuid.UUID]*tasktypes.CreateMonitoringEventPayload)
+	eventTypes := make([]enums.V1EventTypeOlap, 0)
+	readableStatuses := make([]enums.V1ReadableStatusOlap, 0)
+	eventPayloads := make([]string, 0)
+	eventMessages := make([]string, 0)
+	timestamps := make([]pgtype.Timestamptz, 0)
+	eventExternalIds := make([]uuid.UUID, 0)
+	msgIxToSpanEvent := make(map[int]engineSpanEvent)
+
+	// orchestrator tasks have no v1_tasks_olap row; their lifecycle events are applied to their
+	// run's DAG row instead. accumulated in arrival order -- the repository dedupes to the newest
+	// event per DAG, and the query decides from there whether it actually applies.
+	orchestratorUpdates := make([]v1.OrchestratorDAGStatusUpdateOpt, 0)
+	operatorRunIds := make(map[uuid.UUID]struct{})
+	retriedEventIds := make(map[uuid.UUID]struct{})
+
+	for ix, msg := range msgs {
+		taskMeta := taskIdsToMetas[msg.TaskId]
+
+		if taskMeta == nil {
+			tc.l.Error().Ctx(ctx).Msgf("could not find task meta for task id %d", msg.TaskId)
+			continue
+		}
+
+		if !tc.sample(taskMeta.WorkflowRunID.String()) {
+			tc.l.Debug().Ctx(ctx).Msgf("skipping task %d for workflow run %s", msg.TaskId, taskMeta.WorkflowRunID.String())
+			continue
+		}
+
+		readableStatus := olapEventTypeToReadableStatus(msg.EventType)
+
+		if taskMeta.IsDagOrchestrator {
+			if !msg.WillRetry {
+				orchestratorUpdates = append(orchestratorUpdates, v1.OrchestratorDAGStatusUpdateOpt{
+					DagId:              msg.TaskId,
+					DagInsertedAt:      taskMeta.InsertedAt,
+					ReadableStatus:     readableStatus,
+					RetryCount:         msg.RetryCount,
+					ExternalId:         taskMeta.WorkflowRunID,
+					DisplayName:        taskMeta.DisplayName,
+					WorkflowId:         taskMeta.WorkflowID,
+					WorkflowVersionId:  taskMeta.WorkflowVersionID,
+					AdditionalMetadata: taskMeta.AdditionalMetadata,
+				})
+			}
+
+			if msg.StatusOnly {
+				continue
+			}
+		}
+
+		readableStatuses = append(readableStatuses, readableStatus)
+
+		taskIds = append(taskIds, msg.TaskId)
+		taskInsertedAts = append(taskInsertedAts, taskMeta.InsertedAt)
+		workflowIds = append(workflowIds, taskMeta.WorkflowID)
+		retryCounts = append(retryCounts, msg.RetryCount)
+		durableInvocationCounts = append(durableInvocationCounts, msg.DurableInvocationCount)
+		eventTypes = append(eventTypes, msg.EventType)
+		eventPayloads = append(eventPayloads, msg.EventPayload)
+		eventMessages = append(eventMessages, msg.EventMessage)
+		timestamps = append(timestamps, sqlchelpers.TimestamptzFromTime(msg.EventTimestamp))
+		externalId := uuid.New()
+		eventExternalIds = append(eventExternalIds, externalId)
+
+		eventExternalIdToWorkflowRunId[externalId] = taskMeta.WorkflowRunID
+		externalIdToMsg[externalId] = msg
+
+		if msg.WillRetry {
+			retriedEventIds[externalId] = struct{}{}
+		}
+
+		if taskMeta.WasTriggeredByDagOrchestrator {
+			operatorRunIds[taskMeta.WorkflowRunID] = struct{}{}
+		}
+
+		msgIxToSpanEvent[ix] = engineSpanEvent{
+			taskID:             msg.TaskId,
+			insertedAt:         taskMeta.InsertedAt.Time,
+			taskInsertedAt:     taskMeta.InsertedAt.Time,
+			eventType:          msg.EventType,
+			eventTimestamp:     msg.EventTimestamp,
+			eventMessage:       msg.EventMessage,
+			retryCount:         msg.RetryCount,
+			externalID:         taskMeta.ExternalID,
+			workflowRunID:      taskMeta.WorkflowRunID,
+			stepReadableID:     taskMeta.StepReadableID,
+			additionalMetadata: taskMeta.AdditionalMetadata,
+			actionID:           taskMeta.ActionID,
+			displayName:        taskMeta.DisplayName,
+			workflowID:         taskMeta.WorkflowID,
+			workflowVersionID:  taskMeta.WorkflowVersionID,
+			stepID:             taskMeta.StepID,
+			isDagOrchestrator:  taskMeta.IsDagOrchestrator,
+		}
+
+		if msg.WorkerId != nil {
+			workerIds = append(workerIds, *msg.WorkerId)
+		} else {
+			workerIds = append(workerIds, uuid.Nil)
+		}
+	}
+
+	opts := make([]sqlcv1.CreateTaskEventsOLAPParams, 0)
+
+	for i, taskId := range taskIds {
+		var workerId *uuid.UUID
+
+		if workerIds[i] != uuid.Nil {
+			workerId = &workerIds[i]
+		}
+
+		event := sqlcv1.CreateTaskEventsOLAPParams{
+			TenantID:               tenantId,
+			TaskID:                 taskId,
+			TaskInsertedAt:         taskInsertedAts[i],
+			WorkflowID:             workflowIds[i],
+			EventType:              eventTypes[i],
+			EventTimestamp:         timestamps[i],
+			ReadableStatus:         readableStatuses[i],
+			RetryCount:             retryCounts[i],
+			DurableInvocationCount: durableInvocationCounts[i],
+			WorkerID:               workerId,
+			AdditionalEventMessage: sqlchelpers.TextFromStr(eventMessages[i]),
+			ExternalID:             eventExternalIds[i],
+			IsDagOrchestrator:      taskIdsToMetas[taskId].IsDagOrchestrator,
+			PayloadReferenceID:     externalIdToMsg[eventExternalIds[i]].PayloadReferenceId,
+		}
+
+		switch eventTypes[i] {
+		case enums.V1EventTypeOlapFINISHED:
+			if eventPayloads[i] != "" {
+				event.Output = []byte(eventPayloads[i])
+			}
+		case enums.V1EventTypeOlapFAILED:
+			errorMsg := strings.ReplaceAll(eventPayloads[i], "\x00", "")
+			event.ErrorMessage = sqlchelpers.TextFromStr(errorMsg)
+		case enums.V1EventTypeOlapCANCELLED:
+			event.AdditionalEventMessage = sqlchelpers.TextFromStr(eventMessages[i])
+		case enums.V1EventTypeOlapRETRYING,
+			enums.V1EventTypeOlapREASSIGNED,
+			enums.V1EventTypeOlapRETRIEDBYUSER,
+			enums.V1EventTypeOlapCREATED,
+			enums.V1EventTypeOlapQUEUED,
+			enums.V1EventTypeOlapREQUEUEDNOWORKER,
+			enums.V1EventTypeOlapREQUEUEDRATELIMIT,
+			enums.V1EventTypeOlapASSIGNED,
+			enums.V1EventTypeOlapACKNOWLEDGED,
+			enums.V1EventTypeOlapSENTTOWORKER,
+			enums.V1EventTypeOlapSLOTRELEASED,
+			enums.V1EventTypeOlapSTARTED,
+			enums.V1EventTypeOlapTIMEOUTREFRESHED,
+			enums.V1EventTypeOlapSCHEDULINGTIMEDOUT,
+			enums.V1EventTypeOlapTIMEDOUT,
+			enums.V1EventTypeOlapRATELIMITERROR,
+			enums.V1EventTypeOlapSKIPPED,
+			enums.V1EventTypeOlapCOULDNOTSENDTOWORKER,
+			enums.V1EventTypeOlapDURABLEEVICTED,
+			enums.V1EventTypeOlapDURABLERESTORING,
+			enums.V1EventTypeOlapBATCHBUFFERED,
+			enums.V1EventTypeOlapWAITINGFORBATCH,
+			enums.V1EventTypeOlapBATCHFLUSHED:
+		}
+
+		opts = append(opts, event)
+	}
+
+	processedRunIDs := make(map[uuid.UUID]bool)
+
+	attempts := 0
+	for len(opts) > 0 || (attempts == 0 && len(orchestratorUpdates) > 0) {
+		if attempts >= maxLockAttempts {
+			maxRequeueCount := 0
+			for _, msg := range externalIdToMsg {
+				if msg.RequeueCount > maxRequeueCount {
+					maxRequeueCount = msg.RequeueCount
+				}
+			}
+
+			tc.logRepublish(ctx, "monitoring events", len(opts), attempts, maxRequeueCount)
+			return tc.republishMonitoringEvents(ctx, tenantId, opts, externalIdToMsg)
+		}
+
+		attempts++
+
+		result, workflowRunIdsOfLocksNotAcquired, err := tc.repo.OLAP().CreateTaskEvents(ctx, tenantId, opts, eventExternalIdToWorkflowRunId, retriedEventIds, orchestratorUpdates, operatorRunIds)
+
+		if err != nil {
+			return fmt.Errorf("failed to create task events: %w", err)
+		}
+
+		if err := tc.notifyStatusUpdates(ctx, result); err != nil {
+			return fmt.Errorf("failed to notify status updates: %w", err)
+		}
+
+		var spanEventsForSuccessfullyLockedRuns []engineSpanEvent
+		var remainingOpts []sqlcv1.CreateTaskEventsOLAPParams
+
+		justProcessed := make(map[uuid.UUID]bool)
+
+		for ix, msg := range msgs {
+			taskMeta := taskIdsToMetas[msg.TaskId]
+
+			if taskMeta == nil {
+				tc.l.Error().Ctx(ctx).Msgf("could not find task meta for task id %d", msg.TaskId)
+				continue
+			}
+
+			if processedRunIDs[taskMeta.WorkflowRunID] {
+				continue
+			}
+
+			lockNotAcquired := enumerables.HasKey(workflowRunIdsOfLocksNotAcquired, taskMeta.WorkflowRunID)
+
+			if !lockNotAcquired {
+				spanEvent, ok := msgIxToSpanEvent[ix]
+				if ok {
+					spanEventsForSuccessfullyLockedRuns = append(spanEventsForSuccessfullyLockedRuns, spanEvent)
+				}
+				justProcessed[taskMeta.WorkflowRunID] = true
+			}
+		}
+
+		for runID := range justProcessed {
+			processedRunIDs[runID] = true
+		}
+
+		for _, opt := range opts {
+			taskMeta := taskIdsToMetas[opt.TaskID]
+			if taskMeta == nil {
+				continue
+			}
+			if _, lockNotAcquired := workflowRunIdsOfLocksNotAcquired[taskMeta.WorkflowRunID]; lockNotAcquired {
+				remainingOpts = append(remainingOpts, opt)
+			}
+		}
+
+		opts = remainingOpts
+
+		if len(spanEventsForSuccessfullyLockedRuns) > 0 {
+			tc.synthesizeEngineSpans(ctx, tenantId, spanEventsForSuccessfullyLockedRuns)
+		}
+
+		if len(remainingOpts) > 0 && attempts < maxLockAttempts {
+			tc.sleepWithBackoff(attempts)
+		}
+	}
+
+	span.SetAttributes(
+		attribute.Int("attempts", attempts),
+	)
+
+	return nil
+}
+
+func (tc *OLAPControllerImpl) republishCreatedTasks(ctx context.Context, tenantId uuid.UUID, tasks []*tasktypes.CreatedTaskPayload) error {
+	for _, task := range tasks {
+		updated := *task
+		updated.RequeueCount++
+		if updated.RequeueCount > tc.maxRequeueCount {
+			tc.l.Error().Ctx(ctx).Msgf("dropping task %s after %d requeue attempts", task.ExternalID.String(), tc.maxRequeueCount)
+			continue
+		}
+		msg, err := tasktypes.CreatedTaskMessage(tenantId, updated)
+		if err != nil {
+			return err
+		}
+		if err := msgqueue.PubTenantMessage(ctx, tc.l, tc.mq, tc.pubsub, msgqueue.OLAP_QUEUE, msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tc *OLAPControllerImpl) republishCreatedDAGs(ctx context.Context, tenantId uuid.UUID, dags []*tasktypes.CreatedDAGPayload) error {
+	for _, dag := range dags {
+		updated := *dag
+		updated.RequeueCount++
+		if updated.RequeueCount > tc.maxRequeueCount {
+			tc.l.Error().Ctx(ctx).Msgf("dropping dag %s after %d requeue attempts", dag.ExternalID.String(), tc.maxRequeueCount)
+			continue
+		}
+		msg, err := tasktypes.CreatedDAGMessage(tenantId, updated)
+		if err != nil {
+			return err
+		}
+		if err := tc.mq.SendMessage(ctx, msgqueue.OLAP_QUEUE, msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tc *OLAPControllerImpl) republishMonitoringEvents(ctx context.Context, tenantId uuid.UUID, opts []sqlcv1.CreateTaskEventsOLAPParams, externalIdToMsg map[uuid.UUID]*tasktypes.CreateMonitoringEventPayload) error {
+	for _, opt := range opts {
+		payload, ok := externalIdToMsg[opt.ExternalID]
+		if !ok {
+			continue
+		}
+		updated := *payload
+		updated.RequeueCount++
+		if updated.RequeueCount > tc.maxRequeueCount {
+			tc.l.Error().Ctx(ctx).Msgf("dropping monitoring event for task %d after %d requeue attempts", payload.TaskId, tc.maxRequeueCount)
+			continue
+		}
+		msg, err := tasktypes.MonitoringEventMessageFromInternal(tenantId, updated)
+		if err != nil {
+			return err
+		}
+		if err := tc.mq.SendMessage(ctx, msgqueue.OLAP_QUEUE, msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tc *OLAPControllerImpl) handleFailedWebhookValidation(ctx context.Context, tenantId uuid.UUID, payloads [][]byte) error {
+	createFailedWebhookValidationOpts := make([]v1.CreateIncomingWebhookFailureLogOpts, 0)
+
+	msgs := msgqueue.JSONConvert[tasktypes.FailedWebhookValidationPayload](payloads)
+
+	for _, msg := range msgs {
+		if !tc.sample(msg.ErrorText) {
+			tc.l.Debug().Ctx(ctx).Msgf("skipping failure logging for webhook %s", msg.WebhookName)
+			continue
+		}
+
+		createFailedWebhookValidationOpts = append(createFailedWebhookValidationOpts, v1.CreateIncomingWebhookFailureLogOpts{
+			WebhookName: msg.WebhookName,
+			ErrorText:   msg.ErrorText,
+		})
+	}
+
+	return tc.repo.OLAP().CreateIncomingWebhookValidationFailureLogs(ctx, tenantId, createFailedWebhookValidationOpts)
+}
+
+func extractCreatedTaskData(payloads []*tasktypes.CreatedTaskPayload) []*v1.V1TaskWithPayload {
+	result := make([]*v1.V1TaskWithPayload, len(payloads))
+	for i, p := range payloads {
+		result[i] = p.V1TaskWithPayload
+	}
+	return result
+}
+
+func extractCreatedDAGData(payloads []*tasktypes.CreatedDAGPayload) []*v1.DAGWithData {
+	result := make([]*v1.DAGWithData, len(payloads))
+	for i, p := range payloads {
+		result[i] = p.DAGWithData
+	}
+	return result
+}
+
+func (tc *OLAPControllerImpl) sample(workflowRunID string) bool {
+	if tc.samplingHashThreshold == nil {
+		return true
+	}
+
+	bucket := hashToBucket(workflowRunID, 100)
+
+	return int64(bucket) < *tc.samplingHashThreshold
+}
+
+func hashToBucket(workflowRunID string, buckets int) int {
+	hasher := fnv.New32a()
+	idBytes := []byte(workflowRunID)
+	hasher.Write(idBytes)
+	return int(hasher.Sum32()) % buckets
+}

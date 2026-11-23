@@ -1,0 +1,594 @@
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
+from uuid import uuid4
+
+import pytest
+from pydantic import BaseModel
+
+from examples.events.worker import (
+    EVENT_KEY,
+    SECONDARY_KEY,
+    WILDCARD_KEY,
+    EventWorkflowInput,
+    event_workflow,
+)
+from examples.test_utils import poll_for_runs
+from hatchet_sdk import Hatchet, TaskRunSummary
+from hatchet_sdk.features.events import (
+    BulkPushEventWithMetadata,
+    Event,
+)
+
+
+class ProcessedEvent(BaseModel):
+    id: str
+    payload: dict[str, str | bool]
+    meta: dict[str, str | bool | int]
+    should_have_runs: bool
+    test_run_id: str
+
+    def __hash__(self) -> int:
+        return hash(self.model_dump_json())
+
+
+@asynccontextmanager
+async def event_filter(
+    hatchet: Hatchet,
+    test_run_id: str,
+    expression: str | None = None,
+    payload: dict[str, str] | None = None,
+    scope: str | None = None,
+) -> AsyncGenerator[None, None]:
+    expression = (
+        expression
+        or f"input.should_skip == false && payload.test_run_id == '{test_run_id}'"
+    )
+
+    f = await hatchet.filters.aio_create(
+        workflow_id=await event_workflow.aio_get_id(),
+        expression=expression,
+        scope=scope or test_run_id,
+        payload={"test_run_id": test_run_id, **(payload or {})},
+    )
+
+    try:
+        yield
+    finally:
+        await hatchet.filters.aio_delete(f.metadata.id)
+
+
+async def fetch_runs_for_event(
+    hatchet: Hatchet, event: Event
+) -> tuple[ProcessedEvent, list[TaskRunSummary]]:
+    runs = await hatchet.runs.aio_list(triggering_event_id=event.id)
+
+    meta = cast("dict[str, str | int | bool]", event.additional_metadata)
+    payload = cast("dict[str, str | bool]", event.payload)
+
+    processed_event = ProcessedEvent(
+        id=event.id,
+        payload=payload,
+        meta=meta,
+        should_have_runs=meta.get("should_have_runs", False) is True,
+        test_run_id=cast("str", meta["test_run_id"]),
+    )
+
+    if not all(r.status in ["COMPLETED", "FAILED", "CANCELLED"] for r in runs):
+        return (processed_event, [])
+
+    return (
+        processed_event,
+        runs or [],
+    )
+
+
+async def wait_for_result(
+    hatchet: Hatchet, events: list[Event]
+) -> dict[ProcessedEvent, list[TaskRunSummary]]:
+    since = datetime.now(tz=UTC) - timedelta(minutes=2)
+    event_ids = {e.id for e in events}
+
+    iters = 0
+    while True:
+        print("waiting for event runs to complete - iteration", iters)
+        if iters > 20:
+            raise TimeoutError("Timed out waiting for event runs to complete.")
+
+        iters += 1
+
+        persisted = (await hatchet.events.aio_list(limit=100, since=since)) or []
+        if not event_ids.issubset({e.id for e in persisted}):
+            await asyncio.sleep(1)
+            continue
+
+        event_runs = await asyncio.gather(
+            *[fetch_runs_for_event(hatchet, event) for event in events]
+        )
+
+        should_keep_waiting = any(
+            (not event_run and e.should_have_runs)
+            or any(
+                e.status
+                not in [
+                    "COMPLETED",
+                    "FAILED",
+                    "CANCELLED",
+                ]
+                for e in event_run
+            )
+            for e, event_run in event_runs
+        )
+
+        if should_keep_waiting:
+            await asyncio.sleep(1)
+            continue
+
+        event_id_to_runs = dict(event_runs)
+
+        any_queued_or_running = any(
+            run.status in ["QUEUED", "RUNNING"]
+            for runs in event_id_to_runs.values()
+            for run in runs
+        )
+
+        if any_queued_or_running:
+            await asyncio.sleep(1)
+            continue
+
+        break
+
+    return event_id_to_runs
+
+
+async def wait_for_result_and_assert(hatchet: Hatchet, events: list[Event]) -> None:
+    event_to_runs = await wait_for_result(hatchet, events)
+
+    unique_events_with_runs = {
+        event.id
+        for event in events
+        if event.additional_metadata.get("should_have_runs", False) is True
+    }
+
+    unique_events_with_runs_in_results = {
+        event.id for event, runs in event_to_runs.items() if len(runs) > 0
+    }
+
+    assert len(unique_events_with_runs) == len(unique_events_with_runs_in_results)
+
+    for event, runs in event_to_runs.items():
+        await assert_event_runs_processed(event, runs)
+
+
+async def assert_event_runs_processed(
+    event: ProcessedEvent,
+    runs: list[TaskRunSummary],
+) -> None:
+    runs = [
+        run
+        for run in runs
+        if (run.additional_metadata or {}).get("hatchet__event_id") == event.id
+    ]
+
+    if event.should_have_runs:
+        assert len(runs) > 0
+
+        for run in runs:
+            assert run.status == "COMPLETED"
+
+            meta = run.additional_metadata or {}
+            assert meta.get("test_run_id") == event.test_run_id
+    else:
+        assert len(runs) == 0
+
+
+def bpi(
+    index: int = 1,
+    test_run_id: str = "",
+    should_skip: bool = False,
+    should_have_runs: bool = True,
+    key: str = EVENT_KEY,
+    payload: dict[str, str] | None = None,
+    scope: str | None = None,
+) -> BulkPushEventWithMetadata:
+    return BulkPushEventWithMetadata(
+        key=key,
+        payload={
+            "should_skip": should_skip,
+            **(payload or {}),
+        },
+        additional_metadata={
+            "should_have_runs": should_have_runs,
+            "test_run_id": test_run_id,
+            "key": index,
+        },
+        scope=scope,
+    )
+
+
+def cp(should_skip: bool) -> dict[str, Any]:
+    return EventWorkflowInput(should_skip=should_skip).model_dump()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_event_push(hatchet: Hatchet) -> None:
+    e = hatchet.events.push(EVENT_KEY, cp(False))
+
+    assert e.id is not None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_async_event_push(hatchet: Hatchet) -> None:
+    e = await hatchet.events.aio_push(EVENT_KEY, cp(False))
+
+    assert e.id is not None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_async_event_bulk_push(hatchet: Hatchet) -> None:
+    events = [
+        BulkPushEventWithMetadata(
+            key="event1",
+            payload={"message": "This is event 1", "should_skip": False},
+            additional_metadata={"source": "test", "user_id": "user123"},
+        ),
+        BulkPushEventWithMetadata(
+            key="event2",
+            payload={"message": "This is event 2", "should_skip": False},
+            additional_metadata={"source": "test", "user_id": "user456"},
+        ),
+        BulkPushEventWithMetadata(
+            key="event3",
+            payload={"message": "This is event 3", "should_skip": False},
+            additional_metadata={"source": "test", "user_id": "user789"},
+        ),
+    ]
+
+    e = await hatchet.events.aio_bulk_push(events)
+
+    assert len(e) == 3
+
+    # Sort both lists of events by their key to ensure comparison order
+    sorted_events = sorted(events, key=lambda x: x.key)
+    sorted_returned_events = sorted(e, key=lambda x: x.key)
+
+    # Check that the returned events match the original events
+    for original_event, returned_event in zip(
+        sorted_events, sorted_returned_events, strict=False
+    ):
+        assert returned_event.key == hatchet.config.apply_namespace(original_event.key)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_event_bulk_push(hatchet: Hatchet) -> None:
+    events = [
+        BulkPushEventWithMetadata(
+            key="event1",
+            payload={"message": "This is event 1", "should_skip": False},
+            additional_metadata={"source": "test", "user_id": "user123"},
+        ),
+        BulkPushEventWithMetadata(
+            key="event2",
+            payload={"message": "This is event 2", "should_skip": False},
+            additional_metadata={"source": "test", "user_id": "user456"},
+        ),
+        BulkPushEventWithMetadata(
+            key="event3",
+            payload={"message": "This is event 3", "should_skip": False},
+            additional_metadata={"source": "test", "user_id": "user789"},
+        ),
+    ]
+
+    e = hatchet.events.bulk_push(events)
+
+    assert len(e) == 3
+
+    # Sort both lists of events by their key to ensure comparison order
+    sorted_events = sorted(events, key=lambda x: x.key)
+    sorted_returned_events = sorted(e, key=lambda x: x.key)
+
+    # Check that the returned events match the original events
+    for original_event, returned_event in zip(
+        sorted_events, sorted_returned_events, strict=False
+    ):
+        assert returned_event.key == hatchet.config.apply_namespace(original_event.key)
+
+
+@pytest.fixture
+def test_run_id() -> str:
+    return str(uuid4())
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_event_engine_behavior(hatchet: Hatchet, test_run_id: str) -> None:
+    events = [
+        bpi(
+            test_run_id=test_run_id,
+        ),
+        bpi(
+            test_run_id=test_run_id,
+            key="thisisafakeeventfoobarbaz",
+            should_have_runs=False,
+        ),
+    ]
+
+    result = await hatchet.events.aio_bulk_push(events)
+
+    await wait_for_result_and_assert(hatchet, result)
+
+
+def gen_bulk_events(test_run_id: str) -> list[BulkPushEventWithMetadata]:
+    return [
+        ## No scope, so it shouldn't have any runs
+        bpi(
+            index=1,
+            test_run_id=test_run_id,
+            should_skip=False,
+            should_have_runs=False,
+        ),
+        ## No scope, so it shouldn't have any runs
+        bpi(
+            index=2,
+            test_run_id=test_run_id,
+            should_skip=True,
+            should_have_runs=False,
+        ),
+        ## Scope is set and `should_skip` is False, so it should have runs
+        bpi(
+            index=3,
+            test_run_id=test_run_id,
+            should_skip=False,
+            should_have_runs=True,
+            scope=test_run_id,
+        ),
+        ## Scope is set and `should_skip` is True, so it shouldn't have runs
+        bpi(
+            index=4,
+            test_run_id=test_run_id,
+            should_skip=True,
+            should_have_runs=False,
+            scope=test_run_id,
+        ),
+        ## Scope is set, `should_skip` is False, but key is different, so it shouldn't have runs
+        bpi(
+            index=5,
+            test_run_id=test_run_id,
+            should_skip=True,
+            should_have_runs=False,
+            scope=test_run_id,
+            key="thisisafakeeventfoobarbaz",
+        ),
+        ## Scope is set, `should_skip` is False, but key is different, so it shouldn't have runs
+        bpi(
+            index=6,
+            test_run_id=test_run_id,
+            should_skip=False,
+            should_have_runs=False,
+            scope=test_run_id,
+            key="thisisafakeeventfoobarbaz",
+        ),
+    ]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_event_skipping_filtering(hatchet: Hatchet, test_run_id: str) -> None:
+    async with event_filter(hatchet, test_run_id):
+        events = gen_bulk_events(test_run_id)
+
+        result = await hatchet.events.aio_bulk_push(events)
+
+        await wait_for_result_and_assert(hatchet, result)
+
+
+async def bulk_to_single(hatchet: Hatchet, event: BulkPushEventWithMetadata) -> Event:
+    priority = event.priority
+    return await hatchet.events.aio_push(
+        event_key=event.key,
+        payload=event.payload,
+        scope=event.scope,
+        additional_metadata=event.additional_metadata,
+        priority=priority,
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_event_skipping_filtering_no_bulk(
+    hatchet: Hatchet, test_run_id: str
+) -> None:
+    async with event_filter(hatchet, test_run_id):
+        raw_events = gen_bulk_events(test_run_id)
+        events = await asyncio.gather(
+            *[bulk_to_single(hatchet, event) for event in raw_events]
+        )
+
+        await wait_for_result_and_assert(hatchet, events)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_event_payload_filtering(hatchet: Hatchet, test_run_id: str) -> None:
+    async with event_filter(
+        hatchet,
+        test_run_id,
+        "input.should_skip == false && payload.foobar == 'baz'",
+        {"foobar": "qux"},
+    ):
+        event = await hatchet.events.aio_push(
+            event_key=EVENT_KEY,
+            payload={"message": "This is event 1", "should_skip": False},
+            scope=test_run_id,
+            additional_metadata={
+                "should_have_runs": False,
+                "test_run_id": test_run_id,
+                "key": 1,
+            },
+        )
+
+        await wait_for_result_and_assert(hatchet, [event])
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_event_payload_filtering_with_payload_match(
+    hatchet: Hatchet, test_run_id: str
+) -> None:
+    async with event_filter(
+        hatchet,
+        test_run_id,
+        "input.should_skip == false && payload.foobar == 'baz'",
+        {"foobar": "baz"},
+    ):
+        event = await hatchet.events.aio_push(
+            event_key=EVENT_KEY,
+            payload={"message": "This is event 1", "should_skip": False},
+            scope=test_run_id,
+            additional_metadata={
+                "should_have_runs": True,
+                "test_run_id": test_run_id,
+                "key": 1,
+            },
+        )
+
+        await wait_for_result_and_assert(hatchet, [event])
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_filtering_by_event_key(hatchet: Hatchet, test_run_id: str) -> None:
+    async with event_filter(
+        hatchet,
+        test_run_id,
+        f"event_key == '{hatchet.config.apply_namespace(SECONDARY_KEY)}'",
+    ):
+        event_1 = await hatchet.events.aio_push(
+            event_key=SECONDARY_KEY,
+            payload={
+                "message": "Should run because filter matches",
+                "should_skip": False,
+            },
+            scope=test_run_id,
+            additional_metadata={
+                "should_have_runs": True,
+                "test_run_id": test_run_id,
+            },
+        )
+        event_2 = await hatchet.events.aio_push(
+            event_key=EVENT_KEY,
+            payload={
+                "message": "Should skip because filter does not match",
+                "should_skip": False,
+            },
+            scope=test_run_id,
+            additional_metadata={
+                "should_have_runs": False,
+                "test_run_id": test_run_id,
+            },
+        )
+
+        await wait_for_result_and_assert(hatchet, [event_1, event_2])
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_key_wildcards(hatchet: Hatchet, test_run_id: str) -> None:
+    keys = [
+        WILDCARD_KEY.replace("*", "1"),
+        WILDCARD_KEY.replace("*", "2"),
+        "foobar",
+        EVENT_KEY,
+    ]
+
+    async with event_filter(
+        hatchet,
+        test_run_id,
+    ):
+        events = [
+            await hatchet.events.aio_push(
+                event_key=key,
+                payload={
+                    "should_skip": False,
+                },
+                scope=test_run_id,
+                additional_metadata={
+                    "should_have_runs": key != "foobar",
+                    "test_run_id": test_run_id,
+                },
+            )
+            for key in keys
+        ]
+
+        await wait_for_result_and_assert(hatchet, events)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_multiple_runs_for_multiple_scope_matches(
+    hatchet: Hatchet, test_run_id: str
+) -> None:
+    async with (
+        event_filter(
+            hatchet, test_run_id, payload={"filter_id": "1"}, expression="1 == 1"
+        ),
+        event_filter(
+            hatchet, test_run_id, payload={"filter_id": "2"}, expression="2 == 2"
+        ),
+    ):
+        event = await hatchet.events.aio_push(
+            event_key=EVENT_KEY,
+            payload={
+                "should_skip": False,
+            },
+            scope=test_run_id,
+            additional_metadata={
+                "should_have_runs": True,
+                "test_run_id": test_run_id,
+            },
+        )
+
+        event_to_runs = await wait_for_result(hatchet, [event])
+
+        assert len(event_to_runs.keys()) == 1
+
+        runs = next(iter(event_to_runs.values()))
+
+        assert len(runs) == 2
+
+        assert {r.output.get("filter_id") for r in runs} == {"1", "2"}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_multi_scope_bug(hatchet: Hatchet, test_run_id: str) -> None:
+    async with (
+        event_filter(hatchet, test_run_id, expression="1 == 1", scope="a"),
+        event_filter(hatchet, test_run_id, expression="2 == 2", scope="b"),
+    ):
+        events = await hatchet.events.aio_bulk_push(
+            [
+                BulkPushEventWithMetadata(
+                    key=EVENT_KEY,
+                    payload={
+                        "should_skip": False,
+                    },
+                    additional_metadata={
+                        "should_have_runs": True,
+                        "test_run_id": test_run_id,
+                    },
+                    scope="a" if i % 2 == 0 else "b",
+                )
+                for i in range(100)
+            ],
+        )
+
+        await poll_for_runs(
+            hatchet,
+            expected_count=100,
+            additional_metadata={"test_run_id": test_run_id},
+            workflow_ids=[await event_workflow.aio_get_id()],
+            timeout=60.0,
+        )
+
+        for event in events:
+            runs = await hatchet.runs.aio_list(
+                triggering_event_id=event.id,
+                additional_metadata={"test_run_id": test_run_id},
+                workflow_ids=[await event_workflow.aio_get_id()],
+            )
+
+            assert len(runs) == 1

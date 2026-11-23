@@ -1,0 +1,64 @@
+{% from "types/macros.rs.jinja" import field_name -%}
+{% if type.name is endingwith "Patch" -%}
+    #[allow(unused_imports)]
+    use js_option::JsOption;
+{% endif -%}
+use serde::{Deserialize, Serialize};
+
+use super::{
+    {% for c in referenced_components -%}
+        {{ c | to_snake_case }}::{{ c | to_upper_camel_case }},
+    {% endfor -%}
+};
+
+{% set type_name = type.name | to_upper_camel_case -%}
+{{ doc_comment }}
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct {{ type_name }} {
+    {% include "types/struct_fields.rs.jinja" -%}
+}
+
+{#- skip ctors for Out types, they often have weird parameter order and would be
+    broken every time we add another field server-side just like struct literals #}
+{%- if type.name is not endingwith "Out" %}
+
+impl {{ type_name }} {
+    pub fn new(
+        {% for field in type.fields -%}
+            {% if field.type.is_datetime() -%}
+                {% set field_ty = "chrono::DateTime<chrono::Utc>" -%}
+            {% else -%}
+                {% set field_ty = field.type.to_rust() -%}
+            {% endif -%}
+            {% if field.required and not field.nullable -%}
+                {{ field_name(field.name | to_snake_case) }}: {{ field_ty }},
+            {% endif -%}
+        {% endfor -%}
+    ) -> Self {
+        {% if type.fields | selectattr("deprecated") | length > 0 -%}
+            #[expect(deprecated)]
+        {% endif -%}
+        Self {
+            {% for field in type.fields -%}
+                {% if field.required and not field.nullable -%}
+                    {{ field_name(field.name | to_snake_case) }},
+                {% elif type.name is endingwith "Patch" and field.nullable -%}
+                    {{ field_name(field.name | to_snake_case) }}: JsOption::Undefined,
+                {% else -%}
+                    {{ field_name(field.name | to_snake_case) }}: None,
+                {% endif -%}
+            {% endfor -%}
+        }
+    }
+}
+
+{% set all_fields_optional = type.fields | selectattr("required") | length == 0 -%}
+{%- if all_fields_optional %}
+impl Default for {{ type_name }} {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+{%- endif %}
+
+{%- endif %}

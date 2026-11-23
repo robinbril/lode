@@ -1,0 +1,187 @@
+{{- range $name, $_ := .Values.services }}
+{{- if not (has $name (list "core" "egress-proxy")) }}
+{{- fail (printf "unknown service %q in services — valid: core, egress-proxy; core now serves the web UI and sign-in, and auth.enabled turns its built-in sign-in broker on or off" $name) }}
+{{- end }}
+{{- end }}
+{{- if not .Values.publicUrl }}
+{{- fail "Set publicUrl to the instance's public HTTPS origin; core's front door derives its sign-in and web URLs from it" }}
+{{- end }}
+{{- $root := . -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "qm.fullname" $root }}-{{ $name }}
+  labels:
+    {{- include "qm.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ $svc.replicas }}
+  {{- if and (eq $name "core") $svc.persistence.enabled }}
+  {{- if gt (int $svc.replicas) 1 }}
+  {{- fail "core persistence supports at most one replica; shared-storage multi-replica operation is not supported" }}
+  {{- end }}
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "qm.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $name }}
+  template:
+    metadata:
+      annotations:
+        checksum/secret-env: {{ include (print $root.Template.BasePath "/secret.yaml") $root | sha256sum }}
+      labels:
+        {{- include "qm.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $name }}
+    spec:
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "qm.serviceAccountName" $root }}
+      {{- if eq $name "core" }}
+      {{- $drainMs := "" }}
+      {{- range list ($root.Values.env | default dict) ($svc.env | default dict) }}
+      {{- if hasKey . "SHUTDOWN_DRAIN_MS" }}{{ $v := index . "SHUTDOWN_DRAIN_MS" }}{{ $drainMs = ternary "" (toString $v) (kindIs "invalid" $v) | trim }}{{ end }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ add 30 (ceil (maxf 0 (divf (float64 ($drainMs | default "30000")) 1000))) }}
+      {{- end }}
+      {{- if and (eq $name "core") $svc.persistence.enabled }}
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $svc.persistence.existingClaim | default (printf "%s-core-data" (include "qm.fullname" $root)) | quote }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "qm.image" (dict "root" $root "name" $name "service" $svc) | quote }}
+          {{- if and (eq $name "core") $svc.persistence.enabled }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          {{- end }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          {{- with $svc.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            {{- if eq $name "core" }}
+            - name: http
+              containerPort: {{ $svc.port }}
+            - name: public
+              containerPort: {{ $svc.publicPort }}
+            {{- else }}
+            - name: proxy
+              containerPort: {{ $svc.port }}
+            {{- end }}
+          {{- $wired := dict }}
+          {{- $base := trimSuffix "/" $root.Values.publicUrl }}
+          {{- if eq $name "core" }}
+          {{- $_ := set $wired "AGENT_API_URL" $base }}
+          {{- $_ := set $wired "PUBLIC_WEB_URL" $base }}
+          {{- if $root.Values.auth.enabled }}
+          {{- $issuer := printf "%s/idp" $base }}
+          {{- $broker := "http://127.0.0.1:8099" }}
+          {{- $_ := set $wired "AUTH_BROKER_UPSTREAM" $broker }}
+          {{- $_ := set $wired "AUTH_EMBEDDED" "1" }}
+          {{- $_ := set $wired "AUTH_ISSUER" $issuer }}
+          {{- $_ := set $wired "AUTH_CLIENT_ID" "qm-portal" }}
+          {{- $_ := set $wired "AUTH_REDIRECT_URI" (printf "%s/auth/callback" $base) }}
+          {{- $_ := set $wired "AUTH_BROKER_PREFIX" "/idp" }}
+          {{- $_ := set $wired "OIDC_CLIENT_ID" "qm-portal" }}
+          {{- $_ := set $wired "OIDC_ISSUER" $issuer }}
+          {{- $_ := set $wired "OIDC_AUTH_ENDPOINT" (printf "%s/authorize" $issuer) }}
+          {{- $_ := set $wired "OIDC_TOKEN_ENDPOINT" (printf "%s/token" $broker) }}
+          {{- $_ := set $wired "OIDC_USERINFO_ENDPOINT" (printf "%s/userinfo" $broker) }}
+          {{- $_ := set $wired "OIDC_JWKS_URI" (printf "%s/.well-known/jwks.json" $broker) }}
+          {{- $_ := set $wired "OIDC_SCOPES" "openid email" }}
+          {{- $_ := set $wired "OIDC_PRINCIPAL_CLAIM" "email" }}
+          {{- end }}
+          {{- else }}
+          {{- $_ := set $wired "CORE_API_URL" (printf "http://%s-core.%s.svc.cluster.local:%v" (include "qm.fullname" $root) $root.Release.Namespace $root.Values.services.core.port) }}
+          {{- end }}
+          {{- $env := mergeOverwrite (deepCopy $wired) (deepCopy ($root.Values.env | default dict)) (deepCopy ($svc.env | default dict)) }}
+          {{- if eq $name "egress-proxy" }}
+          {{- if ne (int $svc.port) 48080 }}
+          {{- fail "services.egress-proxy.port must be 48080: the Envoy listener is fixed in the image" }}
+          {{- end }}
+          {{- else }}
+          {{- range $key, $port := dict "PORT" $svc.port "PUBLIC_PORT" $svc.publicPort }}
+          {{- if and (hasKey $env $key) (ne (toString (index $env $key)) (toString $port)) }}
+          {{- fail (printf "core %s conflicts with services.core.%s; configure the port there" $key (ternary "port" "publicPort" (eq $key "PORT"))) }}
+          {{- end }}
+          {{- $_ := set $env $key (toString $port) }}
+          {{- end }}
+          {{- if eq (toString $svc.port) (toString $svc.publicPort) }}
+          {{- fail "services.core.port and services.core.publicPort must differ: core serves its API and the public front door on separate listeners" }}
+          {{- end }}
+          {{- if $svc.persistence.enabled }}
+          {{- if and (hasKey $env "DATA_DIR") (ne (index $env "DATA_DIR") "/data") }}
+          {{- fail "core persistence requires DATA_DIR=/data" }}
+          {{- end }}
+          {{- $_ := set $env "DATA_DIR" "/data" }}
+          {{- end }}
+          {{- if and $root.Values.auth.enabled (not $root.Values.envFrom) }}
+          {{- range $authKey, $oidcKey := dict "AUTH_ALLOWED_EMAILS" "OIDC_ALLOWED_EMAILS" "AUTH_ALLOWED_EMAIL_DOMAIN" "OIDC_ALLOWED_EMAIL_DOMAIN" }}
+          {{- if and (hasKey $env $authKey) (not (hasKey $env $oidcKey)) (not (index $root.Values.secretEnv $oidcKey)) }}
+          {{- $_ := set $env $oidcKey (index $env $authKey) }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          env:
+            {{- range $k, $v := $env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- if or (include "qm.hasSecretEnv" $root) $root.Values.envFrom }}
+          envFrom:
+            {{- if include "qm.hasSecretEnv" $root }}
+            - secretRef:
+                name: {{ include "qm.fullname" $root }}-env
+            {{- end }}
+            {{- with $root.Values.envFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- if $svc.startupProbe }}
+          startupProbe:
+            {{- toYaml $svc.startupProbe | nindent 12 }}
+          {{- end }}
+          {{- if $svc.healthPath }}
+          readinessProbe:
+            timeoutSeconds: 2
+            httpGet:
+              path: {{ $svc.readinessPath | default $svc.healthPath }}
+              port: {{ $svc.port }}
+          livenessProbe:
+            httpGet:
+              path: {{ $svc.healthPath }}
+              port: {{ $svc.port }}
+          {{- else }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ $svc.port }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ $svc.port }}
+          {{- end }}
+          {{- with $svc.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $svc.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}
+{{- end }}

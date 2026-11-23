@@ -1,0 +1,477 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { setupCloud, cloud } from "./cloud";
+
+const {
+  fetchOrganizations,
+  fetchProjects,
+  createProject,
+  cloudAccessToken,
+  savedCloudAccessToken,
+  runCloudCommand,
+  sendCloudCommand,
+  loginToCloud,
+  provisionCloudHarness,
+  scaffold,
+  select,
+  password,
+} = vi.hoisted(() => ({
+  fetchOrganizations: vi.fn(),
+  fetchProjects: vi.fn(),
+  createProject: vi.fn(),
+  cloudAccessToken: vi.fn(),
+  savedCloudAccessToken: vi.fn(),
+  runCloudCommand: vi.fn(),
+  sendCloudCommand: vi.fn(),
+  loginToCloud: vi.fn(),
+  provisionCloudHarness: vi.fn(),
+  scaffold: vi.fn(),
+  select: vi.fn(),
+  password: vi.fn(),
+}));
+
+vi.mock("aui-auth/accounts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("aui-auth/accounts")>()),
+  fetchProjects,
+  createProject,
+}));
+vi.mock("../lib/cloud-organizations", () => ({ fetchOrganizations }));
+vi.mock("../lib/cloud-auth", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/cloud-auth")>()),
+  cloudAccessToken,
+  savedCloudAccessToken,
+  loginToCloud,
+}));
+vi.mock("../lib/cloud-remote", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/cloud-remote")>()),
+  runCloudCommand,
+  sendCloudCommand,
+}));
+vi.mock("../lib/cloud-provision", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/cloud-provision")>()),
+  provisionCloudHarness,
+}));
+vi.mock("./create", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./create")>()),
+  create: { parseAsync: scaffold },
+}));
+vi.mock("@clack/prompts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@clack/prompts")>()),
+  select,
+  password,
+}));
+
+const directories: string[] = [];
+afterEach(async () => {
+  await Promise.all(
+    directories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+const fixture = async () => {
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), "assistant-ui-cloud-command-"),
+  );
+  directories.push(directory);
+  cloudAccessToken.mockResolvedValue("oauth-access");
+  fetchOrganizations.mockResolvedValue([
+    { id: "org-1", slug: "team", name: "Team" },
+  ]);
+  fetchProjects.mockResolvedValue([
+    { id: "project-1", slug: "chat", name: "Team chat" },
+  ]);
+  provisionCloudHarness.mockResolvedValue({
+    project_id: "project-1",
+    workspace_id: "shared-workspace",
+    harness_id: "harness-1",
+    harness_origin: "https://harness.example.com",
+    api_origin: "https://project.example.com",
+    api_key: "cloud-server-key",
+  });
+  scaffold.mockResolvedValue(undefined);
+  return directory;
+};
+
+const options = {
+  backendUrl: "http://localhost:3000/api/chat",
+  apiUrl: "https://cloud.example.com",
+  yes: true,
+  skipInstall: true,
+  accessCode: "hackathon-code",
+};
+
+describe("cloud setup", () => {
+  it("creates a new organization and project through Cloud commands", async () => {
+    const directory = await fixture();
+    fetchOrganizations.mockResolvedValue([]);
+    fetchProjects.mockResolvedValue([]);
+    sendCloudCommand.mockReset();
+    sendCloudCommand
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          id: "org-new",
+          slug: "new-team",
+          name: "New",
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          id: "project-new",
+          slug: "chat-app",
+          name: "Chat",
+        }),
+      });
+    provisionCloudHarness.mockResolvedValueOnce({
+      project_id: "project-new",
+      workspace_id: "shared-workspace",
+      harness_id: "harness-1",
+      harness_origin: "https://harness.example.com",
+      api_origin: "https://project.example.com",
+      api_key: "cloud-server-key",
+    });
+    await setupCloud(directory, {
+      ...options,
+      newOrg: "new-team",
+      newProject: "chat-app",
+      name: "Chat",
+    });
+    expect(sendCloudCommand.mock.calls).toEqual([
+      [
+        options.apiUrl,
+        ["orgs", "create", "new-team", "--name", "Chat", "--json"],
+        "oauth-access",
+      ],
+      [
+        options.apiUrl,
+        [
+          "projects",
+          "create",
+          "chat-app",
+          "--name",
+          "Chat",
+          "--org",
+          "org-new",
+          "--json",
+        ],
+        "oauth-access",
+      ],
+    ]);
+    expect(createProject).not.toHaveBeenCalled();
+    expect(provisionCloudHarness).toHaveBeenLastCalledWith(
+      options.apiUrl,
+      "oauth-access",
+      expect.objectContaining({ org_id: "org-new", project_id: "project-new" }),
+    );
+  });
+
+  it("refuses a creation answer without an id, slug and name", async () => {
+    const directory = await fixture();
+    fetchProjects.mockResolvedValue([]);
+    sendCloudCommand.mockReset();
+    const before = provisionCloudHarness.mock.calls.length;
+    for (const stdout of [
+      JSON.stringify({ project: { id: "p" } }),
+      JSON.stringify({ id: "", slug: "chat-app", name: "Chat" }),
+      "not json",
+    ]) {
+      sendCloudCommand.mockResolvedValueOnce({ exitCode: 0, stdout });
+      await expect(
+        setupCloud(directory, { ...options, newProject: "chat-app" }),
+      ).rejects.toThrow(/Unexpected response from `projects create/);
+    }
+    expect(provisionCloudHarness.mock.calls.length).toBe(before);
+  });
+
+  it("stops with the Cloud command's error when creation is refused", async () => {
+    const directory = await fixture();
+    fetchProjects.mockResolvedValue([]);
+    sendCloudCommand.mockReset();
+    sendCloudCommand.mockResolvedValueOnce({
+      exitCode: 1,
+      stderr: "You don't have permission to create projects in team.\n",
+    });
+    const before = provisionCloudHarness.mock.calls.length;
+    await expect(
+      setupCloud(directory, { ...options, newProject: "chat-app" }),
+    ).rejects.toThrow(
+      "Could not create project: You don't have permission to create projects in team.",
+    );
+    expect(provisionCloudHarness.mock.calls.length).toBe(before);
+  });
+
+  it("selects an existing project and scaffolds a shared harness with server-only credentials", async () => {
+    const directory = await fixture();
+    await setupCloud(directory, { ...options, org: "team", project: "chat" });
+    expect(createProject).not.toHaveBeenCalled();
+    expect(scaffold).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        "cloud-harness",
+        "--skip-install",
+        "--no-skills",
+      ]),
+      { from: "user" },
+    );
+    expect(provisionCloudHarness).toHaveBeenCalledWith(
+      options.apiUrl,
+      "oauth-access",
+      expect.objectContaining({
+        org_id: "org-1",
+        project_id: "project-1",
+        access_code: "hackathon-code",
+        backend_urls: [],
+        allow_localhost: true,
+      }),
+    );
+    const env = await readFile(path.join(directory, ".env.local"), "utf8");
+    expect(env).toContain('ASSISTANT_API_KEY="cloud-server-key"');
+    expect(env).not.toContain("NEXT_PUBLIC_ASSISTANT_API_KEY");
+    expect(
+      await readFile(
+        path.join(directory, ".assistant-ui", "cloud.json"),
+        "utf8",
+      ),
+    ).not.toContain("cloud-server-key");
+  });
+
+  it("does not provision again or overwrite customizations when setup is repeated", async () => {
+    const directory = await fixture();
+    await setupCloud(directory, options);
+    const envFile = path.join(directory, ".env.local");
+    const custom = `${(await readFile(envFile, "utf8")).replace(/^ASSISTANT_API_KEY=/m, "export ASSISTANT_API_KEY=")}OPENAI_API_KEY=custom-key\nCUSTOM_SETTING=keep-me\n`;
+    await writeFile(envFile, custom);
+    const before = provisionCloudHarness.mock.calls.length;
+    await setupCloud(directory, options);
+    expect(provisionCloudHarness.mock.calls.length).toBe(before);
+    expect(await readFile(envFile, "utf8")).toBe(custom);
+  });
+
+  it("requires an explicit project when noninteractive users have several choices", async () => {
+    const directory = await fixture();
+    fetchProjects.mockResolvedValue([
+      { id: "one", slug: "one", name: "One" },
+      { id: "two", slug: "two", name: "Two" },
+    ]);
+    await expect(setupCloud(directory, options)).rejects.toThrow("--project");
+  });
+
+  it("reuses an organization created by an interrupted setup", async () => {
+    const directory = await fixture();
+    const before = fetchProjects.mock.calls.length;
+    await setupCloud(directory, {
+      ...options,
+      newOrg: "team",
+      project: "chat",
+    });
+    expect(fetchProjects.mock.calls.slice(before)).toEqual([
+      [expect.anything(), "oauth-access", { id: "org-1" }],
+    ]);
+    expect(fetchProjects).toHaveBeenCalledWith(
+      expect.anything(),
+      "oauth-access",
+      {
+        id: "org-1",
+      },
+    );
+    expect(provisionCloudHarness).toHaveBeenCalledWith(
+      options.apiUrl,
+      "oauth-access",
+      expect.objectContaining({ org_id: "org-1" }),
+    );
+  });
+
+  it("rejects a changed backend before silently reusing configured resources", async () => {
+    const directory = await fixture();
+    await setupCloud(directory, options);
+    const before = provisionCloudHarness.mock.calls.length;
+    await expect(
+      setupCloud(directory, {
+        ...options,
+        backendUrl: "https://app.example.com/api/chat",
+      }),
+    ).rejects.toThrow("backend allowlist in the Cloud dashboard");
+    expect(provisionCloudHarness.mock.calls.length).toBe(before);
+  });
+
+  it("rejects conflicting selection flags before logging in", async () => {
+    const directory = await fixture();
+    const before = cloudAccessToken.mock.calls.length;
+    await expect(
+      setupCloud(directory, { ...options, org: "team", newOrg: "other" }),
+    ).rejects.toThrow("Choose --org or --new-org");
+    expect(cloudAccessToken.mock.calls.length).toBe(before);
+  });
+
+  it("rejects URL credentials and invalid organization slugs before logging in", async () => {
+    const directory = await fixture();
+    const before = cloudAccessToken.mock.calls.length;
+    await expect(
+      setupCloud(directory, {
+        ...options,
+        backendUrl: "https://user:secret@app.example.com/api/chat",
+      }),
+    ).rejects.toThrow("credentials");
+    await expect(
+      setupCloud(directory, { ...options, newOrg: "Bad Org!" }),
+    ).rejects.toThrow("Organization slugs");
+    expect(cloudAccessToken.mock.calls.length).toBe(before);
+  });
+
+  it("allows an HTTP backend on any 127.0.0.0/8 address, like the Cloud URL", async () => {
+    const directory = await fixture();
+    await setupCloud(directory, {
+      ...options,
+      backendUrl: "http://127.1.2.3:3000/api/chat",
+    });
+    expect(provisionCloudHarness).toHaveBeenLastCalledWith(
+      options.apiUrl,
+      "oauth-access",
+      expect.objectContaining({ backend_urls: [], allow_localhost: true }),
+    );
+  });
+
+  it("rejects an HTTP backend that is not on this machine before logging in", async () => {
+    const directory = await fixture();
+    const before = cloudAccessToken.mock.calls.length;
+    await expect(
+      setupCloud(directory, {
+        ...options,
+        backendUrl: "http://app.example.com/api/chat",
+      }),
+    ).rejects.toThrow("Use an HTTPS backend URL");
+    expect(cloudAccessToken.mock.calls.length).toBe(before);
+  });
+
+  it("stops before provisioning when organization selection is cancelled", async () => {
+    const directory = await fixture();
+    fetchOrganizations.mockResolvedValue([
+      { id: "one", slug: "one", name: "One" },
+      { id: "two", slug: "two", name: "Two" },
+    ]);
+    const prompts =
+      await vi.importActual<typeof import("@clack/prompts")>("@clack/prompts");
+    const cancelled = await prompts.select({
+      message: "Cancel test",
+      options: [{ value: "one", label: "One" }],
+      signal: AbortSignal.abort(),
+    });
+    select.mockResolvedValue(cancelled);
+    const before = provisionCloudHarness.mock.calls.length;
+    await expect(
+      setupCloud(directory, { ...options, yes: false }),
+    ).rejects.toThrow();
+    expect(provisionCloudHarness.mock.calls.length).toBe(before);
+  });
+
+  it("exposes login, logout, and setup as cloud commands", () => {
+    expect(cloud.commands.map((command) => command.name())).toEqual([
+      "login",
+      "logout",
+      "setup",
+    ]);
+  });
+});
+
+describe("cloud remote forwarding", () => {
+  const forwarded = async (argv: string[]) => {
+    runCloudCommand.mockClear();
+    runCloudCommand.mockResolvedValue(4);
+    await cloud.parseAsync(argv, { from: "user" });
+    return runCloudCommand.mock.calls.map(([args]) => args);
+  };
+
+  it("forwards help, unknown subcommands and their flags verbatim", async () => {
+    for (const argv of [
+      [],
+      ["help"],
+      ["--help"],
+      ["-h"],
+      ["help", "projects"],
+      ["projects", "list", "--org", "acme", "--json"],
+      ["whoami", "--version"],
+      ["--org=acme", "projects"],
+    ]) {
+      await expect(forwarded(argv)).resolves.toEqual([argv]);
+    }
+    expect(process.exitCode).toBe(4);
+    process.exitCode = undefined;
+  });
+
+  it("keeps login local", async () => {
+    loginToCloud.mockResolvedValue(undefined);
+    await expect(forwarded(["login", "--no-open"])).resolves.toEqual([]);
+    expect(loginToCloud).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ noOpen: true }),
+    );
+  });
+
+  it("sends the saved login without starting a new one", async () => {
+    savedCloudAccessToken.mockResolvedValue(null);
+    runCloudCommand.mockImplementationOnce(async (_args, options) => {
+      await expect(options.accessToken()).resolves.toBeNull();
+      return 0;
+    });
+    await cloud.parseAsync(["whoami"], { from: "user" });
+    expect(savedCloudAccessToken).toHaveBeenCalled();
+    expect(cloudAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("answers help for a local command here, with its flags", async () => {
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+    try {
+      await expect(forwarded(["help", "setup"])).resolves.toEqual([]);
+      const text = write.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(text).toMatch(/--new-project <slug>/);
+      expect(text).toMatch(/--backend-url <url>/);
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it("sends the directory defaults and the action handlers along", async () => {
+    runCloudCommand.mockImplementationOnce(async (_args, options) => {
+      expect(typeof options.defaults).toBe("function");
+      expect(typeof options.openUrl).toBe("function");
+      return 0;
+    });
+    await cloud.parseAsync(["projects", "show"], { from: "user" });
+    expect(runCloudCommand).toHaveBeenCalled();
+  });
+});
+
+describe("cloud --no-open", () => {
+  const sent = async (argv: string[]) => {
+    runCloudCommand.mockClear();
+    runCloudCommand.mockResolvedValue(0);
+    await cloud.parseAsync(argv, { from: "user" });
+    const [args, options] = runCloudCommand.mock.calls[0]!;
+    return { args, noOpen: options.noOpen };
+  };
+
+  it("is the client's flag before --, and the remote command's after it", async () => {
+    await expect(
+      sent(["projects", "list", "--no-open", "--json"]),
+    ).resolves.toEqual({
+      args: ["projects", "list", "--json"],
+      noOpen: true,
+    });
+    await expect(
+      sent(["projects", "show", "--", "--no-open"]),
+    ).resolves.toEqual({
+      args: ["projects", "show", "--no-open"],
+      noOpen: false,
+    });
+    await expect(sent(["projects", "list"])).resolves.toEqual({
+      args: ["projects", "list"],
+      noOpen: false,
+    });
+  });
+});

@@ -1,0 +1,130 @@
+---
+name: update-deps
+description: Update dependencies across the assistant-ui monorepo (npm via pnpm + taze, Expo SDK-pinned packages, Python packages via uv, and GitHub Actions). Use when the user asks to bump, upgrade, or update dependencies (root, packages, examples, templates, python/*, .github/workflows/*), refresh the pnpm lockfile or uv.lock files, repin GitHub Actions, or run the dependency-update workflow before a release.
+---
+
+# update-deps
+
+Update every package's dependencies across the monorepo (packages, apps, examples, templates, `python/*`, and `.github/workflows/*`), regenerate lockfiles, and create a `chore: update dependencies` changeset for the JS side.
+
+## JS / TS (pnpm workspaces)
+
+Preview what would change without writing anything:
+
+```bash
+pnpm deps:check
+```
+
+Run the full update (writes package.json files, reinstalls, dedupes, generates the changeset):
+
+```bash
+pnpm deps:update
+```
+
+Both are defined in the root `package.json`; `deps:update` runs `scripts/update-deps.sh`, which performs, in order:
+
+1. `npx taze major -f -w -r`: bump every dependency (incl. major) recursively. taze skips the packages `pnpm-workspace.yaml` lists under `update.ignoreDeps`, which hold `@babel/core` and the Babel AST packages on 7; the comment there says why.
+2. Wipe the `node_modules` of every tracked package and `pnpm-lock.yaml`. The wipe is driven from `git ls-files`, so a git worktree checked out under the repository keeps its own installed tree.
+3. `pnpm install --no-frozen-lockfile` — **required** before the repin: `expo install --fix` resolves the installed versions off the file system and compares those against the SDK matrix, so it has to see a tree resolved from the manifest taze just wrote. It has to be this fresh resolve, because an install that still had the old lockfile to reuse would resolve back to the versions taze replaced and the repin would inspect a tree that will never ship.
+4. `npx expo install --fix` inside `examples/with-expo` — **required**: taze does not know about Expo's SDK compatibility matrix and will bump `expo-*` / `react-native-*` / `react` / `react-dom` to versions that crash at runtime. `expo install --fix` re-pins them to the versions sanctioned by the current `expo` SDK. Do not skip this step, and do not commit Expo-related bumps without it. When either step fails on anything but a trust downgrade (see Notes), the script restores the entries in the SDK's native-module matrix from `examples/with-expo/package.json`, because taze's Expo bumps are unsanctioned without the repin, finishes the remaining steps, and exits non-zero.
+5. `pnpm install` + `pnpm dedupe` — reconcile the lockfile with whatever the repin rewrote.
+6. `bash scripts/generate-deps-changeset.sh` — write a patch changeset for each published package whose `package.json` changed in a field consumers install, the same rule the Changeset Semver Check applies; edits confined to `devDependencies`, `version`, or workspace ranges release nothing and are left out.
+
+### Expo notes
+
+- If you bump the `expo` major in `examples/with-expo` (e.g. SDK 55 → 56), `expo install --fix` will rewrite the matching `react`, `react-dom`, `react-native`, `react-native-*`, and `expo-*` versions. Eyeball the diff in `examples/with-expo/package.json` to confirm everything snapped to the expected SDK line.
+- If you intentionally want to hold Expo back, run `pnpm deps:update`, then `git checkout examples/with-expo/package.json` and re-run `pnpm install` + the changeset script manually.
+- `examples/with-expo` pins `@react-native/metro-config` to its `react-native` version only to satisfy `@react-native/community-cli-plugin`'s exact optional peer; nothing imports it (`metro.config.js` uses `expo/metro-config`). The updater moves the pin to the manifest's `react-native` after the Expo repin or the fallback restore, and `pnpm unmanaged-pins:check` fails when the two differ or the pin is gone.
+- `expo install --fix` upgrades the `expo` package itself before it repins anything, so a release inside pnpm's `minimumReleaseAge` window (`pnpm-workspace.yaml` sets 1440 minutes) makes it, or the install that precedes it, exit non-zero having applied nothing. The script then restores the entries keyed in `expo/bundledNativeModules.json`, read rather than hardcoded so the set tracks the SDK, unioned with an `expo` / `expo-*` / `@expo/*` / `react` / `react-native*` name pattern so an SDK package missing from the matrix is still covered, because the floor taze wrote matches only the age-blocked release and keeping it would fail the fresh resolve that follows. That is the matrix half of what `expo install --fix` consults; the `relatedPackages` half (`@babel/core`, `@types/react`, `typescript` among them) comes from Expo's versions endpoint over the network, so those keep taze's bumps and are reviewed like any other bump. The run still exits non-zero, because the repin is required. Rerun the update once the release has aged.
+
+### Workflow
+
+1. From a clean working tree on a feature branch, run `pnpm deps:update`. It takes several minutes (lockfile is regenerated from scratch).
+2. `git status` to confirm the changeset file appeared under `.changeset/` and that only `package.json` / `pnpm-lock.yaml` files changed.
+3. Validate before committing:
+   ```bash
+   pnpm build
+   pnpm lint
+   pnpm test
+   ```
+4. If a package breaks on a major bump, pin that one dep back in the offending `package.json` and re-run `pnpm install`; the changeset script does **not** need to re-run.
+5. Commit as `chore: update dependencies` and push.
+
+### Notes
+
+- Do **not** hand-edit the generated changeset's bump levels — `generate-deps-changeset.sh` emits `patch` for every published package whose `package.json` changed in a consumer-facing field and skips private packages (`@assistant-ui/docs-site`, `@assistant-ui/shadcn-registry`, etc.). Per `AGENTS.md`, dependency updates are always patch.
+- The script compares every `package.json` against the point where the branch left `origin/main`, so committed, staged and unstaged edits all count and it can run after the bumps are committed; fetch `origin/main` first. A rerun on an existing dependency branch rewrites the changeset an earlier run added instead of writing a second one.
+- `pnpm-lock.yaml` will have a huge diff; that's expected since step 2 deletes it.
+- `pnpm-workspace.yaml` sets `trustPolicy: no-downgrade`, so an install fails when taze moves a package to a release that lacks the trusted publishing or provenance an earlier release had. pnpm names it a "trust downgrade". Vercel's releases stopped carrying provenance attestations, so a `vercel` bump trips this on most runs. Waiting won't clear it, and the script stops with this remedy instead of restoring the Expo entries: check the flagged release on the registry (`npm view <name>@<version> _npmUser dist.attestations` shows who published it and whether it has provenance) and compare it with its upstream source, add the exact `name@version` to `trustPolicyExclude`, and rerun. The aborted run already wrote taze's bumps, so restore the manifests and lockfile first (`git checkout -- '*package.json' pnpm-lock.yaml`) so the Expo fallback backs up the branch's own versions. `trustPolicyExcludePrune` drops an entry once its locked version is gone.
+- `pnpm unmanaged-pins:check` guards two pins the updater never opens, so a routine run can go red on a file it did not touch. Raise the exact pins in `apps/docs/lib/xulux/learn/courses/*/shared/project/package.json` to whatever the workspace now prevailingly declares (pins on packages this repository publishes are exempt, since those move on every release), and move any version-scoped `allowBuilds` entry in `pnpm-workspace.yaml` to the version the refreshed lockfile installs.
+- taze never sees the versions the CLI runs through the package runner: `SHADCN_PACKAGE` in `packages/cli/src/lib/utils/package-manager.ts` and `SKILLS_CLI_PACKAGE` in `packages/cli/src/lib/agent-skill.ts`. Raise each to its newest release older than `minimumReleaseAge` (`npm view <name> time`), and include the CLI package in the changeset, since the pin ships in its published code.
+- Node `>=24` (root `package.json` `engines`) and the pnpm version pinned in its `packageManager` are required. pnpm switches to the pinned version on its own inside the repository.
+
+## Python (uv)
+
+Python packages live under `python/` and each has its own `pyproject.toml` + `uv.lock`. They are **not** touched by `pnpm deps:update`.
+
+Packages:
+
+- `python/assistant-stream`
+- `python/assistant-ui-sync-server-api`
+- `python/assistant-transport-backend`
+- `python/assistant-transport-backend-langgraph`
+- `python/state-test`
+- `python/assistant-stream-hello-world` (no lockfile — example)
+
+For each package with a `uv.lock`, upgrade with:
+
+```bash
+cd python/<package>
+uv lock --upgrade
+uv sync
+uv run pytest        # if tests exist
+```
+
+Or in one pass from the repo root:
+
+```bash
+for d in python/*/uv.lock; do
+  (cd "$(dirname "$d")" && uv lock --upgrade && uv sync)
+done
+```
+
+Notes:
+
+- Python bumps do **not** require a changeset — Python packages are versioned manually in their `pyproject.toml` and published via `.github/workflows/pypi-publish.yaml`, independent of the JS changesets pipeline.
+- Bumping a published Python package's own version (e.g. `assistant-stream`) is a separate release decision; `uv lock --upgrade` only touches transitive deps.
+- Commit Python and JS dep updates separately if the diff is large, or as one `chore: update dependencies` commit if both are clean.
+
+## GitHub Actions
+
+Every `uses:` entry under `.github/workflows/*.{yml,yaml}` is SHA-pinned for supply-chain hardening and carries a `ratchet:` marker naming the release the SHA came from:
+
+```yaml
+uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+```
+
+The marker is what `ratchet update` reads to recognize the entry, so an entry that loses it keeps working and stops being updated. `pnpm unmanaged-pins:check` fails on a ref that is not a commit SHA, on a missing marker, on a marker with no version, and on one that names a different action than its `uses:` ref. Annotate a deliberately unmanaged ref, or a pinned container image, with `# ratchet:exclude`, which waives all four.
+
+There is **no Dependabot config** (`.github/dependabot.yml` does not exist), so these don't update themselves. `pnpm deps:update` does not touch them either.
+
+To refresh them, use [`ratchet`](https://github.com/sethvargo/ratchet) (or `pinact`):
+
+```bash
+# pin any remaining tag refs to SHAs (one-time per file)
+ratchet pin .github/workflows/*.yml .github/workflows/*.yaml
+
+# bump every SHA-pinned action to the latest release SHA for its major
+ratchet update .github/workflows/*.yml .github/workflows/*.yaml
+```
+
+Both rewrite the marker alongside the SHA. If `ratchet` isn't available, fall back to manually checking each `uses:` against the action's releases page and updating the SHA and marker together.
+
+After updating, sanity-check on a branch by pushing and watching the affected workflows actually run (most are PR-triggered: `code-quality`, `autofix`, `changeset`, `changeset-semver-check`, `expo`, `devtools-frame`, `registry`). Release workflows (`npm-publish`, `pypi-publish`, `traction`) can't be tested without a release tag — eyeball those diffs extra carefully.
+
+Notes:
+
+- GH Actions updates do not need a changeset (they don't ship in any npm package).
+- `pnpm unmanaged-pins:check` also holds the Node.js major consistent across every workflow, so bump `runtime: node@N` and `node-version:` together.
+- Commit as `chore: update github actions` (or roll into `chore: update dependencies` if landing alongside the JS/Python bumps).
+- If a major bump changes inputs/outputs, check the action's release notes — `ratchet` will happily move you from `v4` to `v6` without warning about breaking changes.

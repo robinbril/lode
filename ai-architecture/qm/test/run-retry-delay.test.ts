@@ -1,0 +1,208 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import type { Pool } from "pg";
+import { createPostgresRunStore } from "../src/runs/postgres-run-store.ts";
+import type { OrchestratorInput } from "../src/core/orchestrator.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { seedTestTenant } from "./support/test-tenant.ts";
+
+const request: OrchestratorInput = {
+  actor: { id: "retry-test", type: "internal" },
+  conversation: { kind: "dm", threadRef: "retry-test", audience: [] },
+  origin: { kind: "direct" },
+  text: "test",
+};
+
+for (const backend of ["memory", "postgres"] as const) {
+  test(
+    `${backend}: retry deadline is respected across claim paths and preserves session order`,
+    {
+      skip: backend === "postgres" && !process.env.DATABASE_URL,
+    },
+    async (t) => {
+      let connectionString = process.env.DATABASE_URL!;
+      let admin: Pool | undefined;
+      const schema = `retry_${randomUUID().replaceAll("-", "")}`;
+      if (backend === "postgres") {
+        const pg = (await import("pg")).default;
+        admin = new pg.Pool({ connectionString });
+        await admin.query(`CREATE SCHEMA ${schema}`);
+        const url = new URL(connectionString);
+        url.searchParams.set("options", `${url.searchParams.get("options") ?? ""} -c search_path=${schema}`.trim());
+        await seedTestTenant(url.toString());
+        connectionString = url.toString();
+      }
+      const runtime =
+        backend === "memory" ? createPostgresRunStore(testDatabaseUrl()) : createPostgresRunStore(connectionString);
+      let { runs } = runtime;
+      const sessionId = randomUUID();
+      try {
+        const first = (await runs.enqueue({ sessionId, request })).run;
+        const lease = await runs.claimById(first.id, "worker-1", 60_000);
+        assert.ok(lease?.leaseToken);
+        const now = Date.now();
+        t.mock.timers.enable({ apis: ["Date"], now });
+        await runs.fail(first.id, lease.leaseToken, "temporary outage", { retryAfterMs: 30_000 });
+        if (backend === "postgres") {
+          await runs.close?.();
+          runs = createPostgresRunStore(connectionString).runs;
+        }
+        const later = (await runs.enqueue({ sessionId, request })).run;
+        const other = (await runs.enqueue({ sessionId: randomUUID(), request })).run;
+        assert.equal(await runs.claimById(first.id, "worker-2", 60_000), null);
+        assert.equal(await runs.claimById(later.id, "worker-2", 60_000), null);
+        const unrelated = (await runs.claim("worker-2", 60_000))[0] ?? null;
+        assert.equal(unrelated?.id, other.id);
+        await runs.complete(other.id, unrelated!.leaseToken!, { status: "ok", sessionId: other.sessionId });
+        t.mock.timers.tick(29_999);
+        assert.equal((await runs.claim("worker-3", 60_000))[0] ?? null, null);
+        t.mock.timers.tick(1);
+        assert.equal(await runs.claimById(later.id, "worker-3", 60_000), null);
+        const retried = (await runs.claim("worker-3", 60_000))[0] ?? null;
+        assert.equal(retried?.id, first.id);
+        assert.equal(retried?.attempts, 2);
+        assert.equal(retried?.errorAttempts, 1);
+        await runs.complete(first.id, retried!.leaseToken!, { status: "ok", sessionId });
+        const next = (await runs.claim("worker-3", 60_000))[0] ?? null;
+        assert.equal(next?.id, later.id);
+        await runs.complete(later.id, next!.leaseToken!, { status: "ok", sessionId });
+      } finally {
+        t.mock.timers.reset();
+        await runs.close?.();
+        if (admin) {
+          try {
+            await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+          } finally {
+            await admin.end();
+          }
+        }
+      }
+    },
+  );
+
+  test(
+    `${backend}: failed returns wait durably without delaying new work or acknowledging results`,
+    { skip: backend === "postgres" && !process.env.DATABASE_URL },
+    async (t) => {
+      let connectionString = process.env.DATABASE_URL!;
+      let admin: Pool | undefined;
+      const schema = `return_retry_${randomUUID().replaceAll("-", "")}`;
+      if (backend === "postgres") {
+        const pg = (await import("pg")).default;
+        admin = new pg.Pool({ connectionString });
+        await admin.query(`CREATE SCHEMA ${schema}`);
+        const url = new URL(connectionString);
+        url.searchParams.set("options", `${url.searchParams.get("options") ?? ""} -c search_path=${schema}`.trim());
+        await seedTestTenant(url.toString());
+        connectionString = url.toString();
+      }
+      let { runs } =
+        backend === "memory" ? createPostgresRunStore(testDatabaseUrl()) : createPostgresRunStore(connectionString);
+      try {
+        const child = (await runs.enqueue({ sessionId: `agent:main:subagent:${randomUUID()}`, request })).run;
+        await runs.deferReturn(child.id, 60_000);
+        const lease = await runs.claimById(child.id, "worker", 60_000);
+        assert.ok(lease?.leaseToken);
+        await runs.complete(child.id, lease.leaseToken, { status: "ok", reply: "saved result" });
+        const completed = await runs.get(child.id);
+        const wake = (await runs.enqueue({ sessionId: randomUUID(), request, dedupKey: `subagent-return:${child.id}` }))
+          .run;
+        t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+        await runs.deferReturn(child.id, 60_000);
+        if (backend === "postgres") {
+          await runs.close?.();
+          runs = createPostgresRunStore(connectionString).runs;
+        }
+        assert.deepEqual(await runs.pendingReturns(), []);
+        assert.deepEqual(await runs.get(child.id), completed);
+        const fresh = (await runs.enqueue({ sessionId: `agent:main:subagent:${randomUUID()}`, request })).run;
+        const freshLease = await runs.claimById(fresh.id, "worker", 60_000);
+        await runs.fail(fresh.id, freshLease!.leaseToken!, "failed task", { retry: false });
+        assert.deepEqual(
+          (await runs.pendingReturns()).map((run) => run.id),
+          [fresh.id],
+        );
+        await runs.deferReturn(fresh.id, 60_000);
+        t.mock.timers.tick(59_999);
+        assert.deepEqual(await runs.pendingReturns(), []);
+        t.mock.timers.tick(1);
+        assert.equal((await runs.pendingReturns()).length, 2);
+        await runs.markReturned(child.id);
+        await runs.deferReturn(child.id, 60_000);
+        assert.ok(!(await runs.pendingReturns()).some((run) => run.id === child.id));
+        t.mock.timers.tick(60_000);
+        assert.ok((await runs.pendingReturns()).some((run) => run.id === child.id));
+        await runs.withdraw(wake.id, { unstartedOnly: true });
+        assert.deepEqual(
+          (await runs.pendingReturns()).map((run) => run.id),
+          [fresh.id],
+        );
+      } finally {
+        t.mock.timers.reset();
+        await runs.close?.();
+        if (admin) {
+          try {
+            await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+          } finally {
+            await admin.end();
+          }
+        }
+      }
+    },
+  );
+}
+
+test(
+  "postgres: the recent runs read uses its ordered index",
+  {
+    skip: !process.env.DATABASE_URL,
+  },
+  async () => {
+    const pg = (await import("pg")).default;
+    const admin = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+    const schema = `run_history_${randomUUID().replaceAll("-", "")}`;
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const url = new URL(process.env.DATABASE_URL!);
+    url.searchParams.set("options", `${url.searchParams.get("options") ?? ""} -c search_path=${schema}`.trim());
+    await seedTestTenant(url.toString());
+    const runtime = createPostgresRunStore(url.toString());
+    const pool = new pg.Pool({ connectionString: url.toString() });
+    try {
+      await runtime.runs.list({ limit: 1 });
+      const client = await pool.connect();
+      try {
+        await client.query("SET enable_seqscan = off");
+        const recent = await client.query(
+          "EXPLAIN (FORMAT JSON) SELECT * FROM runs ORDER BY created_at DESC, seq DESC LIMIT 500",
+        );
+        assert.match(JSON.stringify(recent.rows), /idx_runs_created/);
+        assert.doesNotMatch(JSON.stringify(recent.rows), /"Node Type":"Sort"/);
+      } finally {
+        client.release();
+      }
+    } finally {
+      await runtime.close();
+      await pool.end();
+      try {
+        await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      } finally {
+        await admin.end();
+      }
+    }
+  },
+);
+
+test("memory: one claim uses one clock snapshot across the retry boundary", async (t) => {
+  const { runs } = createPostgresRunStore(testDatabaseUrl());
+  const first = (await runs.enqueue({ sessionId: "same", request })).run;
+  const claimed = (await runs.claim("w1", 60_000))[0] ?? null;
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  await runs.fail(first.id, claimed!.leaseToken!, "temporary", { retryAfterMs: 1_000 });
+  await runs.enqueue({ sessionId: "same", request });
+  let reads = 0;
+  t.mock.method(Date, "now", () => now + (++reads === 1 ? 999 : 1_000));
+  assert.equal((await runs.claim("w2", 60_000))[0] ?? null, null);
+  assert.equal(((await runs.claim("w2", 60_000))[0] ?? null)?.id, first.id);
+});

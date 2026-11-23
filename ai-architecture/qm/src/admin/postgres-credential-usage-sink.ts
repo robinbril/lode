@@ -1,0 +1,94 @@
+import { createPostgresEventSink, type EventColumn } from "./scoped-event-sink.ts";
+import {
+  CREDENTIAL_USAGE_WINDOW,
+  utcDayStart,
+  type CredentialUsageSample,
+  type CredentialUsageSink,
+} from "./credential-usage-sink.ts";
+import { tenantTables } from "../tenants/migrations.ts";
+
+const COLUMNS: readonly EventColumn<keyof CredentialUsageSample & string>[] = [
+  ["ts", "ts", "BIGINT", "number", true],
+  ["slug", "slug", "TEXT", "string", true],
+  ["host", "host", "TEXT", "string", true],
+  ["status", "status", "TEXT", "string", true],
+  ["upstream_status", "upstreamStatus", "INT", "number"],
+  ["scope_label", "scopeLabel", "TEXT", "string", true],
+  ["principal_id", "principalId", "TEXT", "string", true],
+];
+
+export function createPostgresCredentialUsageSink(connectionString: string): CredentialUsageSink {
+  const sink = createPostgresEventSink<CredentialUsageSample>({
+    connectionString,
+    table: "credential_usage",
+    columns: COLUMNS,
+
+    schema: {
+      expectedChecksum: "42188c2f50734398496ddd5a47a9ec3c15a507059c713a4a6ced0b0b81d908eb",
+      followUps: [
+        {
+          id: "admin/scoped-events/credential_usage/0002",
+          statements: [
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS credential_usage_by_slug_ts_id ON credential_usage(slug, ts DESC, id DESC)",
+          ],
+        },
+        {
+          id: "admin/scoped-events/credential_usage/0003",
+          statements: [
+            "CREATE TABLE IF NOT EXISTS credential_daily_calls(slug TEXT NOT NULL, day BIGINT NOT NULL, sent INT NOT NULL, PRIMARY KEY (slug, day))",
+          ],
+        },
+        ...tenantTables("admin/scoped-events/credential_usage/0004-daily-calls-tenants", [
+          { table: "credential_daily_calls", primaryKey: "slug, day" },
+        ]),
+      ],
+    },
+    defaultLimit: CREDENTIAL_USAGE_WINDOW,
+    equalityFilters: { scopeId: "scope_label", slug: "slug" },
+    persistErrorMessage: "[credential-usage] failed to persist broker call:",
+  });
+  return {
+    ...sink,
+    async admitDailyCall(tenant, slug, cap) {
+      const rows = await sink.forTenant(tenant).q(
+        `INSERT INTO credential_daily_calls(tenant_id, slug, day, sent) VALUES ($1, $2, $3, 1)
+         ON CONFLICT (tenant_id, slug, day) DO UPDATE SET sent = credential_daily_calls.sent + 1
+         WHERE credential_daily_calls.sent < $4
+         RETURNING sent`,
+        [tenant.id, slug, utcDayStart(Date.now()), cap],
+      );
+      return rows.length > 0;
+    },
+    async summary(tenant, slugs) {
+      if (!slugs.length) return [];
+      const rows = await sink.forTenant(tenant).q(
+        `SELECT requested.slug, summary.*
+         FROM unnest($1::text[]) AS requested(slug)
+         CROSS JOIN LATERAL (
+           WITH recent AS (
+             SELECT id, ts, status, principal_id FROM credential_usage
+             WHERE tenant_id = $3 AND slug = requested.slug ORDER BY ts DESC, id DESC LIMIT $2
+           )
+           SELECT count(*) FILTER (WHERE status = 'ok') AS usage_count,
+             count(*) = $2 AS usage_truncated,
+             min(ts) FILTER (WHERE status = 'ok') AS usage_since,
+             max(ts) FILTER (WHERE status = 'ok') AS last_used_at,
+             ARRAY(SELECT principal_id FROM (
+               SELECT DISTINCT ON (principal_id) principal_id, ts, id FROM recent WHERE status = 'ok'
+               ORDER BY principal_id, ts DESC, id DESC
+             ) AS latest ORDER BY ts DESC, id DESC LIMIT 12) AS principals
+           FROM recent
+         ) AS summary`,
+        [[...new Set(slugs)], CREDENTIAL_USAGE_WINDOW, tenant.id],
+      );
+      return rows.map((row) => ({
+        slug: String(row.slug),
+        usageCount: Number(row.usage_count),
+        usageTruncated: Boolean(row.usage_truncated),
+        usageSince: row.usage_since == null ? null : Number(row.usage_since),
+        lastUsedAt: row.last_used_at == null ? null : Number(row.last_used_at),
+        recentUsagePrincipals: row.principals as string[],
+      }));
+    },
+  };
+}

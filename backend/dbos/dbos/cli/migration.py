@@ -1,0 +1,125 @@
+from typing import List, Optional
+
+import click
+import sqlalchemy as sa
+
+from dbos._dbos import DBOS
+from dbos._migration import get_dbos_migrations, get_dbos_schema_permissions_sql
+from dbos._utils import quote_identifier
+
+
+def run_dbos_database_migrations(
+    system_database_url: str,
+    *,
+    schema: str = "dbos",
+    application_role: Optional[str] = None,
+    sharding: bool = False,
+) -> None:
+    try:
+        DBOS.migrate(
+            system_database_url,
+            schema=schema,
+            application_role=application_role,
+            sharding=sharding,
+        )
+    except Exception as e:
+        click.echo(f"DBOS migrations failed: {e}")
+        raise click.exceptions.Exit(code=1)
+
+
+def _emit_sql(sql: str) -> None:
+    sql = sql.strip()
+    if sql:
+        click.echo(sql if sql.endswith(";") else sql + ";")
+
+
+def print_dbos_migrations(
+    system_database_url: Optional[str],
+    *,
+    schema: str = "dbos",
+    migration: str = "all",
+) -> None:
+    """Print to stdout the SQL of the DBOS system database migrations, all of
+    them (migration is "all") or starting from a number (migration is N),
+    without touching any database. Stdout is pure SQL and comments.
+
+    system_database_url may be None: it is only read to reject SQLite."""
+    if system_database_url is not None and system_database_url.startswith("sqlite"):
+        click.echo(
+            "--print-migrations is only supported for Postgres databases", err=True
+        )
+        raise click.exceptions.Exit(code=1)
+
+    quoted_schema = quote_identifier(schema)
+    migrations = get_dbos_migrations(schema, use_listen_notify=True)
+    latest_version = len(migrations)
+    if migration == "all":
+        start = 1
+    else:
+        try:
+            start = int(migration)
+        except ValueError:
+            click.echo(
+                f"Invalid --print-migrations value '{migration}': expected 'all' or a migration number",
+                err=True,
+            )
+            raise click.exceptions.Exit(code=1)
+        if not 1 <= start <= latest_version:
+            click.echo(
+                f"Migration {start} does not exist: valid migrations are 1 through {latest_version}",
+                err=True,
+            )
+            raise click.exceptions.Exit(code=1)
+
+    click.echo("-- DBOS system database migrations")
+    click.echo(
+        "-- Contains CREATE/DROP INDEX CONCURRENTLY: run outside a transaction block (e.g. plain psql, not psql --single-transaction)."
+    )
+    if start == 1:
+        click.echo("-- This script is for FRESH databases only.")
+        _emit_sql(f"CREATE SCHEMA IF NOT EXISTS {quoted_schema}")
+        _emit_sql(
+            f"CREATE TABLE IF NOT EXISTS {quoted_schema}.dbos_migrations (version BIGINT NOT NULL PRIMARY KEY)"
+        )
+
+    version_row_exists = start > 1
+    last_emitted = start - 1
+
+    def _emit_version(version: int) -> None:
+        nonlocal version_row_exists, last_emitted
+        if version_row_exists:
+            _emit_sql(f"UPDATE {quoted_schema}.dbos_migrations SET version = {version}")
+        else:
+            _emit_sql(
+                f"INSERT INTO {quoted_schema}.dbos_migrations (version) VALUES ({version})"
+            )
+            version_row_exists = True
+        last_emitted = version
+
+    for i in range(start, latest_version + 1):
+        migration_sql = migrations[i - 1]
+        if i == 10:
+            # Migration 10 backfills the notifications primary key, which
+            # migration 1 already creates on a fresh database.
+            click.echo("-- Migration 10 skipped: not applicable on fresh databases")
+        elif migration_sql.strip():
+            click.echo(f"-- Migration {i}")
+            _emit_sql(migration_sql)
+        else:
+            # Renumbering left long runs of empty migrations; nothing to emit.
+            continue
+        # Per-migration version bookkeeping, mirroring the runner: an
+        # interrupted apply can be resumed from the next migration number.
+        _emit_version(i)
+
+    # Empty migrations at the end still count as applied.
+    if latest_version > last_emitted:
+        _emit_version(latest_version)
+
+
+def print_dbos_user_role_sql(*, schema: str = "dbos", role_name: str) -> None:
+    """Print to stdout the SQL granting an application role access to the DBOS
+    system schema, without touching any database."""
+    click.echo("-- Permissions on the DBOS system schema")
+    for sql in get_dbos_schema_permissions_sql(schema, role_name):
+        _emit_sql(sql)

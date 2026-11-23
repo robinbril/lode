@@ -1,0 +1,27 @@
+"use client";
+
+import type { ReactNode } from "react";
+import { usePathname } from "next/navigation";
+import { CurrentPageProvider } from "@/components/pages/docs/contexts/current-page";
+import { AssistantPanelProvider } from "@/components/pages/docs/assistant/context";
+import { AskAiBall } from "@/components/pages/docs/assistant/ball";
+import { AskAiWindow } from "@/components/pages/docs/assistant/window";
+import { isAssistantHiddenPath } from "@/lib/embedded-paths";
+
+export function SiteAssistant({ children }: { children: ReactNode }) {
+  const pathname = usePathname();
+  const hidden = isAssistantHiddenPath(pathname);
+  return (
+    <CurrentPageProvider>
+      <AssistantPanelProvider>
+        {children}
+        {!hidden ? (
+          <>
+            <AskAiWindow />
+            <AskAiBall />
+          </>
+        ) : null}
+      </AssistantPanelProvider>
+    </CurrentPageProvider>
+  );
+}

@@ -1,0 +1,101 @@
+import type { DurableMap } from "./persistence/durable-map.ts";
+import { orgId as configOrgId } from "./config.ts";
+import { scopeId, type ScopeId } from "./types.ts";
+
+export const FEATURES = {
+  app_annotations: {
+    label: "App annotations",
+    personalOnly: true,
+    hint: "Enables app text comments and annotation tools for the selected people. Applies on the next app page load; app management permission is still required.",
+  },
+  personas: {
+    label: "Personas",
+    hint: "Lets the selected people create, share and chat with personas: reusable agents with their own instructions, skills and credentials.",
+  },
+  inbox_loops: { label: "Inbox Loops" },
+  company_welcome: {
+    label: "Company welcome",
+    hint: "Shows the selected people their organization's activity seeds: the seeded welcome screen and the company's starting suggestions. Seeds can be stored while this is off.",
+  },
+  slack_loading_indicator: {
+    label: "Slack loading indicator (experimental)",
+    hint: "Shows a live activity card in Slack threads: the current step, background work, monitors and subagents, with a link to the web conversation. The card disappears once the reply has landed. Everyone in a shared thread can see it. Top-level DMs stay unchanged. Turning this off removes open cards.",
+  },
+  next_prompt_suggestions: {
+    label: "Next-message suggestions (experimental)",
+    personalOnly: true,
+    hint: "After each reply in the web app, predicts the selected people's likely next message and shows it in their empty composer; Tab fills it in. Each suggestion is one extra model call on their conversation. Turning it on applies on their next page load.",
+  },
+  external_app_sharing: { label: "External app sharing (public links, outside emails)" },
+  loop_triage: { label: "Loop triage (prioritize and consolidate)" },
+  team_scopes: { label: "Team scopes" },
+  ui_canvas: {
+    label: "UI canvas and UI state (agent code runs in the page)",
+    personalOnly: true,
+    hint: "Lets the agent read the selected people's whole web UI and place live HTML/CSS/JS panels in their conversations. Canvas code runs unsandboxed in their page with their full session: it can do anything they can, including answering approvals. Personal scopes only. Turning it off stops canvases from loading on the next page load.",
+  },
+} as const satisfies Record<string, { label: string; personalOnly?: boolean; hint?: string }>;
+export type FeatureName = keyof typeof FEATURES;
+export const FEATURE_NAMES = Object.keys(FEATURES) as FeatureName[];
+
+export interface FeatureFlagRecord {
+  featureName: FeatureName;
+  enabledScopes: ScopeId[];
+  updatedAt: number;
+  updatedBy: string;
+}
+
+export interface FeatureFlagStore {
+  list(): Promise<FeatureFlagRecord[]>;
+  get(featureName: FeatureName): Promise<FeatureFlagRecord | null>;
+  enabled(featureName: FeatureName, scope: ScopeId): Promise<boolean>;
+  enabledFor(scope: ScopeId): Promise<ReadonlySet<FeatureName>>;
+  setEnabled(featureName: FeatureName, scope: ScopeId, on: boolean, updatedBy: string): Promise<FeatureFlagRecord>;
+}
+
+export function createFeatureFlagStore(
+  backing: DurableMap<FeatureFlagRecord>,
+  opts: { now?: () => number } = {},
+): FeatureFlagStore {
+  const orgScope = scopeId("org", configOrgId());
+  const now = opts.now ?? Date.now;
+  const key = (featureName: FeatureName) => featureName;
+  const list = async () => (await backing.all()).filter((row) => FEATURE_NAMES.includes(row.featureName));
+  const enabledFor = async (scope: ScopeId): Promise<ReadonlySet<FeatureName>> =>
+    new Set(
+      (await list())
+        .filter((row) => row.enabledScopes.includes(orgScope) || row.enabledScopes.includes(scope))
+        .map((row) => row.featureName),
+    );
+  return {
+    list,
+    get: (featureName) => backing.get(key(featureName)),
+    enabled: async (featureName, scope) => (await enabledFor(scope)).has(featureName),
+    enabledFor,
+    async setEnabled(featureName, scope, on, updatedBy) {
+      if (!updatedBy.trim()) throw new Error("feature flag updater must not be empty");
+      const current = await backing.get(key(featureName));
+      const scopes = new Set(current?.enabledScopes ?? []);
+      if (on) scopes.add(scope);
+      else scopes.delete(scope);
+      const record = {
+        featureName,
+        enabledScopes: [...scopes].sort(),
+        updatedAt: now(),
+        updatedBy,
+      };
+      await backing.put(key(featureName), record);
+      return record;
+    },
+  };
+}
+
+export const EXTERNAL_APP_SHARING_OFF =
+  "sharing apps outside the organization is turned off; an org admin can enable the external_app_sharing flag";
+
+export function externalAppSharingAllowed(
+  flags: FeatureFlagStore | undefined,
+  ownerScopeId: ScopeId,
+): Promise<boolean> {
+  return flags ? flags.enabled("external_app_sharing", ownerScopeId) : Promise.resolve(false);
+}

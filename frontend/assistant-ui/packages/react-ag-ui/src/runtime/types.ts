@@ -1,0 +1,350 @@
+import type {
+  CreateAppendMessage,
+  AttachmentAdapter,
+  DictationAdapter,
+  ExternalStoreSharedOptions,
+  ExternalStoreThreadListAdapter,
+  FeedbackAdapter,
+  RealtimeVoiceAdapter,
+  RunConfig,
+  SpeechSynthesisAdapter,
+  ThreadHistoryAdapter,
+  ThreadMessage,
+} from "@assistant-ui/core";
+import type { JoinStrategy } from "@assistant-ui/core/react";
+import type {
+  AbstractAgent,
+  ContentPart,
+  Context,
+  Message,
+} from "@ag-ui/client";
+import type { Logger } from "./logger";
+import type { ReadonlyJSONValue } from "assistant-stream/utils";
+import type { McpToolCallResult } from "./mcp-tool-result";
+
+export const AG_UI_METADATA_NAMESPACE = "agui";
+export const MCP_APPS_ACTIVITY_TYPE = "mcp-apps";
+export const A2UI_SURFACE_ACTIVITY_TYPE = "a2ui-surface";
+
+// Defensive guard against a malformed or cyclic parentToolCallId /
+// parentSubagentRunId chain, not a realistic nesting depth.
+export const MAX_SUBAGENT_DEPTH = 16;
+
+export type AgUiOpaqueReasoning = {
+  id: string;
+  encryptedValue: string;
+  metadata?: Record<string, unknown>;
+  /** Replays after the message and its tool results. */
+  after?: boolean;
+  /**
+   * Content index the block arrived ahead of, so a message joining several
+   * steps replays it inside the step it came from. Without it, the block
+   * replays ahead of the whole message.
+   */
+  index?: number;
+  /**
+   * The block arrived after a tool result, so it opens a new step even when
+   * no visible part marks the boundary.
+   */
+  opensStep?: boolean;
+};
+
+export type AgUiCustomMetadata = {
+  /** Wire role restored on export for messages the internal model cannot
+   * represent (a developer record rides as a system message). */
+  role?: "developer";
+  /** The agent's id for this assistant record when it named the record after
+   * the message was created; `message.id` stays the local id the UI keys on. */
+  messageId?: string;
+  interrupts?: AgUiInterrupt[];
+  pendingToolCallIds?: string[];
+  opaqueReasoning?: AgUiOpaqueReasoning[];
+};
+
+/**
+ * Same as ExternalStoreThreadListAdapter, except `onSwitchToThread` returns
+ * the messages (and optional state) to hydrate the thread with.
+ *
+ * @deprecated Experimental since 2026-06-13. Not scheduled for removal; the API may change in any release.
+ */
+type SwitchToThreadResult = {
+  messages: readonly ThreadMessage[];
+  state?: ReadonlyJSONValue;
+  /**
+   * Set when the thread has a run in flight. The runtime resumes the run
+   * after hydrating, the same way `ThreadHistoryAdapter.load()` does when it
+   * returns `unstable_resume: true`.
+   *
+   * @deprecated Experimental since 2025-03-31. Not scheduled for removal; the API may change in any release.
+   */
+  unstable_resume?: boolean;
+};
+
+export type UseAgUiThreadListAdapter = Omit<
+  ExternalStoreThreadListAdapter,
+  "onSwitchToThread"
+> & {
+  onSwitchToThread?:
+    | ((
+        threadId: string,
+      ) => Promise<SwitchToThreadResult> | SwitchToThreadResult)
+    | undefined;
+};
+
+export type UseAgUiRuntimeAdapters = {
+  attachments?: AttachmentAdapter;
+  speech?: SpeechSynthesisAdapter;
+  dictation?: DictationAdapter;
+  voice?: RealtimeVoiceAdapter;
+  feedback?: FeedbackAdapter;
+  history?: ThreadHistoryAdapter;
+  /** @deprecated Experimental since 2026-01-28. Not scheduled for removal; the API may change in any release. */
+  threadList?: UseAgUiThreadListAdapter;
+};
+
+export type AgUiResumeTranscript = "full" | "appended";
+
+export type UseAgUiRuntimeOptions = ExternalStoreSharedOptions & {
+  agent: AbstractAgent;
+  logger?: Partial<Logger>;
+  showThinking?: boolean;
+  joinStrategy?: JoinStrategy;
+  /**
+   * Join adjacent assistant records of an imported snapshot into one message.
+   * See `FromAgUiMessagesOptions.joinAdjacentAssistantMessages`. Defaults to
+   * `false`.
+   */
+  joinAdjacentAssistantMessages?: boolean;
+  /**
+   * Return context entries for each run. `messages` is the exact AG-UI
+   * transcript sent in the run input, after transcript selection and message
+   * conversion. On resume, it follows `resumeTranscript`: "full" sends the
+   * whole thread, while "appended" sends messages after the interrupted
+   * assistant message, falling back to the whole thread if that message is
+   * missing. `runConfig` is the run config passed while building that input.
+   * If the getter throws, the error is reported and the run continues without host entries.
+   */
+  getRunContext?:
+    | ((input: {
+        messages: readonly Message[];
+        runConfig: RunConfig | undefined;
+      }) => readonly Context[])
+    | undefined;
+  /**
+   * What `messages` carries on a resume run, meaning a `RunAgentInput` that
+   * also carries `resume`. The AG-UI interrupt spec leaves this undefined: its
+   * contract rules constrain the thread id, interrupt coverage, idempotency,
+   * and expiry, and none of them mentions `messages`. Hosts therefore disagree,
+   * and both readings are conformant.
+   *
+   * `"full"` sends the whole thread, which is what `@ag-ui/client` itself does.
+   * Hosts that resume from a checkpoint ignore the transcript, and hosts that
+   * rebuild the interrupted run from it need it.
+   *
+   * `"appended"` sends only what was appended locally after the interrupted
+   * assistant message, which is nothing for an approval or a denial and the new
+   * user turn for `steerAway`. Choose it for a host that owns the thread and
+   * seeds a resume request from its own stored snapshot, because such a host
+   * appends the request body to that snapshot and a re-sent transcript
+   * duplicates the interrupted turn in its stored history. A host that rebuilds
+   * the run from `messages` has nothing to resume from under `"appended"`, and
+   * a host that derives its outgoing `MESSAGES_SNAPSHOT` from the request body
+   * emits a truncated one.
+   *
+   * Defaults to `"full"`.
+   */
+  resumeTranscript?: AgUiResumeTranscript | undefined;
+  /**
+   * When the user sends, edits, or reloads a message while client-side tool
+   * calls are still pending, automatically cancel the unresolved tool calls
+   * with an error result so the agent's tool-call accounting stays
+   * consistent. Pending AG-UI interrupts are exempt: they still reject the
+   * run and must be answered with `useAgUiSubmitInterruptResponses` or
+   * discarded with `useAgUiSteerAway`. When disabled, `useAgUiSteerAway`
+   * remains the explicit way to cancel pending tool calls.
+   * Defaults to `true`.
+   */
+  autoCancelPendingToolCalls?: boolean | undefined;
+  /**
+   * Buffer a message sent while a run is in flight and send it once the run
+   * settles, exposing it on `composer.queue` for `ComposerPrimitive.Queue`.
+   * The runtime owns the queue lifecycle because flushing needs the agent's
+   * send path and the run's own busy and idle edges.
+   *
+   * @deprecated Experimental since 2026-06-04. Not scheduled for removal; the API may change in any release.
+   */
+  unstable_enableMessageQueue?: boolean | undefined;
+  onError?: (e: Error) => void;
+  onCancel?: () => void;
+  adapters?: UseAgUiRuntimeAdapters;
+};
+
+export type AgUiInterruptReason =
+  | "tool_call"
+  | "input_required"
+  | "confirmation"
+  | (string & {});
+
+export type AgUiInterrupt = {
+  id: string;
+  reason: AgUiInterruptReason;
+  message?: string;
+  toolCallId?: string;
+  subagentRunId?: string;
+  responseSchema?: Record<string, unknown>;
+  expiresAt?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AgUiResumeEntry = {
+  interruptId: string;
+  status: "resolved" | "cancelled";
+  payload?: unknown;
+};
+
+export type AgUiRuntimeExtras = {
+  interrupts: readonly AgUiInterrupt[];
+  sendA2uiAction: (action: Record<string, unknown>) => void;
+  submitInterruptResponses: (
+    responses: readonly AgUiResumeEntry[],
+  ) => Promise<void>;
+  steerAway: (
+    message: CreateAppendMessage,
+    responses?: readonly AgUiResumeEntry[],
+  ) => Promise<void>;
+  state: ReadonlyJSONValue | undefined;
+  setState: (
+    next:
+      | ReadonlyJSONValue
+      | ((prev: ReadonlyJSONValue | undefined) => ReadonlyJSONValue),
+  ) => void;
+};
+
+export type AgUiRunFinishedOutcome =
+  | { type: "success"; pendingToolCallIds?: string[] }
+  | { type: "interrupt"; interrupts: AgUiInterrupt[] }
+  | { type: "cancelled" };
+
+export type AgUiSubagentFinishedOutcome =
+  | { type: "success" }
+  | { type: "suspended"; interruptIds?: string[] };
+
+export type AgUiEvent =
+  | { type: "RUN_STARTED"; runId: string }
+  | {
+      type: "RUN_FINISHED";
+      runId: string;
+      outcome?: AgUiRunFinishedOutcome;
+    }
+  | { type: "RUN_CANCELLED"; runId?: string }
+  | { type: "RUN_ERROR"; message?: string; code?: string }
+  | { type: "TEXT_MESSAGE_START"; messageId?: string; subagentRunId?: string }
+  | {
+      type: "TEXT_MESSAGE_CONTENT";
+      messageId?: string;
+      delta: string;
+      subagentRunId?: string;
+    }
+  | { type: "TEXT_MESSAGE_END"; messageId?: string; subagentRunId?: string }
+  | {
+      type: "REASONING_START";
+      messageId: string;
+      subagentRunId?: string;
+      timestamp?: number;
+    }
+  | {
+      type: "REASONING_MESSAGE_START";
+      messageId: string;
+      subagentRunId?: string;
+      timestamp?: number;
+    }
+  | {
+      type: "REASONING_MESSAGE_CONTENT";
+      messageId: string;
+      delta: string;
+      subagentRunId?: string;
+    }
+  | {
+      type: "REASONING_MESSAGE_END";
+      messageId: string;
+      subagentRunId?: string;
+      timestamp?: number;
+    }
+  | {
+      type: "REASONING_ENCRYPTED_VALUE";
+      subtype: "message" | "tool-call";
+      entityId: string;
+      encryptedValue: string;
+      subagentRunId?: string;
+    }
+  | {
+      type: "REASONING_END";
+      messageId: string;
+      subagentRunId?: string;
+      timestamp?: number;
+    }
+  | {
+      type: "TOOL_CALL_START";
+      toolCallId: string;
+      toolCallName?: string;
+      parentMessageId?: string;
+      subagentRunId?: string;
+    }
+  | {
+      type: "TOOL_CALL_ARGS";
+      toolCallId: string;
+      delta: string;
+      subagentRunId?: string;
+    }
+  | { type: "TOOL_CALL_END"; toolCallId: string; subagentRunId?: string }
+  | {
+      type: "TOOL_CALL_RESULT";
+      messageId?: string;
+      toolCallId: string;
+      content: string | ContentPart[];
+      role?: "tool";
+      mcpResult?: McpToolCallResult;
+      metadata?: Record<string, unknown>;
+      subagentRunId?: string;
+    }
+  | {
+      type: "ACTIVITY_SNAPSHOT";
+      activityType: string;
+      content: Record<string, unknown>;
+      messageId?: string;
+      replace?: boolean;
+      subagentRunId?: string;
+    }
+  | {
+      type: "ACTIVITY_DELTA";
+      messageId: string;
+      activityType: string;
+      patch: any[];
+      subagentRunId?: string;
+    }
+  | { type: "RAW"; event: any; source?: string }
+  | { type: "CUSTOM"; name: string; value: any }
+  | { type: "STATE_SNAPSHOT"; snapshot: any }
+  | { type: "STATE_DELTA"; delta: any[] }
+  | { type: "MESSAGES_SNAPSHOT"; messages: any[] }
+  | {
+      type: "SUBAGENT_STARTED";
+      subagentRunId: string;
+      name: string;
+      description?: string;
+      parentSubagentRunId?: string;
+      parentToolCallId?: string;
+      parentMessageId?: string;
+    }
+  | {
+      type: "SUBAGENT_FINISHED";
+      subagentRunId: string;
+      result?: unknown;
+      outcome?: AgUiSubagentFinishedOutcome;
+    }
+  | {
+      type: "SUBAGENT_ERROR";
+      subagentRunId: string;
+      message: string;
+      code?: string;
+    };

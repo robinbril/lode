@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# this is a helper file for launching the server in the Docker image
+
+set -xeuo pipefail
+
+args=()
+# Migrations run by default. Set RUN_MIGRATIONS=0 to skip them (e.g. when the
+# database is managed elsewhere or migrations are run by a separate job).
+if [[ "${RUN_MIGRATIONS:-1}" != "0" ]]; then
+    args+=("--run-migrations")
+fi
+if [[ -n "${WAIT_FOR:-}" ]]; then
+    args+=("--wait-for" "15")
+fi
+
+exec svix-server "${args[@]}"

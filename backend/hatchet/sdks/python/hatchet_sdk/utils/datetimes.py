@@ -1,0 +1,45 @@
+from datetime import UTC, datetime, timedelta
+from typing import TypeVar
+
+from google.protobuf import timestamp_pb2
+
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+def _to_utc(dt: datetime) -> datetime:
+    if not dt.tzinfo:
+        return dt.replace(tzinfo=UTC)
+
+    return dt.astimezone(UTC)
+
+
+def partition_date_range(
+    since: datetime, until: datetime
+) -> list[tuple[datetime, datetime]]:
+    since = _to_utc(since)
+    until = _to_utc(until)
+
+    ranges: list[tuple[datetime, datetime]] = []
+    current_start = since
+
+    while current_start < until:
+        next_day = (current_start + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+        current_end = min(next_day, until)
+
+        ranges.append((current_start, current_end))
+
+        current_start = next_day
+
+    return ranges
+
+
+def proto_timestamp_now() -> timestamp_pb2.Timestamp:
+    t = datetime.now(tz=UTC).timestamp()
+    seconds = int(t)
+    nanos = int(t % 1 * 1e9)
+
+    return timestamp_pb2.Timestamp(seconds=seconds, nanos=nanos)

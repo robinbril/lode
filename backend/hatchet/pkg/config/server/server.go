@@ -1,0 +1,1357 @@
+package server
+
+import (
+	"context"
+	"crypto/tls"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+	"github.com/rs/zerolog"
+	"github.com/spf13/viper"
+	"golang.org/x/oauth2"
+
+	"github.com/hatchet-dev/hatchet/api/v1/server/middleware"
+	"github.com/hatchet-dev/hatchet/internal/integrations/alerting"
+	"github.com/hatchet-dev/hatchet/internal/msgqueue"
+	"github.com/hatchet-dev/hatchet/internal/services/ingestor"
+	"github.com/hatchet-dev/hatchet/pkg/analytics"
+	"github.com/hatchet-dev/hatchet/pkg/auth/cookie"
+	"github.com/hatchet-dev/hatchet/pkg/auth/exchangetoken"
+	"github.com/hatchet-dev/hatchet/pkg/auth/token"
+	client "github.com/hatchet-dev/hatchet/pkg/client/v1"
+	"github.com/hatchet-dev/hatchet/pkg/config/database"
+	"github.com/hatchet-dev/hatchet/pkg/config/limits"
+	"github.com/hatchet-dev/hatchet/pkg/config/shared"
+	"github.com/hatchet-dev/hatchet/pkg/encryption"
+	"github.com/hatchet-dev/hatchet/pkg/errors"
+	"github.com/hatchet-dev/hatchet/pkg/integrations/email"
+	"github.com/hatchet-dev/hatchet/pkg/integrations/metrics/prometheus"
+	"github.com/hatchet-dev/hatchet/pkg/o11yusage"
+	"github.com/hatchet-dev/hatchet/pkg/operator"
+	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
+	"github.com/hatchet-dev/hatchet/pkg/scheduling"
+	"github.com/hatchet-dev/hatchet/pkg/validator"
+)
+
+type ServerConfigFile struct {
+	Auth ConfigFileAuth `mapstructure:"auth" json:"auth,omitempty"`
+
+	Alerting AlertingConfigFile `mapstructure:"alerting" json:"alerting,omitempty"`
+
+	Analytics AnalyticsConfigFile `mapstructure:"analytics" json:"analytics,omitempty"`
+
+	Pylon PylonConfig `mapstructure:"pylon" json:"pylon,omitempty"`
+
+	Encryption EncryptionConfigFile `mapstructure:"encryption" json:"encryption,omitempty"`
+
+	Runtime ConfigFileRuntime `mapstructure:"runtime" json:"runtime,omitempty"`
+
+	MessageQueue MessageQueueConfigFile `mapstructure:"msgQueue" json:"msgQueue,omitempty"`
+
+	Services []string `mapstructure:"services" json:"services,omitempty" default:"[\"all\"]"`
+
+	// Used to bind the environment variable, since the array is not well supported
+	ServicesString string `mapstructure:"servicesString" json:"servicesString,omitempty"`
+
+	PausedControllers string `mapstructure:"pausedControllers" json:"pausedControllers,omitempty"`
+
+	EnableDataRetention bool `mapstructure:"enableDataRetention" json:"enableDataRetention,omitempty" default:"true"`
+
+	EnableWorkerRetention bool `mapstructure:"enableWorkerRetention" json:"enableWorkerRetention,omitempty" default:"false"`
+
+	TLS shared.TLSConfigFile `mapstructure:"tls" json:"tls,omitempty"`
+
+	InternalClient InternalClientTLSConfigFile `mapstructure:"internalClient" json:"internalClient,omitempty"`
+
+	Logger shared.LoggerConfigFile `mapstructure:"logger" json:"logger,omitempty"`
+
+	AdditionalLoggers ConfigFileAdditionalLoggers `mapstructure:"additionalLoggers" json:"additionalLoggers,omitempty"`
+
+	OpenTelemetry shared.OpenTelemetryConfigFile `mapstructure:"otel" json:"otel,omitempty"`
+
+	Prometheus shared.PrometheusConfigFile `mapstructure:"prometheus" json:"prometheus,omitempty"`
+
+	Observability shared.ObservabilityConfigFile `mapstructure:"observability" json:"observability,omitempty"`
+
+	SecurityCheck SecurityCheckConfigFile `mapstructure:"securityCheck" json:"securityCheck,omitempty"`
+
+	TenantAlerting ConfigFileTenantAlerting `mapstructure:"tenantAlerting" json:"tenantAlerting,omitempty"`
+
+	Email ConfigFileEmail `mapstructure:"email" json:"email,omitempty"`
+
+	Monitoring ConfigFileMonitoring `mapstructure:"monitoring" json:"monitoring,omitempty"`
+
+	Sampling ConfigFileSampling `mapstructure:"sampling" json:"sampling,omitempty"`
+
+	OLAP ConfigFileOperations `mapstructure:"olap" json:"olap,omitempty"`
+
+	PayloadStore PayloadStoreConfig `mapstructure:"payloadStore" json:"payloadStore,omitempty"`
+
+	CronOperations CronOperationsConfigFile `mapstructure:"cronOperations" json:"cronOperations,omitempty"`
+
+	OLAPStatusUpdates OLAPStatusUpdateConfigFile `mapstructure:"statusUpdates" json:"statusUpdates,omitempty"`
+
+	VersionOverride string `mapstructure:"versionOverride" json:"versionOverride,omitempty"`
+}
+
+type ConfigFileAdditionalLoggers struct {
+	// Queue is a custom logger config for the queue service
+	Queue shared.LoggerConfigFile `mapstructure:"queue" json:"queue,omitempty"`
+
+	// PgxStats is a custom logger config for the pgx stats service
+	PgxStats shared.LoggerConfigFile `mapstructure:"pgxStats" json:"pgxStats,omitempty"`
+}
+
+type ConfigFileSampling struct {
+	// Enabled controls whether sampling is enabled for this Hatchet instance.
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"false"`
+
+	// SamplingRate is the rate at which to sample events. Default is 1.0 to sample all events.
+	SamplingRate float64 `mapstructure:"samplingRate" json:"samplingRate,omitempty" default:"1.0"`
+}
+
+type ConfigFileOperations struct {
+	// Jitter is the jitter duration for operations pools in milliseconds
+	Jitter int `mapstructure:"jitter" json:"jitter,omitempty" default:"0"`
+
+	// PollInterval is the polling interval for operations in seconds
+	PollInterval int `mapstructure:"pollInterval" json:"pollInterval,omitempty" default:"2"`
+
+	// OLAPMQQos is the prefetch count (QOS) for the OLAP controller's message queue consumer
+	OLAPMQQos int `mapstructure:"olapMqQos" json:"olapMqQos,omitempty" default:"100"`
+}
+
+type TaskOperationLimitsConfigFile struct {
+	// TimeoutLimit is the limit for how many tasks to process in a single timeout operation
+	TimeoutLimit int `mapstructure:"timeoutLimit" json:"timeoutLimit,omitempty" default:"1000"`
+
+	// ReassignLimit is the limit for how many tasks to process in a single reassignment operation
+	ReassignLimit int `mapstructure:"reassignLimit" json:"reassignLimit,omitempty" default:"1000"`
+
+	// ReassignUnackedTasks records when each task is assigned and reassigns tasks whose worker never acknowledged
+	// them within a minute. Only enable it once every engine instance sends acks: during a rolling deploy from an
+	// engine version that doesn't, running tasks look unacked and get reassigned while they're still running.
+	ReassignUnackedTasks bool `mapstructure:"reassignUnackedTasks" json:"reassignUnackedTasks,omitempty" default:"false"`
+
+	// ChildRunDirectSpawn determines whether child runs should use the matching logic or be spawned directly without it
+	ChildRunDirectSpawn bool `mapstructure:"childRunDirectSpawn" json:"childRunDirectSpawn,omitempty" default:"false"`
+
+	// RetryQueueLimit is the limit for how many retry queue items to process in a single operation
+	RetryQueueLimit int `mapstructure:"retryQueueLimit" json:"retryQueueLimit,omitempty" default:"1000"`
+
+	// DurableSleepLimit is the limit for how many durable sleep items to process in a single operation
+	DurableSleepLimit int `mapstructure:"durableSleepLimit" json:"durableSleepLimit,omitempty" default:"1000"`
+}
+
+// CronOperationsConfigFile is the configuration for the cron operations
+type CronOperationsConfigFile struct {
+	// TaskAnalyzeCronInterval is the interval for the task analyze cron operation
+	TaskAnalyzeCronInterval time.Duration `mapstructure:"taskAnalyzeCronInterval" json:"taskAnalyzeCronInterval,omitempty" default:"3h"`
+
+	// OLAPAnalyzeCronInterval is the interval for the olap analyze cron operation
+	OLAPAnalyzeCronInterval time.Duration `mapstructure:"olapAnalyzeCronInterval" json:"olapAnalyzeCronInterval,omitempty" default:"3h"`
+
+	// DBHealthMetricsInterval is the interval for collecting database health metrics
+	DBHealthMetricsInterval time.Duration `mapstructure:"dbHealthMetricsInterval" json:"dbHealthMetricsInterval,omitempty" default:"60s"`
+
+	// OLAPMetricsInterval is the interval for collecting OLAP metrics
+	OLAPMetricsInterval time.Duration `mapstructure:"olapMetricsInterval" json:"olapMetricsInterval,omitempty" default:"5m"`
+
+	// WorkerMetricsInterval is the interval for collecting worker metrics
+	WorkerMetricsInterval time.Duration `mapstructure:"workerMetricsInterval" json:"workerMetricsInterval,omitempty" default:"60s"`
+
+	// YesterdayRunCountHour is the hour (0-23) at which to collect yesterday's run count metrics
+	YesterdayRunCountHour uint `mapstructure:"yesterdayRunCountHour" json:"yesterdayRunCountHour,omitempty" default:"0"`
+
+	// YesterdayRunCountMinute is the minute (0-59) at which to collect yesterday's run count metrics
+	YesterdayRunCountMinute uint `mapstructure:"yesterdayRunCountMinute" json:"yesterdayRunCountMinute,omitempty" default:"5"`
+}
+
+// OLAPStatusUpdateConfigFile is the configuration for OLAP status updates
+type OLAPStatusUpdateConfigFile struct {
+	// DagBatchSizeLimit is the limit for how many DAG status updates to process in a single batch update
+	DagBatchSizeLimit int `mapstructure:"dagBatchSizeLimit" json:"dagBatchSizeLimit,omitempty" default:"1000"`
+
+	// TaskBatchSizeLimit is the limit for how many task status updates to process in a single batch update
+	TaskBatchSizeLimit int `mapstructure:"taskBatchSizeLimit" json:"taskBatchSizeLimit,omitempty" default:"1000"`
+}
+
+// DefaultTenantEntitlementsConfigFile defines the feature entitlements granted to new tenants.
+type DefaultTenantEntitlementsConfigFile struct {
+	AuditLogs                       bool `mapstructure:"auditLogs" json:"auditLogs,omitempty" default:"false"`
+	PrometheusMetrics               bool `mapstructure:"prometheusMetrics" json:"prometheusMetrics,omitempty" default:"false"`
+	StrictAdditionalMetadataFilters bool `mapstructure:"strictAdditionalMetadataFilters" json:"strictAdditionalMetadataFilters,omitempty" default:"false"`
+	DurableStreams                  bool `mapstructure:"durableStreams" json:"durableStreams,omitempty" default:"false"`
+	ServerlessOperator              bool `mapstructure:"serverlessOperator" json:"serverlessOperator,omitempty" default:"false"`
+	SandboxOperator                 bool `mapstructure:"sandboxOperator" json:"sandboxOperator,omitempty" default:"false"`
+	OperatorStepDirectCompletion    bool `mapstructure:"operatorStepDirectCompletion" json:"operatorStepDirectCompletion,omitempty" default:"false"`
+}
+
+// General server runtime options
+type ConfigFileRuntime struct {
+	// Port is the port that the core server listens on
+	Port int `mapstructure:"port" json:"port,omitempty" default:"8080"`
+
+	// ServerURL is the full server URL of the instance, including protocol.
+	ServerURL string `mapstructure:"url" json:"url,omitempty" default:"http://localhost:8080"`
+
+	// FrontendURL is the full URL of the frontend, used to render actionable links in emails and other notifications.
+	// Defaults to the ServerURL if not set.
+	FrontendURL string `mapstructure:"frontendUrl" json:"frontendUrl,omitempty"`
+
+	// Healthcheck controls whether the server has a healthcheck endpoint
+	Healthcheck bool `mapstructure:"healthcheck" json:"healthcheck,omitempty" default:"true"`
+
+	// HealthcheckPort is the port that the healthcheck server listens on
+	HealthcheckPort int `mapstructure:"healthcheckPort" json:"healthcheckPort,omitempty" default:"8733"`
+
+	// GRPCPort is the port that the grpc service listens on
+	GRPCPort int `mapstructure:"grpcPort" json:"grpcPort,omitempty" default:"7070"`
+
+	// GRPCBindAddress is the address that the grpc server binds to. Should set to 0.0.0.0 if binding in docker container.
+	GRPCBindAddress string `mapstructure:"grpcBindAddress" json:"grpcBindAddress,omitempty" default:"127.0.0.1"`
+
+	// GRPCBroadcastAddress is the address that the grpc server broadcasts to, which is what clients should use when connecting.
+	GRPCBroadcastAddress string `mapstructure:"grpcBroadcastAddress" json:"grpcBroadcastAddress,omitempty" default:"127.0.0.1:7070"`
+
+	// GRPCInsecure controls whether the grpc server is insecure or uses certs
+	GRPCInsecure bool `mapstructure:"grpcInsecure" json:"grpcInsecure,omitempty" default:"false"`
+
+	// GRPCMaxMsgSize is the maximum message size that the grpc server will accept
+	GRPCMaxMsgSize int `mapstructure:"grpcMaxMsgSize" json:"grpcMaxMsgSize,omitempty" default:"4194304"`
+
+	// GRPCMaxWorkerLockAcquisitionTime bounds how long an unsent action waits behind a worker's
+	// active send. The one-second default tolerates short transport stalls without holding a
+	// stalled worker's entire bulk until the dispatch deadline. It does not time out active sends.
+	GRPCMaxWorkerLockAcquisitionTime time.Duration `mapstructure:"grpcWorkerMaxLockAcquisitionTime" json:"grpcWorkerMaxLockAcquisitionTime,omitempty" default:"1s"`
+
+	// GRPCStaticStreamWindowSize sets the static stream window size for the grpc server. This can help with performance
+	// with overloaded workers and large messages. Default is 10MB.
+	GRPCStaticStreamWindowSize int32 `mapstructure:"grpcStaticStreamWindowSize" json:"grpcStaticStreamWindowSize,omitempty" default:"10485760"`
+
+	// GRPCRateLimit is the rate limit for the grpc server. We count limits separately for the Workflow, Dispatcher and Events services. Workflow and Events service are set to this rate, Dispatcher is 10X this rate. The rate limit is per second, per engine, per api token.
+	GRPCRateLimit float64 `mapstructure:"grpcRateLimit" json:"grpcRateLimit,omitempty" default:"1000"`
+
+	// GRPCShutdownTimeout is the maximum time to wait for the grpc server to drain in-flight requests and streams on graceful shutdown before forcing a hard stop
+	GRPCShutdownTimeout time.Duration `mapstructure:"grpcShutdownTimeout" json:"grpcShutdownTimeout,omitempty" default:"10s"`
+
+	// EnforceLimits controls whether the server enforces tenant limits
+	EnforceLimits bool `mapstructure:"enforceLimits" json:"enforceLimits,omitempty" default:"false"`
+
+	// Default limit values
+	Limits limits.LimitConfigFile `mapstructure:"limits" json:"limits,omitempty"`
+
+	// DefaultTenantEntitlements are the entitlements granted to every tenant created by this server
+	DefaultTenantEntitlements DefaultTenantEntitlementsConfigFile `mapstructure:"defaultTenantEntitlements" json:"defaultTenantEntitlements,omitempty"`
+
+	// QueueLimit is the limit of items to return from a single queue at a time
+	SingleQueueLimit int `mapstructure:"singleQueueLimit" json:"singleQueueLimit,omitempty" default:"100"`
+
+	// Whether optimistic scheduling is enabled
+	OptimisticSchedulingEnabled bool `mapstructure:"optimisticSchedulingEnabled" json:"optimisticSchedulingEnabled,omitempty" default:"true"`
+
+	// How many slots to allocate for optimistic scheduling
+	OptimisticSchedulingSlots int `mapstructure:"optimisticSchedulingSlots" json:"optimisticSchedulingSlots,omitempty" default:"5"`
+
+	// Whether we can perform writes from the gRPC API and fall back to sending messages through RabbitMQ if we exhaust slots
+	GRPCTriggerWritesEnabled bool `mapstructure:"grpcTriggerWritesEnabled" json:"grpcTriggerWritesEnabled,omitempty" default:"true"`
+
+	// The number of slots for gRPC writes
+	GRPCTriggerWriteSlots int `mapstructure:"grpcTriggerWriteSlots" json:"grpcTriggerWriteSlots,omitempty" default:"5"`
+
+	// Allow new tenants to be created
+	AllowSignup bool `mapstructure:"allowSignup" json:"allowSignup,omitempty" default:"true"`
+
+	// Allow new invites to be created
+	AllowInvites bool `mapstructure:"allowInvites" json:"allowInvites,omitempty" default:"true"`
+
+	// Maximum number of pending invites an inviter can have
+	MaxPendingInvites int `mapstructure:"maxPendingInvites" json:"maxPendingInvites,omitempty" default:"100"`
+
+	// Allow new tenants to be created
+	AllowCreateTenant bool `mapstructure:"allowCreateTenant" json:"allowCreateTenant,omitempty" default:"true"`
+
+	// Allow passwords to be changed
+	AllowChangePassword bool `mapstructure:"allowChangePassword" json:"allowChangePassword,omitempty" default:"true"`
+
+	// Whether this instance is running in embedded mode
+	Embedded bool `mapstructure:"embedded" json:"embedded,omitempty" default:"false"`
+
+	// Rate limiting configuration for API operations by IP
+	APIRateLimit       int           `mapstructure:"apiRateLimit" json:"apiRateLimit,omitempty" default:"10"`
+	APIRateLimitWindow time.Duration `mapstructure:"apiRateLimitWindow" json:"apiRateLimitWindow,omitempty" default:"300s"`
+
+	// Comma-separated CIDR ranges whose forwarding headers are trusted when deriving the client IP for rate limiting
+	APITrustedProxies []string `mapstructure:"apiTrustedProxies" json:"apiTrustedProxies,omitempty"`
+
+	// Trust forwarding headers from loopback/link-local/private peers by default; set false to trust only APITrustedProxies
+	APITrustPrivateProxies bool `mapstructure:"apiTrustPrivateProxies" json:"apiTrustPrivateProxies,omitempty" default:"true"`
+
+	// WebhookRateLimit is the rate limit for webhook endpoints per second, per webhook
+	WebhookRateLimit float64 `mapstructure:"webhookRateLimit" json:"webhookRateLimit,omitempty" default:"50"`
+
+	// WebhookRateLimitBurst is the burst size for webhook rate limiting
+	WebhookRateLimitBurst int `mapstructure:"webhookRateLimitBurst" json:"webhookRateLimitBurst,omitempty" default:"100"`
+
+	// TaskStatsRateLimit is the sustained rate limit for the task-stats endpoint per second, per tenant. 0 disables it
+	TaskStatsRateLimit float64 `mapstructure:"taskStatsRateLimit" json:"taskStatsRateLimit,omitempty" default:"10"`
+
+	// TaskStatsRateLimitBurst is the burst size for task-stats rate limiting, at least 1
+	TaskStatsRateLimitBurst int `mapstructure:"taskStatsRateLimitBurst" json:"taskStatsRateLimitBurst,omitempty" default:"100"`
+
+	// DisableTenantPubs controls whether tenant pubsub is disabled
+	DisableTenantPubs bool `mapstructure:"disableTenantPubs" json:"disableTenantPubs,omitempty"`
+
+	// MaxInternalRetryCount is the maximum number of internal retries before a step run is considered failed (default: 10)
+	MaxInternalRetryCount int32 `mapstructure:"maxInternalRetryCount" json:"maxInternalRetryCount,omitempty" default:"10"`
+
+	Monitoring ConfigFileMonitoring `mapstructure:"monitoring" json:"monitoring,omitempty"`
+
+	// PreventTenantVersionUpgrade controls whether the server prevents tenant version upgrades
+	PreventTenantVersionUpgrade bool `mapstructure:"preventTenantVersionUpgrade" json:"preventTenantVersionUpgrade,omitempty" default:"false"`
+
+	// ReplayEnabled controls whether the server enables replay for tasks
+	ReplayEnabled bool `mapstructure:"replayEnabled" json:"replayEnabled,omitempty" default:"true"`
+
+	// AllowedOrigins is a list of origin patterns permitted for CORS requests.
+	// Patterns may include wildcards, e.g. "https://*.hatchet.run".
+	// If empty, all origins are allowed ("*").
+	// Populated from AllowedOriginsString at startup; do not set directly via env.
+	AllowedOrigins []string `mapstructure:"allowedOrigins" json:"allowedOrigins,omitempty"`
+
+	// AllowedOriginsString is the raw space-separated value used for env binding
+	// (SERVER_ALLOWED_ORIGINS). Example: "https://app.example.com https://*.hatchet.run".
+	// The loader splits this into AllowedOrigins at startup.
+	AllowedOriginsString string `mapstructure:"allowedOriginsString" json:"allowedOriginsString,omitempty"`
+
+	// OperatorInfraBlockedCIDRs are additional CIDR ranges that consumers of
+	// pkg/operator/safeclient block when delivering outbound requests (our own
+	// infrastructure: VPC, metadata, internal LBs), on top of the built-in
+	// reserved/private denylist. The engine does not read it today; it is kept so the
+	// serverless operator can consume it. Populated from OperatorInfraBlockedCIDRsString
+	// at startup; do not set directly via env.
+	OperatorInfraBlockedCIDRs []string `mapstructure:"operatorInfraBlockedCIDRs" json:"operatorInfraBlockedCIDRs,omitempty"`
+
+	// OperatorInfraBlockedCIDRsString is the raw space-separated value used for env binding
+	// (SERVER_OPERATOR_INFRA_BLOCKED_CIDRS). Example: "10.0.0.0/8 fd00::/8".
+	// The loader splits this into OperatorInfraBlockedCIDRs at startup.
+	OperatorInfraBlockedCIDRsString string `mapstructure:"operatorInfraBlockedCIDRsString" json:"operatorInfraBlockedCIDRsString,omitempty"`
+
+	// DagOperatorDefaultSlots is how many DAG runs one DAG operator worker orchestrates at once.
+	// Every engine pod runs a DAG worker for each tenant, so a tenant gets this many per pod, and
+	// the scheduler rebuilds one entry per free slot about every second, even for idle tenants.
+	DagOperatorDefaultSlots int `mapstructure:"dagOperatorDefaultSlots" json:"dagOperatorDefaultSlots,omitempty" default:"5000"`
+
+	// GRPCOperatorsEnabled registers the v1.OperatorService gRPC API for operators running outside the engine
+	// process. Off by default; when disabled the service is not registered and callers receive Unimplemented.
+	GRPCOperatorsEnabled bool `mapstructure:"grpcOperatorsEnabled" json:"grpcOperatorsEnabled,omitempty" default:"false"`
+
+	// GRPCOperatorMaxListenStreamsPerOperator caps the Listen streams one operator holds open on this replica
+	// (SERVER_GRPC_OPERATOR_MAX_LISTEN_STREAMS_PER_OPERATOR). Each stream is a live worker, metered like an SDK
+	// worker; the cap bounds what one operator can hold on a replica on top of the tenant's worker limit. A
+	// stream over the cap is refused with ResourceExhausted before its worker is activated. Zero disables the cap.
+	GRPCOperatorMaxListenStreamsPerOperator int `mapstructure:"grpcOperatorMaxListenStreamsPerOperator" json:"grpcOperatorMaxListenStreamsPerOperator,omitempty" default:"100"`
+
+	// GRPCOperatorMaxActionsPerOperator caps the action links held across all workers of one operator
+	// (SERVER_GRPC_OPERATOR_MAX_ACTIONS_PER_OPERATOR). A delta that would newly link actions over the cap is
+	// refused with ResourceExhausted and links nothing. Zero disables the cap.
+	GRPCOperatorMaxActionsPerOperator int64 `mapstructure:"grpcOperatorMaxActionsPerOperator" json:"grpcOperatorMaxActionsPerOperator,omitempty" default:"1000000"`
+
+	// ServerlessOperatorEnabled runs the serverless operator core inside the engine's dispatcher process
+	// (SERVER_SERVERLESS_OPERATOR_ENABLED). Registrations then go straight to the local dispatcher instead
+	// of over the OperatorService API. Off by default. Deliveries go through pkg/operator/safeclient, so
+	// OperatorInfraBlockedCIDRs must be set (or ServerlessOperator.AllowEmptyInfraCIDRs) for it to start.
+	ServerlessOperatorEnabled bool `mapstructure:"serverlessOperatorEnabled" json:"serverlessOperatorEnabled,omitempty" default:"false"`
+
+	// ServerlessOperator holds the knobs of the in-engine serverless operator (SERVER_SERVERLESS_OPERATOR_*).
+	ServerlessOperator ServerlessOperatorConfigFile `mapstructure:"serverlessOperator" json:"serverlessOperator,omitempty"`
+
+	// SchedulerConcurrencyRateLimit is the rate limit for scheduler concurrency strategy execution (per second)
+	SchedulerConcurrencyRateLimit int `mapstructure:"schedulerConcurrencyRateLimit" json:"schedulerConcurrencyRateLimit,omitempty" default:"20"`
+
+	// SchedulerConcurrencyPollingMinInterval is the minimum interval for concurrency polling
+	SchedulerConcurrencyPollingMinInterval time.Duration `mapstructure:"schedulerConcurrencyPollingMinInterval" json:"schedulerConcurrencyPollingMinInterval,omitempty" default:"500ms"`
+
+	// SchedulerConcurrencyPollingMaxInterval is the maximum interval for concurrency polling
+	SchedulerConcurrencyPollingMaxInterval time.Duration `mapstructure:"schedulerConcurrencyPollingMaxInterval" json:"schedulerConcurrencyPollingMaxInterval,omitempty" default:"5s"`
+
+	// SchedulerCheckActiveMinInterval is the minimum interval for the check-active polling loop
+	SchedulerCheckActiveMinInterval time.Duration `mapstructure:"schedulerCheckActiveMinInterval" json:"schedulerCheckActiveMinInterval,omitempty" default:"30s"`
+
+	// SchedulerCheckActiveMaxInterval is the maximum interval for the check-active polling loop
+	SchedulerCheckActiveMaxInterval time.Duration `mapstructure:"schedulerCheckActiveMaxInterval" json:"schedulerCheckActiveMaxInterval,omitempty" default:"60s"`
+
+	SchedulerAdvisoryLockTimeout time.Duration `mapstructure:"schedulerAdvisoryLockTimeout" json:"schedulerAdvisoryLockTimeout,omitempty" default:"5s"`
+
+	// ConcurrencyInMemoryIndexEnabled controls whether the in-memory index + outbox approach is used for concurrency strategies
+	ConcurrencyInMemoryIndexEnabled bool `mapstructure:"concurrencyInMemoryIndexEnabled" json:"concurrencyInMemoryIndexEnabled,omitempty" default:"true"`
+
+	// LogIngestionEnabled controls whether the server enables log ingestion for tasks
+	LogIngestionEnabled bool `mapstructure:"logIngestionEnabled" json:"logIngestionEnabled,omitempty" default:"true"`
+
+	// O11yUsageFlushInterval is how often the engine flushes per-tenant ingested
+	// log/span bytes to the optional O11yUsageFlush callback.
+	O11yUsageFlushInterval time.Duration `mapstructure:"o11yUsageFlushInterval" json:"o11yUsageFlushInterval,omitempty" default:"30s"`
+
+	// TaskOperationLimits controls the limits for various task operations
+	TaskOperationLimits TaskOperationLimitsConfigFile `mapstructure:"taskOperationLimits" json:"taskOperationLimits,omitempty"`
+
+	// WorkflowRunBufferSize is the buffer size for workflow run event batching in the dispatcher
+	WorkflowRunBufferSize int `mapstructure:"workflowRunBufferSize" json:"workflowRunBufferSize,omitempty" default:"1000"`
+
+	// DurableEventBufferFlushInterval is the minimum amount of time between batches of durable event log entries that we
+	// flush to the database. If an event comes in and we haven't flushed for longer than this interval, we'll flush it right away.
+	// Otherwise, it waits for the next flush, which can take up to twice this interval, or less if the buffer fills up first.
+	DurableEventBufferFlushInterval time.Duration `mapstructure:"durableEventBufferFlushInterval" json:"durableEventBufferFlushInterval,omitempty" default:"5ms"`
+
+	// DurableEventBufferMaxSize caps how many durable task events a single flush
+	// batches together, so a burst of traffic still flushes promptly.
+	DurableEventBufferMaxSize int `mapstructure:"durableEventBufferMaxSize" json:"durableEventBufferMaxSize,omitempty" default:"100"`
+
+	// DurableEventBufferMaxConcurrentFlushes bounds how many durable event ingestion
+	// transactions run concurrently.
+	DurableEventBufferMaxConcurrentFlushes int `mapstructure:"durableEventBufferMaxConcurrentFlushes" json:"durableEventBufferMaxConcurrentFlushes,omitempty" default:"16"`
+
+	// StreamEventBufferTimeout is the timeout duration for the stream event buffer in the dispatcher.
+	// This controls how long the buffer waits for out-of-order events before flushing them.
+	StreamEventBufferTimeout time.Duration `mapstructure:"streamEventBufferTimeout" json:"streamEventBufferTimeout,omitempty" default:"5s"`
+}
+
+type InternalClientTLSConfigFile struct {
+	// InheritBase controls whether the internal client should inherit the base TLS config from the
+	// server config. This will work if there's no gRPC proxy in between the externally-facing grpc server
+	// and the API server. If there is a proxy, you should set this to false and configure the base TLS
+	// config for the internal client.
+	InheritBase bool `mapstructure:"inheritBase" json:"inheritBase,omitempty" default:"true"`
+
+	// InternalGRPCBroadcastAddress is the address that the API endpoints can use to proxy to the gRPC server. If this
+	// is not set, it defaults to the GRPC_BROADCAST_ADDRESS
+	InternalGRPCBroadcastAddress string `mapstructure:"internalGRPCBroadcastAddress" json:"internalGRPCBroadcastAddress,omitempty"`
+
+	// TLSServerName is the server name to use to verify the TLS connection. If this is not set, it defaults
+	// to the host of the GRPC_BROADCAST_ADDRESS
+	TLSServerName string `mapstructure:"tlsServerName" json:"tlsServerName,omitempty"`
+
+	Base shared.TLSConfigFile `mapstructure:"base" json:"base,omitempty"`
+}
+
+type SecurityCheckConfigFile struct {
+	Enabled  bool   `mapstructure:"enabled" json:"enabled,omitempty" default:"true"`
+	Endpoint string `mapstructure:"endpoint" json:"endpoint,omitempty" default:"https://security.hatchet.run"`
+}
+
+// Alerting options
+type AlertingConfigFile struct {
+	Sentry SentryConfigFile `mapstructure:"sentry" json:"sentry,omitempty"`
+}
+
+type SentryConfigFile struct {
+	// Enabled controls whether the Sentry service is enabled for this Hatchet instance.
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty"`
+
+	// DSN is the Data Source Name for the Sentry instance
+	DSN string `mapstructure:"dsn" json:"dsn,omitempty"`
+
+	// Environment is the environment that the instance is running in
+	Environment string `mapstructure:"environment" json:"environment,omitempty" default:"development"`
+
+	// Sample rate is the rate at which to sample events. Default is 1.0 to sample all events.
+	SampleRate float64 `mapstructure:"sampleRate" json:"sampleRate,omitempty" default:"1.0"`
+}
+
+type AnalyticsConfigFile struct {
+	Posthog                PosthogConfigFile `mapstructure:"posthog" json:"posthog,omitempty"`
+	AggregateEnabled       bool              `mapstructure:"aggregateEnabled" json:"aggregateEnabled,omitempty" default:"false"`
+	AggregateFlushInterval string            `mapstructure:"aggregateFlushInterval" json:"aggregateFlushInterval,omitempty" default:"60m"`
+	AggregateMaxKeys       int               `mapstructure:"aggregateMaxKeys" json:"aggregateMaxKeys,omitempty" default:"500"`
+}
+
+type PosthogConfigFile struct {
+	// Enabled controls whether the Posthog service is enabled for this Hatchet instance.
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty"`
+
+	// APIKey is the API key for the Posthog instance
+	ApiKey string `mapstructure:"apiKey" json:"apiKey,omitempty"`
+
+	// Endpoint is the endpoint for the Posthog instance
+	Endpoint string `mapstructure:"endpoint" json:"endpoint,omitempty"`
+
+	// FeApiKey is the frontend API key for the Posthog instance
+	FeApiKey string `mapstructure:"feApiKey" json:"feApiKey,omitempty"`
+
+	// FeApiHost is the frontend API host for the Posthog instance
+	FeApiHost string `mapstructure:"feApiHost" json:"feApiHost,omitempty"`
+}
+
+// Encryption options
+type EncryptionConfigFile struct {
+	// MasterKeyset is the raw master keyset for the instance. This should be a base64-encoded JSON string. You must set
+	// either MasterKeyset, MasterKeysetFile or cloudKms.enabled with CloudKMS credentials
+	MasterKeyset string `mapstructure:"masterKeyset" json:"masterKeyset,omitempty"`
+
+	// MasterKeysetFile is the path to the master keyset file for the instance.
+	MasterKeysetFile string `mapstructure:"masterKeysetFile" json:"masterKeysetFile,omitempty"`
+
+	JWT EncryptionConfigFileJWT `mapstructure:"jwt" json:"jwt,omitempty"`
+
+	// CloudKMS is the configuration for Google Cloud KMS. You must set either MasterKeyset or cloudKms.enabled.
+	CloudKMS EncryptionConfigFileCloudKMS `mapstructure:"cloudKms" json:"cloudKMS,omitempty"`
+}
+
+type EncryptionConfigFileJWT struct {
+	// PublicJWTKeyset is a base64-encoded JSON string containing the public keyset which has been encrypted
+	// by the master key.
+	PublicJWTKeyset string `mapstructure:"publicJWTKeyset" json:"publicJWTKeyset,omitempty"`
+
+	// PublicJWTKeysetFile is the path to the public keyset file for the instance.
+	PublicJWTKeysetFile string `mapstructure:"publicJWTKeysetFile" json:"publicJWTKeysetFile,omitempty"`
+
+	// PrivateJWTKeyset is a base64-encoded JSON string containing the private keyset which has been encrypted
+	// by the master key.
+	PrivateJWTKeyset string `mapstructure:"privateJWTKeyset" json:"privateJWTKeyset,omitempty"`
+
+	// PrivateJWTKeysetFile is the path to the private keyset file for the instance.
+	PrivateJWTKeysetFile string `mapstructure:"privateJWTKeysetFile" json:"privateJWTKeysetFile,omitempty"`
+}
+
+type EncryptionConfigFileCloudKMS struct {
+	// Enabled controls whether the Cloud KMS service is enabled for this Hatchet instance.
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"false"`
+
+	// KeyURI is the URI of the key in Google Cloud KMS. This should be in the format of
+	// gcp-kms://...
+	KeyURI string `mapstructure:"keyURI" json:"keyURI,omitempty"`
+
+	// CredentialsJSON is the JSON credentials for the Google Cloud KMS service account.
+	CredentialsJSON string `mapstructure:"credentialsJSON" json:"credentialsJSON,omitempty"`
+}
+
+type ConfigFileAuth struct {
+	// RestrictedEmailDomains sets the restricted email domains for the instance.
+	// NOTE: do not use this on the server from the config file.
+	RestrictedEmailDomains string `mapstructure:"restrictedEmailDomains" json:"restrictedEmailDomains,omitempty"`
+
+	// BasedAuthEnabled controls whether email and password-based login is enabled for this
+	// Hatchet instance
+	BasicAuthEnabled bool `mapstructure:"basicAuthEnabled" json:"basicAuthEnabled,omitempty" default:"true"`
+
+	// SetEmailVerified controls whether the user's email is automatically set to verified
+	SetEmailVerified bool `mapstructure:"setEmailVerified" json:"setEmailVerified,omitempty" default:"false"`
+
+	// Configuration options for the cookie
+	Cookie ConfigFileAuthCookie `mapstructure:"cookie" json:"cookie,omitempty"`
+
+	Google ConfigFileAuthGoogle `mapstructure:"google" json:"google,omitempty"`
+
+	Github ConfigFileAuthGithub `mapstructure:"github" json:"github,omitempty"`
+
+	ControlPlaneExchangeTokenConfig ConfigFileAuthControlPlaneExchangeToken `mapstructure:"controlPlaneExchangeToken" json:"controlPlaneExchangeToken,omitempty"`
+}
+
+type ConfigFileAuthControlPlaneExchangeToken struct {
+	// JWTPublicKeyset and JWTPublicKeysetFile must contain a base64 raw-encoded (no padding)
+	// JSON keyset as produced by the Tink library. These are passed to
+	// encryption.InsecureHandleFromBytes, which expects base64-raw-encoded JSON — not a
+	// raw JSON file. Only the public keyset is needed here; Hatchet does not generate the
+	// private keyset.
+	//
+	// JWTPublicKeyset: inline base64-raw-encoded JSON keyset (single line, no whitespace).
+	// JWTPublicKeysetFile: path to a file whose entire contents are the same encoded value.
+	JWTPublicKeyset     string `mapstructure:"jwtPublicKeyset" json:"jwtPublicKeyset,omitempty"`
+	JWTPublicKeysetFile string `mapstructure:"jwtPublicKeysetFile" json:"jwtPublicKeysetFile,omitempty"`
+
+	// Issuer is the expected issuer for the exchange token. This should be set to the URL of the control plane instance.
+	Issuer string `mapstructure:"issuer" json:"issuer,omitempty"`
+
+	// Audience is the expected audience for the exchange token. This should be set to the identifier of the API server in the control plane instance.
+	Audience string `mapstructure:"audience" json:"audience,omitempty"`
+
+	// Enabled controls whether the control plane exchange token authentication method is enabled for this Hatchet instance.
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"false"`
+}
+
+// DirectUserLoginDisabled reports whether password, OAuth, and session-cookie
+// login must be refused. Shards that accept control-plane exchange tokens are
+// reached through the control plane, so a direct user session is not a login.
+func (a ConfigFileAuth) DirectUserLoginDisabled() bool {
+	return a.ControlPlaneExchangeTokenConfig.Enabled
+}
+
+type ConfigFileTenantAlerting struct {
+	Slack ConfigFileSlack `mapstructure:"slack" json:"slack,omitempty"`
+}
+
+type ConfigFileSlack struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty"`
+
+	SlackAppClientID     string   `mapstructure:"clientID" json:"clientID,omitempty"`
+	SlackAppClientSecret string   `mapstructure:"clientSecret" json:"clientSecret,omitempty"`
+	SlackAppScopes       []string `mapstructure:"scopes" json:"scopes,omitempty" default:"[\"incoming-webhook\"]"`
+}
+
+type ConfigFileAuthGoogle struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"false"`
+
+	ClientID     string   `mapstructure:"clientID" json:"clientID,omitempty"`
+	ClientSecret string   `mapstructure:"clientSecret" json:"clientSecret,omitempty"`
+	Scopes       []string `mapstructure:"scopes" json:"scopes,omitempty" default:"[\"openid\", \"profile\", \"email\"]"`
+}
+
+type ConfigFileAuthGithub struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"false"`
+
+	ClientID     string   `mapstructure:"clientID" json:"clientID,omitempty"`
+	ClientSecret string   `mapstructure:"clientSecret" json:"clientSecret,omitempty"`
+	Scopes       []string `mapstructure:"scopes" json:"scopes,omitempty" default:"[\"read:user\", \"user:email\"]"`
+}
+
+type ConfigFileAuthCookie struct {
+	Name     string `mapstructure:"name" json:"name,omitempty" default:"hatchet"`
+	Domain   string `mapstructure:"domain" json:"domain,omitempty"`
+	Secrets  string `mapstructure:"secrets" json:"secrets,omitempty"`
+	Insecure bool   `mapstructure:"insecure" json:"insecure,omitempty" default:"false"`
+}
+
+type MessageQueueConfigFile struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"true"`
+
+	Kind string `mapstructure:"kind" json:"kind,omitempty" validate:"required,oneof=rabbitmq postgres" default:"rabbitmq"`
+
+	Postgres PostgresMQConfigFile `mapstructure:"postgres" json:"postgres,omitempty"`
+
+	RabbitMQ RabbitMQConfigFile `mapstructure:"rabbitmq" json:"rabbitmq,omitempty" validate:"required"`
+
+	PubSub PubSubConfigFile `mapstructure:"pubSub" json:"pubSub,omitempty"`
+}
+
+// PubSubConfigFile configures the best-effort pub/sub mechanism. All settings
+// are optional overrides which inherit from the durable message queue settings
+// when unset, so existing deployments need zero new configuration.
+type PubSubConfigFile struct {
+	// Kind is "rabbitmq", "postgres", or "nats"; empty inherits msgQueue.kind
+	Kind string `mapstructure:"kind" json:"kind,omitempty" validate:"omitempty,oneof=rabbitmq postgres nats"`
+
+	RabbitMQ PubSubRabbitMQConfigFile `mapstructure:"rabbitmq" json:"rabbitmq,omitempty"`
+
+	Postgres PubSubPostgresConfigFile `mapstructure:"postgres" json:"postgres,omitempty"`
+
+	NATS PubSubNATSConfigFile `mapstructure:"nats" json:"nats,omitempty"`
+}
+
+type PubSubRabbitMQConfigFile struct {
+	// URL is the connection URL; empty inherits msgQueue.rabbitmq.url. The
+	// pub/sub always opens its own connections, even when the durable queue is
+	// also rabbitmq on the same URL.
+	URL string `mapstructure:"url" json:"url,omitempty"`
+
+	MaxPubChans int32 `mapstructure:"maxPubChans" json:"maxPubChans,omitempty" default:"10"`
+	MaxSubChans int32 `mapstructure:"maxSubChans" json:"maxSubChans,omitempty" default:"20"`
+}
+
+type PubSubPostgresConfigFile struct {
+	// The pub/sub uses a small dedicated pool built from the direct DATABASE_URL
+	// (never pgbouncer — LISTEN does not survive transaction pooling).
+	MaxConns int32 `mapstructure:"maxConns" json:"maxConns,omitempty" default:"5"`
+	MinConns int32 `mapstructure:"minConns" json:"minConns,omitempty" default:"1"`
+}
+
+type PubSubNATSConfigFile struct {
+	// URL is comma-separated seed URL(s). Prefer bare hosts (e.g.
+	// nats://nats:4222); put auth in Username/Password so rediscovered
+	// cluster peers authenticate too. URL-embedded user:pass still works for
+	// single-server/dev. No durable-MQ inheritance — NATS is pub/sub only.
+	URL string `mapstructure:"url" json:"url,omitempty"`
+
+	Username string `mapstructure:"username" json:"username,omitempty"`
+	Password string `mapstructure:"password" json:"password,omitempty"`
+
+	// TLSEnabled requires TLS with a TLS-first handshake (the server must
+	// enable handshake_first). Without TLSRootCAFile, verification uses the
+	// system roots.
+	TLSEnabled bool `mapstructure:"tlsEnabled" json:"tlsEnabled,omitempty"`
+
+	// TLSRootCAFile is a PEM CA bundle for server verification. Requires
+	// TLSEnabled.
+	TLSRootCAFile string `mapstructure:"tlsRootCAFile" json:"tlsRootCAFile,omitempty"`
+
+	// SubjectPrefix is prepended (with a trailing ".") to topic names.
+	// Empty defaults to "hatchet.pubsub".
+	SubjectPrefix string `mapstructure:"subjectPrefix" json:"subjectPrefix,omitempty"`
+}
+
+type PostgresMQConfigFile struct {
+	Qos int `mapstructure:"qos" json:"qos,omitempty" default:"100"`
+}
+
+type RabbitMQConfigFile struct {
+	URL                    string `mapstructure:"url" json:"url,omitempty" validate:"required"`
+	Qos                    int    `mapstructure:"qos" json:"qos,omitempty" default:"100"`
+	MaxPubChans            int32  `mapstructure:"maxPubChans" json:"maxPubChans,omitempty" default:"20"`
+	MaxSubChans            int32  `mapstructure:"maxSubChans" json:"maxSubChans,omitempty" default:"100"`
+	CompressionEnabled     bool   `mapstructure:"compressionEnabled" json:"compressionEnabled,omitempty" default:"false"`
+	CompressionThreshold   int    `mapstructure:"compressionThreshold" json:"compressionThreshold,omitempty" default:"5120"`
+	EnableMessageRejection bool   `mapstructure:"enableMessageRejection" json:"enableMessageRejection,omitempty" default:"false"`
+	MaxDeathCount          int    `mapstructure:"maxDeathCount" json:"maxDeathCount,omitempty" default:"1000"`
+}
+
+type ConfigFileEmail struct {
+	Kind string `mapstructure:"kind" json:"kind,omitempty" default:"postmark"`
+
+	Postmark PostmarkConfigFile `mapstructure:"postmark" json:"postmark,omitempty"`
+
+	SMTP SMTPEmailConfig `mapstructure:"smtp" json:"smtp,omitempty"`
+}
+
+// ServerlessOperatorConfigFile is the in-engine serverless operator's configuration. The values mirror the
+// hatchet-serverless-operator binary's SERVERLESS_OPERATOR_* environment; the database, encryption, blocked
+// CIDRs and metrics come from the engine config.
+type ServerlessOperatorConfigFile struct {
+	// OperatorName is the v1_operator row name every registration's worker is attached to; the out-of-process
+	// binary uses the same name so both modes share one operator row per tenant.
+	OperatorName string `mapstructure:"operatorName" json:"operatorName,omitempty" default:"serverless"`
+
+	// DefaultSlots and DurableSlots are the slot config of every registration's worker (per tenant
+	// partition).
+	DefaultSlots int32 `mapstructure:"defaultSlots" json:"defaultSlots,omitempty" default:"10000"`
+	DurableSlots int32 `mapstructure:"durableSlots" json:"durableSlots,omitempty" default:"10000"`
+
+	// EndpointPartitionCount (SERVER_SERVERLESS_OPERATOR_ENDPOINT_PARTITION_COUNT, 1 to 64) is the
+	// endpoint_partition_count a tenant's serverless row is created with by the API server, alongside
+	// the tenant's first endpoint. A count above 1 lets several operator processes serve one tenant.
+	// A later change applies only to tenants first seen after it; existing tenants and endpoints
+	// keep their partitions.
+	EndpointPartitionCount int32 `mapstructure:"endpointPartitionCount" json:"endpointPartitionCount,omitempty" default:"1"`
+
+	// LeaseTTL is how long the process row stays live after a heartbeat; HeartbeatInterval refreshes it and
+	// RebalanceInterval is the claim/shed tick.
+	LeaseTTL          time.Duration `mapstructure:"leaseTtl" json:"leaseTtl,omitempty" default:"15s"`
+	HeartbeatInterval time.Duration `mapstructure:"heartbeatInterval" json:"heartbeatInterval,omitempty" default:"5s"`
+	RebalanceInterval time.Duration `mapstructure:"rebalanceInterval" json:"rebalanceInterval,omitempty" default:"5s"`
+
+	// ShedHysteresis is the fraction above fair share a process tolerates before shedding units.
+	ShedHysteresis float64 `mapstructure:"shedHysteresis" json:"shedHysteresis,omitempty" default:"0.2"`
+
+	// DrainTimeout bounds how long in-flight deliveries are awaited when a unit is lost or the engine stops.
+	DrainTimeout time.Duration `mapstructure:"drainTimeout" json:"drainTimeout,omitempty" default:"60s"`
+
+	// RoutingRefreshInterval is the incremental routing cache refresh cadence.
+	RoutingRefreshInterval time.Duration `mapstructure:"routingRefreshInterval" json:"routingRefreshInterval,omitempty" default:"10s"`
+
+	// HealthcheckTimeout bounds one endpoint healthcheck; HealthcheckConcurrency caps them process-wide and
+	// HealthcheckTenantConcurrency per tenant within that limit.
+	HealthcheckTimeout           time.Duration `mapstructure:"healthcheckTimeout" json:"healthcheckTimeout,omitempty" default:"10s"`
+	HealthcheckConcurrency       int           `mapstructure:"healthcheckConcurrency" json:"healthcheckConcurrency,omitempty" default:"256"`
+	HealthcheckTenantConcurrency int           `mapstructure:"healthcheckTenantConcurrency" json:"healthcheckTenantConcurrency,omitempty" default:"32"`
+
+	// HealthcheckApplyTimeout bounds the registration of one changed endpoint catalog.
+	HealthcheckApplyTimeout time.Duration `mapstructure:"healthcheckApplyTimeout" json:"healthcheckApplyTimeout,omitempty" default:"60s"`
+
+	// MaxWorkflowsPerEndpoint and MaxActionsPerEndpoint cap what one healthcheck may advertise.
+	MaxWorkflowsPerEndpoint int `mapstructure:"maxWorkflowsPerEndpoint" json:"maxWorkflowsPerEndpoint,omitempty" default:"200"`
+	MaxActionsPerEndpoint   int `mapstructure:"maxActionsPerEndpoint" json:"maxActionsPerEndpoint,omitempty" default:"500"`
+
+	// MaintenanceConcurrency is how many tenants a maintenance pass refreshes at once.
+	MaintenanceConcurrency int `mapstructure:"maintenanceConcurrency" json:"maintenanceConcurrency,omitempty" default:"8"`
+
+	// LeaseMaxClaimPerTick caps how many lease units one rebalance tick claims.
+	LeaseMaxClaimPerTick int32 `mapstructure:"leaseMaxClaimPerTick" json:"leaseMaxClaimPerTick,omitempty" default:"1024"`
+
+	// WSMaxFrameBytes and WSPingInterval configure the durable websocket relay.
+	WSMaxFrameBytes int64         `mapstructure:"wsMaxFrameBytes" json:"wsMaxFrameBytes,omitempty" default:"4194304"`
+	WSPingInterval  time.Duration `mapstructure:"wsPingInterval" json:"wsPingInterval,omitempty" default:"15s"`
+
+	// AllowEmptyInfraCIDRs lets the operator start without OperatorInfraBlockedCIDRs; only the built-in
+	// reserved/private denylist then applies to deliveries.
+	AllowEmptyInfraCIDRs bool `mapstructure:"allowEmptyInfraCidrs" json:"allowEmptyInfraCidrs,omitempty" default:"false"`
+
+	// InsecureDestinations disables the delivery SSRF policy (plain http, any port, private ranges) for local
+	// development and e2e runs only.
+	InsecureDestinations bool `mapstructure:"insecureDestinations" json:"insecureDestinations,omitempty" default:"false"`
+
+	// Relay resource limits (SERVER_SERVERLESS_OPERATOR_WS_*).
+
+	// WSMaxUpgradeHeaderBytes bounds an endpoint's websocket upgrade response head, which is parsed before
+	// WSMaxFrameBytes applies.
+	WSMaxUpgradeHeaderBytes int64 `mapstructure:"wsMaxUpgradeHeaderBytes" json:"wsMaxUpgradeHeaderBytes,omitempty" default:"65536"`
+
+	// WSMaxQueuedBytes bounds the encoded frames one durable relay retains for a slow endpoint.
+	WSMaxQueuedBytes int64 `mapstructure:"wsMaxQueuedBytes" json:"wsMaxQueuedBytes,omitempty" default:"16777216"`
+
+	// WSMaxStreams caps the engine streams one invocation socket may hold open at once.
+	WSMaxStreams int `mapstructure:"wsMaxStreams" json:"wsMaxStreams,omitempty" default:"16"`
+
+	// WSMaxRunsPerStream caps the workflow runs one SubscribeToWorkflowRuns stream opened over an invocation
+	// socket may await at once.
+	WSMaxRunsPerStream int `mapstructure:"wsMaxRunsPerStream" json:"wsMaxRunsPerStream,omitempty" default:"1024"`
+
+	// HTTPMaxIdleConns, HTTPMaxIdleConnsPerHost and HTTPIdleConnTimeout bound the delivery client's idle
+	// connection pool (SERVER_SERVERLESS_OPERATOR_HTTP_*).
+	HTTPMaxIdleConns        int           `mapstructure:"httpMaxIdleConns" json:"httpMaxIdleConns,omitempty" default:"256"`
+	HTTPMaxIdleConnsPerHost int           `mapstructure:"httpMaxIdleConnsPerHost" json:"httpMaxIdleConnsPerHost,omitempty" default:"4"`
+	HTTPIdleConnTimeout     time.Duration `mapstructure:"httpIdleConnTimeout" json:"httpIdleConnTimeout,omitempty" default:"90s"`
+}
+
+type ConfigFileMonitoring struct {
+	// Enabled controls whether the monitoring service is enabled for this Hatchet instance.
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"true"`
+
+	// PermittedTenants is a list of tenant IDs that are allowed to use the monitoring service.
+	PermittedTenants []string `mapstructure:"permittedTenants" json:"permittedTenants"`
+
+	// ProbeTimeout is the time to wait for the probe to complete
+	ProbeTimeout time.Duration `mapstructure:"probeTimeout" json:"probeTimeout,omitempty" default:"30s"`
+
+	// TLSRootCAFile is the path to the root CA file for the monitoring service
+	TLSRootCAFile string `mapstructure:"tlsRootCAFile" json:"tlsRootCAFile,omitempty"`
+}
+
+type PostmarkConfigFile struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty"`
+
+	ServerKey    string `mapstructure:"serverKey" json:"serverKey,omitempty"`
+	FromEmail    string `mapstructure:"fromEmail" json:"fromEmail,omitempty"`
+	FromName     string `mapstructure:"fromName" json:"fromName,omitempty" default:"Hatchet Support"`
+	SupportEmail string `mapstructure:"supportEmail" json:"supportEmail,omitempty"`
+}
+
+type SMTPEmailConfig struct {
+	BasicAuth    SMTPEmailConfigAuthBasic `mapstructure:"basicAuth" json:"basicAuth,omitempty"`
+	ServerKey    string                   `mapstructure:"serverKey" json:"serverKey,omitempty"`
+	ServerAddr   string                   `mapstructure:"serverAddr" json:"serverAddr,omitempty"`
+	FromEmail    string                   `mapstructure:"fromEmail" json:"fromEmail,omitempty"`
+	FromName     string                   `mapstructure:"fromName" json:"fromName,omitempty" default:"Hatchet Support"`
+	SupportEmail string                   `mapstructure:"supportEmail" json:"supportEmail,omitempty"`
+	Enabled      bool                     `mapstructure:"enabled" json:"enabled,omitempty"`
+}
+
+type SMTPEmailConfigAuthBasic struct {
+	Username string `mapstructure:"username" json:"username,omitempty"`
+	Password string `mapstructure:"password" json:"password,omitempty"`
+}
+type CustomAuthenticator interface {
+	// Authenticate is called to authenticate for endpoints that support the customAuth security scheme
+	Authenticate(c echo.Context, r *middleware.RouteInfo) error
+
+	// Authorize is called to authorize for endpoints that support the customAuth security scheme
+	Authorize(c echo.Context, r *middleware.RouteInfo) error
+
+	// CookieAuthorizerHook is called as part of cookie authorization
+	CookieAuthorizerHook(c echo.Context, r *middleware.RouteInfo) error
+}
+
+type AuthConfig struct {
+	RestrictedEmailDomains []string
+
+	ConfigFile ConfigFileAuth
+
+	GoogleOAuthConfig *oauth2.Config
+
+	GithubOAuthConfig *oauth2.Config
+
+	JWTManager token.JWTManager
+
+	ExchangeTokenClient exchangetoken.ExchangeTokenClient
+
+	CustomAuthenticator CustomAuthenticator
+
+	// Operations listed here bypass the tenant RBAC check for every role. Use this for read-only
+	// extension operations (e.g. cloud) that aren't known to the base OpenAPI spec / rbac.yaml and
+	// so would otherwise be denied to every role, including OWNER. OSS operations in rbac.yaml are
+	// still fully checked.
+	AllowedOperations []string
+
+	// AllowedWriteOperations behaves like AllowedOperations (bypasses the tenant RBAC check for
+	// operations unknown to rbac.yaml) except for the VIEWER role, which is denied - VIEWER must
+	// stay read-only even for extension operations the base RBAC system has no knowledge of. Use
+	// this for mutating extension operations (create/update/delete); use AllowedOperations for
+	// read-only ones.
+	AllowedWriteOperations []string
+}
+
+type PylonConfig struct {
+	Enabled bool   `mapstructure:"enabled" json:"enabled,omitempty"`
+	AppID   string `mapstructure:"appID" json:"appID,omitempty"`
+	Secret  string `mapstructure:"secret" json:"secret,omitempty"`
+}
+
+type FePosthogConfig struct {
+	ApiKey  string
+	ApiHost string
+}
+
+type ServerConfig struct {
+	*database.Layer
+
+	Auth AuthConfig
+
+	Alerter errors.Alerter
+
+	Analytics analytics.Analytics
+
+	// O11yUsageFlush, when set, receives periodic tenant → log/otel byte maps
+	// from the engine. Nil means the aggregator is not started (OSS / self-host).
+	O11yUsageFlush o11yusage.FlushFunc
+
+	Pylon *PylonConfig
+
+	FePosthog *FePosthogConfig
+
+	Encryption encryption.EncryptionService
+
+	Runtime ConfigFileRuntime
+
+	PayloadStore PayloadStoreConfig
+
+	Services []string
+
+	PausedControllers map[string]bool
+
+	EnableDataRetention bool
+
+	EnableWorkerRetention bool
+
+	Namespaces []string
+
+	MessageQueueV1 msgqueue.MessageQueue
+
+	PubSubV1 msgqueue.PubSub
+
+	Logger *zerolog.Logger
+
+	AdditionalLoggers ConfigFileAdditionalLoggers
+
+	TLSConfig *tls.Config
+
+	InternalClientFactory *client.GRPCClientFactory
+
+	SessionStore *cookie.UserSessionStore
+
+	Validator validator.Validator
+
+	Ingestor ingestor.Ingestor
+
+	OpenTelemetry shared.OpenTelemetryConfigFile
+
+	Prometheus shared.PrometheusConfigFile
+
+	PrometheusGate *prometheus.Gate
+
+	Observability shared.ObservabilityConfigFile
+
+	Email email.EmailService
+
+	TenantAlerter *alerting.TenantAlertManager
+
+	AdditionalOAuthConfigs map[string]*oauth2.Config
+
+	SchedulingPoolV1 scheduling.Pool
+
+	AuditLogOutbox *v1.AuditLogOutbox
+
+	Sampling ConfigFileSampling
+
+	Operations ConfigFileOperations
+
+	GRPCInterceptors []connect.UnaryInterceptorFunc
+
+	InprocOperators []InprocOperator
+
+	Version string
+
+	CronOperations CronOperationsConfigFile
+
+	OLAPStatusUpdates OLAPStatusUpdateConfigFile
+
+	MQMaxDeathCount int
+}
+
+type PayloadStoreConfig struct {
+	ExternalCutoverProcessInterval       time.Duration `mapstructure:"externalCutoverProcessInterval" json:"externalCutoverProcessInterval,omitempty" default:"15s"`
+	ExternalCutoverBatchSize             int32         `mapstructure:"externalCutoverBatchSize" json:"externalCutoverBatchSize,omitempty" default:"1000"`
+	ExternalCutoverNumConcurrentOffloads int32         `mapstructure:"externalCutoverNumConcurrentOffloads" json:"externalCutoverNumConcurrentOffloads,omitempty" default:"10"`
+	InlineStoreTTLDays                   int32         `mapstructure:"inlineStoreTTLDays" json:"inlineStoreTTLDays,omitempty" default:"2"`
+	EnableWindowSizeOptimization         bool          `mapstructure:"enableWindowSizeOptimization" json:"enableWindowSizeOptimization,omitempty" default:"true"`
+	// Writes the task input to the payload store wrapped in the full step run data, which engines before the
+	// `triggers`, `dag_parent_task_run_ids` and `child_task_desired_worker_labels` columns on v1_task can read.
+	// Every engine from this version on reads both shapes. Turn off only once every engine is on this version
+	// or later, because an older engine cannot read a bare input and turning it back on does not repair rows
+	// already written bare.
+	WrapTaskInputInStepRunData bool `mapstructure:"wrapTaskInputInStepRunData" json:"wrapTaskInputInStepRunData,omitempty" default:"true"`
+	// Lets the tasks and DAGs an event triggers read the event's input payload row, lets a DAG share one row with
+	// its tasks, and stops storing OLAP's own copies of run inputs, event payloads and task outputs. Task inputs
+	// are written unwrapped while it is on, whatever WrapTaskInputInStepRunData says. Turn on only
+	// once every engine is on this version or later: an older engine cannot find the input of a run that
+	// references another row, and an older OLAP controller stores an empty input for a run whose message carries
+	// no bytes.
+	EnablePayloadConsolidation bool `mapstructure:"enablePayloadConsolidation" json:"enablePayloadConsolidation,omitempty" default:"false"`
+}
+
+func (c *ServerConfig) HasService(name string) bool {
+	for _, s := range c.Services {
+		if s == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *ServerConfig) AddGRPCUnaryInterceptor(interceptor connect.UnaryInterceptorFunc) {
+	c.GRPCInterceptors = append(c.GRPCInterceptors, interceptor)
+}
+
+type InprocOperator struct {
+	Name string
+	Run  func(ctx context.Context, processId uuid.UUID, host operator.Host) error
+}
+
+func (c *ServerConfig) AddInprocOperator(op InprocOperator) {
+	c.InprocOperators = append(c.InprocOperators, op)
+}
+
+func BindAllEnv(v *viper.Viper) {
+	// runtime options
+	_ = v.BindEnv("runtime.port", "SERVER_PORT")
+	_ = v.BindEnv("runtime.url", "SERVER_URL")
+	_ = v.BindEnv("runtime.frontendUrl", "SERVER_FRONTEND_URL")
+	_ = v.BindEnv("runtime.healthcheck", "SERVER_HEALTHCHECK")
+	_ = v.BindEnv("runtime.healthcheckPort", "SERVER_HEALTHCHECK_PORT")
+	_ = v.BindEnv("runtime.grpcPort", "SERVER_GRPC_PORT")
+	_ = v.BindEnv("runtime.grpcBindAddress", "SERVER_GRPC_BIND_ADDRESS")
+	_ = v.BindEnv("runtime.grpcBroadcastAddress", "SERVER_GRPC_BROADCAST_ADDRESS")
+	_ = v.BindEnv("runtime.grpcInsecure", "SERVER_GRPC_INSECURE")
+	_ = v.BindEnv("runtime.grpcMaxMsgSize", "SERVER_GRPC_MAX_MSG_SIZE")
+	_ = v.BindEnv("runtime.grpcWorkerMaxLockAcquisitionTime", "SERVER_GRPC_WORKER_MAX_LOCK_ACQUISITION_TIME")
+	_ = v.BindEnv("runtime.grpcStaticStreamWindowSize", "SERVER_GRPC_STATIC_STREAM_WINDOW_SIZE")
+	_ = v.BindEnv("runtime.grpcRateLimit", "SERVER_GRPC_RATE_LIMIT")
+	_ = v.BindEnv("runtime.webhookRateLimit", "SERVER_INCOMING_WEBHOOK_RATE_LIMIT")
+	_ = v.BindEnv("runtime.webhookRateLimitBurst", "SERVER_INCOMING_WEBHOOK_RATE_LIMIT_BURST")
+	_ = v.BindEnv("runtime.taskStatsRateLimit", "SERVER_TASK_STATS_RATE_LIMIT")
+	_ = v.BindEnv("runtime.taskStatsRateLimitBurst", "SERVER_TASK_STATS_RATE_LIMIT_BURST")
+	_ = v.BindEnv("runtime.grpcShutdownTimeout", "SERVER_GRPC_SHUTDOWN_TIMEOUT")
+	_ = v.BindEnv("runtime.schedulerConcurrencyRateLimit", "SCHEDULER_CONCURRENCY_RATE_LIMIT")
+	_ = v.BindEnv("runtime.schedulerConcurrencyPollingMinInterval", "SCHEDULER_CONCURRENCY_POLLING_MIN_INTERVAL")
+	_ = v.BindEnv("runtime.schedulerConcurrencyPollingMaxInterval", "SCHEDULER_CONCURRENCY_POLLING_MAX_INTERVAL")
+	_ = v.BindEnv("runtime.schedulerCheckActiveMinInterval", "SCHEDULER_CHECK_ACTIVE_MIN_INTERVAL")
+	_ = v.BindEnv("runtime.schedulerCheckActiveMaxInterval", "SCHEDULER_CHECK_ACTIVE_MAX_INTERVAL")
+	_ = v.BindEnv("runtime.schedulerAdvisoryLockTimeout", "SCHEDULER_ADVISORY_LOCK_TIMEOUT")
+	_ = v.BindEnv("runtime.concurrencyInMemoryIndexEnabled", "SERVER_CONCURRENCY_IN_MEMORY_INDEX_ENABLED")
+	_ = v.BindEnv("servicesString", "SERVER_SERVICES")
+	_ = v.BindEnv("pausedControllers", "SERVER_PAUSED_CONTROLLERS")
+	_ = v.BindEnv("enableDataRetention", "SERVER_ENABLE_DATA_RETENTION")
+	_ = v.BindEnv("enableWorkerRetention", "SERVER_ENABLE_WORKER_RETENTION")
+	_ = v.BindEnv("runtime.enforceLimits", "SERVER_ENFORCE_LIMITS")
+	_ = v.BindEnv("runtime.allowSignup", "SERVER_ALLOW_SIGNUP")
+	_ = v.BindEnv("runtime.allowInvites", "SERVER_ALLOW_INVITES")
+	_ = v.BindEnv("runtime.allowCreateTenant", "SERVER_ALLOW_CREATE_TENANT")
+	_ = v.BindEnv("runtime.maxPendingInvites", "SERVER_MAX_PENDING_INVITES")
+	_ = v.BindEnv("runtime.allowChangePassword", "SERVER_ALLOW_CHANGE_PASSWORD")
+	_ = v.BindEnv("runtime.apiRateLimit", "SERVER_API_RATE_LIMIT")
+	_ = v.BindEnv("runtime.apiRateLimitWindow", "SERVER_API_RATE_LIMIT_WINDOW")
+	_ = v.BindEnv("runtime.apiTrustedProxies", "SERVER_API_TRUSTED_PROXIES")
+	_ = v.BindEnv("runtime.apiTrustPrivateProxies", "SERVER_API_TRUST_PRIVATE_PROXIES")
+	_ = v.BindEnv("runtime.disableTenantPubs", "SERVER_DISABLE_TENANT_PUBS")
+	_ = v.BindEnv("runtime.maxInternalRetryCount", "SERVER_MAX_INTERNAL_RETRY_COUNT")
+	_ = v.BindEnv("runtime.preventTenantVersionUpgrade", "SERVER_PREVENT_TENANT_VERSION_UPGRADE")
+	_ = v.BindEnv("runtime.replayEnabled", "SERVER_REPLAY_ENABLED")
+	_ = v.BindEnv("runtime.allowedOriginsString", "SERVER_ALLOWED_ORIGINS")
+	_ = v.BindEnv("runtime.operatorInfraBlockedCIDRsString", "SERVER_OPERATOR_INFRA_BLOCKED_CIDRS")
+	_ = v.BindEnv("runtime.dagOperatorDefaultSlots", "SERVER_DAG_OPERATOR_DEFAULT_SLOTS")
+	_ = v.BindEnv("runtime.grpcOperatorsEnabled", "SERVER_GRPC_OPERATORS_ENABLED")
+	_ = v.BindEnv("runtime.grpcOperatorMaxListenStreamsPerOperator", "SERVER_GRPC_OPERATOR_MAX_LISTEN_STREAMS_PER_OPERATOR")
+	_ = v.BindEnv("runtime.grpcOperatorMaxActionsPerOperator", "SERVER_GRPC_OPERATOR_MAX_ACTIONS_PER_OPERATOR")
+	_ = v.BindEnv("runtime.serverlessOperatorEnabled", "SERVER_SERVERLESS_OPERATOR_ENABLED")
+	_ = v.BindEnv("runtime.serverlessOperator.operatorName", "SERVER_SERVERLESS_OPERATOR_OPERATOR_NAME")
+	_ = v.BindEnv("runtime.serverlessOperator.defaultSlots", "SERVER_SERVERLESS_OPERATOR_DEFAULT_SLOTS")
+	_ = v.BindEnv("runtime.serverlessOperator.durableSlots", "SERVER_SERVERLESS_OPERATOR_DURABLE_SLOTS")
+	_ = v.BindEnv("runtime.serverlessOperator.endpointPartitionCount", "SERVER_SERVERLESS_OPERATOR_ENDPOINT_PARTITION_COUNT")
+	_ = v.BindEnv("runtime.serverlessOperator.leaseTtl", "SERVER_SERVERLESS_OPERATOR_LEASE_TTL")
+	_ = v.BindEnv("runtime.serverlessOperator.heartbeatInterval", "SERVER_SERVERLESS_OPERATOR_HEARTBEAT_INTERVAL")
+	_ = v.BindEnv("runtime.serverlessOperator.rebalanceInterval", "SERVER_SERVERLESS_OPERATOR_REBALANCE_INTERVAL")
+	_ = v.BindEnv("runtime.serverlessOperator.shedHysteresis", "SERVER_SERVERLESS_OPERATOR_SHED_HYSTERESIS")
+	_ = v.BindEnv("runtime.serverlessOperator.drainTimeout", "SERVER_SERVERLESS_OPERATOR_DRAIN_TIMEOUT")
+	_ = v.BindEnv("runtime.serverlessOperator.routingRefreshInterval", "SERVER_SERVERLESS_OPERATOR_ROUTING_REFRESH_INTERVAL")
+	_ = v.BindEnv("runtime.serverlessOperator.healthcheckTimeout", "SERVER_SERVERLESS_OPERATOR_HEALTHCHECK_TIMEOUT")
+	_ = v.BindEnv("runtime.serverlessOperator.healthcheckConcurrency", "SERVER_SERVERLESS_OPERATOR_HEALTHCHECK_CONCURRENCY")
+	_ = v.BindEnv("runtime.serverlessOperator.healthcheckTenantConcurrency", "SERVER_SERVERLESS_OPERATOR_HEALTHCHECK_TENANT_CONCURRENCY")
+	_ = v.BindEnv("runtime.serverlessOperator.healthcheckApplyTimeout", "SERVER_SERVERLESS_OPERATOR_HEALTHCHECK_APPLY_TIMEOUT")
+	_ = v.BindEnv("runtime.serverlessOperator.maxWorkflowsPerEndpoint", "SERVER_SERVERLESS_OPERATOR_MAX_WORKFLOWS_PER_ENDPOINT")
+	_ = v.BindEnv("runtime.serverlessOperator.maxActionsPerEndpoint", "SERVER_SERVERLESS_OPERATOR_MAX_ACTIONS_PER_ENDPOINT")
+	_ = v.BindEnv("runtime.serverlessOperator.maintenanceConcurrency", "SERVER_SERVERLESS_OPERATOR_MAINTENANCE_CONCURRENCY")
+	_ = v.BindEnv("runtime.serverlessOperator.leaseMaxClaimPerTick", "SERVER_SERVERLESS_OPERATOR_LEASE_MAX_CLAIM_PER_TICK")
+	_ = v.BindEnv("runtime.serverlessOperator.wsMaxFrameBytes", "SERVER_SERVERLESS_OPERATOR_WS_MAX_FRAME_BYTES")
+	_ = v.BindEnv("runtime.serverlessOperator.wsPingInterval", "SERVER_SERVERLESS_OPERATOR_WS_PING_INTERVAL")
+	_ = v.BindEnv("runtime.serverlessOperator.allowEmptyInfraCidrs", "SERVER_SERVERLESS_OPERATOR_ALLOW_EMPTY_INFRA_CIDRS")
+	_ = v.BindEnv("runtime.serverlessOperator.insecureDestinations", "SERVER_SERVERLESS_OPERATOR_INSECURE_DESTINATIONS")
+
+	// serverless operator relay resource limits
+	_ = v.BindEnv("runtime.serverlessOperator.wsMaxUpgradeHeaderBytes", "SERVER_SERVERLESS_OPERATOR_WS_MAX_UPGRADE_HEADER_BYTES")
+	_ = v.BindEnv("runtime.serverlessOperator.wsMaxQueuedBytes", "SERVER_SERVERLESS_OPERATOR_WS_MAX_QUEUED_BYTES")
+	_ = v.BindEnv("runtime.serverlessOperator.wsMaxStreams", "SERVER_SERVERLESS_OPERATOR_WS_MAX_STREAMS")
+	_ = v.BindEnv("runtime.serverlessOperator.wsMaxRunsPerStream", "SERVER_SERVERLESS_OPERATOR_WS_MAX_RUNS_PER_STREAM")
+	_ = v.BindEnv("runtime.serverlessOperator.httpMaxIdleConns", "SERVER_SERVERLESS_OPERATOR_HTTP_MAX_IDLE_CONNS")
+	_ = v.BindEnv("runtime.serverlessOperator.httpMaxIdleConnsPerHost", "SERVER_SERVERLESS_OPERATOR_HTTP_MAX_IDLE_CONNS_PER_HOST")
+	_ = v.BindEnv("runtime.serverlessOperator.httpIdleConnTimeout", "SERVER_SERVERLESS_OPERATOR_HTTP_IDLE_CONN_TIMEOUT")
+
+	// security check options
+	_ = v.BindEnv("securityCheck.enabled", "SERVER_SECURITY_CHECK_ENABLED")
+	_ = v.BindEnv("securityCheck.endpoint", "SERVER_SECURITY_CHECK_ENDPOINT")
+
+	// default tenant entitlements
+	_ = v.BindEnv("runtime.defaultTenantEntitlements.auditLogs", "SERVER_DEFAULT_TENANT_ENTITLEMENT_AUDIT_LOGS")
+	_ = v.BindEnv("runtime.defaultTenantEntitlements.prometheusMetrics", "SERVER_DEFAULT_TENANT_ENTITLEMENT_PROMETHEUS_METRICS")
+	_ = v.BindEnv("runtime.defaultTenantEntitlements.strictAdditionalMetadataFilters", "SERVER_DEFAULT_TENANT_ENTITLEMENT_STRICT_ADDITIONAL_METADATA_FILTERS")
+	_ = v.BindEnv("runtime.defaultTenantEntitlements.durableStreams", "SERVER_DEFAULT_TENANT_ENTITLEMENT_DURABLE_STREAMS")
+	_ = v.BindEnv("runtime.defaultTenantEntitlements.serverlessOperator", "SERVER_DEFAULT_TENANT_ENTITLEMENT_SERVERLESS_OPERATOR")
+	_ = v.BindEnv("runtime.defaultTenantEntitlements.sandboxOperator", "SERVER_DEFAULT_TENANT_ENTITLEMENT_SANDBOX_OPERATOR")
+	_ = v.BindEnv("runtime.defaultTenantEntitlements.operatorStepDirectCompletion", "SERVER_DEFAULT_TENANT_ENTITLEMENT_OPERATOR_STEP_DIRECT_COMPLETION")
+
+	// limit options
+	_ = v.BindEnv("runtime.limits.defaultTenantRetentionPeriod", "SERVER_LIMITS_DEFAULT_TENANT_RETENTION_PERIOD")
+	_ = v.BindEnv("runtime.limits.corePartitionRetention", "SERVER_LIMITS_CORE_PARTITION_RETENTION")
+	_ = v.BindEnv("runtime.limits.olapPartitionRetention", "SERVER_LIMITS_OLAP_PARTITION_RETENTION")
+
+	_ = v.BindEnv("runtime.limits.defaultTaskRunLimit", "SERVER_LIMITS_DEFAULT_TASK_RUN_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultTaskRunAlarmLimit", "SERVER_LIMITS_DEFAULT_TASK_RUN_ALARM_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultTaskRunWindow", "SERVER_LIMITS_DEFAULT_TASK_RUN_WINDOW")
+
+	_ = v.BindEnv("runtime.limits.defaultWorkerLimit", "SERVER_LIMITS_DEFAULT_WORKER_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultWorkerAlarmLimit", "SERVER_LIMITS_DEFAULT_WORKER_ALARM_LIMIT")
+
+	_ = v.BindEnv("runtime.limits.defaultWorkerSlotLimit", "SERVER_LIMITS_DEFAULT_WORKER_SLOT_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultWorkerSlotAlarmLimit", "SERVER_LIMITS_DEFAULT_WORKER_SLOT_ALARM_LIMIT")
+
+	_ = v.BindEnv("runtime.limits.defaultEventLimit", "SERVER_LIMITS_DEFAULT_EVENT_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultEventAlarmLimit", "SERVER_LIMITS_DEFAULT_EVENT_ALARM_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultEventWindow", "SERVER_LIMITS_DEFAULT_EVENT_WINDOW")
+
+	_ = v.BindEnv("runtime.limits.defaultIncomingWebhookLimit", "SERVER_LIMITS_DEFAULT_INCOMING_WEBHOOK_LIMIT")
+
+	_ = v.BindEnv("runtime.limits.defaultStreamTopicLimit", "SERVER_LIMITS_DEFAULT_STREAM_TOPIC_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultStreamTopicAlarmLimit", "SERVER_LIMITS_DEFAULT_STREAM_TOPIC_ALARM_LIMIT")
+
+	_ = v.BindEnv("runtime.limits.defaultStreamMessageLimit", "SERVER_LIMITS_DEFAULT_STREAM_MESSAGE_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultStreamMessageAlarmLimit", "SERVER_LIMITS_DEFAULT_STREAM_MESSAGE_ALARM_LIMIT")
+	_ = v.BindEnv("runtime.limits.defaultStreamMessageWindow", "SERVER_LIMITS_DEFAULT_STREAM_MESSAGE_WINDOW")
+
+	// log ingestion
+	_ = v.BindEnv("runtime.logIngestionEnabled", "SERVER_LOG_INGESTION_ENABLED")
+	_ = v.BindEnv("runtime.o11yUsageFlushInterval", "SERVER_O11Y_USAGE_FLUSH_INTERVAL")
+
+	// alerting options
+	_ = v.BindEnv("alerting.sentry.enabled", "SERVER_ALERTING_SENTRY_ENABLED")
+	_ = v.BindEnv("alerting.sentry.dsn", "SERVER_ALERTING_SENTRY_DSN")
+	_ = v.BindEnv("alerting.sentry.environment", "SERVER_ALERTING_SENTRY_ENVIRONMENT")
+	_ = v.BindEnv("alerting.sentry.sampleRate", "SERVER_ALERTING_SENTRY_SAMPLE_RATE")
+
+	// analytics options
+	_ = v.BindEnv("analytics.posthog.enabled", "SERVER_ANALYTICS_POSTHOG_ENABLED")
+	_ = v.BindEnv("analytics.posthog.apiKey", "SERVER_ANALYTICS_POSTHOG_API_KEY")
+	_ = v.BindEnv("analytics.posthog.endpoint", "SERVER_ANALYTICS_POSTHOG_ENDPOINT")
+	_ = v.BindEnv("analytics.posthog.feApiHost", "SERVER_ANALYTICS_POSTHOG_FE_API_HOST")
+	_ = v.BindEnv("analytics.posthog.feApiKey", "SERVER_ANALYTICS_POSTHOG_FE_API_KEY")
+	_ = v.BindEnv("analytics.aggregateEnabled", "SERVER_ANALYTICS_AGGREGATE_ENABLED")
+	_ = v.BindEnv("analytics.aggregateFlushInterval", "SERVER_ANALYTICS_AGGREGATE_FLUSH_INTERVAL")
+	_ = v.BindEnv("analytics.aggregateMaxKeys", "SERVER_ANALYTICS_AGGREGATE_MAX_KEYS")
+
+	// pylon options
+	_ = v.BindEnv("pylon.enabled", "SERVER_PYLON_ENABLED")
+	_ = v.BindEnv("pylon.appID", "SERVER_PYLON_APP_ID")
+	_ = v.BindEnv("pylon.secret", "SERVER_PYLON_SECRET")
+
+	// encryption options
+	_ = v.BindEnv("encryption.masterKeyset", "SERVER_ENCRYPTION_MASTER_KEYSET")
+	_ = v.BindEnv("encryption.masterKeysetFile", "SERVER_ENCRYPTION_MASTER_KEYSET_FILE")
+	_ = v.BindEnv("encryption.jwt.publicJWTKeyset", "SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET")
+	_ = v.BindEnv("encryption.jwt.publicJWTKeysetFile", "SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET_FILE")
+	_ = v.BindEnv("encryption.jwt.privateJWTKeyset", "SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET")
+	_ = v.BindEnv("encryption.jwt.privateJWTKeysetFile", "SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET_FILE")
+	_ = v.BindEnv("encryption.cloudKms.enabled", "SERVER_ENCRYPTION_CLOUDKMS_ENABLED")
+	_ = v.BindEnv("encryption.cloudKms.keyURI", "SERVER_ENCRYPTION_CLOUDKMS_KEY_URI")
+	_ = v.BindEnv("encryption.cloudKms.credentialsJSON", "SERVER_ENCRYPTION_CLOUDKMS_CREDENTIALS_JSON")
+
+	// auth options
+	_ = v.BindEnv("auth.restrictedEmailDomains", "SERVER_AUTH_RESTRICTED_EMAIL_DOMAINS")
+	_ = v.BindEnv("auth.basicAuthEnabled", "SERVER_AUTH_BASIC_AUTH_ENABLED")
+	_ = v.BindEnv("auth.setEmailVerified", "SERVER_AUTH_SET_EMAIL_VERIFIED")
+	_ = v.BindEnv("auth.cookie.name", "SERVER_AUTH_COOKIE_NAME")
+	_ = v.BindEnv("auth.cookie.domain", "SERVER_AUTH_COOKIE_DOMAIN")
+	_ = v.BindEnv("auth.cookie.secrets", "SERVER_AUTH_COOKIE_SECRETS")
+	_ = v.BindEnv("auth.cookie.insecure", "SERVER_AUTH_COOKIE_INSECURE")
+	_ = v.BindEnv("auth.google.enabled", "SERVER_AUTH_GOOGLE_ENABLED")
+	_ = v.BindEnv("auth.google.clientID", "SERVER_AUTH_GOOGLE_CLIENT_ID")
+	_ = v.BindEnv("auth.google.clientSecret", "SERVER_AUTH_GOOGLE_CLIENT_SECRET")
+	_ = v.BindEnv("auth.google.scopes", "SERVER_AUTH_GOOGLE_SCOPES")
+	_ = v.BindEnv("auth.github.enabled", "SERVER_AUTH_GITHUB_ENABLED")
+	_ = v.BindEnv("auth.github.clientID", "SERVER_AUTH_GITHUB_CLIENT_ID")
+	_ = v.BindEnv("auth.github.clientSecret", "SERVER_AUTH_GITHUB_CLIENT_SECRET")
+	_ = v.BindEnv("auth.github.scopes", "SERVER_AUTH_GITHUB_SCOPES")
+
+	// task queue options
+	// legacy options
+	_ = v.BindEnv("msgQueue.kind", "SERVER_TASKQUEUE_KIND")
+	_ = v.BindEnv("msgQueue.rabbitmq.url", "SERVER_TASKQUEUE_RABBITMQ_URL")
+
+	_ = v.BindEnv("msgQueue.kind", "SERVER_MSGQUEUE_KIND")
+	_ = v.BindEnv("msgQueue.rabbitmq.url", "SERVER_MSGQUEUE_RABBITMQ_URL")
+	_ = v.BindEnv("msgQueue.rabbitmq.maxPubChans", "SERVER_MSGQUEUE_RABBITMQ_MAX_PUB_CHANS")
+	_ = v.BindEnv("msgQueue.rabbitmq.maxSubChans", "SERVER_MSGQUEUE_RABBITMQ_MAX_SUB_CHANS")
+	_ = v.BindEnv("msgQueue.rabbitmq.compressionEnabled", "SERVER_MSGQUEUE_RABBITMQ_COMPRESSION_ENABLED")
+	_ = v.BindEnv("msgQueue.rabbitmq.compressionThreshold", "SERVER_MSGQUEUE_RABBITMQ_COMPRESSION_THRESHOLD")
+	_ = v.BindEnv("msgQueue.rabbitmq.enableMessageRejection", "SERVER_MSGQUEUE_RABBITMQ_ENABLE_MESSAGE_REJECTION")
+	_ = v.BindEnv("msgQueue.rabbitmq.maxDeathCount", "SERVER_MSGQUEUE_RABBITMQ_MAX_DEATH_COUNT")
+
+	// throughput options
+	_ = v.BindEnv("msgQueue.rabbitmq.qos", "SERVER_MSGQUEUE_RABBITMQ_QOS")
+
+	// pub/sub (all optional: inherit from the durable msgQueue settings when unset)
+	_ = v.BindEnv("msgQueue.pubSub.kind", "SERVER_MSGQUEUE_PUBSUB_KIND")
+	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.url", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL")
+	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.maxPubChans", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_MAX_PUB_CHANS")
+	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.maxSubChans", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_MAX_SUB_CHANS")
+	_ = v.BindEnv("msgQueue.pubSub.postgres.maxConns", "SERVER_MSGQUEUE_PUBSUB_POSTGRES_MAX_CONNS")
+	_ = v.BindEnv("msgQueue.pubSub.postgres.minConns", "SERVER_MSGQUEUE_PUBSUB_POSTGRES_MIN_CONNS")
+	_ = v.BindEnv("msgQueue.pubSub.nats.url", "SERVER_MSGQUEUE_PUBSUB_NATS_URL")
+	_ = v.BindEnv("msgQueue.pubSub.nats.username", "SERVER_MSGQUEUE_PUBSUB_NATS_USERNAME")
+	_ = v.BindEnv("msgQueue.pubSub.nats.password", "SERVER_MSGQUEUE_PUBSUB_NATS_PASSWORD")
+	_ = v.BindEnv("msgQueue.pubSub.nats.subjectPrefix", "SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tlsEnabled", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ENABLED")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tlsRootCAFile", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ROOT_CA_FILE")
+	_ = v.BindEnv("runtime.singleQueueLimit", "SERVER_SINGLE_QUEUE_LIMIT")
+	_ = v.BindEnv("runtime.optimisticSchedulingEnabled", "SERVER_OPTIMISTIC_SCHEDULING_ENABLED")
+	_ = v.BindEnv("runtime.optimisticSchedulingSlots", "SERVER_OPTIMISTIC_SCHEDULING_SLOTS")
+	_ = v.BindEnv("runtime.grpcTriggerWritesEnabled", "SERVER_GRPC_TRIGGER_WRITES_ENABLED")
+	_ = v.BindEnv("runtime.grpcTriggerWriteSlots", "SERVER_GRPC_TRIGGER_WRITE_SLOTS")
+
+	// internal client options
+	_ = v.BindEnv("internalClient.base.tlsStrategy", "SERVER_INTERNAL_CLIENT_BASE_STRATEGY")
+	_ = v.BindEnv("internalClient.inheritBase", "SERVER_INTERNAL_CLIENT_BASE_INHERIT_BASE")
+	_ = v.BindEnv("internalClient.base.tlsCert", "SERVER_INTERNAL_CLIENT_TLS_BASE_CERT")
+	_ = v.BindEnv("internalClient.base.tlsCertFile", "SERVER_INTERNAL_CLIENT_TLS_BASE_CERT_FILE")
+	_ = v.BindEnv("internalClient.base.tlsKey", "SERVER_INTERNAL_CLIENT_TLS_BASE_KEY")
+	_ = v.BindEnv("internalClient.base.tlsKeyFile", "SERVER_INTERNAL_CLIENT_TLS_BASE_KEY_FILE")
+	_ = v.BindEnv("internalClient.base.tlsRootCA", "SERVER_INTERNAL_CLIENT_TLS_BASE_ROOT_CA")
+	_ = v.BindEnv("internalClient.base.tlsRootCAFile", "SERVER_INTERNAL_CLIENT_TLS_BASE_ROOT_CA_FILE")
+	_ = v.BindEnv("internalClient.tlsServerName", "SERVER_INTERNAL_CLIENT_TLS_SERVER_NAME")
+	_ = v.BindEnv("internalClient.internalGRPCBroadcastAddress", "SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS")
+
+	// tls options
+	_ = v.BindEnv("tls.tlsStrategy", "SERVER_TLS_STRATEGY")
+	_ = v.BindEnv("tls.tlsCert", "SERVER_TLS_CERT")
+	_ = v.BindEnv("tls.tlsCertFile", "SERVER_TLS_CERT_FILE")
+	_ = v.BindEnv("tls.tlsKey", "SERVER_TLS_KEY")
+	_ = v.BindEnv("tls.tlsKeyFile", "SERVER_TLS_KEY_FILE")
+	_ = v.BindEnv("tls.tlsRootCA", "SERVER_TLS_ROOT_CA")
+	_ = v.BindEnv("tls.tlsRootCAFile", "SERVER_TLS_ROOT_CA_FILE")
+	_ = v.BindEnv("tls.tlsMinVersion", "SERVER_TLS_MIN_VERSION")
+
+	// logger options
+	_ = v.BindEnv("logger.level", "SERVER_LOGGER_LEVEL")
+	_ = v.BindEnv("logger.format", "SERVER_LOGGER_FORMAT")
+
+	// additional logger options
+	_ = v.BindEnv("additionalLoggers.queue.level", "SERVER_ADDITIONAL_LOGGERS_QUEUE_LEVEL")
+	_ = v.BindEnv("additionalLoggers.queue.format", "SERVER_ADDITIONAL_LOGGERS_QUEUE_FORMAT")
+	_ = v.BindEnv("additionalLoggers.pgxStats.level", "SERVER_ADDITIONAL_LOGGERS_PGXSTATS_LEVEL")
+	_ = v.BindEnv("additionalLoggers.pgxStats.format", "SERVER_ADDITIONAL_LOGGERS_PGXSTATS_FORMAT")
+
+	// engine OTel options
+	_ = v.BindEnv("otel.serviceName", "SERVER_OTEL_SERVICE_NAME")
+	_ = v.BindEnv("otel.collectorURL", "SERVER_OTEL_COLLECTOR_URL")
+	_ = v.BindEnv("otel.traceIdRatio", "SERVER_OTEL_TRACE_ID_RATIO")
+	_ = v.BindEnv("otel.insecure", "SERVER_OTEL_INSECURE")
+	_ = v.BindEnv("otel.collectorAuth", "SERVER_OTEL_COLLECTOR_AUTH")
+	_ = v.BindEnv("otel.metricsEnabled", "SERVER_OTEL_METRICS_ENABLED")
+
+	// Hatchet O11y options
+	_ = v.BindEnv("observability.enabled", "SERVER_OBSERVABILITY_ENABLED")
+	_ = v.BindEnv("observability.maxBatchSize", "SERVER_OBSERVABILITY_MAX_BATCH_SIZE")
+
+	// prometheus options
+	_ = v.BindEnv("prometheus.prometheusServerURL", "SERVER_PROMETHEUS_SERVER_URL")
+	_ = v.BindEnv("prometheus.prometheusServerUsername", "SERVER_PROMETHEUS_SERVER_USERNAME")
+	_ = v.BindEnv("prometheus.prometheusServerPassword", "SERVER_PROMETHEUS_SERVER_PASSWORD")
+	_ = v.BindEnv("prometheus.enabled", "SERVER_PROMETHEUS_ENABLED")
+	_ = v.BindEnv("prometheus.address", "SERVER_PROMETHEUS_ADDRESS")
+	_ = v.BindEnv("prometheus.path", "SERVER_PROMETHEUS_PATH")
+	_ = v.BindEnv("prometheus.tenantScoped", "SERVER_PROMETHEUS_SERVER_TENANT_SCOPED")
+
+	// tenant alerting options
+	_ = v.BindEnv("tenantAlerting.slack.enabled", "SERVER_TENANT_ALERTING_SLACK_ENABLED")
+	_ = v.BindEnv("tenantAlerting.slack.clientID", "SERVER_TENANT_ALERTING_SLACK_CLIENT_ID")
+	_ = v.BindEnv("tenantAlerting.slack.clientSecret", "SERVER_TENANT_ALERTING_SLACK_CLIENT_SECRET")
+	_ = v.BindEnv("tenantAlerting.slack.scopes", "SERVER_TENANT_ALERTING_SLACK_SCOPES")
+
+	// email options
+	_ = v.BindEnv("email.kind", "SERVER_EMAIL_KIND")
+
+	// postmark options
+	_ = v.BindEnv("email.postmark.enabled", "SERVER_EMAIL_POSTMARK_ENABLED")
+	_ = v.BindEnv("email.postmark.serverKey", "SERVER_EMAIL_POSTMARK_SERVER_KEY")
+	_ = v.BindEnv("email.postmark.fromEmail", "SERVER_EMAIL_POSTMARK_FROM_EMAIL")
+	_ = v.BindEnv("email.postmark.fromName", "SERVER_EMAIL_POSTMARK_FROM_NAME")
+	_ = v.BindEnv("email.postmark.supportEmail", "SERVER_EMAIL_POSTMARK_SUPPORT_EMAIL")
+
+	// smtp options
+	_ = v.BindEnv("email.smtp.enabled", "SERVER_EMAIL_SMTP_ENABLED")
+	_ = v.BindEnv("email.smtp.serverAddr", "SERVER_EMAIL_SMTP_SERVER_ADDR")
+	_ = v.BindEnv("email.smtp.fromEmail", "SERVER_EMAIL_SMTP_FROM_EMAIL")
+	_ = v.BindEnv("email.smtp.fromName", "SERVER_EMAIL_SMTP_FROM_NAME")
+	_ = v.BindEnv("email.smtp.supportEmail", "SERVER_EMAIL_SMTP_SUPPORT_EMAIL")
+	// allow basic auth credentials to be set
+	_ = v.BindEnv("email.smtp.basicAuth.username", "SERVER_EMAIL_SMTP_AUTH_USERNAME")
+	_ = v.BindEnv("email.smtp.basicAuth.password", "SERVER_EMAIL_SMTP_AUTH_PASSWORD")
+
+	// monitoring options
+	_ = v.BindEnv("runtime.monitoring.enabled", "SERVER_MONITORING_ENABLED")
+	_ = v.BindEnv("runtime.monitoring.permittedTenants", "SERVER_MONITORING_PERMITTED_TENANTS")
+	_ = v.BindEnv("runtime.monitoring.probeTimeout", "SERVER_MONITORING_PROBE_TIMEOUT")
+	// we will fill this in from the server config if it is not set
+	_ = v.BindEnv("runtime.monitoring.tlsRootCAFile", "SERVER_MONITORING_TLS_ROOT_CA_FILE")
+
+	// sampling options
+	_ = v.BindEnv("sampling.enabled", "SERVER_SAMPLING_ENABLED")
+	_ = v.BindEnv("sampling.samplingRate", "SERVER_SAMPLING_RATE")
+
+	// operations options
+	_ = v.BindEnv("olap.jitter", "SERVER_OPERATIONS_JITTER")
+	_ = v.BindEnv("olap.pollInterval", "SERVER_OPERATIONS_POLL_INTERVAL")
+
+	// dispatcher options
+	_ = v.BindEnv("runtime.workflowRunBufferSize", "SERVER_WORKFLOW_RUN_BUFFER_SIZE")
+	_ = v.BindEnv("runtime.durableEventBufferFlushInterval", "SERVER_DURABLE_EVENT_BUFFER_FLUSH_INTERVAL")
+	_ = v.BindEnv("runtime.durableEventBufferMaxSize", "SERVER_DURABLE_EVENT_BUFFER_MAX_SIZE")
+	_ = v.BindEnv("runtime.durableEventBufferMaxConcurrentFlushes", "SERVER_DURABLE_EVENT_BUFFER_MAX_CONCURRENT_FLUSHES")
+	_ = v.BindEnv("runtime.streamEventBufferTimeout", "SERVER_STREAM_EVENT_BUFFER_TIMEOUT")
+	_ = v.BindEnv("runtime.taskOperationLimits.reassignUnackedTasks", "SERVER_REASSIGN_UNACKED_TASKS")
+	_ = v.BindEnv("runtime.taskOperationLimits.childRunDirectSpawn", "SERVER_CHILD_RUN_DIRECT_SPAWN")
+
+	// payload store options
+	_ = v.BindEnv("payloadStore.externalCutoverProcessInterval", "SERVER_PAYLOAD_STORE_EXTERNAL_CUTOVER_PROCESS_INTERVAL")
+	_ = v.BindEnv("payloadStore.externalCutoverBatchSize", "SERVER_PAYLOAD_STORE_EXTERNAL_CUTOVER_BATCH_SIZE")
+	_ = v.BindEnv("payloadStore.externalCutoverNumConcurrentOffloads", "SERVER_PAYLOAD_STORE_EXTERNAL_CUTOVER_NUM_CONCURRENT_OFFLOADS")
+	_ = v.BindEnv("payloadStore.inlineStoreTTLDays", "SERVER_PAYLOAD_STORE_INLINE_STORE_TTL_DAYS")
+	_ = v.BindEnv("payloadStore.enableWindowSizeOptimization", "SERVER_PAYLOAD_STORE_ENABLE_WINDOW_SIZE_OPTIMIZATION")
+	_ = v.BindEnv("payloadStore.wrapTaskInputInStepRunData", "SERVER_PAYLOAD_STORE_WRAP_TASK_INPUT_IN_STEP_RUN_DATA")
+	_ = v.BindEnv("payloadStore.enablePayloadConsolidation", "SERVER_PAYLOAD_STORE_ENABLE_PAYLOAD_CONSOLIDATION")
+
+	// cron operations options
+	_ = v.BindEnv("cronOperations.taskAnalyzeCronInterval", "SERVER_CRON_OPERATIONS_TASK_ANALYZE_CRON_INTERVAL")
+	_ = v.BindEnv("cronOperations.olapAnalyzeCronInterval", "SERVER_CRON_OPERATIONS_OLAP_ANALYZE_CRON_INTERVAL")
+
+	// OLAP status update options
+	_ = v.BindEnv("statusUpdates.dagBatchSizeLimit", "SERVER_OLAP_STATUS_UPDATE_DAG_BATCH_SIZE_LIMIT")
+	_ = v.BindEnv("statusUpdates.taskBatchSizeLimit", "SERVER_OLAP_STATUS_UPDATE_TASK_BATCH_SIZE_LIMIT")
+	_ = v.BindEnv("olap.olapMqQos", "SERVER_OLAP_MQ_QOS")
+	// exchange token options
+	_ = v.BindEnv("auth.controlPlaneExchangeToken.enabled", "SERVER_AUTH_CONTROL_PLANE_EXCHANGE_TOKEN_ENABLED")
+	_ = v.BindEnv("auth.controlPlaneExchangeToken.jwtPublicKeyset", "SERVER_AUTH_CONTROL_PLANE_EXCHANGE_TOKEN_JWT_PUBLIC_KEYSET")
+	_ = v.BindEnv("auth.controlPlaneExchangeToken.jwtPublicKeysetFile", "SERVER_AUTH_CONTROL_PLANE_EXCHANGE_TOKEN_JWT_PUBLIC_KEYSET_FILE")
+	_ = v.BindEnv("auth.controlPlaneExchangeToken.issuer", "SERVER_AUTH_CONTROL_PLANE_EXCHANGE_TOKEN_ISSUER")
+	_ = v.BindEnv("auth.controlPlaneExchangeToken.audience", "SERVER_AUTH_CONTROL_PLANE_EXCHANGE_TOKEN_AUDIENCE")
+
+	// misc options
+	_ = v.BindEnv("versionOverride", "SERVER_VERSION_OVERRIDE")
+}

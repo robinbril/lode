@@ -1,0 +1,196 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createPgPool, type Rows } from "../persistence/pg-pool.ts";
+import { jsonbStringify, pgTextSafe } from "../util/text.ts";
+import { subscribePostgresChannel } from "../persistence/postgres-listener.ts";
+import type { RunSignal, RunSignalKind, RunSignalStore } from "./run-signal-store.ts";
+import { spokenByPerson } from "../core/turn-origin.ts";
+import { tenantTables } from "../tenants/migrations.ts";
+import { claimFunction, claimRows, servingTenant } from "../tenants/claim.ts";
+
+const CHANNEL = "run_signals";
+
+function toSignals(rows: Rows): RunSignal[] {
+  return rows
+    .sort((a, b) => Number(a.id) - Number(b.id))
+    .map((r): RunSignal =>
+      r.payload != null
+        ? (r.payload as RunSignal)
+        : {
+            kind: r.kind as RunSignalKind,
+            ...(r.text != null ? { text: r.text as string } : {}),
+          },
+    );
+}
+
+export function createPostgresRunSignalStore(connectionString: string): RunSignalStore {
+  const pg = createPgPool(connectionString, [
+    {
+      id: "runs/signals/0001",
+      statements: [
+        `CREATE TABLE IF NOT EXISTS run_signals(
+        id BIGSERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        text TEXT,
+        payload JSONB,
+        created_at BIGINT NOT NULL,
+        consumed_at BIGINT
+      )`,
+        `ALTER TABLE run_signals ADD COLUMN IF NOT EXISTS payload JSONB`,
+        `CREATE INDEX IF NOT EXISTS idx_run_signals_pending ON run_signals(run_id) WHERE consumed_at IS NULL`,
+      ],
+    },
+    {
+      id: "runs/signals/0002",
+      statements: [
+        `ALTER TABLE run_signals ADD COLUMN IF NOT EXISTS dedupe_key TEXT`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS run_signals_by_dedupe_key ON run_signals(dedupe_key) WHERE dedupe_key IS NOT NULL`,
+      ],
+    },
+    ...tenantTables("runs/signals/0003-tenants", [
+      {
+        table: "run_signals",
+        primaryKey: "id",
+        unique: [{ name: "run_signals_by_dedupe_key", columns: "dedupe_key", where: "dedupe_key IS NOT NULL" }],
+      },
+    ]),
+    {
+      id: "runs/signals/0004-claims",
+      statements: [
+        claimFunction(
+          "claim_signaled_runs",
+          "",
+          "SELECT DISTINCT tenant_id, run_id FROM run_signals WHERE consumed_at IS NULL ORDER BY tenant_id, run_id",
+        ),
+        claimFunction(
+          "claim_pruned_signals",
+          "before bigint",
+          "DELETE FROM run_signals WHERE consumed_at IS NOT NULL AND consumed_at < $1 RETURNING tenant_id, id::text",
+        ),
+      ],
+    },
+    {
+      id: "runs/signals/0005-serving-claim-signaled",
+      statements: [
+        claimFunction(
+          "claim_signaled_runs",
+          "",
+          `SELECT DISTINCT tenant_id, run_id FROM run_signals WHERE consumed_at IS NULL${servingTenant("tenant_id")} ORDER BY tenant_id, run_id`,
+        ),
+      ],
+    },
+  ]);
+  const q = pg.query;
+
+  const listeners = new Map<string, Set<() => void>>();
+  let stopListening: (() => Promise<void>) | null = null;
+  let closed = false;
+  let cleanup = Promise.resolve();
+
+  function ring(runId: string): void {
+    for (const cb of listeners.get(runId) ?? []) cb();
+  }
+
+  function dropListenClient() {
+    const stop = stopListening;
+    stopListening = null;
+    if (stop) cleanup = Promise.all([cleanup, stop()]).then(() => {});
+  }
+
+  function ensureListening() {
+    if (closed || stopListening || listeners.size === 0) return;
+    stopListening = subscribePostgresChannel(connectionString, CHANNEL, ring, () => {
+      for (const runId of listeners.keys()) ring(runId);
+    });
+  }
+
+  return {
+    async send(runId, signal) {
+      const { rows } = await q(
+        `WITH ins AS (
+           INSERT INTO run_signals(run_id, kind, text, payload, created_at, dedupe_key) VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (tenant_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+           RETURNING id
+         )
+         SELECT pg_notify('${CHANNEL}', $1) FROM ins`,
+        [
+          runId,
+          signal.kind,
+          signal.text === undefined ? null : pgTextSafe(signal.text),
+          jsonbStringify(signal),
+          Date.now(),
+          signal.dedupeKey ?? null,
+        ],
+      );
+      return rows.length > 0;
+    },
+
+    async runForDedupeKey(dedupeKey) {
+      const { rows } = await q(`SELECT run_id FROM run_signals WHERE dedupe_key = $1 LIMIT 1`, [dedupeKey]);
+      return rows[0]?.run_id as string | undefined;
+    },
+
+    async steerAuthors(runId) {
+      const { rows } = await q(
+        `SELECT payload FROM run_signals WHERE run_id=$1 AND kind='steer' AND payload IS NOT NULL`,
+        [runId],
+      );
+      const ids = rows
+        .map((r) => (r.payload as RunSignal).request)
+        .filter((request) => request?.origin && spokenByPerson(request.origin))
+        .map((request) => request?.actor?.externalId)
+        .filter((id): id is string => typeof id === "string" && id !== "");
+      return [...new Set(ids)];
+    },
+
+    async pending(runId) {
+      const { rows } = await q(
+        "SELECT id, kind, text, payload FROM run_signals WHERE run_id=$1 AND consumed_at IS NULL ORDER BY id",
+        [runId],
+      );
+      return rows.map((row) => ({ id: String(row.id), signal: toSignals([row])[0]! }));
+    },
+    async acknowledge(runId, id) {
+      await q("UPDATE run_signals SET consumed_at=$3 WHERE run_id=$1 AND id=$2 AND consumed_at IS NULL", [
+        runId,
+        id,
+        Date.now(),
+      ]);
+    },
+    async takePending(runId) {
+      const { rows } = await q(
+        `UPDATE run_signals SET consumed_at=$2
+         WHERE run_id=$1 AND consumed_at IS NULL
+         RETURNING id, kind, text, payload`,
+        [runId, Date.now()],
+      );
+      return toSignals(rows);
+    },
+
+    pendingRuns: () => claimRows(pg, "claim_signaled_runs"),
+
+    async prune(olderThanMs) {
+      await claimRows(pg, "claim_pruned_signals", [Date.now() - olderThanMs]);
+    },
+
+    onSignal(runId, cb) {
+      const bound = AsyncLocalStorage.bind(cb);
+      const set = listeners.get(runId) ?? new Set();
+      set.add(bound);
+      listeners.set(runId, set);
+      ensureListening();
+      return () => {
+        set.delete(bound);
+        if (set.size === 0) listeners.delete(runId);
+        if (listeners.size === 0) dropListenClient();
+      };
+    },
+
+    async close() {
+      closed = true;
+      dropListenClient();
+      await cleanup;
+      await pg.close();
+    },
+  };
+}

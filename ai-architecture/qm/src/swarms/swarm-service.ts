@@ -1,0 +1,1176 @@
+import { HeldTurnError, NonRetryableTurnError } from "../core/turn-error.ts";
+import { assertSwarmRun, type SwarmRunFence } from "./swarm-fence.ts";
+import { createHash, randomUUID } from "node:crypto";
+import type { CapabilityClaims } from "../auth/capability-token.ts";
+import type { OrchestratorInput } from "../core/orchestrator.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
+import { botLimited, type Run, type RunStore } from "../runs/run-store.ts";
+import type { RunSignalStore } from "../runs/run-signal-store.ts";
+import { SandboxAccessError, type SandboxResource, type SandboxResources } from "../sandbox/sandbox-resources.ts";
+import type { SessionStore } from "../sessions/session-store.ts";
+import { hiddenFromBotWork } from "../sessions/session-syscalls.ts";
+import { conversationScope } from "../resolution/resolution-service.ts";
+import { sleep, withTimeout } from "../util/async.ts";
+import { createSweeper } from "../util/sweeper.ts";
+import { canonicalJson } from "../../cli/src/canonical-json.ts";
+import { resolveSwarmSettings, type SwarmSettings } from "./swarm-settings.ts";
+import { inheritRuntime, spawnRuntime, type SpawnRuntimeFields, type SwarmTemplate } from "./swarm-runtime.ts";
+import { errMessage, swallow, swallowAs } from "../util/errors.ts";
+import { goalFromParams, GoalCreateParams, type GoalCreateInput } from "../agent/goal.ts";
+import { Check } from "typebox/value";
+import {
+  assertSwarmOpen,
+  controlState,
+  memberById,
+  SWARM_LIMITS,
+  swarmExpired,
+  type Swarm,
+  type SwarmControlState,
+  type SwarmMember,
+  type SwarmMessage,
+  type SwarmStore,
+  type PendingSwarm,
+} from "./swarm-store.ts";
+import { type Tenant, withTenant } from "../tenants/context.ts";
+
+export type SwarmCaller =
+  { kind: "agent"; claims: CapabilityClaims } | { kind: "human"; actorId: string; sessionId: string; runId?: string };
+
+export interface SwarmTurn {
+  swarmId: string;
+  messageId: string;
+  recipientId: string;
+}
+
+interface SpawnInput extends SpawnRuntimeFields {
+  requestId: string;
+  count?: number;
+  context?: unknown;
+  contexts?: unknown[];
+  text: string;
+  forumSandboxId?: string;
+  settings?: Partial<SwarmSettings>;
+  backend?: string;
+  goal?: unknown;
+}
+
+interface MessageInput {
+  requestId: string;
+  audience: string[] | "all";
+  text: string;
+  replyTo?: string;
+  wake?: boolean;
+  goal?: unknown;
+}
+
+interface Authority {
+  fence?: SwarmRunFence;
+  sessionId: string;
+  actorId: string;
+  rootId: string;
+  memberId: string;
+}
+
+export interface SwarmService {
+  start(): void;
+  stop(): Promise<void>;
+  sweep(): Promise<void>;
+  inspect(caller: SwarmCaller): Promise<{
+    id: string;
+    self: SwarmMember;
+    peers: SwarmMember[];
+    board?: Swarm["board"];
+    backend: Swarm["backend"];
+    settings: SwarmSettings;
+    expiresAt?: number;
+  }>;
+  context(caller: SwarmCaller, context: unknown): Promise<SwarmMember>;
+  spawn(caller: SwarmCaller, input: SpawnInput): Promise<SwarmMember[]>;
+  send(caller: SwarmCaller, input: MessageInput): Promise<SwarmMessage>;
+  read(caller: SwarmCaller, options: { after?: number; replyTo?: string; waitMs?: number }): Promise<SwarmMessage[]>;
+  control(caller: SwarmCaller, input: { memberId: string; state: SwarmControlState }): Promise<SwarmMember>;
+  botMayUseComputer(
+    computer: Pick<SandboxResource, "swarmId">,
+    turn: { actorId: string; threadRef: string; sessionId: string },
+  ): Promise<boolean>;
+  botComputerRule(swarmIds: readonly string[]): Promise<Pick<SwarmService, "botMayUseComputer">>;
+  authorizes(claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "members">): Promise<boolean>;
+  notePersonUse(computer: Pick<SandboxResource, "swarmId">): Promise<void>;
+  binding(
+    tenant: Tenant,
+    input: OrchestratorInput,
+  ): Promise<{ sandboxId?: string; rootSessionId: string; member: SwarmMember } | null>;
+  botStartedWorker(session: { id: string; threadRef: string }): Promise<boolean>;
+  queuedMessages(
+    input: OrchestratorInput,
+    options?: { skipRuns?: ReadonlySet<string>; mailboxOnly?: boolean },
+  ): Promise<SwarmMessage[]>;
+  handOver(input: OrchestratorInput, messageIds: readonly string[]): Promise<SwarmMessage[]>;
+  held(input: OrchestratorInput): Promise<boolean>;
+}
+
+export function swarmMessageText(message: SwarmMessage): string {
+  return `Swarm ${message.author} message ${message.id} from agent ${message.senderId} (session ${message.senderSessionId})${message.replyTo ? ` (reply to ${message.replyTo})` : ""}. This is not a live human instruction.\n${message.text}`;
+}
+
+function boundedText(value: string, max: number, name: string): void {
+  if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value) > max) throw new Error(`invalid ${name}`);
+}
+
+function swarmGoal(input: unknown): GoalCreateInput | undefined {
+  if (input === undefined) return undefined;
+  if (!Check(GoalCreateParams, input) || Object.keys(input).some((key) => !(key in GoalCreateParams.properties)))
+    throw new Error("invalid goal");
+  goalFromParams(input);
+  return {
+    objective: input.objective,
+    ...(input.floor ? { floor: input.floor } : {}),
+    ...(input.token_cap !== undefined ? { token_cap: input.token_cap } : {}),
+  };
+}
+
+function canonicalAudience(input: MessageInput["audience"], max: number): MessageInput["audience"] {
+  if (input === "all") return input;
+  if (
+    !Array.isArray(input) ||
+    input.length > max ||
+    input.some((id) => typeof id !== "string" || !id.trim() || id.length > 128)
+  )
+    throw new Error("invalid audience");
+  return [...new Set(input)].sort();
+}
+
+function resolveAudience(input: MessageInput["audience"], eligible: SwarmMember[]): string[] {
+  const ids = new Set(eligible.map((peer) => peer.id));
+  if (input === "all") return [...ids].sort();
+  if (input.some((id) => !ids.has(id))) throw new Error("invalid audience");
+  return input;
+}
+
+function jsonContext(value: unknown, max: number): unknown {
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined || Buffer.byteLength(encoded) > max) throw new Error("invalid context");
+  return JSON.parse(encoded) as unknown;
+}
+
+function signature(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function rosterMatches(current: readonly string[], expected: readonly string[]): boolean {
+  const actual = new Set(current);
+  const frozen = new Set(expected);
+  return actual.size === frozen.size && [...actual].every((id) => frozen.has(id));
+}
+
+function botMayDirect(swarm: Swarm, actorId: string): boolean {
+  return (
+    swarm.template.botActor === true &&
+    !swarm.personUsedComputers &&
+    swarm.messages.every((message) => message.actorId === actorId)
+  );
+}
+
+function botLostSwarm(swarm: Swarm): boolean {
+  return swarm.template.botActor === true && !botMayDirect(swarm, swarm.template.actor.id);
+}
+
+function botsRun(swarm: Swarm, run: Run | null): boolean {
+  return !!run && botLimited(run) && run.request.actor.id === swarm.template.actor.id;
+}
+
+function assertCallerMayDirect(caller: SwarmCaller, auth: Authority, swarm: Swarm): void {
+  if (caller.kind === "agent" && caller.claims.botActor && !botMayDirect(swarm, auth.actorId))
+    throw new Error("a Slack bot's turn cannot direct a person's swarm");
+}
+
+function dispatchContract(input: OrchestratorInput) {
+  return {
+    actor: input.actor,
+    conversation: input.conversation,
+    origin: input.origin,
+    surface: input.surface,
+    text: input.text,
+    scopeVersion: input.scopeVersion,
+    readOnly: input.readOnly,
+    botActor: input.botActor,
+    skipMemory: input.skipMemory,
+    memoryNotebookOnly: input.memoryNotebookOnly,
+    model: input.model,
+    thinkingLevel: input.thinkingLevel,
+    fastMode: input.fastMode,
+    turnWallClockMs: input.turnWallClockMs,
+    swarm: input.swarm,
+    swarmGoal: input.swarmGoal,
+    sessionParticipantIds: input.sessionParticipantIds,
+  };
+}
+
+function matchesDispatch(input: OrchestratorInput, expected: OrchestratorInput): boolean {
+  const contract = dispatchContract(input);
+  const execution = {
+    runId: true,
+    runLeaseToken: true,
+    attempt: true,
+    finalAttempt: true,
+    cancel: true,
+    shutdown: true,
+    park: true,
+    runStartedAt: true,
+    resumeCause: true,
+  };
+  return (
+    Object.keys(input).every((key) => Object.hasOwn(contract, key) || Object.hasOwn(execution, key)) &&
+    canonicalJson(contract) === canonicalJson(dispatchContract(expected))
+  );
+}
+
+function turnTarget(session: { threadRef: string; id: string }): Omit<SwarmTurn, "messageId"> {
+  const { rootId, memberId } = threadIdentity(session.threadRef, session.id);
+  return { swarmId: rootId, recipientId: memberId };
+}
+
+const sentWork = "because a person sent work into the swarm";
+
+function threadIdentity(threadRef: string, sessionId: string): { rootId: string; memberId: string } {
+  if (!threadRef.startsWith("swarm:")) return { rootId: sessionId, memberId: sessionId };
+  const parts = threadRef.split(":");
+  if (parts.length !== 3 || !parts[1] || !parts[2]) throw new Error("invalid swarm session");
+  return { rootId: decodeURIComponent(parts[1]), memberId: parts[2] };
+}
+
+export function createSwarmService(deps: {
+  store: SwarmStore;
+  sessions: SessionStore;
+  runs: RunStore;
+  sandboxes: SandboxResources;
+  lock: AdvisoryLock;
+  authorize(claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "members">): Promise<boolean>;
+  signals?: Pick<RunSignalStore, "send">;
+  defaults?: SwarmSettings;
+  sweepProcesses?: () => Promise<unknown>;
+}): SwarmService {
+  const { store, sessions, runs } = deps;
+  const update = (auth: Authority, mutate: (swarm: Swarm) => void) => store.update(auth.rootId, mutate, auth.fence);
+  const defaults = resolveSwarmSettings(deps.defaults);
+  const findComputer = (id: string): Promise<SandboxResource | null> =>
+    deps.sandboxes.get(id).catch((error: unknown) => {
+      if (error instanceof SandboxAccessError) return null;
+      throw error;
+    });
+  const botComputerRule = async (swarmIds: readonly string[]): Promise<Pick<SwarmService, "botMayUseComputer">> => {
+    const loaded = new Map((await store.getMany(swarmIds)).map((swarm) => [swarm.id, swarm]));
+    return {
+      async botMayUseComputer(computer, turn) {
+        if (!computer.swarmId) return false;
+        const swarm = loaded.get(computer.swarmId) ?? (await store.get(computer.swarmId));
+        return !!swarm && botMayDirect(swarm, turn.actorId);
+      },
+    };
+  };
+  const cutOffBot = async (before: Swarm, swarm: Swarm, reason: string): Promise<void> => {
+    if (!botLostSwarm(swarm)) return;
+    const computers = new Set(swarm.members.flatMap((member) => (member.sandboxId ? [member.sandboxId] : [])));
+    if (swarm.board) computers.add(swarm.board.sandboxId);
+    const holders = await Promise.all([...computers].map(async (id) => (await findComputer(id))?.holders ?? []));
+    const active = await runs.activeForThreads(swarm.members.map((member) => member.threadRef));
+    const held = await Promise.all([...new Set(holders.flat())].map((runId) => runs.get(runId)));
+    const running = new Set(
+      [...active.values(), ...held].flatMap((run) =>
+        run?.status === "running" && botsRun(swarm, run) ? [run.id] : [],
+      ),
+    );
+    await Promise.all([...running].map((runId) => deps.signals?.send(runId, { kind: "abort", reason })));
+    if (!botLostSwarm(before))
+      void deps.sweepProcesses?.().catch(swallowAs("swarm: sweep the jobs of a bot that lost the swarm", null));
+  };
+  const notePersonUse = async (computer: Pick<SandboxResource, "swarmId">): Promise<void> => {
+    const swarm = computer.swarmId ? await store.get(computer.swarmId) : null;
+    if (!swarm?.template.botActor) return;
+    const used = swarm.personUsedComputers
+      ? swarm
+      : await store.update(swarm.id, (current) => {
+          current.personUsedComputers = true;
+        });
+    await cutOffBot(swarm, used, "because a person used the swarm's computers");
+  };
+  const view = (member: SwarmMember): SwarmMember => ({
+    ...member,
+    ...(member.sessionId ? { sessionUrl: `/web-ui/s/${encodeURIComponent(member.sessionId)}` } : {}),
+  });
+
+  async function authority(caller: SwarmCaller): Promise<{ auth: Authority; swarm: Swarm | null }> {
+    const actorId = caller.kind === "agent" ? caller.claims.actorId : caller.actorId;
+    const session =
+      caller.kind === "agent"
+        ? await sessions.getByThread(caller.claims.threadRef ?? "")
+        : await sessions.get(caller.sessionId);
+    if (!session) throw new Error("session not found");
+    const participants = await sessions.participantsOf(session.id);
+    if (!participants.includes(actorId)) throw new Error("session access denied");
+    let fence: SwarmRunFence | undefined;
+    if (caller.kind === "agent") {
+      if (caller.claims.scopeId !== session.scopeId || !caller.claims.runId)
+        throw new Error("session-bound capability required");
+      const run = await runs.get(caller.claims.runId);
+      if (
+        !run ||
+        caller.claims.sessionId !== session.id ||
+        run.sessionId !== session.threadRef ||
+        run.request.conversation.threadRef !== session.threadRef ||
+        run.request.actor.id !== actorId ||
+        conversationScope(run.request.conversation, actorId) !== session.scopeId
+      )
+        throw new Error("capability run mismatch");
+      fence = {
+        runId: caller.claims.runId!,
+        attempt: caller.claims.runAttempt!,
+        leaseToken: caller.claims.runLeaseToken!,
+        sessionId: session.id,
+        threadRef: session.threadRef,
+        actorId,
+        scopeId: session.scopeId,
+      };
+      if (!run.leaseExpiresAt) throw new Error("active capability run required");
+      assertSwarmRun(fence, run);
+    }
+    const identity = threadIdentity(session.threadRef, session.id);
+    const swarm = await store.get(identity.rootId);
+    const turnVersion = caller.kind === "agent" ? caller.claims.scopeVersion : undefined;
+    const scopeVersion = swarm ? swarm.template.scopeVersion : turnVersion;
+    if (
+      !(await deps.authorize({
+        actorId,
+        scopeId: session.scopeId,
+        ...(scopeVersion ? { scopeVersion } : {}),
+        ...(caller.kind === "agent" && caller.claims.members ? { members: caller.claims.members } : {}),
+      }))
+    )
+      throw new Error("scope access denied");
+    if (swarm) {
+      if (swarm.scopeId !== session.scopeId || !swarm.participants.includes(actorId))
+        throw new Error("swarm access denied");
+      const rootParticipants = await sessions.participantsOf(swarm.id);
+      if (!rosterMatches(rootParticipants, swarm.participants)) throw new Error("swarm roster changed");
+      if (!rosterMatches(participants, swarm.participants)) throw new Error("swarm session roster changed");
+      if (!swarm.members.some((member) => member.id === identity.memberId && member.sessionId === session.id))
+        throw new Error("session is not a swarm member");
+    } else if (identity.rootId !== session.id) throw new Error("swarm not found");
+    return { auth: { ...identity, sessionId: session.id, actorId, fence }, swarm };
+  }
+
+  async function load(caller: SwarmCaller): Promise<{ auth: Authority; swarm: Swarm; self: SwarmMember }> {
+    const { auth, swarm } = await authority(caller);
+    const self = swarm?.members.find((member) => member.id === auth.memberId);
+    if (!swarm || !self) throw new Error("swarm not found; spawn an initial pool first");
+    return { auth, swarm, self };
+  }
+
+  async function prepareInitialSwarm(
+    caller: SwarmCaller,
+    auth: Authority,
+    settings: SwarmSettings,
+    backend?: string,
+    forumSandboxId?: string,
+  ): Promise<Swarm> {
+    const runId = caller.kind === "agent" ? caller.claims.runId : caller.runId;
+    const run = runId ? await runs.get(runId) : null;
+    const session = await sessions.get(auth.sessionId);
+    if (
+      !run ||
+      !session ||
+      run.request.conversation.threadRef !== session.threadRef ||
+      run.request.actor.id !== auth.actorId
+    )
+      throw new Error("a run belonging to this session is required to initialize a swarm");
+    if (conversationScope(run.request.conversation, auth.actorId) !== session.scopeId)
+      throw new Error("run scope mismatch");
+    const source = run.request;
+    const inventory = await deps.sandboxes.list(auth.actorId, session.scopeId);
+    const selected = inventory.sandboxes.find((box) => box.id === inventory.defaultSandboxId);
+    const requested = backend ?? selected?.backend ?? (await deps.sandboxes.defaultBackend());
+    const provider = inventory.providers.find((item) => item.name === requested);
+    if (!provider || !provider.actions.includes("create") || !provider.actions.includes("retire"))
+      throw new Error("sandbox backend must support creating and retiring workers");
+    const template: SwarmTemplate = {
+      actor: source.actor,
+      conversation: {
+        ...source.conversation,
+        channelRef:
+          source.conversation.channelRef ??
+          (source.conversation.kind === "dm" ? undefined : source.conversation.threadRef),
+      },
+      origin: { kind: "automation" },
+      surface: "swarm",
+      text: "",
+      ...(source.scopeVersion ? { scopeVersion: source.scopeVersion } : {}),
+      ...(source.readOnly ? { readOnly: true } : {}),
+      ...(botLimited(run) ? { botActor: true } : {}),
+      ...(source.skipMemory ? { skipMemory: true } : {}),
+      ...(source.memoryNotebookOnly ||
+      session.spawnMeta?.memoryNotebookOnly ||
+      (caller.kind === "agent" && caller.claims.memory?.notebookOnly)
+        ? { memoryNotebookOnly: true }
+        : {}),
+      ...(settings.turnMs === undefined ? {} : { turnWallClockMs: settings.turnMs }),
+    };
+    const createdAt = Date.now();
+    return {
+      id: session.id,
+      scopeId: session.scopeId,
+      ownerId: auth.actorId,
+      participants: await sessions.participantsOf(session.id),
+      template,
+      settings,
+      backend: provider.name,
+      createdAt,
+      ...(settings.lifetimeMs === undefined ? {} : { expiresAt: createdAt + settings.lifetimeMs }),
+      ...(forumSandboxId ? {} : { board: { sandboxId: randomUUID() } }),
+      members: [
+        {
+          id: session.id,
+          sessionId: session.id,
+          threadRef: session.threadRef,
+          depth: 0,
+          context: {},
+          state: "ready",
+          attempts: 0,
+        },
+      ],
+      messages: [],
+      spawnRequests: {},
+      messageRequests: {},
+      notificationCount: 0,
+      pending: true,
+    };
+  }
+
+  function dispatchRequest(swarm: Swarm, message: SwarmMessage, recipient: SwarmMember): OrchestratorInput {
+    const { turnWallClockMs, ...template } = swarm.template;
+    return {
+      ...template,
+      ...(message.goal || turnWallClockMs === undefined ? {} : { turnWallClockMs }),
+      ...recipient.runtime,
+      conversation: { ...swarm.template.conversation, threadRef: recipient.threadRef },
+      origin: { kind: "automation", screenData: message.text },
+      text: swarmMessageText(message),
+      swarm: { swarmId: swarm.id, messageId: message.id, recipientId: recipient.id },
+      ...(message.goal ? { swarmGoal: { ...message.goal, assignedAt: message.createdAt } } : {}),
+      sessionParticipantIds: swarm.participants,
+    };
+  }
+
+  async function deliver(
+    swarm: Swarm,
+    step: <Result>(start: () => Promise<Result>) => Promise<Result>,
+    tenant: Tenant,
+  ): Promise<void> {
+    const root = swarm.template.botActor ? await sessions.get(swarm.id) : null;
+    const rootHidden = !!root && (await hiddenFromBotWork(tenant, swarm.template, root, { sessions, swarms: service }));
+    for (const message of swarm.messages) {
+      for (const [recipientId, notification] of Object.entries(message.notifications)) {
+        if (notification.state !== "pending") continue;
+        const recipient = memberById(swarm, recipientId);
+        if (!recipient || recipient.state === "reserved") continue;
+        const control = controlState(swarm, recipient.id);
+        const failed = recipient.state === "failed" || control === "stopped" || swarmExpired(swarm);
+        if (!failed && control === "paused") continue;
+        if (failed || botLostSwarm(swarm) || (rootHidden && recipientId === swarm.id)) {
+          await step(() =>
+            store.update(swarm.id, (current) => {
+              const notifications = current.messages.find((item) => item.id === message.id)!.notifications;
+              const held = notifications[recipientId];
+              if (held?.state === "pending")
+                notifications[recipientId] = failed ? { ...held, state: "failed" } : { state: "mailbox" };
+            }),
+          );
+          continue;
+        }
+        const request = dispatchRequest(swarm, message, recipient);
+        const { run } = await step(() =>
+          runs.enqueue({
+            sessionId: recipient.threadRef,
+            request,
+            dedupKey: `swarm:${message.id}:${recipientId}`,
+            maxAttempts: 2,
+          }),
+        );
+        let held = false;
+        await step(() =>
+          store.update(swarm.id, (current) => {
+            const notifications = current.messages.find((item) => item.id === message.id)!.notifications;
+            held = controlState(current, recipientId) !== "active";
+            if (notifications[recipientId]?.state !== "pending") return;
+            notifications[recipientId] = { state: held ? "pending" : "queued", runId: run.id };
+          }),
+        );
+        if (held)
+          await step(() =>
+            runs.withdraw(run.id, { unstartedOnly: true }).catch(swallowAs("swarm: withdraw a paused run", false)),
+          );
+      }
+    }
+  }
+
+  async function reconcile(rootId: string, phase: "resources" | "delivery", tenant: Tenant): Promise<void> {
+    const deadline = Date.now() + SWARM_LIMITS.reconcileMs;
+    const key = phase === "resources" ? `swarm-reconcile:${rootId}` : `swarm-delivery:${rootId}`;
+    await deps.lock.tryWithLock(key, async () => {
+      const pending = new Set<Promise<unknown>>();
+      const step = <Result>(
+        start: () => Promise<Result>,
+        maxMs: number = SWARM_LIMITS.reconcileMs,
+      ): Promise<Result> => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return Promise.reject(new Error("swarm reconciliation deadline exceeded"));
+        const operation = start();
+        pending.add(operation);
+        void operation.then(
+          () => pending.delete(operation),
+          () => pending.delete(operation),
+        );
+        return withTimeout(() => operation, Math.min(remaining, maxMs), "swarm reconciliation");
+      };
+      try {
+        let swarm = await step(() => store.get(rootId));
+        if (!swarm) return;
+        if (phase === "delivery") {
+          await deliver(swarm, step, tenant);
+          return;
+        }
+        for (const member of swarm.members.filter((peer) => peer.state === "reserved")) {
+          let provisioningTimedOut = false;
+          try {
+            assertSwarmOpen(swarm);
+            await step(() =>
+              store.update(rootId, (current) => {
+                current.members.find((peer) => peer.id === member.id)!.attempts++;
+              }),
+            );
+            if (!member.sandboxId) throw new Error("missing sandbox reservation");
+            const provision = (name: string, id: string) => {
+              const provisionDeadline = Math.min(deadline, Date.now() + SWARM_LIMITS.provisionMs);
+              return step(
+                () =>
+                  deps.sandboxes.create(
+                    swarm!.ownerId,
+                    swarm!.scopeId,
+                    swarm!.backend,
+                    name,
+                    id,
+                    undefined,
+                    undefined,
+                    swarm!.id,
+                  ),
+                SWARM_LIMITS.provisionMs,
+              ).catch((error: unknown) => {
+                provisioningTimedOut = Date.now() >= provisionDeadline;
+                throw error;
+              });
+            };
+            if (member.forumSandboxId) {
+              const forum =
+                member.forumSandboxId === swarm.board?.sandboxId
+                  ? await provision("Swarm board", member.forumSandboxId)
+                  : await step(() => deps.sandboxes.access(swarm!.ownerId, member.forumSandboxId!));
+              if (forum.ownerScopeId !== swarm.scopeId) throw new Error("forum scope mismatch");
+              if (forum.id !== swarm.board?.sandboxId && (!forum.personUsed || forum.swarmId))
+                await step(async () => notePersonUse(await deps.sandboxes.notePersonUse(forum.id)));
+            }
+            await provision("Swarm worker", member.id);
+            const session = await step(() =>
+              sessions.getOrCreateByThread(
+                member.threadRef,
+                swarm!.template.conversation.kind,
+                swarm!.scopeId,
+                undefined,
+                "swarm",
+              ),
+            );
+            await Promise.all(
+              swarm.participants.map((principalId) => step(() => sessions.addParticipant(session.id, principalId))),
+            );
+            await step(() => sessions.updateTitle(session.id, `Swarm worker ${member.id.slice(0, 8)}`));
+            await step(() =>
+              store.update(rootId, (current) => {
+                if (Date.now() >= deadline) throw new Error("swarm reconciliation deadline exceeded");
+                assertSwarmOpen(current);
+                Object.assign(
+                  current.members.find((peer) => peer.id === member.id)!,
+                  { state: "ready", sessionId: session.id },
+                );
+              }),
+            );
+          } catch (error) {
+            await store.update(rootId, (current) => {
+              const failed = current.members.find((peer) => peer.id === member.id)!;
+              if (failed.state !== "reserved") return;
+              failed.error = errMessage(error).slice(0, 500);
+              if (provisioningTimedOut || Date.now() >= deadline || failed.attempts >= 3 || swarmExpired(current)) {
+                failed.state = "failed";
+                failed.cleanupPending = true;
+              }
+            });
+            if (pending.size || Date.now() >= deadline) return;
+          }
+        }
+        if (pending.size) return;
+        swarm = await step(() => store.get(rootId));
+        for (const member of swarm?.members.filter((peer) => peer.cleanupPending) ?? []) {
+          const session = await step(() => sessions.getByThread(member.threadRef));
+          if (session && !(await step(() => sessions.deleteSessionIfEmpty(session.id)))) continue;
+          if (member.sandboxId === member.id) {
+            const inventory = await step(() => deps.sandboxes.list(swarm!.ownerId, swarm!.scopeId));
+            const resource = inventory.sandboxes.find((resource) => resource.id === member.id);
+            if (resource) await step(() => deps.sandboxes.retire(swarm!.ownerId, member.id));
+          }
+          await step(() =>
+            store.update(rootId, (current) => {
+              current.members.find((peer) => peer.id === member.id)!.cleanupPending = false;
+            }),
+          );
+        }
+      } finally {
+        await Promise.allSettled(pending);
+      }
+    });
+  }
+
+  let sweeping: Promise<void> | undefined;
+  let selecting: Promise<PendingSwarm[]> | undefined;
+  let afterId: string | undefined;
+  const reconciling = {
+    resources: new Map<string, Promise<void>>(),
+    delivery: new Map<string, Promise<void>>(),
+  };
+  async function reconcileBatch(batch: PendingSwarm[], phase: keyof typeof reconciling): Promise<void> {
+    const active = reconciling[phase];
+    const remaining = batch.values();
+    await Promise.all(
+      Array.from({ length: Math.min(batch.length, SWARM_LIMITS.sweepConcurrency - active.size) }, async () => {
+        for (const swarm of remaining) {
+          if (active.has(swarm.id)) continue;
+          if (
+            phase === "resources" &&
+            !swarm.members.some((member) => member.state === "reserved" || member.cleanupPending)
+          )
+            continue;
+          if (active.size >= SWARM_LIMITS.sweepConcurrency) return;
+          const operation = withTenant(swarm.tenantId, (tenant) => reconcile(swarm.id, phase, tenant))
+            .catch((error) => swallow("swarm outbox reconciliation", error))
+            .finally(() => active.delete(swarm.id));
+          active.set(swarm.id, operation);
+          await withTimeout(() => operation, SWARM_LIMITS.reconcileMs, "swarm reconciliation").catch((error) =>
+            swallow("swarm outbox reconciliation", error),
+          );
+        }
+      }),
+    );
+  }
+  const sweep = (): Promise<void> => {
+    sweeping ??= (async () => {
+      selecting ??= store.pending(afterId).finally(() => {
+        selecting = undefined;
+      });
+      const batch = await withTimeout(() => selecting!, SWARM_LIMITS.reconcileMs, "swarm pending batch");
+      afterId = batch.length === SWARM_LIMITS.sweepBatch ? batch.at(-1)!.id : undefined;
+      await reconcileBatch(batch, "resources");
+      await reconcileBatch(batch, "delivery");
+    })().finally(() => {
+      sweeping = undefined;
+    });
+    return sweeping;
+  };
+  const sweeper = createSweeper(sweep, 2_000, { label: "swarm-outbox", immediate: true });
+
+  const service: SwarmService = {
+    ...sweeper,
+    sweep,
+    async inspect(caller) {
+      const { auth, swarm, self } = await load(caller);
+      assertCallerMayDirect(caller, auth, swarm);
+      return {
+        id: swarm.id,
+        self: view(self),
+        peers: swarm.members.map(view),
+        ...(swarm.board ? { board: swarm.board } : {}),
+        backend: swarm.backend,
+        settings: swarm.settings,
+        ...(swarm.expiresAt === undefined ? {} : { expiresAt: swarm.expiresAt }),
+      };
+    },
+    async context(caller, context) {
+      const { auth, swarm } = await load(caller);
+      const value = jsonContext(context, swarm.settings.contextBytes);
+      const updated = await update(auth, (swarm) => {
+        assertCallerMayDirect(caller, auth, swarm);
+        assertSwarmOpen(swarm);
+        swarm.members.find((member) => member.id === auth.memberId)!.context = value;
+      });
+      return view(updated.members.find((member) => member.id === auth.memberId)!);
+    },
+    async spawn(caller, input) {
+      boundedText(input.requestId, 128, "requestId");
+      const { auth, swarm: existing } = await authority(caller);
+      const key = signature([auth.memberId, auth.actorId, caller.kind, input.requestId]);
+      const fingerprint = signature(input);
+      const previous = existing?.spawnRequests[key];
+      if (previous) {
+        if (previous.signature !== fingerprint) throw new Error("requestId reused with different content");
+        return existing!.members.filter((member) => previous.memberIds.includes(member.id)).map(view);
+      }
+      if (existing && input.backend !== undefined) throw new Error("backend is only allowed on initial swarm creation");
+      if (existing && input.settings !== undefined && auth.memberId !== existing.id)
+        throw new Error("only the root session can change swarm settings");
+      const settings = resolveSwarmSettings(input.settings, existing?.settings ?? defaults);
+      boundedText(input.text, settings.textBytes, "text");
+      const goal = swarmGoal(input.goal);
+      const requestedRuntime = spawnRuntime(input);
+      const count = input.count ?? input.contexts?.length ?? 1;
+      if (!Number.isSafeInteger(count) || count < 1 || count >= settings.agents) throw new Error("invalid pool size");
+      if (input.contexts && input.contexts.length !== count) throw new Error("contexts must match count");
+      const defaultContext = "context" in input ? input.context : {};
+      const contexts = Array.from({ length: count }, (_value, index) =>
+        jsonContext(input.contexts ? input.contexts[index] : defaultContext, settings.contextBytes),
+      );
+      if (!existing && count > (settings.notifications ?? Infinity))
+        throw new Error("swarm notification budget exhausted");
+      if (input.forumSandboxId) {
+        if (existing?.template.botActor || (caller.kind === "agent" && caller.claims.botActor))
+          throw new Error(
+            "a swarm a Slack bot starts cannot take forumSandboxId; spawn without it and the swarm uses its own board computer",
+          );
+        const forum = await deps.sandboxes.access(auth.actorId, input.forumSandboxId);
+        const session = await sessions.get(auth.sessionId);
+        if (forum.ownerScopeId !== session?.scopeId) throw new Error("forum scope mismatch");
+      }
+      const reserve = (swarm: Swarm): void => {
+        const previous = swarm.spawnRequests[key];
+        if (previous) {
+          if (previous.signature !== fingerprint) throw new Error("requestId reused with different content");
+          return;
+        }
+        if (!existing) {
+          if (
+            canonicalJson(settings) !== canonicalJson(swarm.settings) ||
+            (input.backend !== undefined && input.backend !== swarm.backend)
+          )
+            throw new Error("conflicting initial swarm settings");
+        } else if (input.settings !== undefined) {
+          const next = resolveSwarmSettings(input.settings, swarm.settings);
+          if (next.turnMs !== swarm.settings.turnMs) throw new Error("turnMs cannot change after swarm creation");
+          swarm.settings = next;
+          if (next.lifetimeMs !== undefined) swarm.expiresAt = swarm.createdAt + next.lifetimeMs;
+        }
+        assertCallerMayDirect(caller, auth, swarm);
+        if (swarm.template.botActor && !(caller.kind === "agent" && caller.claims.botActor))
+          throw new Error("a person's turn cannot add workers to a swarm a Slack bot started");
+        assertSwarmOpen(swarm);
+        const parent = swarm.members.find((member) => member.id === auth.memberId)!;
+        if (parent.depth >= swarm.settings.depth) throw new Error("swarm depth budget exhausted");
+        if (swarm.members.length + count > swarm.settings.agents) throw new Error("swarm agent budget exhausted");
+        if (Object.keys(swarm.spawnRequests).length >= (swarm.settings.spawnRequests ?? Infinity))
+          throw new Error("swarm spawn budget exhausted");
+        if (
+          swarm.messages.length >= (swarm.settings.messages ?? Infinity) ||
+          swarm.notificationCount + count > (swarm.settings.notifications ?? Infinity)
+        )
+          throw new Error("swarm work budget exhausted");
+        const runtime = inheritRuntime(parent.runtime, requestedRuntime);
+        const members: SwarmMember[] = contexts.map((context) => {
+          const id = randomUUID();
+          return {
+            id,
+            parentId: parent.id,
+            threadRef: `swarm:${encodeURIComponent(swarm.id)}:${id}`,
+            depth: parent.depth + 1,
+            context,
+            ...(runtime ? { runtime: { ...runtime } } : {}),
+            sandboxId: id,
+            ...((input.forumSandboxId ?? swarm.board?.sandboxId)
+              ? { forumSandboxId: input.forumSandboxId ?? swarm.board!.sandboxId }
+              : {}),
+            state: "reserved",
+            attempts: 0,
+          };
+        });
+        swarm.members.push(...members);
+        swarm.spawnRequests[key] = { memberIds: members.map((member) => member.id), signature: fingerprint };
+        swarm.messages.push({
+          id: randomUUID(),
+          seq: swarm.messages.length + 1,
+          senderId: parent.id,
+          senderSessionId: auth.sessionId,
+          author: caller.kind,
+          actorId: auth.actorId,
+          text: input.text,
+          audience: members.map((member) => member.id),
+          ...(goal ? { goal } : {}),
+          createdAt: Date.now(),
+          notifications: Object.fromEntries(members.map((member) => [member.id, { state: "pending" as const }])),
+        });
+        swarm.notificationCount += count;
+      };
+      let updated: Swarm;
+      if (existing) updated = await update(auth, reserve);
+      else {
+        const initial = await prepareInitialSwarm(caller, auth, settings, input.backend, input.forumSandboxId);
+        reserve(initial);
+        updated = await store.create(initial, auth.fence);
+        if (!updated.spawnRequests[key]) updated = await update(auth, reserve);
+      }
+      if (updated.spawnRequests[key]!.signature !== fingerprint)
+        throw new Error("requestId reused with different content");
+      const ids = updated.spawnRequests[key]!.memberIds;
+      return updated.members.filter((member) => ids.includes(member.id)).map(view);
+    },
+    async send(caller, input) {
+      boundedText(input.requestId, 128, "requestId");
+      const { auth, swarm } = await load(caller);
+      boundedText(input.text, swarm.settings.textBytes, "text");
+      input = {
+        ...input,
+        audience: canonicalAudience(input.audience, swarm.settings.agents),
+        wake: input.wake !== false,
+      };
+      const goal = swarmGoal(input.goal);
+      if (goal && input.wake === false) throw new Error("a goal must wake its recipient; drop wake:false");
+      const key = signature([auth.memberId, auth.actorId, caller.kind, input.requestId]);
+      const fingerprint = signature(input);
+      const previous = swarm.messageRequests[key];
+      if (previous) {
+        if (previous.signature !== fingerprint) throw new Error("requestId reused with different content");
+        await cutOffBot(swarm, swarm, sentWork);
+        return swarm.messages.find((message) => message.id === previous.messageId)!;
+      }
+      const checked = await Promise.all(
+        swarm.members.map(async (member) => {
+          if (member.state !== "ready" || !member.sessionId) return false;
+          const [session, participants] = await Promise.all([
+            sessions.get(member.sessionId),
+            sessions.participantsOf(member.sessionId),
+          ]);
+          return session?.scopeId === swarm.scopeId && rosterMatches(participants, swarm.participants);
+        }),
+      );
+      const eligible = swarm.members.filter((_, index) => checked[index]);
+      const audience = resolveAudience(input.audience, eligible);
+      const id = randomUUID();
+      const updated = await update(auth, (swarm) => {
+        const previous = swarm.messageRequests[key];
+        if (previous) {
+          if (previous.signature !== fingerprint) throw new Error("requestId reused with different content");
+          return;
+        }
+        assertCallerMayDirect(caller, auth, swarm);
+        assertSwarmOpen(swarm);
+        if (swarm.messages.length >= (swarm.settings.messages ?? Infinity))
+          throw new Error("swarm message budget exhausted");
+        if (input.replyTo && !swarm.messages.some((message) => message.id === input.replyTo))
+          throw new Error("reply target is not in this swarm");
+        const broadcast = input.audience === "all";
+        const recipients = audience.filter((peer) =>
+          peer === auth.memberId ? !!goal && !broadcast : !(goal && broadcast && peer === swarm.id),
+        );
+        if (goal && (!recipients.length || recipients.includes(swarm.id)))
+          throw new Error("goals can only be assigned to workers");
+        const wakes = input.wake !== false;
+        const woken = wakes ? recipients.length : 0;
+        if (swarm.notificationCount + woken > (swarm.settings.notifications ?? Infinity))
+          throw new Error("swarm notification budget exhausted; wake:false still leaves messages in mailboxes");
+        swarm.notificationCount += woken;
+        swarm.messages.push({
+          id,
+          seq: swarm.messages.length + 1,
+          senderId: auth.memberId,
+          senderSessionId: auth.sessionId,
+          author: caller.kind,
+          actorId: auth.actorId,
+          text: input.text,
+          audience,
+          ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+          ...(goal ? { goal } : {}),
+          createdAt: Date.now(),
+          notifications: Object.fromEntries(
+            recipients.map((peer) => [peer, { state: wakes ? ("pending" as const) : ("mailbox" as const) }]),
+          ),
+        });
+        swarm.messageRequests[key] = { messageId: id, signature: fingerprint };
+      });
+      await cutOffBot(swarm, updated, sentWork);
+      return updated.messages.find((message) => message.id === updated.messageRequests[key]!.messageId)!;
+    },
+    async read(caller, options) {
+      let { auth, swarm } = await load(caller);
+      const waitMs = options.waitMs ?? 0;
+      const after = options.after ?? 0;
+      if (
+        !Number.isInteger(waitMs) ||
+        waitMs < 0 ||
+        waitMs > swarm.settings.waitMs ||
+        !Number.isInteger(after) ||
+        after < 0
+      )
+        throw new Error("invalid read bounds");
+      const deadline = Date.now() + waitMs;
+      const pick = (current: Swarm) =>
+        current.messages
+          .filter((message) => message.seq > after && (!options.replyTo || message.replyTo === options.replyTo))
+          .slice(0, 32);
+      for (;;) {
+        assertCallerMayDirect(caller, auth, swarm);
+        let messages = pick(swarm);
+        const unread = (current: Swarm) =>
+          pick(current).filter((message) => message.notifications[auth.memberId]?.state === "mailbox");
+        if (caller.kind === "agent" && options.replyTo && unread(swarm).length) {
+          const updated = await update(auth, (current) => {
+            assertCallerMayDirect(caller, auth, current);
+            for (const message of unread(current)) message.notifications[auth.memberId] = { state: "handed" };
+          });
+          messages = pick(updated);
+        }
+        if (messages.length || Date.now() >= deadline) return messages;
+        await sleep(Math.min(200, deadline - Date.now()));
+        ({ auth, swarm } = await load(caller));
+      }
+    },
+    authorizes: (claims) => deps.authorize(claims),
+    botComputerRule,
+    botMayUseComputer: async (computer, turn) => (await botComputerRule([])).botMayUseComputer(computer, turn),
+    notePersonUse,
+    async control(caller, input) {
+      const { auth, swarm } = await load(caller);
+      if (!["active", "paused", "stopped"].includes(input.state)) throw new Error("invalid control state");
+      const target = swarm.members.find((member) => member.id === input.memberId);
+      if (!target) throw new Error("unknown swarm member");
+      if (target.id === swarm.id) throw new Error("the root session cannot be controlled");
+      if (caller.kind === "agent") {
+        let ancestor: string | undefined = target.id;
+        while (ancestor && ancestor !== auth.memberId)
+          ancestor = swarm.members.find((member) => member.id === ancestor)?.parentId;
+        if (!ancestor) throw new Error("agents may only control themselves or their descendants");
+      }
+      const withdrawing: string[] = [];
+      const updated = await update(auth, (current) => {
+        assertCallerMayDirect(caller, auth, current);
+        const member = current.members.find((peer) => peer.id === target.id)!;
+        if (member.control === "stopped") throw new Error("stopped workers cannot be resumed");
+        if (input.state === "active") delete member.control;
+        else member.control = input.state;
+        withdrawing.length = 0;
+        if (input.state !== "paused") return;
+        for (const message of current.messages)
+          for (const [id, notification] of Object.entries(message.notifications))
+            if (notification.state === "queued" && notification.runId && controlState(current, id) === "paused") {
+              message.notifications[id] = { state: "pending", runId: notification.runId };
+              withdrawing.push(notification.runId);
+            }
+      });
+      await Promise.all(
+        withdrawing.map((runId) =>
+          runs.withdraw(runId, { unstartedOnly: true }).catch(swallowAs("swarm: withdraw a paused run", false)),
+        ),
+      );
+      if (input.state === "stopped") {
+        const stopped = new Set(
+          updated.members.filter((m) => controlState(updated, m.id) === "stopped").map((m) => m.id),
+        );
+        const runIds = updated.messages.flatMap((message) =>
+          Object.entries(message.notifications).flatMap(([id, n]) => (stopped.has(id) && n.runId ? [n.runId] : [])),
+        );
+        await Promise.all(
+          runIds.map(async (runId) => {
+            if (
+              await runs
+                .withdraw(runId, { unstartedOnly: true })
+                .catch(swallowAs("swarm: withdraw a stopped run", false))
+            )
+              return;
+            const run = await runs.get(runId);
+            if (run?.status === "running")
+              await deps.signals
+                ?.send(runId, { kind: "abort", reason: "by the swarm" })
+                .catch(swallowAs("swarm: abort a stopped run", false));
+          }),
+        );
+      }
+      return view(updated.members.find((member) => member.id === target.id)!);
+    },
+    async queuedMessages(input, options = {}) {
+      const session = input.swarm ? null : await sessions.getByThread(input.conversation.threadRef);
+      const target = input.swarm ?? (session && turnTarget(session));
+      if (!target) return [];
+      const swarm = await store.get(target.swarmId);
+      if (!swarm || (input.botActor && !botMayDirect(swarm, input.actor.id))) return [];
+      const mine = swarm.messages.filter((message) => {
+        const state = message.notifications[target.recipientId]?.state;
+        return state === "mailbox" || (state === "queued" && !options.mailboxOnly);
+      });
+      if (!mine.length) return [];
+      if (session) {
+        const rosters = await Promise.all(
+          [...new Set([swarm.id, session.id])].map((id) => sessions.participantsOf(id)),
+        );
+        if (session.scopeId !== swarm.scopeId || rosters.some((roster) => !rosterMatches(roster, swarm.participants)))
+          return [];
+      }
+      const unstarted = new Set(
+        mine.some((message) => message.notifications[target.recipientId]!.state === "queued")
+          ? (await runs.inFlightForThread(input.conversation.threadRef))
+              .filter(
+                (run) =>
+                  run.status === "pending" &&
+                  run.attempts === 0 &&
+                  run.turnUserSeq === null &&
+                  !options.skipRuns?.has(run.id),
+              )
+              .map((run) => run.id)
+          : [],
+      );
+      return mine
+        .filter((message) => {
+          const notification = message.notifications[target.recipientId]!;
+          return notification.state === "mailbox" || unstarted.has(notification.runId!);
+        })
+        .sort((a, b) => a.seq - b.seq);
+    },
+    async held(input) {
+      if (!input.swarm) return false;
+      const swarm = await store.get(input.swarm.swarmId);
+      return !!swarm && controlState(swarm, input.swarm.recipientId) !== "active";
+    },
+    async handOver(input, messageIds) {
+      if (!input.runId || !input.runLeaseToken || !messageIds.length) return [];
+      const session = await sessions.getByThread(input.conversation.threadRef);
+      if (!session) return [];
+      const target = input.swarm ?? turnTarget(session);
+      const fence: SwarmRunFence = {
+        runId: input.runId,
+        attempt: input.attempt ?? 1,
+        leaseToken: input.runLeaseToken,
+        sessionId: session.id,
+        threadRef: session.threadRef,
+        actorId: input.actor.id,
+        scopeId: session.scopeId,
+      };
+      let handed: SwarmMessage[] = [];
+      await store.update(
+        target.swarmId,
+        (current) => {
+          handed = [];
+          for (const id of messageIds) {
+            const message = current.messages.find((item) => item.id === id);
+            const notification = message?.notifications[target.recipientId];
+            if (
+              !message ||
+              (notification?.state !== "queued" &&
+                notification?.state !== "mailbox" &&
+                !(notification?.state === "pending" && notification.runId))
+            )
+              continue;
+            message.notifications[target.recipientId] = { ...notification, state: "handed" };
+            handed.push(structuredClone(message));
+          }
+        },
+        fence,
+      );
+      for (const message of handed) {
+        const runId = message.notifications[target.recipientId]?.runId;
+        if (runId)
+          await runs.withdraw(runId, { unstartedOnly: true }).catch(swallowAs("swarm: withdraw handed run", false));
+      }
+      return handed;
+    },
+    async botStartedWorker(session) {
+      const { rootId } = threadIdentity(session.threadRef, session.id);
+      if (rootId === session.id) return false;
+      const swarm = await store.get(rootId);
+      return !swarm || swarm.template.botActor === true;
+    },
+
+    async binding(tenant, input) {
+      const session = await sessions.getByThread(input.conversation.threadRef);
+      if (!session) {
+        if (input.swarm || input.conversation.threadRef.startsWith("swarm:"))
+          throw new NonRetryableTurnError("unknown swarm session");
+        return null;
+      }
+      const identity = threadIdentity(session.threadRef, session.id);
+      if (!input.swarm && identity.rootId === session.id) return null;
+      const swarm = await store.get(identity.rootId);
+      if (!swarm) {
+        if (input.swarm || session.threadRef.startsWith("swarm:")) throw new NonRetryableTurnError("unknown swarm");
+        return null;
+      }
+      const member = swarm.members.find((peer) => peer.id === identity.memberId);
+      if (!member || member.state !== "ready" || member.sessionId !== session.id || session.scopeId !== swarm.scopeId)
+        throw new NonRetryableTurnError("invalid swarm membership");
+      if (controlState(swarm, member.id) === "stopped") throw new NonRetryableTurnError("swarm worker stopped");
+      if (!input.swarm) {
+        if (
+          !(await sessions.participantsOf(session.id)).includes(input.actor.id) ||
+          conversationScope(input.conversation, input.actor.id) !== session.scopeId ||
+          !(await deps.authorize({
+            actorId: input.actor.id,
+            scopeId: session.scopeId,
+            scopeVersion: input.scopeVersion,
+            members: input.conversation.audience,
+          }))
+        )
+          throw new NonRetryableTurnError("swarm session access denied");
+        return { sandboxId: member.sandboxId, rootSessionId: swarm.id, member };
+      }
+      assertSwarmOpen(swarm);
+      if (controlState(swarm, member.id) === "paused")
+        throw new HeldTurnError("swarm worker paused", SWARM_LIMITS.pausedRecheckMs);
+      const message = swarm.messages.find((item) => item.id === input.swarm!.messageId);
+      const dedup = message ? await runs.getByDedupKey(`swarm:${message.id}:${member.id}`) : null;
+      const expected = message && dedup ? dispatchRequest(swarm, message, member) : null;
+      if (
+        input.swarm.swarmId !== swarm.id ||
+        input.swarm.recipientId !== member.id ||
+        !message?.audience.includes(member.id) ||
+        !dedup ||
+        dedup.id !== input.runId ||
+        input.origin.kind !== "automation" ||
+        input.actor.id !== swarm.ownerId ||
+        input.surface !== "swarm" ||
+        input.deliveryTarget ||
+        input.surfaceTools ||
+        input.origin.useOwnerKeychain ||
+        !expected ||
+        !matchesDispatch(input, expected)
+      )
+        throw new NonRetryableTurnError("forged swarm provenance");
+      if (message?.notifications[member.id]?.state === "handed")
+        throw new NonRetryableTurnError("swarm message already handed to a running turn");
+      const participants = await sessions.participantsOf(swarm.id);
+      const recipientParticipants = await sessions.participantsOf(session.id);
+      if (
+        !rosterMatches(participants, swarm.participants) ||
+        !rosterMatches(recipientParticipants, swarm.participants) ||
+        !swarm.participants.includes(input.actor.id) ||
+        conversationScope(input.conversation, input.actor.id) !== swarm.scopeId ||
+        !(await deps.authorize({
+          actorId: input.actor.id,
+          scopeId: swarm.scopeId,
+          scopeVersion: swarm.template.scopeVersion,
+          members: input.conversation.audience,
+        }))
+      )
+        throw new NonRetryableTurnError("swarm authorization changed");
+      if (
+        member.id === swarm.id &&
+        swarm.template.botActor &&
+        (await hiddenFromBotWork(tenant, swarm.template, session, { sessions, swarms: service }))
+      )
+        await store.update(swarm.id, (current) => {
+          const notifications = current.messages.find((item) => item.id === message.id)!.notifications;
+          if (notifications[member.id]?.state === "queued")
+            notifications[member.id] = { state: "pending", runId: input.runId };
+        });
+      return { sandboxId: member.sandboxId, rootSessionId: swarm.id, member };
+    },
+  };
+  return service;
+}

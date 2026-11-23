@@ -1,0 +1,237 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-api/api"
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-engine/engine"
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-staticfileserver/staticfileserver"
+	"github.com/hatchet-dev/hatchet/pkg/cmdutils"
+	"github.com/hatchet-dev/hatchet/pkg/config/loader"
+	"github.com/hatchet-dev/hatchet/pkg/config/server"
+	"github.com/hatchet-dev/hatchet/pkg/encryption"
+)
+
+var printVersion bool
+var configDirectory string
+
+// rootCmd represents the base command when called without any subcommands
+var rootCmd = &cobra.Command{
+	Use:   "hatchet-lite",
+	Short: "hatchet-lite runs a Hatchet instance with static files, API and engine all served on the same instance.",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		return encryption.RequireFIPSBuild()
+	},
+	Run: func(cmd *cobra.Command, args []string) {
+		if printVersion {
+			fmt.Println(Version)
+			os.Exit(0)
+		}
+
+		cmdutils.SetMemoryLimit(context.Background())
+
+		cf := loader.NewConfigLoader(configDirectory)
+		interruptChan := cmdutils.InterruptChan()
+
+		if err := start(cf, interruptChan, Version); err != nil {
+			log.Println("error starting API:", err)
+			os.Exit(1)
+		}
+	},
+}
+
+// Version will be linked by an ldflag during build
+var Version = "v0.1.0-alpha.0"
+
+// shutdownTimeout bounds how long hatchet-lite waits for the engine and API cleanups after an interrupt.
+const shutdownTimeout = 30 * time.Second
+
+func main() {
+	rootCmd.PersistentFlags().BoolVar(
+		&printVersion,
+		"version",
+		false,
+		"print version and exit.",
+	)
+
+	rootCmd.PersistentFlags().StringVar(
+		&configDirectory,
+		"config",
+		"",
+		"The path the config folder.",
+	)
+
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+
+// runs a static file server, api and engine in the same process.
+func start(cf *loader.ConfigLoader, interruptCh <-chan interface{}, version string) error {
+	// read static asset directory and frontend URL from the environment
+	staticAssetDir := os.Getenv("LITE_STATIC_ASSET_DIR")
+	frontendBasePath := os.Getenv("LITE_FRONTEND_BASE_PATH")
+	frontendPort := os.Getenv("LITE_FRONTEND_PORT")
+	runtimePort := os.Getenv("LITE_RUNTIME_PORT")
+
+	if staticAssetDir == "" {
+		return fmt.Errorf("LITE_STATIC_ASSET_DIR environment variable is required")
+	}
+
+	if frontendBasePath == "" {
+		frontendBasePath = "/"
+	}
+
+	if frontendPort == "" {
+		return fmt.Errorf("LITE_FRONTEND_PORT environment variable is required")
+	}
+
+	if runtimePort == "" {
+		runtimePort = "8082"
+	}
+
+	feURL, err := url.Parse(fmt.Sprintf("http://localhost:%s", frontendPort))
+
+	if err != nil {
+		return fmt.Errorf("error parsing frontend URL: %w", err)
+	}
+
+	_, msgQueueKindSet := os.LookupEnv("SERVER_MSGQUEUE_KIND")
+	_, msgQueueRabbitMQURLSet := os.LookupEnv("SERVER_MSGQUEUE_RABBITMQ_URL")
+	// for legacy reasons let us also check for these two variables
+	_, taskQueueKindSet := os.LookupEnv("SERVER_TASKQUEUE_KIND")
+	_, taskQueueRabbitMQURLSet := os.LookupEnv("SERVER_TASKQUEUE_RABBITMQ_URL")
+
+	if !msgQueueKindSet && !msgQueueRabbitMQURLSet && !taskQueueKindSet && !taskQueueRabbitMQURLSet {
+		err := os.Setenv("SERVER_MSGQUEUE_KIND", "postgres")
+
+		if err != nil {
+			return fmt.Errorf("error setting SERVER_MSGQUEUE_KIND to postgres: %w", err)
+		}
+	}
+
+	_, sc, err := cf.CreateServerFromConfig(version)
+
+	if err != nil {
+		return fmt.Errorf("error loading server config: %w", err)
+	}
+
+	apiURL, err := url.Parse(fmt.Sprintf("http://localhost:%d", sc.Runtime.Port))
+
+	if err != nil {
+		return fmt.Errorf("error parsing API URL: %w", err)
+	}
+
+	disableSecurityCheck := func(scf *server.ServerConfigFile) {
+		scf.SecurityCheck.Enabled = false
+	}
+
+	// api process
+	apiDone := make(chan struct{})
+
+	go func() {
+		defer close(apiDone)
+
+		api.Start(cf, interruptCh, version, disableSecurityCheck) // nolint:errcheck
+	}()
+
+	// static file server
+	go func() {
+		c := staticfileserver.NewStaticFileServer(staticAssetDir, frontendBasePath, staticfileserver.DefaultContentSecurityPolicy)
+
+		s := &http.Server{
+			Addr:              fmt.Sprintf(":%s", frontendPort),
+			Handler:           c,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+
+		if err := s.ListenAndServe(); err != nil {
+			log.Printf("static file server failure: %s", err.Error())
+			os.Exit(1)
+		}
+	}()
+
+	// built from the channel the API and the wait below share, so an interrupt that arrives before
+	// this point still cancels the engine
+	ctx, cancel := cmdutils.InterruptContextFromChan(interruptCh)
+	defer cancel()
+
+	engineDone := make(chan struct{})
+
+	go func() {
+		defer close(engineDone)
+
+		if err := engine.Run(ctx, cf, version, disableSecurityCheck); err != nil {
+			log.Printf("engine failure: %s", err.Error())
+			os.Exit(1)
+		}
+	}()
+
+	s := &http.Server{
+		Addr:              fmt.Sprintf(":%s", runtimePort),
+		ReadHeaderTimeout: 5 * time.Second,
+		Handler: &httputil.ReverseProxy{
+			// The API rate-limits by client IP, which it reads from X-Forwarded-For. Set that header to
+			// the address of whoever connected to hatchet-lite and drop any X-Forwarded-For or X-Real-IP
+			// the client sent, so a client cannot choose its own IP. Behind a load balancer, every
+			// connection comes from the balancer, so all clients share one IP.
+			Rewrite: func(r *httputil.ProxyRequest) {
+				if strings.HasPrefix(r.In.URL.Path, "/api") {
+					r.SetURL(apiURL)
+				} else {
+					r.SetURL(feURL)
+				}
+
+				r.Out.Header.Del("X-Real-Ip")
+				r.SetXForwarded()
+			},
+		},
+	}
+
+	go func() {
+		if err := s.ListenAndServe(); err != nil {
+			log.Printf("reverse proxy failure: %s", err.Error())
+			os.Exit(1)
+		}
+	}()
+
+	<-interruptCh
+
+	cancel()
+
+	// The engine deletes its partitions and releases its leases in its cleanups. Exiting before
+	// they run leaves the next process waiting for the partitions to be judged inactive. A second
+	// interrupt skips the wait.
+	secondInterrupt := make(chan os.Signal, 1)
+	signal.Notify(secondInterrupt, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(secondInterrupt)
+
+	deadline := time.After(shutdownTimeout)
+
+	for _, done := range []chan struct{}{engineDone, apiDone} {
+		select {
+		case <-done:
+		case <-secondInterrupt:
+			log.Printf("second interrupt received, exiting without waiting for cleanup")
+			os.Exit(1)
+		case <-deadline:
+			log.Printf("shutdown did not complete within %s, exiting", shutdownTimeout)
+			return nil
+		}
+	}
+
+	return nil
+}

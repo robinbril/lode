@@ -1,0 +1,351 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { parseMemoryProviderConfig } from "../src/memory/provider-config.ts";
+
+const value = JSON.stringify({
+  providers: [
+    {
+      id: "knowledge",
+      type: "mcp",
+      url: "http://memory-provider.internal:48081",
+      read: {
+        tool: "search_knowledge",
+        clientIdEnv: "KNOWLEDGE_RO_CLIENT_ID",
+        clientSecretEnv: "KNOWLEDGE_RO_CLIENT_SECRET",
+      },
+      write: {
+        tool: "write_knowledge",
+        clientIdEnv: "KNOWLEDGE_RW_CLIENT_ID",
+        clientSecretEnv: "KNOWLEDGE_RW_CLIENT_SECRET",
+      },
+    },
+  ],
+  routes: [
+    { provider: "default", scopes: ["personal", "channel", "group"], capture: "automatic" },
+    { provider: "knowledge", scopes: ["org"], capture: "explicit", manage: false, label: "Organization" },
+  ],
+});
+
+test("provider config resolves MCP credentials and scope routes", () => {
+  const config = parseMemoryProviderConfig(value, {
+    KNOWLEDGE_RO_CLIENT_ID: "ro",
+    KNOWLEDGE_RO_CLIENT_SECRET: "ro-secret",
+    KNOWLEDGE_RW_CLIENT_ID: "rw",
+    KNOWLEDGE_RW_CLIENT_SECRET: "rw-secret",
+  });
+  const knowledge = config?.providers[0];
+  assert.equal(knowledge?.type, "mcp");
+  if (knowledge?.type !== "mcp") throw new Error("expected mcp provider");
+  assert.equal(knowledge.read.auth.clientId, "ro");
+  assert.equal(knowledge.write?.auth.clientId, "rw");
+  assert.deepEqual(
+    config?.routes.map(({ provider, scopes, capture }) => ({ provider, scopes, capture })),
+    [
+      { provider: "default", scopes: ["personal", "channel", "group"], capture: "automatic" },
+      { provider: "knowledge", scopes: ["org"], capture: "explicit" },
+    ],
+  );
+});
+
+test("provider config rejects unknown providers and public cleartext MCP URLs", () => {
+  assert.throws(
+    () =>
+      parseMemoryProviderConfig(
+        JSON.stringify({ providers: [], routes: [{ provider: "missing", scopes: ["org"] }] }),
+        {},
+      ),
+    /unknown memory provider/,
+  );
+  assert.throws(
+    () =>
+      parseMemoryProviderConfig(value.replace("memory-provider.internal", "example.com"), {
+        KNOWLEDGE_RO_CLIENT_ID: "ro",
+        KNOWLEDGE_RO_CLIENT_SECRET: "x",
+        KNOWLEDGE_RW_CLIENT_ID: "rw",
+        KNOWLEDGE_RW_CLIENT_SECRET: "x",
+      }),
+    /HTTPS or a recognized private HTTP host/,
+  );
+});
+
+test("provider config accepts a memorable provider with an allow-listed child environment", () => {
+  const config = parseMemoryProviderConfig(
+    JSON.stringify({
+      providers: [
+        {
+          id: "procedures",
+          type: "memorable",
+          bin: ["node", "/opt/memorable dir/cli.js"],
+          passEnv: ["MEMORABLE_STORE_KEY"],
+          injectTimeoutMs: 5000,
+        },
+      ],
+      routes: [{ provider: "procedures", scopes: ["personal"], capture: "automatic", manage: false }],
+    }),
+    {
+      DATABASE_URL: "postgres://qm",
+      PATH: "/usr/bin",
+      ANTHROPIC_API_KEY: "sk-never",
+      MEMORABLE_API_KEY: "mk",
+      MEMORABLE_STORE_KEY: "aa",
+    },
+  );
+  const provider = config?.providers[0];
+  if (provider?.type !== "memorable") throw new Error("expected memorable provider");
+  assert.deepEqual(provider.argv, ["node", "/opt/memorable dir/cli.js"]);
+  assert.equal(provider.injectTimeoutMs, 5000);
+  assert.equal(provider.recordTimeoutMs, 120_000);
+  assert.deepEqual(provider.env, {
+    PATH: "/usr/bin",
+    MEMORABLE_API_KEY: "mk",
+    MEMORABLE_STORE_KEY: "aa",
+    MEMORABLE_BACKEND: "qm",
+    MEMORABLE_DB_URL: "postgres://qm",
+  });
+  assert.equal(provider.redactValues.ANTHROPIC_API_KEY, "sk-never");
+  assert.equal(config?.routes[0]?.manage, false);
+});
+
+test("provider config rejects explicit capture on a memorable route", () => {
+  assert.throws(
+    () =>
+      parseMemoryProviderConfig(
+        JSON.stringify({
+          providers: [{ id: "procedures", type: "memorable" }],
+          routes: [{ provider: "procedures", scopes: ["personal"], capture: "explicit" }],
+        }),
+        {},
+      ),
+    /does not support capture "explicit"/,
+  );
+});
+
+test("provider config rejects malformed passEnv names and empty bin", () => {
+  assert.throws(
+    () =>
+      parseMemoryProviderConfig(
+        JSON.stringify({ providers: [{ id: "p", type: "memorable", passEnv: ["lower"] }], routes: [] }),
+        {},
+      ),
+    /passEnv/,
+  );
+  assert.throws(
+    () =>
+      parseMemoryProviderConfig(
+        JSON.stringify({ providers: [{ id: "p", type: "memorable", bin: [] }], routes: [] }),
+        {},
+      ),
+    /bin/,
+  );
+});
+
+const ENV = {
+  KNOWLEDGE_RO_CLIENT_ID: "ro",
+  KNOWLEDGE_RO_CLIENT_SECRET: "x",
+  KNOWLEDGE_RW_CLIENT_ID: "rw",
+  KNOWLEDGE_RW_CLIENT_SECRET: "x",
+};
+
+const withProvider = (fields: Record<string, unknown>) => {
+  const parsed = JSON.parse(value) as { providers: Array<Record<string, unknown>> };
+  parsed.providers[0] = { ...parsed.providers[0], ...fields };
+  return JSON.stringify(parsed);
+};
+
+const withRoute = (config: string, fields: Record<string, unknown>) => {
+  const parsed = JSON.parse(config) as { routes: Array<Record<string, unknown>> };
+  parsed.routes[1] = { ...parsed.routes[1], ...fields };
+  return JSON.stringify(parsed);
+};
+
+const knowledge = (JSON.parse(value) as { providers: Array<Record<string, Record<string, unknown>>> }).providers[0]!;
+const scoped = { read: { ...knowledge.read, scopeArg: "scope" }, write: { ...knowledge.write, scopeArg: "scope" } };
+
+test("attestActor is an opt-in boolean on mcp providers only", () => {
+  const mcp = (fields: Record<string, unknown>) => {
+    const provider = parseMemoryProviderConfig(withRoute(withProvider(fields), { scopes: ["personal"] }), ENV)
+      ?.providers[0];
+    return provider?.type === "mcp" ? provider.attestActor : undefined;
+  };
+  assert.equal(mcp({}), false);
+  assert.equal(mcp({ attestActor: true }), true);
+  assert.equal(mcp({ attestActor: false }), false);
+  for (const attestActor of ["true", 1, null])
+    assert.throws(() => mcp({ attestActor }), /knowledge\.attestActor must be true or false on an mcp provider/);
+  assert.throws(
+    () =>
+      parseMemoryProviderConfig(
+        JSON.stringify({ providers: [{ id: "procedures", type: "memorable", attestActor: true }], routes: [] }),
+        {},
+      ),
+    /procedures\.attestActor must be true or false on an mcp provider/,
+  );
+});
+
+test("an attested provider serves only personal scopes, so a shared conversation never sees one member's private memory", () => {
+  const scopes = (selectors: string[], provider = withProvider({ attestActor: true })) =>
+    parseMemoryProviderConfig(withRoute(provider, { scopes: selectors }), ENV)?.routes[1]?.scopes;
+  assert.deepEqual(scopes(["personal"]), ["personal"]);
+  assert.deepEqual(scopes(["personal", "personal:U1"]), ["personal", "personal:U1"]);
+  for (const shared of ["org", "channel", "group", "team", "org:acme", "channel:C1", "group:G1", "team:T1"]) {
+    assert.throws(
+      () => scopes(["personal", shared]),
+      new RegExp(
+        `memory route 1: provider knowledge sets attestActor, so it may serve only personal scopes, not ${shared}; an attested read returns that member's private memory`,
+      ),
+    );
+    assert.deepEqual(scopes([shared], withProvider(scoped)), [shared]);
+  }
+});
+
+test("a provider without scopeArg serves only scopes its server can tell apart, so it never pools conversations' memory", () => {
+  const scopes = (provider: Record<string, unknown>, ...routes: Array<Record<string, unknown>>) => {
+    const parsed = JSON.parse(withProvider(provider)) as { routes: Array<Record<string, unknown>> };
+    parsed.routes.splice(1, 1, ...routes.map((route) => ({ provider: "knowledge", manage: false, ...route })));
+    return parseMemoryProviderConfig(JSON.stringify(parsed), ENV)
+      ?.routes.slice(1)
+      .flatMap((route) => route.scopes);
+  };
+  const twins = (url: string, ...routes: Array<Record<string, unknown>>) => {
+    const parsed = JSON.parse(value) as {
+      providers: Array<Record<string, unknown>>;
+      routes: Array<Record<string, unknown>>;
+    };
+    parsed.providers.push({ ...parsed.providers[0], id: "twin", url });
+    parsed.routes.splice(1, 1, ...routes.map((route) => ({ manage: false, ...route })));
+    return parseMemoryProviderConfig(JSON.stringify(parsed), ENV)
+      ?.routes.slice(1)
+      .flatMap((route) => route.scopes);
+  };
+  const refused = (names: string, listed: string) => (error: unknown) =>
+    String(error).includes(
+      `memory provider ${names}: no scopeArg, so the server cannot tell apart the scopes it serves (${listed})`,
+    );
+  assert.throws(() => scopes({}, { scopes: ["channel"] }), refused("knowledge.read", "channel"));
+  assert.throws(() => scopes({}, { scopes: ["personal", "channel"] }), refused("knowledge.read", "personal, channel"));
+  assert.throws(
+    () => scopes({}, { scopes: ["personal", "persona:p1"] }),
+    refused("knowledge.read", "personal, persona:p1"),
+  );
+  assert.throws(() => scopes({}, { scopes: ["personal"], manage: true }), refused("knowledge.read", "personal"));
+  assert.throws(
+    () => scopes({}, { scopes: ["personal:U1"] }, { scopes: ["org:acme"], capture: "explicit" }),
+    refused("knowledge.read", "personal:U1, org:acme"),
+  );
+  assert.throws(
+    () => scopes({ read: scoped.read }, { scopes: ["group", "team"], capture: "explicit" }),
+    refused("knowledge.write", "group, team"),
+  );
+  const sameServer = "http://memory-provider.internal:48081";
+  assert.throws(
+    () =>
+      twins(
+        sameServer,
+        { provider: "knowledge", scopes: ["channel:C1"] },
+        { provider: "twin", scopes: ["channel:C2"] },
+      ),
+    refused("knowledge.read and twin.read", "channel:C1, channel:C2"),
+  );
+  assert.throws(
+    () => twins(sameServer, { provider: "knowledge", scopes: ["personal"] }, { provider: "twin", scopes: ["org"] }),
+    refused("knowledge.read and twin.read", "personal, org"),
+  );
+  assert.deepEqual(
+    twins(
+      "http://other-provider.internal:48081",
+      { provider: "knowledge", scopes: ["channel:C1"] },
+      { provider: "twin", scopes: ["channel:C2"] },
+    ),
+    ["channel:C1", "channel:C2"],
+  );
+  assert.deepEqual(scopes(scoped, { scopes: ["personal", "channel", "persona:p1"] }), [
+    "personal",
+    "channel",
+    "persona:p1",
+  ]);
+  assert.deepEqual(scopes({ read: scoped.read, write: undefined }, { scopes: ["group", "team"] }), ["group", "team"]);
+  assert.deepEqual(scopes({}, { scopes: ["personal"] }, { scopes: ["personal:U1"] }), ["personal", "personal:U1"]);
+  assert.deepEqual(scopes({}, { scopes: ["org", "org:acme"] }), ["org", "org:acme"]);
+  assert.deepEqual(scopes({}, { scopes: ["persona:p1"], manage: true }), ["persona:p1"]);
+});
+
+test("a write operation maps its facts with factsArg or contentArg, not both", () => {
+  const write = (fields: Record<string, unknown>) => {
+    const parsed = JSON.parse(value) as { providers: Array<{ write: Record<string, unknown> }> };
+    parsed.providers[0]!.write = { ...parsed.providers[0]!.write, ...fields };
+    const provider = parseMemoryProviderConfig(JSON.stringify(parsed), ENV)?.providers[0];
+    return provider?.type === "mcp" ? provider.write : undefined;
+  };
+  assert.equal(write({ factsArg: "facts" })?.factsArg, "facts");
+  assert.equal(write({ contentArg: "text" })?.contentArg, "text");
+  assert.throws(
+    () => write({ factsArg: "facts", contentArg: "text" }),
+    /memory provider knowledge\.write sets both factsArg and contentArg; keep one/,
+  );
+});
+
+test("an attested provider cannot manage a notebook, because notebook reads carry no member", () => {
+  const route = (fields: Record<string, unknown>) => {
+    const parsed = JSON.parse(withProvider({ attestActor: true })) as { routes: Array<Record<string, unknown>> };
+    parsed.routes[1] = { ...parsed.routes[1], scopes: ["personal"], ...fields };
+    return parseMemoryProviderConfig(JSON.stringify(parsed), ENV)?.routes[1]?.manage;
+  };
+  assert.equal(route({ manage: false }), false);
+  assert.equal(route({ manage: undefined }), false);
+  assert.throws(
+    () => route({ manage: true }),
+    /memory route 1: provider knowledge sets attestActor, so it cannot manage a notebook; set "manage": false/,
+  );
+  const plain = JSON.parse(value) as { routes: Array<Record<string, unknown>> };
+  plain.routes[1] = { ...plain.routes[1], manage: true };
+  assert.equal(parseMemoryProviderConfig(JSON.stringify(plain), ENV)?.routes[1]?.manage, true);
+});
+
+test("provider URL errors name only the protocol and host and never echo secrets", () => {
+  const SENTINEL = "s3ntinel-credential";
+  const cases: Array<[string, RegExp]> = [
+    [
+      `https://user:${SENTINEL}@memory.example.com/mcp?token=${SENTINEL}`,
+      /\(https:\/\/memory\.example\.com\) must not carry credentials or a #fragment/,
+    ],
+    [
+      `https://memory.example.com/mcp?token=${SENTINEL}#${SENTINEL}`,
+      /\(https:\/\/memory\.example\.com\) must not carry credentials or a #fragment/,
+    ],
+    [
+      `http://memory.example.com/mcp?token=${SENTINEL}`,
+      /\(http:\/\/memory\.example\.com\) must use HTTPS or a recognized private HTTP host/,
+    ],
+    [`not a url ${SENTINEL}`, /is not a valid URL \(value not shown\)/],
+  ];
+  for (const [url, message] of cases) {
+    assert.throws(
+      () => parseMemoryProviderConfig(withProvider({ url }), ENV),
+      (error: unknown) => {
+        const text = String(error);
+        assert.match(text, message);
+        assert.match(text, /localhost, 127\.0\.0\.1, \*\.internal, \*\.flycast or \*\.local/);
+        assert.match(text, /docs\/memory-providers\.md#troubleshooting/);
+        assert.doesNotMatch(text, new RegExp(SENTINEL));
+        assert.doesNotMatch(text, /user:|token=/);
+        return true;
+      },
+    );
+  }
+});
+
+test("plain HTTP reaches a private memory provider only on an origin the operator listed", () => {
+  const brain = withProvider({ url: "http://gbrain:8787/mcp" });
+  assert.throws(
+    () => parseMemoryProviderConfig(brain, ENV),
+    /\(http:\/\/gbrain\) must use HTTPS or a recognized private HTTP host/,
+  );
+  const listed = { ...ENV, PRIVATE_NETWORK_ALLOWED_ORIGINS: "http://gbrain:8787" };
+  const provider = parseMemoryProviderConfig(brain, listed)?.providers[0];
+  assert.ok(provider?.type === "mcp");
+  assert.equal(provider.url, "http://gbrain:8787/mcp");
+  assert.throws(
+    () => parseMemoryProviderConfig(withProvider({ url: "http://gbrain:9090/mcp" }), listed),
+    /must use HTTPS or a recognized private HTTP host/,
+  );
+});

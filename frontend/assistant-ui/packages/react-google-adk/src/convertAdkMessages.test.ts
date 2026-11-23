@@ -1,0 +1,966 @@
+import { describe, it, expect } from "vitest";
+import { convertExternalMessages } from "@assistant-ui/core/react";
+import { getMessagePartKeys } from "@assistant-ui/core/internal";
+import { AdkEventAccumulator } from "./AdkEventAccumulator";
+import { parseAdkEventValue } from "./parseAdkEvent";
+import toolMedia from "./__fixtures__/tool-media.json";
+import {
+  convertAdkMessage,
+  createAdkMessageConverter,
+} from "./convertAdkMessages";
+import type { AdkMessage } from "./types";
+
+describe("createAdkMessageConverter - queued replies", () => {
+  it("marks the gated call while its confirmation reply is buffered", () => {
+    const message: AdkMessage = {
+      id: "ai-1",
+      type: "ai",
+      content: [],
+      tool_calls: [{ id: "gated", name: "delete_file", args: {} }],
+    };
+    const approvals = new Map([["gated", { id: "confirmation" }]]);
+    const queued = createAdkMessageConverter(
+      approvals,
+      new Set(["confirmation"]),
+    )(message, {});
+    const sent = createAdkMessageConverter(approvals)(message, {});
+
+    expect(queued).toMatchObject({
+      content: [
+        {
+          toolCallId: "gated",
+          approval: { id: "confirmation" },
+          responseDeliveryStatus: "queued",
+        },
+      ],
+    });
+    expect(sent).not.toHaveProperty("content.0.responseDeliveryStatus");
+  });
+});
+
+describe("convertAdkMessage - tool results", () => {
+  it("keeps ADK tool media on the same call live and after session replay", () => {
+    const live = new AdkEventAccumulator();
+    const first = live.processEvent(
+      parseAdkEventValue(toolMedia.events[0], "ADK recording"),
+    );
+    const initial = convertExternalMessages(
+      first,
+      convertAdkMessage,
+      true,
+      {},
+    )[0]!;
+    for (const event of toolMedia.events.slice(1)) {
+      live.processEvent(parseAdkEventValue(event, "ADK recording"));
+    }
+    const completed = convertExternalMessages(
+      live.getMessages(),
+      convertAdkMessage,
+      false,
+      {},
+    )[0]!;
+    const history = new AdkEventAccumulator();
+    for (const event of toolMedia.reloaded_events) {
+      history.processEvent(parseAdkEventValue(event, "ADK recording"));
+    }
+    const reloaded = convertExternalMessages(
+      history.getMessages(),
+      convertAdkMessage,
+      false,
+      {},
+    ).find((message) => message.role === "assistant")!;
+
+    const expected = {
+      type: "tool-call",
+      toolCallId: "adk-281b4c4b-c4b5-446c-b424-7b7c8c6820a8",
+      result: { status: "ok" },
+      modelContent: [
+        { type: "text", text: '{"status":"ok"}' },
+        {
+          type: "file",
+          mediaType: "image/png",
+          data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+        },
+      ],
+    };
+    expect(completed.content[0]).toMatchObject(expected);
+    expect(reloaded.content[0]).toMatchObject(expected);
+    expect(completed.id).toBe(initial.id);
+    expect(reloaded.id).toBe(initial.id);
+    expect(getMessagePartKeys(completed.content)[0]).toBe(
+      getMessagePartKeys(initial.content)[0],
+    );
+    expect(getMessagePartKeys(reloaded.content)[0]).toBe(
+      getMessagePartKeys(initial.content)[0],
+    );
+  });
+
+  it("preserves tool file URIs with and without MIME types", () => {
+    const messages = new AdkEventAccumulator().processEvent(
+      parseAdkEventValue(
+        {
+          id: "tool-event",
+          author: "agent",
+          content: {
+            parts: [
+              {
+                function_response: {
+                  name: "search",
+                  id: "call-1",
+                  response: { status: "ok" },
+                  parts: [
+                    {
+                      fileData: {
+                        fileUri: "gs://bucket/report.pdf",
+                        mimeType: "application/pdf",
+                        displayName: "report.pdf",
+                      },
+                    },
+                    {
+                      file_data: {
+                        file_uri: "gs://bucket/raw_data-v1",
+                        display_name: "raw_data-v1",
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        "ADK tool response",
+      ),
+    );
+
+    expect(convertAdkMessage(messages[0]!, {})).toMatchObject({
+      role: "tool",
+      toolCallId: "call-1",
+      result: { status: "ok" },
+      modelContent: [
+        { type: "text", text: '{"status":"ok"}' },
+        {
+          type: "file",
+          data: "gs://bucket/report.pdf",
+          mediaType: "application/pdf",
+          filename: "report.pdf",
+        },
+        {
+          type: "file",
+          data: "gs://bucket/raw_data-v1",
+          mediaType: "application/octet-stream",
+          filename: "raw_data-v1",
+        },
+      ],
+    });
+  });
+
+  const convertResult = (content: string) =>
+    convertAdkMessage(
+      {
+        id: "tool-1",
+        type: "tool",
+        tool_call_id: "call-1",
+        name: "search",
+        content,
+      },
+      {},
+    );
+
+  it.each(["agent", "user"] as const)(
+    "passes %s-authored ADK object responses to tool renderers",
+    (author) => {
+      const toolMessage = new AdkEventAccumulator()
+        .processEvent({
+          id: `${author}-event`,
+          author,
+          content: {
+            parts: [
+              {
+                functionResponse: {
+                  name: "search",
+                  id: "call-1",
+                  response: { results: [1] },
+                },
+              },
+            ],
+          },
+        })
+        .find((message) => message.type === "tool");
+
+      expect(toolMessage).toBeDefined();
+      expect(convertAdkMessage(toolMessage!, {})).toMatchObject({
+        role: "tool",
+        result: { results: [1] },
+      });
+    },
+  );
+
+  it("preserves a loaded tool result artifact on the tool call", () => {
+    const artifact = { rows: [{ title: "Found document" }] };
+    const messages = convertExternalMessages<AdkMessage>(
+      [
+        {
+          id: "ai-1",
+          type: "ai",
+          content: [],
+          tool_calls: [{ id: "call-1", name: "search", args: {} }],
+        },
+        {
+          id: "tool-1",
+          type: "tool",
+          tool_call_id: "call-1",
+          name: "search",
+          content: '{"count":1}',
+          artifact,
+          status: "success",
+        },
+      ],
+      (message) => convertAdkMessage(message, {}),
+      false,
+      {},
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.content).toMatchObject([
+      {
+        type: "tool-call",
+        toolCallId: "call-1",
+        result: { count: 1 },
+        artifact,
+        isError: false,
+      },
+    ]);
+  });
+
+  it("preserves a loaded error tool result artifact on the tool call", () => {
+    const artifact = { details: "Search service unavailable" };
+    const messages = convertExternalMessages<AdkMessage>(
+      [
+        {
+          id: "ai-1",
+          type: "ai",
+          content: [],
+          tool_calls: [{ id: "call-1", name: "search", args: {} }],
+        },
+        {
+          id: "tool-1",
+          type: "tool",
+          tool_call_id: "call-1",
+          name: "search",
+          content: "Failed",
+          artifact,
+          status: "error",
+        },
+      ],
+      (message) => convertAdkMessage(message, {}),
+      false,
+      {},
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.content).toMatchObject([
+      {
+        type: "tool-call",
+        toolCallId: "call-1",
+        result: "Failed",
+        artifact,
+        isError: true,
+      },
+    ]);
+  });
+
+  it("preserves string-valued results", () => {
+    expect(convertResult('"ready"')).toMatchObject({
+      role: "tool",
+      result: "ready",
+    });
+  });
+
+  it("passes through content that is not serialized JSON", () => {
+    expect(convertResult("plain text")).toMatchObject({
+      role: "tool",
+      result: "plain text",
+    });
+  });
+});
+
+describe("createAdkMessageConverter - ADK confirmations", () => {
+  it("renders approval on the gated tool and omits its synthetic request", () => {
+    const gatedCall: AdkMessage = {
+      id: "ai-gated",
+      type: "ai",
+      content: [],
+      tool_calls: [{ id: "gated", name: "delete_file", args: {} }],
+    };
+    const confirmationCall: AdkMessage = {
+      id: "ai-confirmation",
+      type: "ai",
+      content: [],
+      tool_calls: [
+        {
+          id: "confirmation",
+          name: "adk_request_confirmation",
+          args: {
+            originalFunctionCall: { id: "gated", name: "delete_file" },
+          },
+        },
+      ],
+    };
+    const approval = { id: "confirmation" };
+    const convert = createAdkMessageConverter(
+      new Map([
+        ["confirmation", approval],
+        ["gated", approval],
+      ]),
+    );
+
+    expect(convert(gatedCall, {})).toMatchObject({
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "gated",
+          approval: { id: "confirmation" },
+        },
+      ],
+    });
+    expect(convert(confirmationCall, {})).toEqual([]);
+  });
+});
+
+describe("convertAdkMessage - human messages", () => {
+  it("converts a human message with string content to user role", () => {
+    const msg: AdkMessage = { id: "m1", type: "human", content: "Hello" };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "user",
+      id: "m1",
+      content: [{ type: "text", text: "Hello" }],
+    });
+  });
+
+  it("returns empty content when content is neither a string nor an array", () => {
+    for (const content of [null, undefined, { text: "Hello" }]) {
+      const msg = {
+        id: "m1",
+        type: "human",
+        content,
+      } as unknown as AdkMessage;
+      expect(convertAdkMessage(msg, {})).toMatchObject({
+        role: "user",
+        content: [],
+      });
+    }
+  });
+
+  it("skips media parts without their data, url, or mime type", () => {
+    const msg = {
+      id: "m1",
+      type: "human",
+      content: [
+        { type: "image", mimeType: "image/png" },
+        { type: "image", data: "iVBORw0KGgo=" },
+        { type: "image_url" },
+        { type: "file", mimeType: "application/pdf" },
+        { type: "file", data: "QUJD" },
+        { type: "file_url", mimeType: "application/pdf" },
+        { type: "text", text: "Hello" },
+      ],
+    } as AdkMessage;
+    expect(convertAdkMessage(msg, {})).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: "Hello" }],
+    });
+  });
+
+  it("skips a reasoning part on a human message", () => {
+    const messages = convertExternalMessages<AdkMessage>(
+      [
+        {
+          id: "m1",
+          type: "human",
+          content: [
+            { type: "reasoning", text: "thinking" },
+            { type: "text", text: "Hello" },
+          ],
+        } satisfies AdkMessage,
+      ],
+      (message) => convertAdkMessage(message, {}),
+      false,
+      {},
+    );
+    expect(messages).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "Hello" }] },
+    ]);
+  });
+
+  it("converts a human message with text content parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "human",
+      content: [{ type: "text", text: "Hello" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: "Hello" }],
+    });
+  });
+
+  it("preserves activity messages as visible text", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "human",
+      content: [{ type: "activity", message: "Working on it" }],
+    };
+
+    expect(convertAdkMessage(msg, {})).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: "Working on it" }],
+    });
+  });
+
+  it("restores a file_url part as a file part stamped with sourceType url", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "human",
+      content: [
+        {
+          type: "file_url",
+          url: "gs://bucket/report.pdf",
+          mimeType: "application/pdf",
+          filename: "report.pdf",
+        },
+      ],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "user",
+      content: [
+        {
+          type: "file",
+          data: "gs://bucket/report.pdf",
+          mimeType: "application/pdf",
+          sourceType: "url",
+          filename: "report.pdf",
+        },
+      ],
+    });
+  });
+
+  it("preserves file_url filenames in assistant data parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [
+        {
+          type: "file_url",
+          url: "gs://bucket/report.pdf",
+          mimeType: "application/pdf",
+          filename: "report.pdf",
+        },
+      ],
+    };
+    expect(convertAdkMessage(msg, {})).toMatchObject({
+      role: "assistant",
+      content: [
+        {
+          type: "data",
+          name: "file_url",
+          data: {
+            url: "gs://bucket/report.pdf",
+            mimeType: "application/pdf",
+            filename: "report.pdf",
+          },
+        },
+      ],
+    });
+  });
+
+  it("preserves image filenames from inline and URL media", () => {
+    const inline = convertAdkMessage(
+      {
+        id: "m1",
+        type: "human",
+        content: [
+          {
+            type: "image",
+            mimeType: "image/png",
+            data: "AAAA",
+            filename: "photo.png",
+          },
+        ],
+      },
+      {},
+    );
+    expect(inline).toMatchObject({
+      role: "user",
+      content: [
+        {
+          type: "image",
+          image: "data:image/png;base64,AAAA",
+          filename: "photo.png",
+        },
+      ],
+    });
+
+    const url = convertAdkMessage(
+      {
+        id: "m2",
+        type: "human",
+        content: [
+          {
+            type: "image_url",
+            url: "https://example.com/photo.png",
+            filename: "photo.png",
+          },
+        ],
+      },
+      {},
+    );
+    expect(url).toMatchObject({
+      role: "user",
+      content: [
+        {
+          type: "image",
+          image: "https://example.com/photo.png",
+          filename: "photo.png",
+        },
+      ],
+    });
+  });
+
+  it("falls back to application/octet-stream for file_url parts without mimeType", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "human",
+      content: [{ type: "file_url", url: "gs://bucket/blob" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "user",
+      content: [
+        {
+          type: "file",
+          data: "gs://bucket/blob",
+          mimeType: "application/octet-stream",
+          sourceType: "url",
+        },
+      ],
+    });
+  });
+
+  it("keeps an audio file part as a file part", () => {
+    for (const mimeType of ["audio/mp3", "audio/wav"]) {
+      const msg: AdkMessage = {
+        id: "m1",
+        type: "human",
+        content: [{ type: "file", mimeType, data: "QUJD" }],
+      };
+      expect(convertAdkMessage(msg, {})).toMatchObject({
+        role: "user",
+        content: [{ type: "file", data: "QUJD", mimeType }],
+      });
+    }
+  });
+
+  it("keeps attachment-derived audio file parts (with filename) as file parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "human",
+      content: [
+        {
+          type: "file",
+          mimeType: "audio/wav",
+          data: "QUJD",
+          filename: "memo.wav",
+        },
+      ],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "user",
+      content: [
+        {
+          type: "file",
+          mimeType: "audio/wav",
+          data: "QUJD",
+          filename: "memo.wav",
+        },
+      ],
+    });
+  });
+
+  it("keeps file parts with other audio mime types as file parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "human",
+      content: [{ type: "file", mimeType: "audio/ogg", data: "QUJD" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "user",
+      content: [{ type: "file", mimeType: "audio/ogg", data: "QUJD" }],
+    });
+  });
+});
+
+describe("convertAdkMessage - ai messages", () => {
+  it("coerces missing text on text and reasoning parts to an empty string", () => {
+    const msg = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "text" }, { type: "reasoning" }],
+    } as AdkMessage;
+    expect(convertAdkMessage(msg, {})).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "text", text: "" },
+        { type: "reasoning", text: "" },
+      ],
+    });
+  });
+
+  it("skips non-object entries in content arrays", () => {
+    const msg = {
+      id: "m1",
+      type: "ai",
+      content: [null, "Hello", { type: "text", text: "Hi" }],
+    } as unknown as AdkMessage;
+    expect(convertAdkMessage(msg, {})).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "Hi" }],
+    });
+  });
+
+  it("converts an ai message with text content", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "text", text: "Hi there" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "assistant",
+      id: "m1",
+      content: [{ type: "text", text: "Hi there" }],
+    });
+  });
+
+  it("converts reasoning content parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "reasoning", text: "Let me think..." }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [{ type: "reasoning", text: "Let me think..." }],
+    });
+  });
+
+  it("converts image content parts to data URI", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "image", mimeType: "image/png", data: "abc123" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [{ type: "image", image: "data:image/png;base64,abc123" }],
+    });
+  });
+
+  it("converts image_url content parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "image_url", url: "https://example.com/img.png" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [{ type: "image", image: "https://example.com/img.png" }],
+    });
+  });
+
+  it("keeps audio/mp3 file parts as file parts on assistant messages", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "file", mimeType: "audio/mp3", data: "QUJD" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "assistant",
+      content: [{ type: "file", mimeType: "audio/mp3", data: "QUJD" }],
+    });
+  });
+
+  it("converts file content parts to file message parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [
+        {
+          type: "file",
+          mimeType: "application/pdf",
+          data: "JVBERi0xLjQK",
+          filename: "report.pdf",
+        },
+      ],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [
+        {
+          type: "file",
+          mimeType: "application/pdf",
+          data: "JVBERi0xLjQK",
+          filename: "report.pdf",
+        },
+      ],
+    });
+  });
+
+  it("converts file_url content parts to data parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [
+        {
+          type: "file_url",
+          url: "gs://bucket/report.pdf",
+          mimeType: "application/pdf",
+        },
+      ],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [
+        {
+          type: "data",
+          name: "file_url",
+          data: {
+            url: "gs://bucket/report.pdf",
+            mimeType: "application/pdf",
+          },
+        },
+      ],
+    });
+  });
+
+  it("converts code content parts to data parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "code", code: "print(1)", language: "python" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [
+        {
+          type: "data",
+          name: "executable_code",
+          data: { code: "print(1)", language: "python" },
+        },
+      ],
+    });
+  });
+
+  it("converts code_result content parts to data parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "code_result", output: "1", outcome: "OUTCOME_OK" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [
+        {
+          type: "data",
+          name: "code_execution_result",
+          data: { output: "1", outcome: "OUTCOME_OK" },
+        },
+      ],
+    });
+  });
+
+  it("converts tool_calls to tool-call content parts", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [],
+      tool_calls: [{ id: "tc-1", name: "search", args: { q: "test" } }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "tc-1",
+          toolName: "search",
+          args: { q: "test" },
+        },
+      ],
+    });
+  });
+
+  it("skips null entries in tool_calls", () => {
+    const msg = {
+      id: "m1",
+      type: "ai",
+      content: [],
+      tool_calls: [null, { id: "tc-1", name: "search", args: {} }],
+    } as unknown as AdkMessage;
+    expect(convertAdkMessage(msg, {})).toMatchObject({
+      content: [{ type: "tool-call", toolCallId: "tc-1", toolName: "search" }],
+    });
+  });
+
+  it("skips a tool call without a name, so its named result does not break the thread", () => {
+    const messages = convertExternalMessages<AdkMessage>(
+      [
+        {
+          id: "m1",
+          type: "ai",
+          content: "Checking",
+          tool_calls: [{ id: "tc-1", args: {} }],
+        } as unknown as AdkMessage,
+        {
+          id: "m2",
+          type: "tool",
+          tool_call_id: "tc-1",
+          name: "search",
+          content: "{}",
+        },
+      ],
+      (message) => convertAdkMessage(message, {}),
+      false,
+      {},
+    );
+    expect(messages).toMatchObject([
+      { role: "assistant", content: [{ type: "text", text: "Checking" }] },
+    ]);
+  });
+
+  it.each([
+    ["an empty", ""],
+    ["a non-string", 42],
+  ])(
+    "skips a tool call with %s name, so its named result does not break the thread",
+    (_, name) => {
+      const messages = convertExternalMessages<AdkMessage>(
+        [
+          {
+            id: "m1",
+            type: "ai",
+            content: "Checking",
+            tool_calls: [{ id: "tc-1", name, args: {} }],
+          } as AdkMessage,
+          {
+            id: "m2",
+            type: "tool",
+            tool_call_id: "tc-1",
+            name: "search",
+            content: "{}",
+          },
+        ],
+        (message) => convertAdkMessage(message, {}),
+        false,
+        {},
+      );
+      expect(messages).toMatchObject([
+        { role: "assistant", content: [{ type: "text", text: "Checking" }] },
+      ]);
+    },
+  );
+
+  it("includes status when present", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "text", text: "done" }],
+      status: { type: "complete", reason: "stop" },
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      status: { type: "complete", reason: "stop" },
+    });
+  });
+
+  it("includes author/branch metadata when author is set", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "text", text: "hi" }],
+      author: "search_agent",
+      branch: "root.search_agent",
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      metadata: {
+        custom: { author: "search_agent", branch: "root.search_agent" },
+      },
+    });
+  });
+
+  it("omits metadata when author is not set", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "ai",
+      content: [{ type: "text", text: "hi" }],
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).not.toHaveProperty("metadata");
+  });
+});
+
+describe("convertAdkMessage - tool messages", () => {
+  it("converts a tool message to tool role", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "tool",
+      tool_call_id: "tc-1",
+      name: "search",
+      content: '{"results":[]}',
+      status: "success",
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({
+      role: "tool",
+      toolCallId: "tc-1",
+      toolName: "search",
+      result: { results: [] },
+      isError: false,
+    });
+  });
+
+  it("sets isError to true when status is error", () => {
+    const msg: AdkMessage = {
+      id: "m1",
+      type: "tool",
+      tool_call_id: "tc-1",
+      name: "search",
+      content: "Failed",
+      status: "error",
+    };
+    const result = convertAdkMessage(msg, {});
+    expect(result).toMatchObject({ isError: true });
+  });
+});
+
+describe("convertAdkMessage - unknown messages", () => {
+  it("skips a message without a type", () => {
+    const messages = convertExternalMessages<AdkMessage>(
+      [
+        { id: "m1", type: "human", content: "Hello" },
+        { id: "m2", content: "no type" } as unknown as AdkMessage,
+      ],
+      (message) => convertAdkMessage(message, {}),
+      false,
+      {},
+    );
+    expect(messages).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "Hello" }] },
+    ]);
+  });
+});

@@ -1,0 +1,260 @@
+use std::{sync::Arc, time::Duration};
+
+use hyper::body::Bytes;
+use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
+
+use crate::connector::{make_connector, Connector};
+
+const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub struct SvixOptions {
+    pub debug: bool,
+
+    /// Base URL of the Svix API server.
+    ///
+    /// Trailing slashes are stripped, so `https://api.svix.com/` and
+    /// `https://api.svix.com` are equivalent.
+    pub server_url: Option<String>,
+
+    /// Timeout for HTTP requests.
+    ///
+    /// The timeout is applied from when the request starts connecting until
+    /// the response body has finished. If set to `None`, requests never time
+    /// out.
+    ///
+    /// Default: 15 seconds.
+    pub timeout: Option<Duration>,
+
+    /// Number of retries
+    ///
+    /// The number of times the client will retry if a server-side error,
+    /// HTTP 423 (Locked), or a timeout is received.
+    ///
+    /// Default: 2
+    pub num_retries: Option<u32>,
+
+    /// Retry Schedule in milliseconds
+    ///
+    /// List of delays to wait before each retry attempt.
+    /// Takes precedence over `num_retries`.
+    pub retry_schedule: Option<Vec<Duration>>,
+
+    /// Proxy address.
+    ///
+    /// Currently `http://` and `https://` proxies using `HTTP CONNECT`, as well
+    /// as `socks5://` and `socks5h://` URLs are supported. The difference
+    /// between the last two is that DNS resolution also goes through the proxy
+    /// for `socks5h`, but not for `socks5`.
+    pub proxy_address: Option<String>,
+}
+
+impl Default for SvixOptions {
+    fn default() -> Self {
+        Self {
+            debug: false,
+            server_url: None,
+            timeout: Some(Duration::from_secs(15)),
+            num_retries: None,
+            retry_schedule: None,
+            proxy_address: None,
+        }
+    }
+}
+
+pub(crate) struct Configuration {
+    pub base_path: String,
+    pub user_agent: Option<String>,
+    pub bearer_access_token: Option<String>,
+    pub timeout: Option<Duration>,
+    pub num_retries: u32,
+    pub retry_schedule: Option<Vec<Duration>>,
+    pub client: HyperClient<Connector, http_body_util::Full<Bytes>>,
+}
+
+/// Svix API client.
+#[derive(Clone)]
+pub struct Svix {
+    pub(super) cfg: Arc<Configuration>,
+    server_url: Option<String>,
+}
+
+impl Svix {
+    pub fn new(token: String, options: Option<SvixOptions>) -> Self {
+        let options = options.unwrap_or_default();
+
+        let mut user_agent_fields = vec![format!("svix-libs/{CRATE_VERSION}/rust")];
+
+        if let Some(rustc) = version_check::Version::read() {
+            user_agent_fields.push(format!("rust/{rustc}"));
+        }
+
+        #[cfg(unix)]
+        if let Ok(uname) = nix::sys::utsname::uname() {
+            user_agent_fields.push(format!(
+                "{}/{}",
+                uname.sysname().to_string_lossy(),
+                uname.machine().to_string_lossy()
+            ));
+        }
+
+        let cfg = Arc::new(Configuration {
+            user_agent: Some(user_agent_fields.join(" ")),
+            client: HyperClient::builder(TokioExecutor::new())
+                .build(make_connector(options.proxy_address)),
+            timeout: options.timeout,
+            // These fields will be set by `with_token` below
+            base_path: String::new(),
+            bearer_access_token: None,
+            num_retries: options.num_retries.unwrap_or(2),
+            retry_schedule: options.retry_schedule,
+        });
+        let svix = Self {
+            cfg,
+            server_url: options
+                .server_url
+                .map(|url| url.trim_end_matches('/').to_owned()),
+        };
+        svix.with_token(token)
+    }
+
+    /// Creates a new `Svix` API client with a different token,
+    /// re-using all of the settings and the Hyper client from
+    /// an existing `Svix` instance.
+    ///
+    /// This can be used to change the token without incurring
+    /// the cost of TLS initialization.
+    pub fn with_token(&self, token: String) -> Self {
+        let base_path = self.server_url.clone().unwrap_or_else(|| {
+            match token.split('.').next_back() {
+                Some("us") => "https://api.us.svix.com",
+                Some("eu") => "https://api.eu.svix.com",
+                Some("in") => "https://api.in.svix.com",
+                Some("ca") => "https://api.ca.svix.com",
+                Some("au") => "https://api.au.svix.com",
+                _ => "https://api.svix.com",
+            }
+            .to_owned()
+        });
+        let cfg = Arc::new(Configuration {
+            base_path,
+            user_agent: self.cfg.user_agent.clone(),
+            bearer_access_token: Some(token),
+            client: self.cfg.client.clone(),
+            timeout: self.cfg.timeout,
+            num_retries: self.cfg.num_retries,
+            retry_schedule: self.cfg.retry_schedule.clone(),
+        });
+
+        Self {
+            cfg,
+            server_url: self.server_url.clone(),
+        }
+    }
+
+    pub(crate) fn cfg(&self) -> &Configuration {
+        &self.cfg
+    }
+
+    /// Get back the access token used to construct this `Svix` client.
+    pub fn token(&self) -> Option<&str> {
+        self.cfg.bearer_access_token.as_deref()
+    }
+
+    /// Get the server base URL used for API requests.
+    ///
+    /// Never includes a trailing slash, even if one was part of the server URL
+    /// passed via [`SvixOptions`].
+    pub fn server_url(&self) -> &str {
+        &self.cfg.base_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::{Svix, SvixOptions};
+
+    fn base_path(server_url: &str) -> String {
+        let svix = Svix::new(
+            "token".to_owned(),
+            Some(SvixOptions {
+                server_url: Some(server_url.to_owned()),
+                ..Default::default()
+            }),
+        );
+        svix.cfg.base_path.clone()
+    }
+
+    #[test]
+    fn test_server_url_trailing_slashes_are_stripped() {
+        assert_eq!(
+            base_path("https://api.example.com/"),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            base_path("https://api.example.com///"),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            base_path("https://api.example.com/prefix/"),
+            "https://api.example.com/prefix"
+        );
+    }
+
+    #[test]
+    fn test_server_url_without_trailing_slash_is_unchanged() {
+        assert_eq!(
+            base_path("https://api.example.com"),
+            "https://api.example.com"
+        );
+    }
+
+    #[test]
+    fn test_default_server_url() {
+        let svix = Svix::new("token".to_owned(), None);
+        assert_eq!(svix.cfg.base_path, "https://api.svix.com");
+    }
+
+    #[test]
+    fn test_regional_server_url() {
+        let svix = Svix::new("token.eu".to_owned(), None);
+        assert_eq!(svix.cfg.base_path, "https://api.eu.svix.com");
+    }
+
+    #[test]
+    fn test_with_token_keeps_normalized_server_url() {
+        let svix = Svix::new(
+            "token".to_owned(),
+            Some(SvixOptions {
+                server_url: Some("https://api.example.com/".to_owned()),
+                ..Default::default()
+            }),
+        )
+        .with_token("token2".to_owned());
+        assert_eq!(svix.cfg.base_path, "https://api.example.com");
+    }
+
+    #[test]
+    fn test_future_send_sync() {
+        fn require_send_sync<T: Send + Sync>(_: T) {}
+
+        let svix = Svix::new(String::new(), None);
+        let message_api = svix.message();
+        let fut = message_api.expunge_content(String::new(), String::new());
+        require_send_sync(fut);
+    }
+
+    #[test]
+    fn test_user_agent() {
+        let svix = Svix::new(String::new(), None);
+        let re = regex::Regex::new(
+            r"^svix-libs/[0-9.]+(-[a-z]+.[0-9]+)?/rust rust/1\.[0-9.]+ [^ ]+/[^ ]+$",
+        )
+        .unwrap();
+        let ua = svix
+            .cfg
+            .user_agent
+            .as_ref()
+            .expect("user_agent must be set");
+        assert!(re.is_match(ua));
+    }
+}

@@ -1,0 +1,2545 @@
+import { desktopTurnId, serveDesktopRun, webClientSurface } from "./desktop-computer.ts";
+import { CLIENT_SURFACE_HEADER } from "../../chassis/src/client-surface.ts";
+import { reportHandledError, reportRequestTiming, stopBrowserErrors } from "./browser-errors.ts";
+import { captureMessage, stopAnalytics } from "./product-analytics.ts";
+import { streamedAnswer } from "./timeline.ts";
+import { fetchServerSentEvents } from "@tanstack/ai-client";
+import { postCallText, postResultOk } from "./surface-post.ts";
+import type { RuntimeChange, RuntimeConfig } from "./runtime-config-cache.ts";
+import type { ChatBrowseStatus } from "./session-list.ts";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import type { Attachment } from "@earendil-works/pi-web-ui";
+import type {
+  Api,
+  AssistantMessage,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  Usage,
+  TextContent,
+} from "@earendil-works/pi-ai";
+import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import { errChain, errMessage, swallow } from "../../chassis/src/errors.ts";
+import { userFacingFailureText } from "../../chassis/src/failure-copy.ts";
+import { groupDmText } from "./group-dm-label.ts";
+import { base64ToBytes } from "./paste-text.ts";
+import { SIGNIN_REQUIRED_EVENT, signinRedirect } from "./signin-return.ts";
+import { messageEntrySeqs } from "./message-link.ts";
+import type { GoalStripState } from "./goal-strip.ts";
+import {
+  activityCreatedAt,
+  activityItems,
+  isHidden,
+  isNarration,
+  isUserMessage,
+  messageTs,
+  proddedReason,
+  retractedReason,
+  stepMessage,
+  type Item,
+  type RunActivityEntry,
+} from "./items.ts";
+
+const BASE_URL = ((import.meta as unknown as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? "/").replace(/\/$/, "");
+
+export function withBase(path: string): string {
+  return `${BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+export function fileContentUrl(id: string, name?: string): string {
+  const base = `/api/files/${encodeURIComponent(id)}/content`;
+  return withBase(name ? `${base}/${encodeURIComponent(name)}` : base);
+}
+
+const POLL_MS = 500;
+const POLL_RETRY_MAX_MS = 5_000;
+export const RUN_IDLE_MS = 6 * 60_000;
+const STALE_GRACE_MS = 10 * 60_000;
+const SSE_OPEN_TIMEOUT_MS = 4_000;
+const SSE_SILENCE_MS = 30_000;
+const RUN_REQUEST_TIMEOUT_MS = 15_000;
+
+let now: () => number = () => Date.now();
+export function setClock(fn: () => number): void {
+  now = fn;
+}
+
+interface PiAttachment {
+  id?: string;
+  type: "image" | "document";
+  fileName: string;
+  mimeType: string;
+  size: number;
+  content: string;
+  extractedText?: string;
+}
+export interface CoreAttachment {
+  name: string;
+  mimetype: string;
+  sizeBytes: number;
+  blobId: string;
+}
+
+export const MAX_ATTACHMENT_BYTES = 1_000_000_000;
+export const MAX_FILES_PER_MESSAGE = 10;
+
+export function oversizeAttachmentNote(name: string): string {
+  return `"${name}" is too large — files up to ~1 GB can be sent. It was left out.`;
+}
+
+function emptyAttachmentNote(name: string): string {
+  return `"${name}" is empty. It was left out.`;
+}
+
+export function tooManyFilesNote(names: string[]): string {
+  const skipped = names.map((n) => `"${n}"`).join(", ");
+  return `Skipped ${skipped} — too many files in one message (max ${MAX_FILES_PER_MESSAGE}).`;
+}
+
+interface SkippedAttachment {
+  id?: string;
+  name: string;
+  note: string;
+  permanent: boolean;
+}
+
+export interface AttachmentUpload {
+  uploaded: CoreAttachment[];
+  skipped: SkippedAttachment[];
+}
+
+export async function uploadAttachments(attachments: readonly PiAttachment[]): Promise<AttachmentUpload> {
+  const uploaded: CoreAttachment[] = [];
+  const skipped: SkippedAttachment[] = [];
+  for (const a of attachments) {
+    const skip = (note: string, permanent: boolean): void => {
+      skipped.push({ ...(a.id ? { id: a.id } : {}), name: a.fileName, note, permanent });
+    };
+    if (typeof a.content !== "string" || a.content.length === 0) {
+      skip(emptyAttachmentNote(a.fileName), true);
+      continue;
+    }
+    if (a.size > MAX_ATTACHMENT_BYTES) {
+      skip(oversizeAttachmentNote(a.fileName), true);
+      continue;
+    }
+    try {
+      uploaded.push(await toCoreAttachment(a));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 413) skip(oversizeAttachmentNote(a.fileName), true);
+      else skip(`"${a.fileName}" couldn't be uploaded (${errMessage(err)}). Try again.`, false);
+    }
+  }
+  return { uploaded, skipped };
+}
+
+type WebUserMessage = AgentMessage & {
+  role: "user" | "user-with-attachments";
+  content: string | Array<{ type: string; text?: string }>;
+  attachments?: PiAttachment[];
+  sendFailure?: string;
+};
+
+export interface DeliveredFile {
+  name: string;
+  mimetype?: string;
+  sizeBytes?: number;
+  artifactId?: string;
+}
+
+export interface CoreSession {
+  id: string;
+  type: "dm" | "channel" | "group";
+  scopeId: string;
+  threadRef: string;
+  createdAt: number;
+  title?: string | null;
+  channelName?: string | null;
+  archived?: boolean;
+  pinned?: boolean;
+  color?: string | null;
+  unread?: boolean;
+  lastActivityAt?: number;
+  working?: boolean;
+  awaitingInput?: boolean;
+  lastTurnFailed?: boolean;
+  canContinue?: boolean;
+  backgroundJobs?: number;
+  watches?: number;
+  crons?: number;
+  goal?: { objective: string; activeMs: number; runningSince?: number; floor?: Record<string, number> };
+  forkedFrom?: { sessionId: string; title?: string | null };
+  forkBoundarySeq?: number;
+  sideChat?: { entrySeq: number; quote: string; occurrence: number; expanded: boolean };
+  parentSessionId?: string;
+  surface?: string;
+  subagents?: { running: number; waiting: number };
+  workingSince?: number;
+  purpose?: string;
+  personaId?: string;
+}
+
+export interface SessionPageQuery {
+  limit: number;
+  before?: string | null;
+  status?: ChatBrowseStatus;
+  surface?: string;
+  scope?: string | null;
+  q?: string;
+}
+
+export interface SessionPage {
+  sessions: CoreSession[];
+  pinned?: CoreSession[];
+  nextCursor: string | null;
+  hasArchived?: boolean;
+}
+
+export function fetchSessionPage(query: SessionPageQuery): Promise<SessionPage> {
+  const qs = new URLSearchParams({ limit: String(query.limit) });
+  if (query.before) qs.set("before", query.before);
+  if (query.status && query.status !== "active") qs.set("status", query.status);
+  if (query.surface) qs.set("surface", query.surface);
+  if (query.scope) qs.set("scope", query.scope);
+  if (query.q?.trim()) qs.set("q", query.q.trim());
+  return api<SessionPage>(`/api/sessions?${qs.toString()}`);
+}
+
+export async function fetchSessionChildren(id: string): Promise<CoreSession[] | null> {
+  try {
+    return (await api<{ sessions: CoreSession[] }>(`/api/sessions/${encodeURIComponent(id)}/children`)).sessions;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+export async function fetchSessionRow(ref: { id: string } | { threadRef: string }): Promise<CoreSession | null> {
+  const qs = new URLSearchParams("id" in ref ? { id: ref.id } : { threadRef: ref.threadRef });
+  try {
+    return (await api<{ session: CoreSession }>(`/api/sessions/row?${qs.toString()}`)).session;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+export function inheritedTranscript(
+  session: Pick<CoreSession, "forkedFrom" | "forkBoundarySeq">,
+  items: Item[],
+): { inherited: Item[]; current: Item[] } {
+  if (!session.forkedFrom || session.forkBoundarySeq === undefined) return { inherited: [], current: items };
+  const inherited: Item[] = [];
+  const current: Item[] = [];
+  for (const item of items) (item.seq <= session.forkBoundarySeq ? inherited : current).push(item);
+  return { inherited, current };
+}
+
+export function inheritedRefreshItems(
+  session: Pick<CoreSession, "forkedFrom" | "forkBoundarySeq">,
+  items: Item[],
+  inheritedLoaded: boolean,
+): Item[] | null {
+  const inherited = inheritedTranscript(session, items).inherited;
+  return inherited.length && !inheritedLoaded ? inherited : null;
+}
+
+export function forkOriginDetails(
+  session: Pick<CoreSession, "forkedFrom" | "forkBoundarySeq">,
+  inheritedCount: number,
+): { sessionId: string; title: string; messageCount?: number } | null {
+  if (!session.forkedFrom || session.forkBoundarySeq === undefined) return null;
+  return {
+    sessionId: session.forkedFrom.sessionId,
+    title: session.forkedFrom.title?.trim() || "another conversation",
+    ...(inheritedCount > 0 ? { messageCount: inheritedCount } : {}),
+  };
+}
+
+export function currentEarlierCount(
+  session: Pick<CoreSession, "forkedFrom" | "forkBoundarySeq">,
+  earlierItems: number,
+): number {
+  if (!session.forkedFrom || session.forkBoundarySeq === undefined) return earlierItems;
+  return Math.max(0, earlierItems - (session.forkBoundarySeq + 1));
+}
+
+export async function loadInheritedTranscript(
+  session: Pick<CoreSession, "id" | "forkedFrom" | "forkBoundarySeq">,
+  loaded: Item[],
+  fetcher: typeof fetchTranscript = fetchTranscript,
+): Promise<Item[]> {
+  if (loaded.length || !session.forkedFrom || session.forkBoundarySeq === undefined) return loaded;
+  let beforeSeq = session.forkBoundarySeq + 1;
+  let inherited: Item[] = [];
+  for (;;) {
+    const page = await fetcher(session.id, { beforeSeq, tailTurns: TAIL_TURNS });
+    const items = inheritedTranscript(session, page.items).inherited;
+    inherited = [...items, ...inherited];
+    const earliestSeq = items[0]?.seq;
+    if (!(page.earlierItems ?? 0) || earliestSeq === undefined || earliestSeq <= 0 || earliestSeq >= beforeSeq) break;
+    beforeSeq = earliestSeq;
+  }
+  return inherited;
+}
+
+export interface SessionBackgroundView {
+  jobs: Array<{ processId: string; command: string; purpose?: string; startedAt: number; expiresAt: number }>;
+  watches: Array<{
+    id: string;
+    processId: string;
+    command: string;
+    pattern?: string;
+    instructions?: string;
+    createdAt: number;
+    expiresAt: number;
+    lastFiredAt?: number;
+  }>;
+  crons: Array<{
+    id: string;
+    title?: string;
+    nextFireAt?: number;
+    lastFire?: { firedAt: number; status?: string };
+  }>;
+}
+
+export interface SessionBackgroundOutput {
+  chunk: string;
+  cursor: number;
+  state: "running" | "exited";
+  exitCode?: number;
+}
+
+export interface CoreContext {
+  scopeId: string;
+  kind: "personal" | "channel" | "group";
+  name: string | null;
+  isPrivate?: boolean;
+  sessionCount: number;
+  lastActivityAt: number | null;
+  project?: CoreProject;
+  groupMembers?: Array<{ principalId: string; displayName: string; avatarUrl?: string }>;
+}
+
+export type ProjectIcon =
+  { kind: "emoji"; value: string } | { kind: "custom"; name: string } | { kind: "image"; url: string };
+
+export interface CoreProject {
+  id: string;
+  name: string;
+  ownerId: string;
+  memberIds: string[];
+  channelMemberIds?: string[];
+  scopeId: string;
+  members: Array<{ principalId: string; displayName: string; avatarUrl?: string; viaChannel?: boolean }>;
+  slackChannel?: { channelId: string; channelName: string; linkedBy?: string; linkedAt?: number };
+  icon?: ProjectIcon;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export function slackThreadUrl(workspaceUrl: string | null, threadRef: string): string | null {
+  if (!workspaceUrl) return null;
+  const m = threadRef.match(/^(?:dm|ch|grp):([A-Z0-9]+)(?::(\d+)\.(\d+))?$/i);
+  if (!m) return null;
+  return `${workspaceUrl}/archives/${m[1]}${m[2] ? `/p${m[2]}${m[3]}` : ""}`;
+}
+
+export function isSharedScopeId(scopeId: string): boolean {
+  return scopeId.startsWith("channel:") || scopeId.startsWith("group:");
+}
+
+export function sharedContextLabel(scopeId: string | null, name: string | null): string | null {
+  if (!scopeId) return null;
+  if (scopeId.startsWith("channel:")) return name ? `#${name.replace(/^#/, "")}` : "Shared channel";
+  if (scopeId.startsWith("group:")) return groupDmText(name) ?? name ?? "Group";
+  return null;
+}
+
+function browserTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export async function updateSession(
+  id: string,
+  patch: { title?: string | null; archived?: boolean; pinned?: boolean; color?: string | null; unread?: boolean },
+): Promise<{ session: CoreSession }> {
+  return api<{ session: CoreSession }>(`/api/sessions/${encodeURIComponent(id)}`, {
+    method: "POST",
+    body: JSON.stringify(patch),
+  });
+}
+
+export async function forkSession(
+  id: string,
+  upToSeq?: number,
+  sideChat?: { entrySeq: number; quote: string; occurrence: number },
+): Promise<{ session: CoreSession; items: Item[] }> {
+  return withItems(
+    await api<{ session: CoreSession; items: Item[] }>(`/api/sessions/${encodeURIComponent(id)}/fork`, {
+      method: "POST",
+      body: JSON.stringify({ upToSeq, sideChat }),
+    }),
+  );
+}
+
+export function forkCutSeq(
+  items: Item[],
+  messages: readonly unknown[],
+  index: number,
+  floorSeq = -1,
+): number | undefined {
+  const isUser = (message: unknown): boolean => {
+    const m = message as { role?: string; opener?: boolean; resumeAnchor?: boolean } | undefined;
+    return (m?.role === "user" || m?.role === "user-with-attachments") && !m.opener && !m.resumeAnchor;
+  };
+  let base = floorSeq;
+  let unsaved = 0;
+  for (let i = index; i >= 0; i--) {
+    const seqs = messageEntrySeqs(messages[i]);
+    if (seqs.length) {
+      base = Math.max(...seqs);
+      break;
+    }
+    if (isUser(messages[i])) unsaved++;
+  }
+  if (isUser(messages[index]) && !unsaved) return base;
+  const later = items.flatMap((item) =>
+    isUserMessage(item) && item.seq > base && userItemMessage(item) ? [item.seq] : [],
+  );
+  if (isUser(messages[index])) return later[unsaved - 1];
+  const nextUser = later[unsaved];
+  return nextUser !== undefined ? nextUser - 1 : items.at(-1)?.seq;
+}
+
+export const TAIL_TURNS = 25;
+
+export interface SessionPin {
+  id: string;
+  text?: string;
+  entrySeq?: number;
+  preview?: string;
+  addedBy: string;
+  createdAt: number;
+}
+
+export interface TranscriptPage {
+  session?: CoreSession;
+  items: Item[];
+  earlierItems?: number;
+  pins?: SessionPin[];
+  goal?: GoalStripState;
+  runtime?: TurnRuntime;
+}
+
+export async function fetchTranscript(
+  id: string,
+  window?: { tailTurns?: number; sinceSeq?: number; beforeSeq?: number },
+): Promise<TranscriptPage> {
+  const qs = new URLSearchParams();
+  if (window?.tailTurns !== undefined) qs.set("tailTurns", String(window.tailTurns));
+  if (window?.sinceSeq !== undefined) qs.set("sinceSeq", String(window.sinceSeq));
+  if (window?.beforeSeq !== undefined) qs.set("beforeSeq", String(window.beforeSeq));
+  const suffix = qs.size ? `?${qs.toString()}` : "";
+  return withItems(await api<TranscriptPage>(`/api/sessions/${encodeURIComponent(id)}${suffix}`));
+}
+
+function withItems<T extends { items: Item[] }>(page: T): T {
+  if (!Array.isArray(page.items)) throw new Error("Unexpected transcript response");
+  return page;
+}
+
+const resolvedCredentialApprovals = new Set<string>();
+
+const decidedDuringRunApprovals = new Set<string>();
+
+export function unresolvedApprovals(approvals: PendingApproval[]): PendingApproval[] {
+  const pending = approvals.filter(
+    (approval) =>
+      !resolvedCredentialApprovals.has(approval.requestId) && !decidedDuringRunApprovals.has(approval.requestId),
+  );
+  return pending.length === approvals.length ? approvals : pending;
+}
+
+export function fetchSessionApprovals(id: string): Promise<{ approvals: PendingApproval[] } | null> {
+  return api<{ approvals: PendingApproval[] }>(`/api/sessions/${encodeURIComponent(id)}/approvals`)
+    .then((result) => ({ approvals: unresolvedApprovals(result.approvals) }))
+    .catch((error: unknown) => {
+      reportHandledError("web:approvals_fetch", error);
+      return null;
+    });
+}
+
+export async function fetchItem(sessionId: string, seq: number): Promise<Item> {
+  const r = await api<{ item: Item }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(String(seq))}`,
+  );
+  return r.item;
+}
+
+export async function regenerateTitle(id: string): Promise<{ title: string | null }> {
+  return api<{ title: string | null }>(`/api/sessions/${encodeURIComponent(id)}/title`, { method: "POST" });
+}
+
+export async function suggestNextPrompt(id: string): Promise<{ enabled: boolean; suggestion: string | null }> {
+  return api<{ enabled: boolean; suggestion: string | null }>(`/api/sessions/${encodeURIComponent(id)}/next-prompt`, {
+    method: "POST",
+  });
+}
+
+export async function detachSession(id: string): Promise<{ detached: true }> {
+  return api<{ detached: true }>(`/api/sessions/${encodeURIComponent(id)}/detach`, { method: "POST" });
+}
+
+export async function cancelSessionGoal(id: string): Promise<{ cancelled: true }> {
+  return api<{ cancelled: true }>(`/api/sessions/${encodeURIComponent(id)}/goal/cancel`, { method: "POST" });
+}
+export async function resumeSessionGoal(id: string): Promise<{ resumed: true; goal: GoalStripState }> {
+  return api<{ resumed: true; goal: GoalStripState }>(`/api/sessions/${encodeURIComponent(id)}/goal/resume`, {
+    method: "POST",
+  });
+}
+type WorkStatus = "thinking" | "working" | "complete" | "failed";
+export interface WorkBlock {
+  streamStartOffset?: number;
+  status: WorkStatus;
+  startedAt?: number;
+  finishedAt?: number;
+  stale?: boolean;
+  activity: RunActivityEntry[];
+  reasoning?: LiveReasoning[];
+  attempt?: number;
+  pendingApprovals?: PendingApproval[];
+  goal?: GoalStripState;
+  runtime?: TurnRuntime;
+}
+
+interface LiveReasoning {
+  step: string;
+  index: number;
+  text: string;
+}
+
+export interface TurnRuntime {
+  modelId: string;
+  label?: string;
+  change?: { rule: string } | { agent: "task" | "scope" };
+}
+
+export function switchedDefault(runtime: TurnRuntime | null | undefined): boolean {
+  return !!runtime?.change && "agent" in runtime.change && runtime.change.agent === "scope";
+}
+
+export function workPausedForApproval(work: WorkBlock): boolean {
+  const last = work.activity.at(-1);
+  if (!last || !("item" in last)) return false;
+  const { kind, body } = last.item;
+  return (
+    kind === "Elicitation" || ((kind === "ToolResult" || kind === "ToolCall") && body.blocked === "needs_approval")
+  );
+}
+
+export interface PendingApproval {
+  requestId: string;
+  command: string;
+  reason?: string;
+  purpose?: string;
+  summary?: string;
+  matched?: string;
+  grantModes?: { session: boolean; always: boolean };
+  blocksInput?: boolean;
+  executesOnApprove?: boolean;
+}
+
+export function approvalDecidableDuringRun(approval: PendingApproval): boolean {
+  return approval.executesOnApprove === true && approval.blocksInput === false;
+}
+
+export interface ApprovalDecision {
+  requestId: string;
+  approved: boolean;
+  scope?: "once" | "session" | "always";
+}
+export type AssistantWork = AssistantMessage & {
+  persisted?: boolean;
+  streamingBaseline?: string;
+  work?: WorkBlock;
+  deliveredFiles?: DeliveredFile[];
+  retryableSend?: boolean;
+  interruptedRunId?: string;
+  sendBlocked?: "pending_approval";
+  sendFailed?: "attachments";
+  droppedAttachmentIds?: string[];
+  continuing?: string;
+  via?: string;
+  viaTitle?: string;
+  viaId?: string;
+  personaId?: string;
+};
+
+function tagPersona(item: Item, turnRows: AgentMessage[]): void {
+  const personaId = item.body.personaId;
+  if (typeof personaId !== "string") return;
+  for (const row of turnRows) if (row.role === "assistant") (row as AssistantWork).personaId = personaId;
+}
+
+export interface RunPoll {
+  status: "pending" | "running" | "done" | "failed";
+  goal?: GoalStripState;
+  runtime?: TurnRuntime;
+  input?: {
+    runId: string;
+    seq: number | null;
+    text: string;
+    createdAt: number;
+    attachments?: Array<{ name: string; mimetype: string; sizeBytes: number }>;
+  };
+  result: {
+    status: string;
+    reply?: string;
+    reason?: string;
+    refusalKind?: string;
+    errorCode?: string;
+    stopped?: boolean;
+    pendingApprovals?: PendingApproval[];
+    attachments?: Array<{ name: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
+  } | null;
+  partial?: string;
+  partialStartOffset?: number;
+  alive?: boolean;
+  stale?: boolean;
+  replyComplete?: boolean;
+  activity?: RunActivityEntry[];
+  reasoning?: LiveReasoning[];
+  attempt?: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+}
+export interface TurnOptions {
+  effortLevel?: string;
+  fastMode?: boolean;
+  scopeId?: string | null;
+  channelName?: string | null;
+}
+
+export interface ActiveRun {
+  runId: string | null;
+  run: RunPoll | null;
+  queued: QueuedRun[];
+}
+
+export interface QueuedRun {
+  runId: string;
+  text: string;
+  hasAttachments?: boolean;
+}
+
+export function runIsTerminal(run: Pick<RunPoll, "status" | "result" | "replyComplete">): boolean {
+  return run.status === "done" || run.status === "failed" || run.result != null || run.replyComplete === true;
+}
+
+export function hasRecordedRunReply(items: Item[], runId: string): boolean {
+  let matchesRun = false;
+  for (const item of items) {
+    if (isUserMessage(item)) {
+      if (item.kind === "UserMessage" || item.turnId !== null) matchesRun = item.turnId === runId;
+    } else if (matchesRun && item.kind === "AgentMessage" && item.variant === null) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function resumeAnchor(): AgentMessage {
+  return { role: "user", content: "", resumeAnchor: true } as unknown as AgentMessage;
+}
+
+export function continuableMessages(
+  messages: AgentMessage[],
+  input?: RunPoll["input"],
+): { messages: AgentMessage[]; popped: AgentMessage[] } {
+  const kept = messages.slice();
+  const popped: AgentMessage[] = [];
+  if (
+    input &&
+    !kept.some((message) => {
+      const user = message as unknown as HistoryUserMessage;
+      return (
+        (user.role === "user" || user.role === "user-with-attachments") &&
+        (user.runId === input.runId || (input.seq !== null && user.entrySeq === input.seq))
+      );
+    })
+  ) {
+    const user: HistoryUserMessage = {
+      role: "user",
+      runId: input.runId,
+      content: input.text,
+      timestamp: input.createdAt,
+      ...(input.attachments?.length
+        ? {
+            attachments: input.attachments.map((attachment, index) => ({
+              id: `${input.runId}:${index}`,
+              type: attachment.mimetype.startsWith("image/") ? ("image" as const) : ("document" as const),
+              fileName: attachment.name,
+              mimeType: attachment.mimetype,
+              size: attachment.sizeBytes,
+            })),
+          }
+        : {}),
+    };
+    return { messages: [...kept, user as AgentMessage], popped };
+  }
+  while (kept.length && (kept[kept.length - 1] as { role?: string }).role === "assistant") {
+    const last = kept.at(-1) as AssistantWork;
+    if (last.stopReason === "aborted" || (!input && last.work && workPausedForApproval(last.work))) {
+      kept.push(resumeAnchor());
+      break;
+    }
+    popped.unshift(kept.pop()!);
+  }
+  return { messages: kept.length ? kept : [resumeAnchor()], popped };
+}
+
+function zeroUsage(): Usage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function baseAssistant(model: Model<Api>): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: "" }],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: zeroUsage(),
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+async function latestUserTurn(agent: Agent): Promise<{
+  text: string;
+  attachments: CoreAttachment[];
+  idempotencyKey?: string;
+  issues: string[];
+  droppedIds: string[];
+  retryable: Attachment[];
+}> {
+  const messages = agent.state.messages as Array<AgentMessage & { attachments?: PiAttachment[] } & SendKeyed>;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== "user" && m?.role !== "user-with-attachments") continue;
+    const text =
+      typeof m.content === "string"
+        ? m.content
+        : (m.content as Array<{ type: string; text?: string }>)
+            .filter((c) => c.type === "text")
+            .map((c) => c.text ?? "")
+            .join("\n");
+    const { uploaded, skipped } = await uploadAttachments(m.attachments ?? []);
+    const transientIds = new Set(skipped.filter((s) => !s.permanent).flatMap((s) => (s.id ? [s.id] : [])));
+    const retryable = (m.attachments ?? []).filter(
+      (a): a is PiAttachment & Attachment => a.id !== undefined && transientIds.has(a.id),
+    );
+    if (skipped.length && m.attachments) {
+      const skippedIds = new Set(skipped.map((s) => s.id).filter(Boolean));
+      m.attachments = m.attachments.filter((a) => !a.id || !skippedIds.has(a.id));
+    }
+    const idempotencyKey = sendKeyOf(m) ?? mintSendKey();
+    m.idempotencyKey = idempotencyKey;
+    return {
+      text,
+      attachments: uploaded,
+      idempotencyKey,
+      issues: skipped.map((s) => s.note),
+      droppedIds: skipped.filter((s) => s.permanent).flatMap((s) => (s.id ? [s.id] : [])),
+      retryable,
+    };
+  }
+  return { text: "", attachments: [], issues: [], droppedIds: [], retryable: [] };
+}
+
+function attachmentBytes(a: PiAttachment): Uint8Array {
+  return base64ToBytes(a.content);
+}
+
+function toHex(buf: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function toCoreAttachment(a: PiAttachment): Promise<CoreAttachment> {
+  const bytes = attachmentBytes(a);
+  const sha256 = toHex(await crypto.subtle.digest("SHA-256", bytes as unknown as ArrayBuffer));
+  const r = await webFetch(withBase(`/api/blobs?sha=${sha256}`), {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: bytes as unknown as BodyInit,
+  });
+  if (!r.ok) throw new ApiError(`attachment upload failed: HTTP ${r.status}`, r.status);
+  const { blobId, sizeBytes } = (await r.json()) as { blobId: string; sizeBytes: number };
+  return { name: a.fileName, mimetype: a.mimeType, sizeBytes: sizeBytes ?? a.size, blobId };
+}
+
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+  constructor(message: string, status: number, body?: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+export interface SigninRequired {
+  mode?: "portal" | "dev";
+}
+
+let onSigninRequired: ((detail: SigninRequired) => void) | null = null;
+
+export function setSigninRequiredHandler(fn: (detail: SigninRequired) => void): void {
+  onSigninRequired = fn;
+}
+
+function reportSigninRequired(detail: SigninRequired): void {
+  onSigninRequired?.(detail);
+}
+
+let servedRelease: string | null = null;
+
+export function servedReleaseChanged(): boolean {
+  const booted = document.querySelector<HTMLMetaElement>('meta[name="qm-release"]')?.content;
+  return Boolean(booted && servedRelease && servedRelease !== booted);
+}
+
+export async function webFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const startMs = Date.now();
+  const request = input instanceof Request ? input : null;
+  const url = request?.url ?? String(input);
+  const method = init?.method ?? request?.method ?? "GET";
+  let response: Response;
+  try {
+    response = await fetch(input, init);
+  } catch (error) {
+    reportRequestTiming(url, method, startMs, null);
+    throw error;
+  }
+  reportRequestTiming(url, method, startMs, response.status);
+  servedRelease = response.headers.get("x-qm-release") ?? servedRelease;
+  if (response.status !== 401) return response;
+  stopBrowserErrors();
+  stopAnalytics();
+  let body: unknown;
+  try {
+    body = await response.clone().json();
+  } catch {
+    body = null;
+  }
+  const redirect = signinRedirect((body as { loginUrl?: unknown } | null)?.loginUrl, window.location);
+  if (redirect) window.location.assign(redirect);
+  else {
+    reportSigninRequired((body ?? {}) as SigninRequired);
+    window.dispatchEvent(new Event(SIGNIN_REQUIRED_EVENT));
+  }
+  return response;
+}
+
+export interface UiStateRecord {
+  value: unknown;
+  updatedAt: number;
+}
+
+export function fetchUiState(key: string): Promise<UiStateRecord> {
+  return api<UiStateRecord>(`/api/ui-state?key=${encodeURIComponent(key)}`);
+}
+
+export function putUiState(
+  key: string,
+  value: unknown,
+  updatedAt: number,
+  init?: RequestInit,
+): Promise<{ ok: boolean; updatedAt: number }> {
+  return api("/api/ui-state", { method: "PUT", body: JSON.stringify({ key, value, updatedAt }), ...init });
+}
+
+const PIN_LATEST_PROMPT_KEY = "pin-latest-prompt";
+const ALWAYS_STEER_KEY = "always-steer";
+
+type ChatPrefKey = typeof PIN_LATEST_PROMPT_KEY | typeof ALWAYS_STEER_KEY;
+
+const CHAT_PREF_DEFAULTS: Record<ChatPrefKey, boolean> = {
+  [PIN_LATEST_PROMPT_KEY]: true,
+  [ALWAYS_STEER_KEY]: false,
+};
+
+const CHAT_PREF_CACHE_PREFIX = "chat-pref:";
+
+const chatPrefValues = new Map<ChatPrefKey, boolean>();
+const chatPrefTouched = new Set<ChatPrefKey>();
+const chatPrefListeners = new Set<() => void>();
+
+function cachedChatPref(key: ChatPrefKey): boolean {
+  try {
+    const raw = localStorage.getItem(CHAT_PREF_CACHE_PREFIX + key);
+    if (raw === "1") return true;
+    if (raw === "0") return false;
+  } catch {
+    void 0;
+  }
+  return CHAT_PREF_DEFAULTS[key];
+}
+
+function readChatPref(key: ChatPrefKey): boolean {
+  let value = chatPrefValues.get(key);
+  if (value === undefined) {
+    value = cachedChatPref(key);
+    chatPrefValues.set(key, value);
+  }
+  return value;
+}
+
+function applyChatPref(key: ChatPrefKey, value: boolean): void {
+  const changed = readChatPref(key) !== value;
+  chatPrefValues.set(key, value);
+  try {
+    if (value === CHAT_PREF_DEFAULTS[key]) localStorage.removeItem(CHAT_PREF_CACHE_PREFIX + key);
+    else localStorage.setItem(CHAT_PREF_CACHE_PREFIX + key, value ? "1" : "0");
+  } catch {
+    void 0;
+  }
+  if (changed) for (const listener of chatPrefListeners) listener();
+}
+
+function writeChatPref(key: ChatPrefKey, value: boolean): void {
+  chatPrefTouched.add(key);
+  applyChatPref(key, value);
+  void putUiState(key, value, Date.now()).catch((error: unknown) => reportHandledError("web:save_chat_pref", error));
+}
+
+export function pinLatestPrompt(): boolean {
+  return readChatPref(PIN_LATEST_PROMPT_KEY);
+}
+
+export function alwaysSteer(): boolean {
+  return readChatPref(ALWAYS_STEER_KEY);
+}
+
+export function setPinLatestPrompt(value: boolean): void {
+  writeChatPref(PIN_LATEST_PROMPT_KEY, value);
+}
+
+export function setAlwaysSteer(value: boolean): void {
+  writeChatPref(ALWAYS_STEER_KEY, value);
+}
+
+export function onChatPrefsChange(listener: () => void): () => void {
+  chatPrefListeners.add(listener);
+  return () => chatPrefListeners.delete(listener);
+}
+
+export async function loadChatPrefs(): Promise<void> {
+  await Promise.all(
+    (Object.keys(CHAT_PREF_DEFAULTS) as ChatPrefKey[]).map(async (key) => {
+      try {
+        const rec = await fetchUiState(key);
+        if (chatPrefTouched.has(key)) return;
+        applyChatPref(key, typeof rec.value === "boolean" ? rec.value : CHAT_PREF_DEFAULTS[key]);
+      } catch (error) {
+        reportHandledError("web:load_chat_pref", error);
+      }
+    }),
+  );
+}
+
+export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers({ "content-type": "application/json" });
+  new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+  headers.set(CLIENT_SURFACE_HEADER, webClientSurface());
+  const r = await webFetch(withBase(path), { ...init, headers });
+  const text = await r.text();
+  let body: unknown = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch (e) {
+    swallow("web-ui: parse api response body", e);
+  }
+  if (!r.ok) {
+    const details = body as { message?: string; reason?: string; error?: string } | null;
+    const msg = details?.message ?? details?.reason ?? details?.error ?? `HTTP ${r.status}`;
+    throw new ApiError(msg, r.status, body);
+  }
+  if (path === "/api/turn" && typeof init?.body === "string") {
+    const request = JSON.parse(init.body) as { desktopClientId?: string };
+    const response = body as { runId?: string } | null;
+    if (request.desktopClientId && response?.runId)
+      void serveDesktopRun(response.runId, request.desktopClientId, withBase, api).catch((error) =>
+        reportHandledError("desktop-computer", error),
+      );
+  }
+  return body as T;
+}
+
+export async function fetchRuntimeConfig(scopeId?: string | null, account?: "company"): Promise<RuntimeConfig | null> {
+  try {
+    const params = new URLSearchParams();
+    if (scopeId) params.set("scopeId", scopeId);
+    if (account) params.set("account", account);
+    const query = params.size ? `?${params}` : "";
+    return await api<RuntimeConfig>(`/api/runtime-config${query}`);
+  } catch (e) {
+    swallow("web-ui: fetch runtime config", e);
+    return null;
+  }
+}
+
+export async function updateRuntimeConfig(scopeId: string | null, change: RuntimeChange): Promise<RuntimeConfig> {
+  return api<RuntimeConfig>("/api/runtime-config", {
+    method: "PUT",
+    body: JSON.stringify({ ...change, ...(scopeId ? { scopeId } : {}) }),
+  });
+}
+
+export type WorkObserver = (work: WorkBlock) => void;
+export type SendIssueObserver = (issues: string[], retryable: Attachment[]) => void;
+
+export interface RunSlot {
+  runId: string | null;
+  generation: number;
+  stopGeneration: number | null;
+  onStopError?: (message: string) => void;
+}
+
+export function createRunSlot(onStopError?: (message: string) => void): RunSlot {
+  return { runId: null, generation: 0, stopGeneration: null, onStopError };
+}
+
+function beginSubmit(slot: RunSlot | undefined): number {
+  if (!slot) return 0;
+  return ++slot.generation;
+}
+
+export function requestStop(slot: RunSlot): void {
+  slot.stopGeneration = slot.generation;
+}
+
+function dropStopForGeneration(slot: RunSlot | undefined, gen: number): void {
+  if (slot && slot.stopGeneration === gen) slot.stopGeneration = null;
+}
+
+export function hasLiveRun(slot: RunSlot): boolean {
+  return slot.runId !== null;
+}
+
+export type SignalOutcome = { ok: true } | { ok: false; reason: string; why?: string; replayed?: boolean };
+
+export interface SteerContext {
+  threadRef: string | null;
+  scopeId?: string | null;
+  channelName?: string | null;
+}
+
+export async function signalLiveRun(
+  slot: RunSlot,
+  kind: "abort" | "steer",
+  text: string | undefined,
+  context: SteerContext,
+  queuedRunId?: string,
+): Promise<SignalOutcome> {
+  const run = slot.runId !== null ? { runId: slot.runId } : null;
+  if (!run) throw new Error("No active run to signal.");
+  const steerContext =
+    kind === "steer" && context.threadRef
+      ? {
+          threadRef: context.threadRef,
+          ...(context.scopeId ? { scopeId: context.scopeId } : {}),
+          ...(context.channelName ? { channelName: context.channelName } : {}),
+        }
+      : {};
+  try {
+    await api(runPath(run.runId, "/signal"), {
+      method: "POST",
+      signal: kind === "abort" ? AbortSignal.timeout(RUN_REQUEST_TIMEOUT_MS) : undefined,
+      body: JSON.stringify({
+        kind,
+        ...(text !== undefined ? { text } : {}),
+        ...steerContext,
+        ...(queuedRunId ? { queuedRunId } : {}),
+      }),
+    });
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 409 || err.status === 404)) {
+      const body = (err.body ?? {}) as { reason?: string; why?: string; replayed?: boolean };
+      return {
+        ok: false,
+        reason: body.reason ?? (err.status === 404 ? "not_found" : "terminal"),
+        ...(body.why ? { why: body.why } : {}),
+        ...(body.replayed ? { replayed: true } : {}),
+      };
+    }
+    throw err;
+  }
+}
+
+export function makeCoreStreamFn(
+  threadRef: string,
+  agent: Agent,
+  getTurnOptions?: () => TurnOptions,
+  onWork?: WorkObserver,
+  slot?: RunSlot,
+  onSendIssues?: SendIssueObserver,
+): StreamFn {
+  const fn = (
+    model: Model<Api>,
+    _context: Context,
+    options?: { signal?: AbortSignal },
+  ): AssistantMessageEventStream => {
+    const stream = createAssistantMessageEventStream();
+    void drive(stream, model, threadRef, agent, getTurnOptions, options?.signal, onWork, false, slot, onSendIssues);
+    return stream;
+  };
+  return fn as unknown as StreamFn;
+}
+
+export async function activeRunForThread(threadRef: string): Promise<ActiveRun> {
+  const q = new URLSearchParams({ threadRef });
+  const r = await api<{ runId?: string | null; run?: RunPoll | null; queued?: QueuedRun[] }>(
+    `/api/runs/active?${q.toString()}`,
+  );
+  const live = r.runId && r.run ? { runId: r.runId, run: r.run } : { runId: null, run: null };
+  return { ...live, queued: r.queued ?? [] };
+}
+
+export const PENDING_APPROVAL_REASON = "Approve or deny the pending command to continue.";
+
+export async function queueTurn(
+  threadRef: string,
+  text: string,
+  agent: Agent,
+  getTurnOptions?: () => TurnOptions,
+  idempotencyKey?: string,
+  attachments: CoreAttachment[] = [],
+  midTurn: "steer" | "queue" = "queue",
+): Promise<QueuedRun & { steered?: boolean; steerTs?: string }> {
+  const submit = await api<{ status?: string; runId?: string; reason?: string; steered?: boolean; steerTs?: string }>(
+    "/api/turn",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...turnRequestBody(threadRef, text, agent.state.model, agent, getTurnOptions, { idempotencyKey, attachments }),
+        midTurn,
+      }),
+    },
+  );
+  if (submit.status === "pending_approval") throw new Error(submit.reason ?? PENDING_APPROVAL_REASON);
+  if (!submit.runId && !submit.steered) throw new Error("Could not queue the message.");
+  return {
+    runId: submit.runId ?? "",
+    text,
+    ...(attachments.length ? { hasAttachments: true } : {}),
+    ...(submit.steered ? { steered: true } : {}),
+    ...(submit.steerTs ? { steerTs: submit.steerTs } : {}),
+  };
+}
+
+export async function editQueuedRun(runId: string, text: string, expectedText: string): Promise<void> {
+  await api(runPath(runId, "/input"), { method: "PATCH", body: JSON.stringify({ text, expectedText }) });
+}
+
+export async function withdrawRun(runId: string): Promise<boolean> {
+  const r = await api<{ withdrawn?: boolean }>(runPath(runId, "/withdraw"), { method: "POST" });
+  return r.withdrawn === true;
+}
+
+export function makeRunResumeStreamFn(
+  run: string | Promise<LocatedRun | null>,
+  initialRun?: RunPoll,
+  onWork?: WorkObserver,
+  slot?: RunSlot,
+  seedText?: string,
+  seedWork?: Pick<WorkBlock, "startedAt" | "activity">,
+): StreamFn {
+  const fn = (
+    model: Model<Api>,
+    _context: Context,
+    options?: { signal?: AbortSignal },
+  ): AssistantMessageEventStream => {
+    const stream = createAssistantMessageEventStream();
+    void resumeDrive(stream, model, run, initialRun, options?.signal, onWork, slot, seedText, seedWork);
+    return stream;
+  };
+  return fn as unknown as StreamFn;
+}
+
+export interface LocatedRun {
+  runId: string;
+  run: RunPoll;
+}
+
+export async function resolveApproval(decision: ApprovalDecision): Promise<string | null> {
+  if (decision.requestId.startsWith("keychain:")) {
+    if (resolvedCredentialApprovals.has(decision.requestId)) return "";
+    const id = decision.requestId.slice("keychain:".length);
+    let choice = "deny";
+    if (decision.approved) choice = decision.scope === "always" ? "standing" : "once";
+    const result = await api<{ ask: { status: string } }>(`/api/keychain/approvals/${encodeURIComponent(id)}`, {
+      method: "POST",
+      body: JSON.stringify({ decision: choice }),
+    });
+    if (!["approved", "declined", "expired"].includes(result.ask?.status))
+      throw new Error("The credential request is still pending. Please try again.");
+    resolvedCredentialApprovals.add(decision.requestId);
+    return "";
+  }
+  const submit = await api<{ runId?: string; steered?: boolean }>(
+    `/api/approvals/${encodeURIComponent(decision.requestId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ approved: decision.approved, ...(decision.scope ? { scope: decision.scope } : {}) }),
+    },
+  ).catch((err: unknown) => {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  });
+  if (!submit) return null;
+  if (!submit.runId) throw new Error("Could not continue after the approval.");
+  if (submit.steered) decidedDuringRunApprovals.add(decision.requestId);
+  return submit.runId;
+}
+
+export async function runApprovalTurn(
+  agent: Agent,
+  decision: ApprovalDecision,
+  onWork: WorkObserver | undefined,
+  slot?: RunSlot,
+): Promise<void> {
+  if (decision.requestId.startsWith("keychain:")) {
+    await resolveApproval(decision);
+    return;
+  }
+  const stream = createAssistantMessageEventStream();
+  await driveApproval(stream, agent.state.model, decision, onWork, slot);
+  const outcome = await stream.result();
+  if (outcome.stopReason === "error") throw new Error(outcome.errorMessage || "Could not send the approval.");
+}
+
+export const APPROVAL_GONE_MESSAGE =
+  "This approval is no longer available — it may have expired or already been handled.";
+const APPROVAL_NOT_APPLIED_MESSAGE =
+  "This approval couldn't be applied right now — the conversation is waiting on a different approval.";
+
+async function driveApproval(
+  stream: AssistantMessageEventStream,
+  model: Model<Api>,
+  decision: ApprovalDecision,
+  onWork?: WorkObserver,
+  slot?: RunSlot,
+): Promise<void> {
+  const gen = beginSubmit(slot);
+  const partial = baseAssistant(model);
+  const work: WorkBlock = { status: "thinking", activity: [] };
+  (partial as AssistantWork).work = work;
+  const notify = (): void => onWork?.(work);
+  try {
+    notify();
+    stream.push({ type: "start", partial });
+    stream.push({ type: "text_start", contentIndex: 0, partial });
+    const submit = await api<{ status?: string; runId?: string; reply?: string; reason?: string }>(
+      `/api/approvals/${encodeURIComponent(decision.requestId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          approved: decision.approved,
+          ...(decision.scope ? { scope: decision.scope } : {}),
+          idempotencyKey: mintSendKey(),
+        }),
+      },
+    );
+    if (submit.runId) {
+      await followRun(stream, partial, submit.runId, undefined, notify, undefined, slot, gen);
+      return;
+    }
+    if (submit.status === "pending_approval") {
+      throw new Error(submit.reason?.trim() ? submit.reason : APPROVAL_NOT_APPLIED_MESSAGE);
+    }
+    work.status = "complete";
+    work.finishedAt = Date.now();
+    notify();
+    finish(stream, partial, { acc: "", startOffset: 0, lastProgressAt: now() }, submit.reply ?? "");
+  } catch (e) {
+    work.status = "failed";
+    work.finishedAt = Date.now();
+    notify();
+    fail(stream, partial, approvalFailureMessage(e));
+  } finally {
+    dropStopForGeneration(slot, gen);
+  }
+}
+
+function approvalFailureMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.status === 404) return APPROVAL_GONE_MESSAGE;
+    const reason = (e.body as { reason?: unknown } | null)?.reason;
+    if (typeof reason === "string" && reason.trim()) return reason;
+  }
+  return errMessage(e);
+}
+
+export function makeOpenerStreamFn(
+  threadRef: string,
+  agent: Agent,
+  getTurnOptions: (() => TurnOptions) | undefined,
+  onWork: WorkObserver | undefined,
+  slot?: RunSlot,
+): StreamFn {
+  const fn = (
+    model: Model<Api>,
+    _context: Context,
+    options?: { signal?: AbortSignal },
+  ): AssistantMessageEventStream => {
+    const stream = createAssistantMessageEventStream();
+    void drive(stream, model, threadRef, agent, getTurnOptions, options?.signal, onWork, true, slot);
+    return stream;
+  };
+  return fn as unknown as StreamFn;
+}
+
+function turnRequestBody(
+  threadRef: string,
+  text: string,
+  model: Model<Api>,
+  agent: Agent,
+  getTurnOptions?: () => TurnOptions,
+  send: { idempotencyKey?: string; attachments?: CoreAttachment[] } = {},
+): Record<string, unknown> {
+  const { idempotencyKey, attachments = [] } = send;
+  const turnOptions = getTurnOptions?.() ?? {};
+  const thinkingLevel = turnOptions.effortLevel;
+  const timezone = browserTimezone();
+  return {
+    desktopClientId: desktopTurnId(),
+    text,
+    threadRef,
+    ...(thinkingLevel ? { model: model.id, thinkingLevel } : {}),
+    ...(typeof turnOptions.fastMode === "boolean" ? { fastMode: turnOptions.fastMode } : {}),
+    ...(timezone ? { timezone } : {}),
+    ...(turnOptions.scopeId ? { scopeId: turnOptions.scopeId } : {}),
+    ...(turnOptions.channelName ? { channelName: turnOptions.channelName } : {}),
+    ...(attachments.length ? { attachments } : {}),
+    ...(idempotencyKey ? { idempotencyKey } : {}),
+  };
+}
+
+interface SendKeyed {
+  idempotencyKey?: string;
+}
+
+export function mintSendKey(): string {
+  return crypto.randomUUID();
+}
+
+function sendKeyOf(message: unknown): string | undefined {
+  const key = (message as SendKeyed | null)?.idempotencyKey;
+  return typeof key === "string" && key ? key : undefined;
+}
+
+export function userSendMessage(text: string, attachments?: unknown[]): AgentMessage {
+  const base = attachments?.length
+    ? { role: "user-with-attachments", content: text, attachments, timestamp: Date.now() }
+    : { role: "user", content: text, timestamp: Date.now() };
+  return { ...base, idempotencyKey: mintSendKey() } satisfies SendKeyed as unknown as AgentMessage;
+}
+
+async function drive(
+  stream: AssistantMessageEventStream,
+  model: Model<Api>,
+  threadRef: string,
+  agent: Agent,
+  getTurnOptions?: () => TurnOptions,
+  signal?: AbortSignal,
+  onWork?: WorkObserver,
+  opener?: boolean,
+  slot?: RunSlot,
+  onSendIssues?: SendIssueObserver,
+): Promise<void> {
+  const gen = beginSubmit(slot);
+  const partial = baseAssistant(model);
+  const work: WorkBlock = { status: "thinking", activity: [] };
+  (partial as AssistantWork).work = work;
+  const notify = (): void => onWork?.(work);
+  try {
+    notify();
+    stream.push({ type: "start", partial });
+    stream.push({ type: "text_start", contentIndex: 0, partial });
+
+    const { text, attachments, idempotencyKey, issues, droppedIds, retryable } = opener
+      ? {
+          text: "",
+          attachments: [] as CoreAttachment[],
+          idempotencyKey: undefined,
+          issues: [] as string[],
+          droppedIds: [] as string[],
+          retryable: [] as Attachment[],
+        }
+      : await latestUserTurn(agent);
+    if (!opener && ((!text.trim() && attachments.length === 0) || retryable.length > 0)) {
+      work.status = "failed";
+      work.finishedAt = Date.now();
+      notify();
+      if (issues.length) {
+        (partial as AssistantWork).sendFailed = "attachments";
+        (partial as AssistantWork).droppedAttachmentIds = droppedIds;
+      }
+      fail(stream, partial, issues.join(" ") || "Nothing to send.");
+      return;
+    }
+    if (issues.length) onSendIssues?.(issues, retryable);
+
+    const submit = await api<{ status?: string; runId?: string; reply?: string; reason?: string }>("/api/turn", {
+      method: "POST",
+      body: JSON.stringify({
+        ...turnRequestBody(threadRef, text, model, agent, getTurnOptions, { idempotencyKey, attachments }),
+        midTurn: "queue",
+        ...(opener ? { proactiveOpener: true, desktopClientId: undefined } : {}),
+      }),
+    });
+
+    if (submit.runId) {
+      if (!opener) {
+        const userMessages = agent.state.messages.filter(
+          (message) =>
+            (message.role === "user" || message.role === "user-with-attachments") &&
+            !(message as { opener?: boolean }).opener,
+        );
+        captureMessage(submit.runId, userMessages.length === 1);
+      }
+      const message = agent.state.messages.find((message) => idempotencyKey && sendKeyOf(message) === idempotencyKey);
+      if (message) (message as unknown as HistoryUserMessage).runId = submit.runId;
+      await followRun(stream, partial, submit.runId, signal, notify, undefined, slot, gen);
+      return;
+    }
+
+    if (submit.status === "pending_approval") {
+      work.status = "failed";
+      work.finishedAt = Date.now();
+      notify();
+      (partial as AssistantWork).sendBlocked = "pending_approval";
+      fail(stream, partial, submit.reason ?? PENDING_APPROVAL_REASON);
+      return;
+    }
+
+    work.status = "complete";
+    work.finishedAt = Date.now();
+    notify();
+    finish(stream, partial, { acc: "", startOffset: 0, lastProgressAt: now() }, submit.reply ?? "");
+  } catch (e) {
+    work.status = "failed";
+    work.finishedAt = Date.now();
+    notify();
+    if (e instanceof TypeError) {
+      const errorMessage = "Message wasn’t sent. Check your connection and try again.";
+      const message = latestUserMessage(agent);
+      if (message) message.sendFailure = errorMessage;
+      fail(stream, partial, errorMessage, true);
+      return;
+    }
+    fail(stream, partial, errChain(e));
+  } finally {
+    dropStopForGeneration(slot, gen);
+  }
+}
+
+async function resumeDrive(
+  stream: AssistantMessageEventStream,
+  model: Model<Api>,
+  target: string | Promise<LocatedRun | null>,
+  knownRun?: RunPoll,
+  signal?: AbortSignal,
+  onWork?: WorkObserver,
+  slot?: RunSlot,
+  seedText?: string,
+  seedWork?: Pick<WorkBlock, "startedAt" | "activity">,
+): Promise<void> {
+  const gen = beginSubmit(slot);
+  const partial = baseAssistant(model);
+  const baseline = (run: RunPoll | undefined): string =>
+    (run?.partial?.length ?? 0) > (seedText?.length ?? 0) ? run!.partial! : (seedText ?? "");
+  (partial as AssistantWork).streamingBaseline = baseline(knownRun);
+  const work: WorkBlock = seedWork
+    ? { status: "working", startedAt: seedWork.startedAt, activity: seedWork.activity }
+    : { status: "thinking", activity: [] };
+  (partial as AssistantWork).work = work;
+  const notify = (): void => onWork?.(work);
+  try {
+    notify();
+    stream.push({ type: "start", partial });
+    stream.push({ type: "text_start", contentIndex: 0, partial });
+    const st: Acc = { acc: "", startOffset: 0, lastProgressAt: now() };
+    if (seedText?.trim()) pushDelta(stream, partial, st, seedText);
+    const located = typeof target === "string" ? { runId: target, run: knownRun } : await target;
+    if (!located) {
+      work.status = "complete";
+      work.finishedAt = Date.now();
+      notify();
+      finish(stream, partial, st, st.acc);
+      return;
+    }
+    const initialRun = located.run;
+    (partial as AssistantWork).streamingBaseline = baseline(initialRun);
+    if (initialRun && applyRun(stream, partial, st, initialRun, notify) === "terminal") return;
+    await followRun(stream, partial, located.runId, signal, notify, st, slot, gen);
+  } catch (e) {
+    work.status = "failed";
+    work.finishedAt = Date.now();
+    notify();
+    fail(stream, partial, errChain(e));
+  } finally {
+    dropStopForGeneration(slot, gen);
+  }
+}
+
+async function followRun(
+  stream: AssistantMessageEventStream,
+  partial: AssistantMessage,
+  runId: string,
+  signal?: AbortSignal,
+  notify?: () => void,
+  st: Acc = { acc: "", startOffset: 0, lastProgressAt: now() },
+  slot?: RunSlot,
+  gen = 0,
+): Promise<void> {
+  try {
+    if (slot && slot.stopGeneration === gen) {
+      slot.runId = runId;
+      void signalLiveRun(slot, "abort", undefined, { threadRef: null }).catch(() => {
+        if (slot.generation !== gen || slot.stopGeneration !== gen) return;
+        slot.stopGeneration = null;
+        slot.onStopError?.("Could not request stop. Try again.");
+        notify?.();
+      });
+    }
+    if (signal?.aborted) return abortStream(stream, partial);
+    if (slot) slot.runId = runId;
+    const viaSse = await streamRunViaSse(stream, partial, runId, st, signal, notify);
+    if (viaSse === "done") return;
+    if (signal?.aborted) return abortStream(stream, partial);
+    return await pollRun(stream, partial, runId, st, signal, notify);
+  } finally {
+    if (slot?.runId === runId) slot.runId = null;
+  }
+}
+
+export async function stopThreadRun(threadRef: string): Promise<"stopped" | "ended"> {
+  const { runId } = await activeRunForThread(threadRef);
+  if (!runId) return "ended";
+  const outcome = await signalLiveRun({ ...createRunSlot(), runId }, "abort", undefined, { threadRef: null });
+  if (outcome.ok) return "stopped";
+  if (outcome.reason === "terminal" || outcome.reason === "not_found") return "ended";
+  throw new Error(outcome.why ?? outcome.reason);
+}
+
+function runPath(runId: string, suffix: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}${suffix}`;
+}
+
+export interface Acc {
+  startOffset: number;
+  acc: string;
+  lastProgressAt: number;
+  staleSince?: number;
+}
+
+function isRenderableThinking(item: Item): boolean {
+  return item.body.redacted !== true && Boolean(item.text?.trim());
+}
+
+function isWorkItem(item: Item): boolean {
+  if (item.kind === "Reasoning") return isRenderableThinking(item);
+  if (item.kind === "AgentMessage") return item.variant === "narration";
+  if (item.kind === "SteeringMessage") return !isHidden(item);
+  return ACTIVITY_KINDS.has(item.kind);
+}
+
+function parseActivity(raw: RunPoll["activity"]): RunActivityEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((entry): entry is RunActivityEntry =>
+    "item" in entry ? isWorkItem(entry.item) : entry.marker === "text_start",
+  );
+}
+
+function mergeReasoning(work: WorkBlock | undefined, block: LiveReasoning, offset = 0): boolean {
+  if (!work || typeof block.step !== "string" || !Number.isSafeInteger(block.index) || typeof block.text !== "string")
+    return false;
+  const blocks = work.reasoning ?? [];
+  const at = blocks.findIndex((b) => b.step === block.step && b.index === block.index);
+  const current = at >= 0 ? blocks[at]!.text : "";
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > current.length) return false;
+  const text = current.slice(0, offset) + block.text;
+  if (text.length <= current.length) return false;
+  const next = { step: block.step, index: block.index, text };
+  work.reasoning =
+    at >= 0 ? blocks.map((b, i) => (i === at ? next : b)) : [...blocks.filter((b) => b.step === block.step), next];
+  return true;
+}
+
+function setWorkStale(work: WorkBlock | undefined, stale: boolean, notify?: () => void): void {
+  if (!work || (work.stale ?? false) === stale) return;
+  work.stale = stale;
+  notify?.();
+}
+
+function mergeWork(
+  work: WorkBlock | undefined,
+  run: { activity?: RunActivityEntry[]; startedAt?: number | null },
+): boolean {
+  if (!work) return false;
+  let changed = false;
+  if (typeof run.startedAt === "number" && work.startedAt == null) {
+    work.startedAt = run.startedAt;
+    changed = true;
+  }
+  const activity = parseActivity(run.activity);
+  if (activity.length > work.activity.length) {
+    work.activity = activity;
+    changed = true;
+  }
+  if (work.status === "thinking" && (work.activity.length > 0 || work.startedAt != null)) {
+    work.status = "working";
+    changed = true;
+  }
+  return changed;
+}
+
+function applyRun(
+  stream: AssistantMessageEventStream,
+  partial: AssistantMessage,
+  st: Acc,
+  run: RunPoll,
+  notify?: () => void,
+): "open" | "terminal" {
+  const work = (partial as AssistantWork).work;
+  const beforeActivity = work?.activity.length ?? 0;
+  if (mergeWork(work, run)) {
+    if ((work?.activity.length ?? 0) > beforeActivity) st.lastProgressAt = now();
+    notify?.();
+  }
+  if (work && typeof run.attempt === "number" && work.attempt !== run.attempt) {
+    if (work.attempt !== undefined && work.reasoning?.length) work.reasoning = [];
+    work.attempt = run.attempt;
+  }
+  if (Array.isArray(run.reasoning) && run.reasoning.map((block) => mergeReasoning(work, block)).some(Boolean))
+    notify?.();
+  setWorkStale(work, run.stale === true, notify);
+  if (work && run.goal && JSON.stringify(run.goal) !== JSON.stringify(work.goal)) {
+    work.goal = run.goal;
+    notify?.();
+  }
+  if (work && run.runtime && JSON.stringify(run.runtime) !== JSON.stringify(work.runtime)) {
+    work.runtime = run.runtime;
+    notify?.();
+  }
+  const p = typeof run.partial === "string" ? run.partial : "";
+  const startOffset = run.partialStartOffset ?? 0;
+  if (p && startOffset + p.length >= st.startOffset + st.acc.length) {
+    if (startOffset + p.length > st.startOffset + st.acc.length) st.lastProgressAt = now();
+    if (startOffset !== st.startOffset) (partial as AssistantWork).streamingBaseline = "";
+    st.startOffset = startOffset;
+    if (work) work.streamStartOffset = startOffset;
+    pushDelta(stream, partial, st, p);
+  }
+  if (!runIsTerminal(run)) return "open";
+  const res = run.result;
+  const delivered = deliveredFilesFromAttachments(res?.attachments);
+  if (delivered.length) {
+    (partial as AssistantWork).deliveredFiles = delivered;
+    notify?.();
+  }
+  const approvals = res?.pendingApprovals ?? [];
+  const paused = approvals.length > 0;
+  const approvalDenied = res?.refusalKind === "approval_denied";
+  const quiet = res?.status === "silent" || res?.status === "react";
+  if (work) {
+    work.finishedAt = typeof run.finishedAt === "number" ? run.finishedAt : Date.now();
+    work.status =
+      !paused && !approvalDenied && !quiet && (run.status === "failed" || (res != null && res.status !== "ok"))
+        ? "failed"
+        : "complete";
+    if (paused) work.pendingApprovals = approvals;
+    notify?.();
+  }
+  if (res?.stopped) {
+    abortStream(stream, partial, res.reply);
+    return "terminal";
+  }
+  if (res?.reply) {
+    finish(stream, partial, st, res.reply);
+    return "terminal";
+  }
+  if (approvalDenied) {
+    (partial as AssistantWork & { approvalDecision?: "denied" }).approvalDecision = "denied";
+    finish(stream, partial, st, "Denied.");
+    return "terminal";
+  }
+  if (!paused && !quiet && (run.status === "failed" || (res && res.status !== "ok"))) {
+    fail(stream, partial, userFacingFailureText(res ?? { status: "failed" }));
+    return "terminal";
+  }
+  finish(stream, partial, st, st.acc);
+  return "terminal";
+}
+
+export async function pollRun(
+  stream: AssistantMessageEventStream,
+  partial: AssistantMessage,
+  runId: string,
+  st: Acc,
+  signal?: AbortSignal,
+  notify?: () => void,
+): Promise<void> {
+  const failIdle = (): void => {
+    (partial as AssistantWork).interruptedRunId = runId;
+    fail(stream, partial, "Timed out waiting for the agent to respond.");
+  };
+  let consecutiveFailures = 0;
+  for (;;) {
+    if (signal?.aborted) return abortStream(stream, partial);
+    let run: RunPoll;
+    try {
+      const timeout = AbortSignal.timeout(RUN_REQUEST_TIMEOUT_MS);
+      run = await api<RunPoll>(runPath(runId, ""), {
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
+      consecutiveFailures = 0;
+    } catch (e) {
+      if (signal?.aborted) return abortStream(stream, partial);
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500) return fail(stream, partial, e.message);
+      consecutiveFailures++;
+      if (now() - st.lastProgressAt > RUN_IDLE_MS) return failIdle();
+      await sleep(Math.min(POLL_MS * 2 ** Math.min(consecutiveFailures, 4), POLL_RETRY_MAX_MS));
+      continue;
+    }
+    if (applyRun(stream, partial, st, run, notify) === "terminal") return;
+    if (run.stale === true) st.staleSince ??= now();
+    else st.staleSince = undefined;
+    if (run.alive === true || (st.staleSince !== undefined && now() - st.staleSince < STALE_GRACE_MS))
+      st.lastProgressAt = now();
+    if (now() - st.lastProgressAt > RUN_IDLE_MS) return failIdle();
+    await sleep(POLL_MS);
+  }
+}
+
+export interface SessionStateEvent {
+  threadRef: string;
+  sessionId?: string;
+  state: "working" | "awaiting_approval" | "idle" | "metadata" | "ui";
+  at: number;
+  ui?: unknown;
+}
+
+export interface InboxItemEvent {
+  loopId: string;
+  itemId: string;
+  op: string;
+}
+
+export function subscribeDeliveries(
+  onThread: (threadRef: string) => void,
+  onSessionState?: (event: SessionStateEvent) => void,
+  onResync?: () => void,
+  onInboxItem?: (event: InboxItemEvent) => void,
+  onInboxResync?: () => void,
+): () => void {
+  if (typeof EventSource === "undefined") return () => {};
+  let everOpened = false;
+  let silence: ReturnType<typeof setTimeout> | undefined;
+  const watchSilence = (): void => {
+    clearTimeout(silence);
+    silence = setTimeout(() => {
+      es.close();
+      es = connect();
+    }, SSE_SILENCE_MS);
+  };
+  const connect = (): EventSource => {
+    const es = new EventSource(withBase("/api/deliveries/events"));
+    es.addEventListener("ping", watchSilence);
+    es.onopen = (): void => {
+      watchSilence();
+      if (everOpened) {
+        onResync?.();
+        onInboxResync?.();
+      }
+      everOpened = true;
+    };
+    es.addEventListener("session_state_resync", () => onResync?.());
+    es.addEventListener("inbox_resync", () => onInboxResync?.());
+    es.addEventListener("session_state", (e: MessageEvent) => {
+      try {
+        const ev = JSON.parse(e.data) as SessionStateEvent;
+        if (typeof ev.threadRef === "string" && ev.threadRef && typeof ev.state === "string") onSessionState?.(ev);
+      } catch (err) {
+        swallow("web-ui: handle session-state frame", err);
+      }
+    });
+    es.addEventListener("inbox_item", (e: MessageEvent) => {
+      try {
+        const ev = JSON.parse(e.data) as InboxItemEvent;
+        if (typeof ev.loopId === "string" && typeof ev.itemId === "string") onInboxItem?.(ev);
+      } catch (err) {
+        swallow("web-ui: handle inbox-item frame", err);
+      }
+    });
+    es.addEventListener("delivery", (e: MessageEvent) => {
+      try {
+        const d = JSON.parse(e.data) as { threadRef?: string };
+        if (typeof d.threadRef === "string" && d.threadRef) onThread(d.threadRef);
+      } catch (err) {
+        swallow("web-ui: handle delivery nudge", err);
+      }
+    });
+    return es;
+  };
+  let es = connect();
+  const suspend = (event: PageTransitionEvent): void => {
+    if (!event.persisted) return;
+    clearTimeout(silence);
+    es.close();
+  };
+  const resume = (event: PageTransitionEvent): void => {
+    if (event.persisted) es = connect();
+  };
+  window.addEventListener("pagehide", suspend);
+  window.addEventListener("pageshow", resume);
+  return () => {
+    window.removeEventListener("pagehide", suspend);
+    window.removeEventListener("pageshow", resume);
+    clearTimeout(silence);
+    es.close();
+  };
+}
+
+async function streamRunViaSse(
+  stream: AssistantMessageEventStream,
+  partial: AssistantMessage,
+  runId: string,
+  st: Acc,
+  signal?: AbortSignal,
+  notify?: () => void,
+): Promise<"done" | "fallback"> {
+  if (typeof window === "undefined") return "fallback";
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) controller.abort();
+  let timer = setTimeout(abort, SSE_OPEN_TIMEOUT_MS);
+  const received = (): void => {
+    clearTimeout(timer);
+    timer = setTimeout(abort, SSE_SILENCE_MS);
+  };
+  const transport = fetchServerSentEvents(withBase(runPath(runId, "/events")), {
+    credentials: "same-origin",
+  });
+  try {
+    for await (const event of transport.joinRun(runId, controller.signal)) {
+      received();
+      if (event.type !== "CUSTOM") continue;
+      if (event.name === "delta") {
+        const value = event.value as { offset?: unknown; delta?: unknown; startOffset?: number };
+        if (
+          typeof value.offset !== "number" ||
+          !Number.isSafeInteger(value.offset) ||
+          value.offset < 0 ||
+          typeof value.delta !== "string"
+        )
+          return "fallback";
+        if (value.offset > Math.max(st.startOffset + st.acc.length, value.startOffset ?? 0)) return "fallback";
+        applyStreamText(stream, partial, st, value.delta, value.offset, value.startOffset ?? 0);
+      } else if (event.name === "reasoning") {
+        const value = event.value as { step: string; index: number; offset: number; delta: string };
+        const work = (partial as AssistantWork).work;
+        if (mergeReasoning(work, { step: value.step, index: value.index, text: value.delta }, value.offset)) {
+          st.lastProgressAt = now();
+          notify?.();
+        }
+      } else if (event.name === "run") {
+        const run = event.value as RunPoll;
+        const terminal = run.status === "done" || run.status === "failed" || run.result != null;
+        if (applyRun(stream, partial, st, { ...run, replyComplete: terminal }, notify) === "terminal") return "done";
+        if (run.alive) st.lastProgressAt = now();
+      }
+    }
+    return "fallback";
+  } catch {
+    return "fallback";
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    controller.abort();
+  }
+}
+
+function fail(
+  stream: AssistantMessageEventStream,
+  partial: AssistantMessage,
+  errorMessage: string,
+  retryableSend = false,
+): void {
+  const block = partial.content[0];
+  const soFar = block?.type === "text" ? block.text : "";
+  const work = (partial as AssistantWork).work;
+  const text = work ? streamedAnswer(soFar, work) : soFar;
+  const error: AssistantMessage = {
+    ...partial,
+    content: [{ type: "text", text }],
+    stopReason: "error",
+    errorMessage,
+    ...(retryableSend ? { retryableSend: true } : {}),
+  };
+  stream.push({ type: "error", reason: "error", error });
+  stream.end(error);
+}
+
+function abortStream(stream: AssistantMessageEventStream, partial: AssistantMessage, reply?: string): void {
+  const work = (partial as AssistantWork).work;
+  if (work && work.status !== "complete") {
+    work.status = "failed";
+    work.finishedAt = Date.now();
+  }
+  const block = partial.content[0];
+  const soFar = block?.type === "text" ? block.text : "";
+  const error: AssistantMessage = {
+    ...partial,
+    content: [{ type: "text", text: reply ?? (work ? streamedAnswer(soFar, work) : soFar) }],
+    stopReason: "aborted",
+    errorMessage: "aborted",
+  };
+  stream.push({ type: "error", reason: "aborted", error });
+  stream.end(error);
+}
+
+function applyStreamText(
+  stream: AssistantMessageEventStream,
+  partial: AssistantMessage,
+  st: Acc,
+  text: string,
+  offset: number,
+  startOffset: number,
+): void {
+  const end = st.startOffset + st.acc.length;
+  if (offset + text.length < end || (offset + text.length === end && startOffset <= st.startOffset)) return;
+  const start = Math.max(st.startOffset ?? 0, startOffset);
+  const next = offset > end ? text : st.acc + text.slice(Math.max(0, end - offset));
+  const nextStart = offset > end ? offset : st.startOffset;
+  const work = (partial as AssistantWork).work;
+  if (work) work.streamStartOffset = start;
+  if (start !== st.startOffset) (partial as AssistantWork).streamingBaseline = "";
+  st.acc = offset > end ? "" : st.acc.slice(start - st.startOffset);
+  st.lastProgressAt = now();
+  pushDelta(stream, partial, st, next.slice(start - nextStart));
+  st.startOffset = start;
+}
+
+function pushDelta(stream: AssistantMessageEventStream, partial: AssistantMessage, st: Acc, next: string): void {
+  const delta = next.slice(st.acc.length);
+  const block = partial.content[0];
+  if (block?.type === "text") block.text = next;
+  st.acc = next;
+  stream.push({ type: "text_delta", contentIndex: 0, delta, partial });
+}
+
+function finish(stream: AssistantMessageEventStream, partial: AssistantMessage, st: Acc, reply: string): void {
+  const finalText = reply;
+  if (finalText.length > st.acc.length) pushDelta(stream, partial, st, finalText);
+  const block = partial.content[0];
+  if (block?.type === "text") block.text = finalText;
+  stream.push({ type: "text_end", contentIndex: 0, content: finalText, partial });
+  const message: AssistantMessage = { ...partial, content: [{ type: "text", text: finalText }], stopReason: "stop" };
+  stream.push({ type: "done", reason: "stop", message });
+  stream.end(message);
+}
+
+function deliveredFilesFromAttachments(
+  attachments: Array<{ name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string }> | undefined,
+): DeliveredFile[] {
+  return (attachments ?? [])
+    .filter((a) => typeof a?.name === "string" && a.name.trim())
+    .map((a) => ({
+      name: a.name!,
+      ...(a.mimetype ? { mimetype: a.mimetype } : {}),
+      ...(typeof a.sizeBytes === "number" ? { sizeBytes: a.sizeBytes } : {}),
+      ...(a.artifactId ? { artifactId: a.artifactId } : {}),
+    }));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+const ACTIVITY_KINDS = new Set<Item["kind"]>([
+  "SteeringMessage",
+  "ToolCall",
+  "ToolResult",
+  "Elicitation",
+  "ElicitationResponse",
+]);
+
+interface HistoryAttachment {
+  id: string;
+  type: "image" | "document";
+  fileName: string;
+  mimeType: string;
+  size?: number;
+  artifactId?: string;
+}
+
+interface HistoryUserMessage {
+  role: "user" | "user-with-attachments";
+  runId?: string;
+  entrySeq?: number;
+  content: string;
+  timestamp?: number;
+  attachments?: HistoryAttachment[];
+  steered?: boolean;
+  speaker?: string;
+  speakerId?: string;
+  overheard?: boolean;
+  ts?: string;
+  edited?: boolean;
+  deleted?: boolean;
+  subagentMail?: SubagentMailRef;
+}
+
+export interface SubagentMailRef {
+  sessionId: string;
+  title: string;
+  kind: string;
+}
+
+const SUBAGENT_MAIL_RE = /^<wake reason="subagent" name="([^"]*)" sessionId="([^"]*)" kind="([^"]*)"/;
+
+function xmlAttrUnescape(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function subagentMailOf(text: string | null): SubagentMailRef | undefined {
+  if (text === null) return undefined;
+  const m = SUBAGENT_MAIL_RE.exec(text);
+  if (!m) return undefined;
+  return { title: xmlAttrUnescape(m[1]!), sessionId: m[2]!, kind: m[3]! };
+}
+
+interface MessageRevisionNote {
+  role: "system-note";
+  note: "message_revision";
+  action: "edited" | "deleted";
+  ts: string;
+  content: string;
+  speaker?: string;
+  byAgent?: boolean;
+  timestamp?: number;
+}
+
+interface GoalCancelledNote {
+  role: "system-note";
+  note: "goal_cancelled";
+  content: string;
+  timestamp?: number;
+}
+
+interface TranscriptNotice {
+  role: "system-note";
+  note: "notice";
+  content: string;
+  timestamp?: number;
+}
+
+export type HistorySystemNote = MessageRevisionNote | GoalCancelledNote | TranscriptNotice;
+
+export interface HistoryApprovalDecision {
+  role: "approval-decision";
+  entrySeq?: number;
+  requestId?: string;
+  approved: boolean;
+  command: string;
+  scope?: string;
+  declined?: string;
+  timestamp: number;
+}
+
+function approvalDecisionMessage(item: Item): HistoryApprovalDecision | null {
+  if (item.kind !== "ElicitationResponse") return null;
+  const { command, scope, declined } = item.body;
+  if (typeof item.approved !== "boolean" || typeof command !== "string") return null;
+  return {
+    role: "approval-decision",
+    entrySeq: item.seq,
+    approved: item.approved,
+    command,
+    requestId: item.elicitId,
+    ...(typeof scope === "string" ? { scope } : {}),
+    ...(typeof declined === "string" ? { declined } : {}),
+    timestamp: item.createdAt,
+  };
+}
+
+export function messagesWithStreaming(messages: AgentMessage[], streaming?: AgentMessage | null): AgentMessage[] {
+  const source = streaming ? [...messages, streaming] : messages;
+  const out: AgentMessage[] = [];
+  const recorded = source.filter(
+    (message) => (message as { role: string }).role === "approval-decision",
+  ) as unknown as HistoryApprovalDecision[];
+  for (const message of source) {
+    for (const item of activityItems((message as AssistantWork).work?.activity ?? [])) {
+      const decision = approvalDecisionMessage(item);
+      if (!decision) continue;
+      const exists = recorded.some((existing) =>
+        decision.requestId
+          ? existing.requestId === decision.requestId && existing.timestamp === decision.timestamp
+          : existing.timestamp === decision.timestamp &&
+            existing.command === decision.command &&
+            existing.approved === decision.approved,
+      );
+      if (!exists) {
+        out.push(decision as unknown as AgentMessage);
+        recorded.push(decision);
+      }
+    }
+    out.push(message);
+  }
+  return out.map((message) => {
+    const assistant = message as AssistantWork;
+    const work = assistant.work;
+    if (!work?.pendingApprovals?.length) return message;
+    const requestedAt = work.activity.length ? Math.max(...work.activity.map(activityCreatedAt)) : assistant.timestamp;
+    const pendingApprovals = work.pendingApprovals.filter(
+      (approval) =>
+        !recorded.some((decision) => decision.requestId === approval.requestId && decision.timestamp >= requestedAt),
+    );
+    if (pendingApprovals.length === work.pendingApprovals.length) return message;
+    return { ...assistant, work: { ...work, pendingApprovals } };
+  });
+}
+
+function goalCancelledNote(item: Item): GoalCancelledNote | null {
+  if (item.kind !== "Wake" || item.body.kind !== "goal_cancelled" || typeof item.body.objective !== "string")
+    return null;
+  return { role: "system-note", note: "goal_cancelled", content: item.body.objective };
+}
+
+function messageRevisionNote(item: Item): MessageRevisionNote | null {
+  if (item.kind !== "Retraction") return null;
+  const { action, ts, text, name, sourceRole } = item.body;
+  if (action !== "edited" && action !== "deleted") return null;
+  if (typeof ts !== "string" || !ts) return null;
+  const byAgent = sourceRole === "agent";
+  return {
+    role: "system-note",
+    note: "message_revision",
+    action,
+    ts,
+    content: typeof text === "string" ? text : "",
+    ...(byAgent ? { byAgent } : {}),
+    ...(!byAgent && typeof name === "string" && name.trim() ? { speaker: name.trim() } : {}),
+  };
+}
+
+function isAgentEcho(item: Item): boolean {
+  return item.body.overheard === true && item.body.sourceRole === "agent";
+}
+
+function userItemText(item: Item): string | null {
+  const display = item.body.display;
+  if (typeof display === "string" && display.trim()) return display;
+  return item.text?.trim() ? item.text : null;
+}
+
+type UserAttachment = { name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string };
+
+export function userItemMessage(item: Item): HistoryUserMessage | null {
+  if (isHidden(item) || isAgentEcho(item)) return null;
+  const text = userItemText(item) ?? "";
+  const attachments = Array.isArray(item.body.attachments) ? (item.body.attachments as UserAttachment[]) : [];
+  if (!text && !attachments.length) return null;
+  const mail = subagentMailOf(item.text);
+  const { name, speakerId } = item.body;
+  const ts = messageTs(item);
+  return {
+    role: "user",
+    ...(item.turnId !== null ? { runId: item.turnId } : {}),
+    entrySeq: item.seq,
+    content: text,
+    timestamp: item.createdAt,
+    ...(mail ? { subagentMail: mail } : {}),
+    ...(item.kind === "SteeringMessage" ? { steered: true } : {}),
+    ...(typeof speakerId === "string" && speakerId ? { speakerId } : {}),
+    ...(item.body.overheard === true ? { overheard: true } : {}),
+    ...(typeof name === "string" && name.trim() ? { speaker: name.trim() } : {}),
+    ...(ts ? { ts } : {}),
+    ...(attachments.length
+      ? {
+          attachments: attachments.map((a, i) => ({
+            id: a.artifactId ?? `${item.seq}:${i}`,
+            type: a.mimetype?.startsWith("image/") ? ("image" as const) : ("document" as const),
+            fileName: a.name ?? "file",
+            mimeType: a.mimetype ?? "application/octet-stream",
+            ...(typeof a.sizeBytes === "number" ? { size: a.sizeBytes } : {}),
+            ...(a.artifactId ? { artifactId: a.artifactId } : {}),
+          })),
+        }
+      : {}),
+  };
+}
+
+export function appendConsumedSteers(messages: AgentMessage[], work: WorkBlock): void {
+  const recorded = new Set(messages.map((message) => (message as { entrySeq?: number }).entrySeq));
+  for (const item of activityItems(work.activity)) {
+    if (item.kind !== "SteeringMessage" || recorded.has(item.seq)) continue;
+    const message = userItemMessage(item);
+    if (!message) continue;
+    messages.push(message as AgentMessage);
+    recorded.add(item.seq);
+  }
+}
+
+const SILENCE_TOOLS = new Set(["finish_silently", "stay_silent"]);
+
+function deliveredSilence(item: Item): boolean {
+  if (item.kind !== "ToolResult") return false;
+  return (
+    (item.tool === "finish_silently" && item.body.silent === true) ||
+    (item.tool === "stay_silent" && item.body.ok === true)
+  );
+}
+
+function isFinishedReplyItem(item: Item): boolean {
+  return (
+    isNarration(item) &&
+    !retractedReason(item) &&
+    stepMessage(item)?.stopReason === "stop" &&
+    Boolean(item.text?.trim())
+  );
+}
+
+function isWorkHistoryItem(item: Item): boolean {
+  if (item.kind === "Reasoning") return isRenderableThinking(item);
+  return item.kind === "ToolCall" || item.kind === "ToolResult" || item.kind === "Elicitation" || isNarration(item);
+}
+
+export function messageText(message: AgentMessage): string {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c): c is TextContent => Boolean(c) && typeof c === "object" && (c as { type?: string }).type === "text")
+      .map((c) => c.text ?? "")
+      .join("\n");
+  }
+  return "";
+}
+
+export function itemsToMessages(items: Item[], model?: Model<Api>): AgentMessage[] {
+  const out: AgentMessage[] = [];
+  const userByTs = new Map<string, HistoryUserMessage>();
+  let pending: Item[] = [];
+  let deliveryFiles: DeliveredFile[] = [];
+  let posted = false;
+  let stoppedShown = false;
+  let hiddenPrompt = false;
+  const heldPosts = new Map<string, { text: string; item: Item }>();
+  const spillHeldPosts = (): void => {
+    for (const held of heldPosts.values()) pending.push(held.item);
+    heldPosts.clear();
+  };
+  const appendDeliveryFiles = (files: DeliveredFile[]): void => {
+    if (!files.length) return;
+    const last = out[out.length - 1] as (AssistantWork & { role?: string }) | undefined;
+    if (last?.role === "assistant") {
+      last.deliveredFiles = [...(last.deliveredFiles ?? []), ...files];
+      return;
+    }
+    deliveryFiles.push(...files);
+  };
+  const appendPostFiles = (result: Item): void => {
+    deliveryFiles.push(...deliveredFilesFromAttachments(result.body.files as UserAttachment[] | undefined));
+  };
+
+  const appendAttachedFiles = (result: Item): void => {
+    const before = deliveryFiles.length;
+    appendPostFiles(result);
+    const restaged = new Set(deliveryFiles.slice(before).map((f) => f.name));
+    if (restaged.size)
+      deliveryFiles = [
+        ...deliveryFiles.slice(0, before).filter((f) => !restaged.has(f.name)),
+        ...deliveryFiles.slice(before),
+      ];
+  };
+  const flushWork = (
+    text: string,
+    at?: number,
+    closed = false,
+    timing?: { startedAt?: number; finishedAt?: number },
+    stopped = false,
+    entrySeqs: number[] = [],
+  ): void => {
+    if (!text && !pending.length && !deliveryFiles.length && !stopped) return;
+    if (stopped) stoppedShown = true;
+    if (hiddenPrompt && !text && !stopped && pending.some(deliveredSilence)) {
+      pending = pending.filter((item) => !SILENCE_TOOLS.has(item.tool ?? ""));
+      if (!pending.some((item) => item.kind === "ToolCall") && !deliveryFiles.length) {
+        pending = [];
+        return;
+      }
+    }
+    entrySeqs = [...entrySeqs, ...pending.map((item) => item.seq)];
+    const lastText = pending.findLastIndex((item) => isNarration(item) && !retractedReason(item));
+    if (lastText >= 0) {
+      const segment = (pending[lastText]!.text ?? "").trim();
+      if (text) {
+        if (segment === text.trim() && pending[lastText]!.body.phase !== "commentary") pending.splice(lastText, 1);
+      } else if (closed && !stopped && segment && !pending.some(deliveredSilence)) {
+        text = segment;
+        pending.splice(lastText, 1);
+      }
+    }
+    const msg: AssistantWork = {
+      persisted: true,
+      ...(entrySeqs.length ? { entrySeqs } : {}),
+      role: "assistant",
+      content: [{ type: "text", text }],
+      api: model?.api ?? "unknown",
+      provider: model?.provider ?? "unknown",
+      model: model?.id ?? "unknown",
+      usage: zeroUsage(),
+      stopReason: stopped ? "aborted" : "stop",
+      timestamp: at ?? pending[pending.length - 1]?.createdAt,
+    };
+    if (pending.length || (stopped && timing?.startedAt !== undefined)) {
+      const boundary = pending.findLast((item) => typeof item.body.workStartedAt === "number")?.body.workStartedAt as
+        number | undefined;
+      msg.work = {
+        status: "complete",
+        startedAt: timing?.startedAt ?? boundary ?? pending[0]?.createdAt,
+        finishedAt: timing?.finishedAt ?? at ?? pending[pending.length - 1]?.createdAt,
+        activity: pending.map((item) => ({ item })),
+      };
+    }
+    if (deliveryFiles.length) msg.deliveredFiles = deliveryFiles;
+    out.push(msg as AgentMessage);
+    pending = [];
+    deliveryFiles = [];
+  };
+  let turn = { id: null as string | null, start: 0 };
+  for (const e of items) {
+    if (e.turnId !== turn.id) turn = { id: e.turnId, start: out.length };
+    const text = e.text ?? "";
+    if (e.kind === "ElicitationResponse") {
+      const decision = approvalDecisionMessage(e);
+      if (decision) {
+        spillHeldPosts();
+        flushWork("", e.createdAt);
+        out.push(decision as unknown as AgentMessage);
+      }
+      continue;
+    }
+    if (isFinishedReplyItem(e)) {
+      spillHeldPosts();
+      flushWork(text, e.createdAt, true, undefined, false, [e.seq]);
+      const prodded = proddedReason(e);
+      const flushed = out.at(-1) as AssistantWork | undefined;
+      if (prodded && flushed?.role === "assistant") flushed.continuing = prodded;
+      posted = false;
+      continue;
+    }
+    if (isWorkHistoryItem(e)) {
+      if (e.kind === "ToolCall") {
+        const postText = postCallText(e);
+        if (postText !== null && e.callId) {
+          heldPosts.set(e.callId, { text: postText, item: e });
+          continue;
+        }
+      }
+      if (e.kind === "ToolResult" && e.callId && heldPosts.has(e.callId)) {
+        const held = heldPosts.get(e.callId)!;
+        heldPosts.delete(e.callId);
+        if (postResultOk(e)) {
+          appendPostFiles(e);
+          flushWork(held.text, e.createdAt, false, undefined, false, [held.item.seq, e.seq]);
+          posted = true;
+        } else {
+          pending.push(held.item, e);
+        }
+        continue;
+      }
+      if (e.kind === "ToolResult" && e.tool === "attach" && postResultOk(e)) appendAttachedFiles(e);
+      pending.push(e);
+      continue;
+    }
+    if (isUserMessage(e)) {
+      if (isAgentEcho(e)) {
+        posted = false;
+        spillHeldPosts();
+        flushWork("", e.createdAt);
+        continue;
+      }
+      const steered = e.kind === "SteeringMessage";
+      if (!steered) {
+        stoppedShown = false;
+        hiddenPrompt = isHidden(e);
+      }
+      if (isHidden(e)) continue;
+      if (!steered) {
+        posted = false;
+        spillHeldPosts();
+        flushWork("", e.createdAt);
+      }
+      const msg = userItemMessage(e);
+      if (msg) {
+        if (msg.ts) userByTs.set(msg.ts, msg);
+        if (steered) pending.push(e);
+        out.push(msg as AgentMessage);
+      }
+    } else if (e.kind === "AgentMessage" && e.variant === null) {
+      const { workStartedAt, workFinishedAt } = e.body;
+      const timing = {
+        ...(typeof workStartedAt === "number" ? { startedAt: workStartedAt } : {}),
+        ...(typeof workFinishedAt === "number" ? { finishedAt: workFinishedAt } : {}),
+      };
+      const stopped = e.body.stopped === true;
+      if (typeof e.body.via === "string" && text.trim()) {
+        spillHeldPosts();
+        flushWork("", e.createdAt);
+        flushWork(text, e.createdAt, true, timing, stopped, [e.seq]);
+        const delivered = out.at(-1) as AssistantWork;
+        delivered.via = e.body.via;
+        if (typeof e.body.sourceTitle === "string") delivered.viaTitle = e.body.sourceTitle;
+        if (typeof e.body.sourceId === "string" && e.body.sourceId) delivered.viaId = e.body.sourceId;
+      } else if (text || pending.length || heldPosts.size || stopped) {
+        spillHeldPosts();
+        if (posted && text) {
+          pending.push({ ...e, variant: "narration", body: { demoted: true } });
+          flushWork("", e.createdAt, false, timing, stopped, [e.seq]);
+        } else {
+          flushWork(text, e.createdAt, !posted, timing, stopped, [e.seq]);
+        }
+      }
+      tagPersona(e, out.slice(turn.start));
+      posted = false;
+    } else if (e.kind === "AgentMessage" && e.variant === "files_delivered") {
+      appendDeliveryFiles(deliveredFilesFromAttachments(e.body.files as UserAttachment[] | undefined));
+    } else if (e.kind === "Stop") {
+      spillHeldPosts();
+      if (pending.length || !stoppedShown) flushWork("", e.createdAt, !posted, undefined, true, [e.seq]);
+      posted = false;
+    } else if (goalCancelledNote(e)) {
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      out.push({ ...goalCancelledNote(e)!, timestamp: e.createdAt } as unknown as AgentMessage);
+    } else if (messageRevisionNote(e)) {
+      const revision = messageRevisionNote(e)!;
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      const original = userByTs.get(revision.ts);
+      if (original) {
+        if (revision.action === "deleted") original.deleted = true;
+        else original.edited = true;
+      }
+      out.push({ ...revision, timestamp: e.createdAt } as unknown as AgentMessage);
+    } else if (e.kind === "Error" && e.text && e.errorCode === "steer_withheld") {
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      out.push({
+        role: "system-note",
+        note: "notice",
+        content: e.text,
+        timestamp: e.createdAt,
+      } as unknown as AgentMessage);
+    } else if (e.kind === "Error" && e.text) {
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      const msg: AssistantMessage = {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        api: model?.api ?? "unknown",
+        provider: model?.provider ?? "unknown",
+        model: model?.id ?? "unknown",
+        usage: zeroUsage(),
+        stopReason: "error",
+        errorMessage: e.text,
+        timestamp: e.createdAt,
+      };
+      out.push(msg as AgentMessage);
+    }
+  }
+  spillHeldPosts();
+  flushWork("");
+  return out;
+}
+
+export function attachPendingApprovals(
+  messages: AgentMessage[],
+  approvals: PendingApproval[],
+  model?: Model<Api>,
+): void {
+  approvals = unresolvedApprovals(approvals);
+  if (!approvals.length) return;
+
+  const turnForCommand = (command: string): AssistantWork | undefined => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i] as AssistantWork;
+      if (m.role !== "assistant" || !m.work) continue;
+      if (activityItems(m.work.activity).some((item) => item.kind === "ToolCall" && item.body.command === command))
+        return m;
+    }
+    return undefined;
+  };
+
+  let trailing: AssistantWork | undefined;
+  const trailingTurn = (): AssistantWork => {
+    if (trailing) return trailing;
+    const tail = messages[messages.length - 1] as AssistantWork | undefined;
+    if (tail && tail.role === "assistant") return (trailing = tail);
+    trailing = {
+      role: "assistant",
+      content: [{ type: "text", text: "" }],
+      api: model?.api ?? "unknown",
+      provider: model?.provider ?? "unknown",
+      model: model?.id ?? "unknown",
+      usage: zeroUsage(),
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+    messages.push(trailing as AgentMessage);
+    return trailing;
+  };
+
+  for (const approval of approvals) {
+    const target = turnForCommand(approval.command) ?? trailingTurn();
+    if (!target.work) target.work = { status: "complete", activity: [] };
+    (target.work.pendingApprovals ??= []).push(approval);
+  }
+}
+
+function latestUserMessage(agent: Agent): WebUserMessage | undefined {
+  const messages = agent.state.messages as WebUserMessage[];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role === "user" || message?.role === "user-with-attachments") return message as WebUserMessage;
+  }
+  return undefined;
+}

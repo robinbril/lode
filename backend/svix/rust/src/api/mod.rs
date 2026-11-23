@@ -1,0 +1,178 @@
+// this file is @generated
+#![warn(unreachable_pub)]
+
+pub(crate) mod client;
+
+pub use self::client::{Svix, SvixOptions};
+
+mod application;
+mod authentication;
+mod autoconfig_subscription;
+mod background_task;
+mod connector;
+mod destination;
+mod destination_transformation;
+mod endpoint;
+mod endpoint_mcp_events;
+mod endpoint_transformation;
+mod environment;
+mod event_type;
+mod health;
+mod ingest;
+mod ingest_authentication;
+mod ingest_endpoint;
+mod ingest_endpoint_transformation;
+mod ingest_source;
+mod integration;
+mod message;
+mod message_attempt;
+mod message_poller;
+mod operational_webhook;
+mod operational_webhook_endpoint;
+mod statistics;
+mod streaming;
+mod streaming_event_type;
+mod streaming_events;
+mod streaming_sink;
+mod streaming_sink_transformation;
+mod streaming_stream;
+
+#[cfg(feature = "svix_beta")]
+pub use self::message::{V1MessageEventsParams, V1MessageEventsSubscriptionParams};
+pub use self::{
+    application::{Application, ApplicationCreateOptions, ApplicationListOptions},
+    authentication::{
+        Authentication, AuthenticationAppPortalAccessOptions, AuthenticationExpireAllOptions,
+        AuthenticationLogoutOptions, AuthenticationRotateStreamPollerTokenOptions,
+        AuthenticationStreamExpireAllOptions, AuthenticationStreamLogoutOptions,
+        AuthenticationStreamPortalAccessOptions,
+    },
+    autoconfig_subscription::{
+        AutoconfigSubscription, AutoconfigSubscriptionCreateOptions,
+        AutoconfigSubscriptionRotateOptions,
+    },
+    background_task::{BackgroundTask, BackgroundTaskListOptions},
+    connector::{Connector, ConnectorCreateOptions, ConnectorListOptions},
+    destination::{
+        Destination, DestinationCreateOptions, DestinationListOptions,
+        DestinationRotateSecretOptions,
+    },
+    destination_transformation::DestinationTransformation,
+    endpoint::{
+        Endpoint, EndpointBulkReplayOptions, EndpointCreateOptions, EndpointGetAttemptStatsOptions,
+        EndpointGetStatsOptions, EndpointListOptions, EndpointRecoverOptions,
+        EndpointReplayMissingOptions, EndpointRotateSecretOptions, EndpointSendExampleOptions,
+    },
+    endpoint_mcp_events::{
+        EndpointMcpEvents, EndpointMcpEventsSubscribeOptions, EndpointMcpEventsUnsubscribeOptions,
+    },
+    endpoint_transformation::EndpointTransformation,
+    environment::{Environment, EnvironmentExportOptions, EnvironmentImportOptions},
+    event_type::{
+        EventType, EventTypeCreateOptions, EventTypeDeleteOptions, EventTypeImportOpenapiOptions,
+        EventTypeListOptions,
+    },
+    health::Health,
+    ingest::Ingest,
+    ingest_authentication::{
+        IngestAuthentication, IngestAuthenticationConsumerPortalAccessOptions,
+    },
+    ingest_endpoint::{
+        IngestEndpoint, IngestEndpointCreateOptions, IngestEndpointListOptions,
+        IngestEndpointRotateSecretOptions,
+    },
+    ingest_endpoint_transformation::IngestEndpointTransformation,
+    ingest_source::{
+        IngestSource, IngestSourceCreateOptions, IngestSourceListOptions,
+        IngestSourceRotateTokenOptions,
+    },
+    integration::{
+        Integration, IntegrationCreateOptions, IntegrationListOptions, IntegrationRotateKeyOptions,
+    },
+    message::{
+        Message, MessageBulkExpungeContentOptions, MessageCreateBatchOptions, MessageCreateOptions,
+        MessageExpungeAllContentsOptions, MessageGetOptions, MessageListOptions,
+        MessagePrecheckOptions,
+    },
+    message_attempt::{
+        MessageAttempt, MessageAttemptGetOptions, MessageAttemptListAttemptedDestinationsOptions,
+        MessageAttemptListAttemptedMessagesOptions, MessageAttemptListByEndpointOptions,
+        MessageAttemptListByMsgOptions, MessageAttemptResendOptions,
+    },
+    message_poller::{
+        MessagePoller, MessagePollerConsumerPollOptions, MessagePollerConsumerSeekOptions,
+        MessagePollerPollOptions,
+    },
+    operational_webhook::OperationalWebhook,
+    operational_webhook_endpoint::{
+        OperationalWebhookEndpoint, OperationalWebhookEndpointCreateOptions,
+        OperationalWebhookEndpointListOptions, OperationalWebhookEndpointRotateSecretOptions,
+    },
+    statistics::{Statistics, StatisticsAggregateAppStatsOptions},
+    streaming::Streaming,
+    streaming_event_type::{
+        StreamingEventType, StreamingEventTypeCreateOptions, StreamingEventTypeDeleteOptions,
+        StreamingEventTypeListOptions,
+    },
+    streaming_events::{StreamingEvents, StreamingEventsCreateOptions, StreamingEventsGetOptions},
+    streaming_sink::{
+        StreamingSink, StreamingSinkCreateOptions, StreamingSinkListOptions,
+        StreamingSinkRotateSecretOptions,
+    },
+    streaming_sink_transformation::StreamingSinkTransformation,
+    streaming_stream::{StreamingStream, StreamingStreamCreateOptions, StreamingStreamListOptions},
+};
+
+impl Svix {
+    pub fn application(&self) -> Application<'_> {
+        Application::new(&self.cfg)
+    }
+    pub fn authentication(&self) -> Authentication<'_> {
+        Authentication::new(&self.cfg)
+    }
+    pub fn autoconfig_subscription(&self) -> AutoconfigSubscription<'_> {
+        AutoconfigSubscription::new(&self.cfg)
+    }
+    pub fn background_task(&self) -> BackgroundTask<'_> {
+        BackgroundTask::new(&self.cfg)
+    }
+    pub fn connector(&self) -> Connector<'_> {
+        Connector::new(&self.cfg)
+    }
+    pub fn destination(&self) -> Destination<'_> {
+        Destination::new(&self.cfg)
+    }
+    pub fn endpoint(&self) -> Endpoint<'_> {
+        Endpoint::new(&self.cfg)
+    }
+    pub fn environment(&self) -> Environment<'_> {
+        Environment::new(&self.cfg)
+    }
+    pub fn event_type(&self) -> EventType<'_> {
+        EventType::new(&self.cfg)
+    }
+    pub fn health(&self) -> Health<'_> {
+        Health::new(&self.cfg)
+    }
+    pub fn ingest(&self) -> Ingest<'_> {
+        Ingest::new(&self.cfg)
+    }
+    pub fn integration(&self) -> Integration<'_> {
+        Integration::new(&self.cfg)
+    }
+    pub fn message(&self) -> Message<'_> {
+        Message::new(&self.cfg)
+    }
+    pub fn message_attempt(&self) -> MessageAttempt<'_> {
+        MessageAttempt::new(&self.cfg)
+    }
+    pub fn operational_webhook(&self) -> OperationalWebhook<'_> {
+        OperationalWebhook::new(&self.cfg)
+    }
+    pub fn statistics(&self) -> Statistics<'_> {
+        Statistics::new(&self.cfg)
+    }
+    pub fn streaming(&self) -> Streaming<'_> {
+        Streaming::new(&self.cfg)
+    }
+}

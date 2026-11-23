@@ -1,0 +1,766 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+from collections.abc import AsyncIterator
+from typing import Literal
+
+import pytest
+
+from assistant_stream.resumable import (
+    CancellationSignal,
+    ResumableStreamEntry,
+    ResumableStreamError,
+    ResumableStreamRole,
+    ResumableStreamStatus,
+    ResumableStreamStore,
+    create_in_memory_resumable_stream_store,
+    create_resumable_stream_context,
+)
+
+
+class LegacyResumableStreamStore:
+    def __init__(self, store: ResumableStreamStore) -> None:
+        self.store = store
+        self.acquired: list[str] = []
+
+    async def acquire(
+        self, stream_id: str, *, ttl_ms: int | None = None
+    ) -> ResumableStreamRole:
+        self.acquired.append(stream_id)
+        return await self.store.acquire(stream_id, ttl_ms=ttl_ms)
+
+    async def append(self, stream_id: str, chunk: bytes) -> None:
+        await self.store.append(stream_id, chunk)
+
+    async def finalize(
+        self,
+        stream_id: str,
+        status: Literal["done", "error"],
+        error: str | None = None,
+    ) -> None:
+        await self.store.finalize(stream_id, status, error)
+
+    def read(
+        self, stream_id: str, cursor: str, signal: CancellationSignal
+    ) -> AsyncIterator[ResumableStreamEntry]:
+        return self.store.read(stream_id, cursor, signal)
+
+    async def status(self, stream_id: str) -> ResumableStreamStatus:
+        return await self.store.status(stream_id)
+
+    async def delete(self, stream_id: str) -> None:
+        await self.store.delete(stream_id)
+
+
+def _bytes(s: str) -> bytes:
+    return s.encode("utf-8")
+
+
+async def _collect(stream: AsyncIterator[bytes]) -> str:
+    out = bytearray()
+    async for chunk in stream:
+        out.extend(chunk)
+    return out.decode("utf-8")
+
+
+def _make_string_stream(parts: list[str]) -> AsyncIterator[bytes]:
+    async def gen() -> AsyncIterator[bytes]:
+        for part in parts:
+            yield _bytes(part)
+            await asyncio.sleep(0)
+
+    return gen()
+
+
+@pytest.mark.anyio
+async def test_producer_receives_full_byte_stream() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["hello ", "world"]))
+    assert await _collect(stream) == "hello world"
+
+
+@pytest.mark.anyio
+async def test_second_caller_is_consumer_with_identical_bytes() -> None:
+    store = create_in_memory_resumable_stream_store()
+    ctx = create_resumable_stream_context(store=store)
+    make_stream_calls = 0
+
+    def make_producer() -> AsyncIterator[bytes]:
+        nonlocal make_stream_calls
+        make_stream_calls += 1
+        return _make_string_stream(["one ", "two ", "three"])
+
+    def make_unused() -> AsyncIterator[bytes]:
+        nonlocal make_stream_calls
+        make_stream_calls += 1
+        return _make_string_stream(["should-not-run"])
+
+    producer_stream = await ctx.run("a", make_producer)
+    consumer_stream = await ctx.run("a", make_unused)
+
+    a, b = await asyncio.gather(
+        _collect(producer_stream), _collect(consumer_stream)
+    )
+    assert a == "one two three"
+    assert b == "one two three"
+    assert make_stream_calls == 1
+
+
+@pytest.mark.anyio
+async def test_late_consumer_after_done_replays_via_resume() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+    producer = await ctx.run(
+        "a", lambda: _make_string_stream(["alpha", "beta", "gamma"])
+    )
+    assert await _collect(producer) == "alphabetagamma"
+
+    replay = await ctx.resume("a")
+    assert replay is not None
+    assert await _collect(replay) == "alphabetagamma"
+
+
+@pytest.mark.anyio
+async def test_resume_returns_none_for_missing() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+    assert await ctx.resume("nope") is None
+
+
+@pytest.mark.anyio
+async def test_require_resume_raises_missing() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+    with pytest.raises(ResumableStreamError) as exc:
+        await ctx.require_resume("nope")
+    assert exc.value.code == "missing"
+
+
+@pytest.mark.anyio
+async def test_require_resume_returns_replay_when_exists() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+    producer = await ctx.run("a", lambda: _make_string_stream(["hi"]))
+    assert await _collect(producer) == "hi"
+
+    replay = await ctx.require_resume("a")
+    assert await _collect(replay) == "hi"
+
+
+@pytest.mark.anyio
+async def test_status_tracks_lifecycle() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+    assert await ctx.status("a") == "missing"
+    stream = await ctx.run("a", lambda: _make_string_stream(["x"]))
+    await _collect(stream)
+    assert await ctx.status("a") == "done"
+
+
+@pytest.mark.anyio
+async def test_delete_removes_stream_state() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["x"]))
+    await _collect(stream)
+    assert await ctx.status("a") == "done"
+    await ctx.delete("a")
+    assert await ctx.status("a") == "missing"
+
+
+@pytest.mark.anyio
+async def test_producer_keeps_writing_after_consumer_closes_early() -> None:
+    store = create_in_memory_resumable_stream_store()
+    ctx = create_resumable_stream_context(store=store)
+
+    producer_emitted = 0
+
+    async def slow_stream() -> AsyncIterator[bytes]:
+        nonlocal producer_emitted
+        for i in range(5):
+            await asyncio.sleep(0.01)
+            yield _bytes(f"chunk{i};")
+            producer_emitted += 1
+
+    stream = await ctx.run("a", lambda: slow_stream())
+    first = await anext(stream)
+    assert first == _bytes("chunk0;")
+    await stream.aclose()
+
+    while producer_emitted < 5:
+        await asyncio.sleep(0.01)
+    while await ctx.status("a") == "streaming":
+        await asyncio.sleep(0.01)
+
+    replay = await ctx.resume("a")
+    assert replay is not None
+    assert await _collect(replay) == "chunk0;chunk1;chunk2;chunk3;chunk4;"
+
+
+@pytest.mark.anyio
+async def test_runs_a_producer_through_acquire_when_acquire_lease_is_absent() -> None:
+    store = LegacyResumableStreamStore(create_in_memory_resumable_stream_store())
+    finalizes: list[tuple[str, str, str | None]] = []
+    ctx = create_resumable_stream_context(
+        store=store,
+        on_finalize=lambda stream_id, status, error: finalizes.append(
+            (stream_id, status, error)
+        ),
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["leg", "acy"]))
+    assert await asyncio.wait_for(_collect(stream), timeout=1) == "legacy"
+    assert await ctx.status("a") == "done"
+    assert store.acquired == ["a"]
+    assert finalizes == [("a", "done", None)]
+
+
+async def _run_fenced_stale_producer(
+    ending: Literal["chunk", "done", "error", "cancelled"],
+) -> tuple[list[object], list[tuple[str, str, str | None]], ResumableStreamStatus]:
+    now = [1_000.0]
+    stale_release = asyncio.Event()
+    fresh_release = asyncio.Event()
+    producer_tasks: list[asyncio.Task[None]] = []
+    errors: list[object] = []
+    finalizes: list[tuple[str, str, str | None]] = []
+
+    def clock() -> float:
+        return now[0]
+
+    async def stale() -> AsyncIterator[bytes]:
+        yield _bytes("old")
+        await stale_release.wait()
+        if ending == "chunk":
+            yield _bytes("late")
+        elif ending == "error":
+            raise RuntimeError("boom")
+        elif ending == "cancelled":
+            raise asyncio.CancelledError("producer stopped")
+
+    async def fresh() -> AsyncIterator[bytes]:
+        yield _bytes("new")
+        await fresh_release.wait()
+        yield _bytes("tail")
+
+    store = create_in_memory_resumable_stream_store(
+        default_ttl_ms=100,
+        now=clock,
+    )
+    ctx = create_resumable_stream_context(
+        store=store,
+        wait_until=producer_tasks.append,
+        on_error=lambda _id, error: errors.append(error),
+        on_finalize=lambda stream_id, status, error: finalizes.append(
+            (stream_id, status, error)
+        ),
+    )
+
+    stale_reader = await ctx.run("a", lambda: stale())
+    assert await asyncio.wait_for(anext(stale_reader), timeout=1) == _bytes("old")
+    await asyncio.wait_for(stale_reader.aclose(), timeout=1)
+
+    now[0] += 101
+    fresh_reader = await ctx.run("a", lambda: fresh())
+    assert await asyncio.wait_for(anext(fresh_reader), timeout=1) == _bytes("new")
+
+    stale_release.set()
+    if ending == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(producer_tasks[0], timeout=1)
+    else:
+        await asyncio.wait_for(producer_tasks[0], timeout=1)
+    status = await ctx.status("a")
+    stale_finalizes = finalizes.copy()
+
+    fresh_release.set()
+    assert await asyncio.wait_for(_collect(fresh_reader), timeout=1) == "tail"
+    await asyncio.wait_for(producer_tasks[1], timeout=1)
+    return errors, stale_finalizes, status
+
+
+@pytest.mark.anyio
+async def test_stale_chunk_reports_store_supersession_without_finalizing() -> None:
+    errors, finalizes, status = await _run_fenced_stale_producer("chunk")
+    assert status == "streaming"
+    assert finalizes == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], ResumableStreamError)
+    assert errors[0].code == "missing"
+    assert str(errors[0]) == "Stream superseded by a new acquisition: a"
+
+
+@pytest.mark.anyio
+async def test_stale_completion_reports_lost_ownership_without_finalizing() -> None:
+    errors, finalizes, status = await _run_fenced_stale_producer("done")
+    assert status == "streaming"
+    assert finalizes == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], ResumableStreamError)
+    assert errors[0].code == "missing"
+    assert str(errors[0]) == "Stream no longer owned by this producer: a"
+
+
+@pytest.mark.anyio
+async def test_stale_error_does_not_finalize_reacquired_stream() -> None:
+    errors, finalizes, status = await _run_fenced_stale_producer("error")
+    assert status == "streaming"
+    assert finalizes == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert str(errors[0]) == "boom"
+
+
+@pytest.mark.anyio
+async def test_stale_cancellation_does_not_finalize_reacquired_stream() -> None:
+    errors, finalizes, status = await _run_fenced_stale_producer("cancelled")
+    assert status == "streaming"
+    assert finalizes == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert str(errors[0]) == "producer stopped"
+
+
+@pytest.mark.anyio
+async def test_propagates_producer_errors_to_consumers() -> None:
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store()
+    )
+
+    async def failing() -> AsyncIterator[bytes]:
+        yield _bytes("partial;")
+        raise Exception("oops")
+
+    stream = await ctx.run("a", lambda: failing())
+    with pytest.raises(Exception, match="oops"):
+        await _collect(stream)
+    assert await ctx.status("a") == "error"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("cancel_from_source", "reason", "hook_error"),
+    [
+        (False, None, "none"),
+        (False, "producer stopped", "none"),
+        (True, None, "none"),
+        (True, "producer stopped", "none"),
+        (False, "producer stopped", "reraise"),
+        (True, None, "replace"),
+    ],
+)
+async def test_cancelled_producer_finalizes_error_for_live_and_resumed_readers(
+    cancel_from_source: bool, reason: str | None, hook_error: str,
+) -> None:
+    tasks: list[asyncio.Task[None]] = []
+    source_errors: list[asyncio.CancelledError] = []
+    release = asyncio.Event()
+    errors: list[object] = []
+    finalizes: list[tuple[str, str, str | None]] = []
+    def on_error(_id: str, error: object) -> None:
+        errors.append(error)
+        if hook_error == "reraise":
+            assert isinstance(error, asyncio.CancelledError)
+            raise error
+        if hook_error == "replace":
+            raise asyncio.CancelledError("hook stopped")
+
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        wait_until=tasks.append,
+        on_error=on_error,
+        on_finalize=lambda stream_id, status, error: finalizes.append(
+            (stream_id, status, error)
+        ),
+    )
+
+    async def source() -> AsyncIterator[bytes]:
+        yield b"partial;"
+        try:
+            await release.wait()
+            if reason is None:
+                raise asyncio.CancelledError()
+            raise asyncio.CancelledError(reason)
+        except asyncio.CancelledError as error:
+            source_errors.append(error)
+            raise
+
+    stream = await ctx.run("a", source)
+    assert await asyncio.wait_for(anext(stream), timeout=1) == b"partial;"
+    if cancel_from_source:
+        release.set()
+    else:
+        tasks[0].cancel(reason)
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[0]
+
+    message = reason if reason is not None else "CancelledError()"
+    assert tasks[0].cancelled()
+    assert await ctx.status("a") == "error"
+    with pytest.raises(RuntimeError) as exc:
+        await asyncio.wait_for(anext(stream), timeout=1)
+    assert str(exc.value) == message
+
+    replay = await ctx.require_resume("a")
+    assert await asyncio.wait_for(anext(replay), timeout=1) == b"partial;"
+    with pytest.raises(RuntimeError) as exc:
+        await asyncio.wait_for(anext(replay), timeout=1)
+    assert str(exc.value) == message
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert finalizes == [("a", "error", message)]
+
+    assert len(source_errors) == 1
+    assert errors[0] is source_errors[0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason", [None, "producer stopped"])
+async def test_cancelled_before_startup_finalizes_for_live_and_resumed_readers(
+    reason: str | None,
+) -> None:
+    tasks: list[asyncio.Task[None]] = []
+    source_started = False
+    errors: list[object] = []
+    finalizes: list[tuple[str, str, str | None]] = []
+
+    def cancel_before_start(task: asyncio.Task[None]) -> None:
+        tasks.append(task)
+        if len(tasks) == 1:
+            task.cancel(reason)
+
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        wait_until=cancel_before_start,
+        on_error=lambda _id, error: errors.append(error),
+        on_finalize=lambda stream_id, status, error: finalizes.append(
+            (stream_id, status, error)
+        ),
+    )
+
+    async def source() -> AsyncIterator[bytes]:
+        nonlocal source_started
+        source_started = True
+        yield b"should not run"
+
+    stream = await ctx.run("a", source)
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(*tasks[1:]), timeout=1)
+
+    # Python 3.11 added propagation of task cancellation messages to observers.
+    message = (
+        reason
+        if reason is not None and sys.version_info >= (3, 11)
+        else "CancelledError()"
+    )
+    assert tasks[0].cancelled()
+    assert source_started is False
+    assert await ctx.status("a") == "error"
+    for reader in (stream, await ctx.require_resume("a")):
+        with pytest.raises(RuntimeError) as exc:
+            await asyncio.wait_for(anext(reader), timeout=1)
+        assert str(exc.value) == message
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert finalizes == [("a", "error", message)]
+
+
+@pytest.mark.anyio
+async def test_startup_cancellation_cleanup_is_registered_until_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks: list[asyncio.Task[None]] = []
+    finalizing = asyncio.Event()
+    release = asyncio.Event()
+    store = create_in_memory_resumable_stream_store()
+    finalize = store.finalize
+
+    async def delayed_finalize(*args, **kwargs):
+        finalizing.set()
+        await release.wait()
+        return await finalize(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finalize", delayed_finalize)
+    ctx = create_resumable_stream_context(store=store, wait_until=tasks.append)
+    stream = await ctx.run("a", lambda: _make_string_stream(["unused"]))
+    tasks[0].cancel()
+    await asyncio.gather(tasks[0], return_exceptions=True)
+    await asyncio.wait_for(finalizing.wait(), timeout=1)
+
+    try:
+        assert len(tasks) == 2
+        assert tasks[0].cancelled()
+        assert not tasks[1].done()
+        assert await ctx.status("a") == "streaming"
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks[1:]), timeout=1)
+        await stream.aclose()
+
+    assert await ctx.status("a") == "error"
+
+
+@pytest.mark.anyio
+async def test_startup_cancellation_cleanup_cannot_finalize_a_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks: list[asyncio.Task[None]] = []
+    finalizing = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    release_fresh = asyncio.Event()
+    finalizes: list[tuple[str, str, str | None]] = []
+    store = create_in_memory_resumable_stream_store()
+    finalize = store.finalize
+
+    async def delayed_error_finalize(stream_id, status, error=None, **kwargs):
+        if status == "error":
+            finalizing.set()
+            await release_cleanup.wait()
+        return await finalize(stream_id, status, error, **kwargs)
+
+    monkeypatch.setattr(store, "finalize", delayed_error_finalize)
+    ctx = create_resumable_stream_context(
+        store=store,
+        wait_until=tasks.append,
+        on_finalize=lambda stream_id, status, error: finalizes.append(
+            (stream_id, status, error)
+        ),
+    )
+    stale_reader = await ctx.run("a", lambda: _make_string_stream(["unused"]))
+    tasks[0].cancel()
+    await asyncio.gather(tasks[0], return_exceptions=True)
+    await asyncio.wait_for(finalizing.wait(), timeout=1)
+    await ctx.delete("a")
+
+    async def fresh() -> AsyncIterator[bytes]:
+        yield b"new"
+        await release_fresh.wait()
+        yield b"tail"
+
+    reader = await ctx.run("a", fresh)
+    try:
+        assert await asyncio.wait_for(anext(reader), timeout=1) == b"new"
+        release_cleanup.set()
+        await asyncio.wait_for(tasks[1], timeout=1)
+        assert await ctx.status("a") == "streaming"
+        assert finalizes == []
+        release_fresh.set()
+        assert await asyncio.wait_for(_collect(reader), timeout=1) == "tail"
+        assert finalizes == [("a", "done", None)]
+    finally:
+        release_cleanup.set()
+        release_fresh.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await stale_reader.aclose()
+        await reader.aclose()
+
+
+@pytest.mark.anyio
+async def test_startup_cancellation_logs_finalization_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tasks: list[asyncio.Task[None]] = []
+    now = [1_000.0]
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(
+            default_ttl_ms=100, now=lambda: now[0]
+        ),
+        wait_until=tasks.append,
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["unused"]))
+    tasks[0].cancel()
+    now[0] += 101
+    await asyncio.gather(tasks[0], return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(*tasks[1:]), timeout=1)
+
+    assert tasks[0].cancelled()
+    assert await ctx.status("a") == "missing"
+    assert "resumable stream finalize failed: Stream not found: a" in caplog.text
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_cancelled_producer_remains_cancelled_when_finalization_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [1_000.0]
+    tasks: list[asyncio.Task[None]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(
+            default_ttl_ms=100, now=lambda: now[0]
+        ),
+        wait_until=tasks.append,
+    )
+
+    async def source() -> AsyncIterator[bytes]:
+        yield b"partial;"
+        await asyncio.Event().wait()
+
+    stream = await ctx.run("a", source)
+    assert await asyncio.wait_for(anext(stream), timeout=1) == b"partial;"
+    now[0] += 101
+    tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[0]
+    assert tasks[0].cancelled()
+    assert await ctx.status("a") == "missing"
+    assert "resumable stream finalize failed: Stream not found: a" in caplog.text
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_wait_until_receives_the_task() -> None:
+    tasks: list[asyncio.Task[None]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        wait_until=lambda t: tasks.append(t),
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["x"]))
+    assert await _collect(stream) == "x"
+    assert len(tasks) == 1
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.anyio
+async def test_on_acquire_fires_for_producer_and_consumer() -> None:
+    calls: list[dict[str, str]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        on_acquire=lambda id, role: calls.append({"id": id, "role": role}),
+    )
+    producer = await ctx.run("a", lambda: _make_string_stream(["x"]))
+    consumer = await ctx.run("a", lambda: _make_string_stream(["unused"]))
+    await asyncio.gather(_collect(producer), _collect(consumer))
+    assert calls == [
+        {"id": "a", "role": "producer"},
+        {"id": "a", "role": "consumer"},
+    ]
+
+
+@pytest.mark.anyio
+async def test_on_append_fires_per_chunk_with_byte_length() -> None:
+    calls: list[dict[str, object]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        on_append=lambda id, n: calls.append({"id": id, "byteLength": n}),
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["ab", "cde"]))
+    assert await _collect(stream) == "abcde"
+    assert calls == [
+        {"id": "a", "byteLength": 2},
+        {"id": "a", "byteLength": 3},
+    ]
+
+
+@pytest.mark.anyio
+async def test_on_finalize_fires_on_success() -> None:
+    calls: list[dict[str, object]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        on_finalize=lambda id, status, error: calls.append(
+            {"id": id, "status": status, "error": error}
+        ),
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["x"]))
+    await _collect(stream)
+    assert calls == [{"id": "a", "status": "done", "error": None}]
+
+
+@pytest.mark.anyio
+async def test_on_finalize_and_on_error_fire_on_failure() -> None:
+    finalize_calls: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        on_finalize=lambda id, status, error: finalize_calls.append(
+            {"id": id, "status": status, "error": error}
+        ),
+        on_error=lambda id, error: errors.append({"id": id, "error": error}),
+    )
+
+    async def failing() -> AsyncIterator[bytes]:
+        raise Exception("boom")
+        yield b""  # pragma: no cover
+
+    stream = await ctx.run("a", lambda: failing())
+    with pytest.raises(Exception, match="boom"):
+        await _collect(stream)
+    assert finalize_calls == [{"id": "a", "status": "error", "error": "boom"}]
+    assert len(errors) == 1
+    assert errors[0]["id"] == "a"
+    assert str(errors[0]["error"]) == "boom"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("hook_name", ["on_acquire", "on_append", "on_finalize"])
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_raising_hooks_do_not_break_producer_pipeline(
+    hook_name: str, error_type: type[BaseException],
+) -> None:
+    def failing_hook(*_args: object) -> None:
+        raise error_type("hook failed")
+
+    tasks: list[asyncio.Task[None]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        wait_until=tasks.append,
+        **{hook_name: failing_hook},
+    )
+    stream = await ctx.run("a", lambda: _make_string_stream(["hello ", "world"]))
+    await asyncio.wait(tasks)
+    assert not tasks[0].cancelled()
+    assert await _collect(stream) == "hello world"
+    assert await ctx.status("a") == "done"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_raising_on_error_still_finalizes_error_status(
+    error_type: type[BaseException],
+) -> None:
+    def boom_error(_id: str, _err: object) -> None:
+        raise error_type("hook-error-boom")
+
+    tasks: list[asyncio.Task[None]] = []
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(),
+        wait_until=tasks.append,
+        on_error=boom_error,
+    )
+
+    async def failing() -> AsyncIterator[bytes]:
+        yield _bytes("partial;")
+        raise Exception("producer-failed")
+
+    stream = await ctx.run("a", lambda: failing())
+    await asyncio.wait(tasks)
+    assert await ctx.status("a") == "error"
+    with pytest.raises(Exception, match="producer-failed"):
+        await _collect(stream)
+    assert await ctx.status("a") == "error"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+async def test_hooks_preserve_process_exit_signals(
+    error_type: type[BaseException],
+) -> None:
+    error = error_type("exit")
+
+    def exit_hook(_id: str, _role: str) -> None:
+        raise error
+
+    ctx = create_resumable_stream_context(
+        store=create_in_memory_resumable_stream_store(), on_acquire=exit_hook,
+    )
+    with pytest.raises(error_type) as exc:
+        await ctx.run("a", lambda: _make_string_stream(["unused"]))
+    assert exc.value is error

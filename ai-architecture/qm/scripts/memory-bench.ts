@@ -1,0 +1,101 @@
+import { fileURLToPath } from "node:url";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createAgent, agentConfigOptions } from "../src/agent/agent-run.ts";
+import { configRouteOptions, createModelRoutes } from "../src/model/model-route.ts";
+import { loadConfig } from "../src/config.ts";
+import { createPostgresMemoryService } from "../src/memory/postgres-memory-service.ts";
+import { createMemoryStrategy, DEFAULT_MEMORY_STRATEGY, type MemoryStrategyKind } from "../src/memory/strategy.ts";
+import {
+  DEFAULT_STRATEGY_FLOORS,
+  floorFailures,
+  formatTable,
+  JUDGE_PROMPT,
+  parseBenchConversation,
+  parseJudgeVerdict,
+  renderJudgeInput,
+  replayConversation,
+  summarize,
+  type BenchResult,
+} from "../src/memory/bench.ts";
+
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error("ANTHROPIC_API_KEY not set — the benchmark replays extraction and judges with a live model.");
+  process.exit(1);
+}
+
+const KNOWN_KINDS: MemoryStrategyKind[] = ["per-turn", "agent-only"];
+const requested = (process.env.MEMORY_BENCH_KINDS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const kinds: MemoryStrategyKind[] = requested.length ? (requested as MemoryStrategyKind[]) : KNOWN_KINDS;
+for (const k of kinds) {
+  if (!KNOWN_KINDS.includes(k)) {
+    console.error(`unknown strategy kind '${k}' (known: ${KNOWN_KINDS.join(", ")})`);
+    process.exit(1);
+  }
+}
+
+const fixtureDir = fileURLToPath(new URL("../test/memory-bench/conversations/", import.meta.url));
+const conversations = readdirSync(fixtureDir)
+  .filter((f) => f.endsWith(".json"))
+  .sort()
+  .map((f) => parseBenchConversation(JSON.parse(readFileSync(join(fixtureDir, f), "utf8")), f));
+
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) throw new Error("DATABASE_URL is required");
+
+const config = loadConfig();
+const agent = createAgent({
+  ...agentConfigOptions(config),
+  routes: createModelRoutes(configRouteOptions(config)),
+  tempDirPrefix: "membench",
+});
+if (!agent.oneShot) {
+  console.error("agent has no oneShot — cannot judge");
+  process.exit(1);
+}
+const oneShot = agent.oneShot.bind(agent);
+
+const results: BenchResult[] = [];
+for (const kind of kinds) {
+  for (const conversation of conversations) {
+    const memory = createPostgresMemoryService(databaseUrl);
+    const { strategy } = createMemoryStrategy(kind, { agent, memory });
+    const scopeId = `user:bench-${kind}-${conversation.id}-${Date.now()}`;
+    if (!strategy.onTurnEnd) {
+      console.log(`[${kind}] ${conversation.id}: no automatic capture — judging empty notebook`);
+    }
+    await replayConversation(strategy, scopeId, conversation);
+    const notebook = await memory.read(scopeId);
+    const judgeOut = await oneShot(JUDGE_PROMPT, renderJudgeInput(conversation, notebook));
+    const verdict = parseJudgeVerdict(judgeOut ?? "");
+    results.push({ kind, conversationId: conversation.id, notebook, verdict });
+    console.log(
+      `[${kind}] ${conversation.id}: s/n=${verdict.signalToNoise} stale=${verdict.staleness} ` +
+        `infer=${verdict.inferenceVsObservation} — ${verdict.notes}`,
+    );
+  }
+}
+
+const rows = summarize(results);
+console.log(`\n${formatTable(rows)}\n`);
+
+const outPath = process.env.MEMORY_BENCH_OUT;
+if (outPath) {
+  writeFileSync(outPath, JSON.stringify({ generatedAt: new Date().toISOString(), rows, results }, null, 2));
+  console.log(`report written to ${outPath}`);
+}
+
+const defaultRow = rows.find((r) => r.kind === DEFAULT_MEMORY_STRATEGY);
+if (defaultRow) {
+  const failures = floorFailures(defaultRow);
+  if (failures.length) {
+    console.error(
+      `default strategy '${DEFAULT_MEMORY_STRATEGY}' is below its quality floors ` +
+        `(${JSON.stringify(DEFAULT_STRATEGY_FLOORS)}): ${failures.join("; ")}`,
+    );
+    process.exit(2);
+  }
+}

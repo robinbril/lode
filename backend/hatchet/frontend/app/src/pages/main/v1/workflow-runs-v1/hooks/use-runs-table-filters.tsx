@@ -1,0 +1,365 @@
+import {
+  statusKey,
+  workflowKey,
+  additionalMetadataKey,
+  additionalMetadataOperatorKey,
+  flattenDAGsKey,
+  createdAfterKey,
+  finishedBeforeKey,
+  isCustomTimeRangeKey,
+  timeWindowKey,
+  runningFilterKey,
+  idempotencyKeyKey,
+} from '../components/v1/task-runs-columns';
+import { useRetentionGate } from '@/hooks/use-retention-gate';
+import { useTenantDetails } from '@/hooks/use-tenant';
+import { useZodColumnFilters } from '@/hooks/use-zod-column-filters';
+import {
+  V1AdditionalMetadataOperator,
+  V1RunningFilter,
+  V1TaskStatus,
+} from '@/lib/api';
+import { useSearchParams } from '@/lib/router-helpers';
+import {
+  defaultTimeWindowForRetention,
+  getRetentionBoundary,
+  isBeforeRetention,
+  isTimeWindowOutsideRetention,
+  largestAllowedTimeWindow,
+  TIME_WINDOW_HOURS,
+  TIME_WINDOW_PRESETS,
+  type TimeWindowPreset,
+} from '@/lib/utils/retention';
+import { ColumnFiltersState } from '@tanstack/react-table';
+import { useCallback, useEffect, useMemo } from 'react';
+import { z } from 'zod';
+
+type TimeWindow = TimeWindowPreset;
+
+const getCreatedAfterFromTimeRange = (timeWindow: TimeWindow): string =>
+  new Date(
+    Date.now() - TIME_WINDOW_HOURS[timeWindow] * 60 * 60 * 1000,
+  ).toISOString();
+
+export type AdditionalMetadataProp = {
+  key: string;
+  value: string;
+};
+
+type APIFilters = {
+  since: string;
+  until?: string;
+  statuses?: V1TaskStatus[];
+  workflowIds?: string[];
+  additionalMetadata?: string[];
+  additionalMetadataOperator: V1AdditionalMetadataOperator;
+  flattenDAGs: boolean;
+  runningFilter?: V1RunningFilter;
+  idempotencyKeys?: string[];
+};
+
+export type FilterActions = {
+  timeWindow: TimeWindow;
+  isCustomTimeRange: boolean;
+  apiFilters: APIFilters;
+  setTimeWindow: (timeWindow: TimeWindow) => void;
+  setCustomTimeRange: (range: { start: string; end: string } | null) => void;
+  updateCurrentTimeWindow: () => void;
+  setStatuses: (statuses: V1TaskStatus[]) => void;
+  setAdditionalMetadata: (metadata: AdditionalMetadataProp) => void;
+  setIdempotencyKey: (idempotencyKey: string) => void;
+  setAdditionalMetadataOperator: (
+    operator: V1AdditionalMetadataOperator,
+  ) => void;
+  setColumnFilters: (filters: ColumnFiltersState) => void;
+  resetFilters: () => void;
+  searchAllRetainedHistory: () => void;
+  retentionPeriod?: string;
+  retentionGate: ReturnType<typeof useRetentionGate>;
+  isDefaultOneDayWindow: boolean;
+};
+
+const createApiFilterSchema = (initialValues?: { workflowIds?: string[] }) =>
+  z.object({
+    tw: z.enum(TIME_WINDOW_PRESETS).default('1d'), // time window preset
+    ctr: z.boolean().default(false), // whether using custom range
+    s: z.string().optional(), // since
+    u: z.string().optional(), // until
+    st: z
+      .array(z.nativeEnum(V1TaskStatus))
+      .default(() => Object.values(V1TaskStatus)), // statuses
+    w: z // workflow ids
+      .array(z.string())
+      .optional()
+      .default(() =>
+        initialValues?.workflowIds?.length ? initialValues.workflowIds : [],
+      ),
+    m: z.array(z.string()).optional(), // additional metadata
+    // metadata match operator. The frontend defaults to AND (all pairs must
+    // match) even though the API defaults to OR, so the param is always sent.
+    mo: z
+      .nativeEnum(V1AdditionalMetadataOperator)
+      .default(V1AdditionalMetadataOperator.AND),
+    f: z.boolean().default(false), // flatten dags
+    rf: z.nativeEnum(V1RunningFilter).optional(), // running sub-filter (undefined = ALL)
+    i: z.array(z.string()).optional(), // idempotency keys
+  });
+
+export const useRunsTableFilters = (
+  tableKey: string,
+  initialValues?: {
+    workflowIds?: string[];
+  },
+): FilterActions & {
+  columnFilters: ColumnFiltersState;
+  timeWindow: TimeWindow;
+  isCustomTimeRange: boolean;
+  apiFilters: APIFilters;
+} => {
+  const paramKey = tableKey + '-workflow-runs-filters';
+  const apiFilterSchema = createApiFilterSchema(initialValues);
+  const [, setSearchParams] = useSearchParams();
+  const { tenant } = useTenantDetails();
+  const retentionPeriod = tenant?.dataRetentionPeriod;
+  const retentionGate = useRetentionGate(retentionPeriod);
+
+  const zodFiltersHook = useZodColumnFilters(apiFilterSchema, paramKey, {
+    tw: timeWindowKey,
+    ctr: isCustomTimeRangeKey,
+    u: finishedBeforeKey,
+    s: createdAfterKey,
+    st: statusKey,
+    w: workflowKey,
+    m: additionalMetadataKey,
+    mo: additionalMetadataOperatorKey,
+    f: flattenDAGsKey,
+    rf: runningFilterKey,
+    i: idempotencyKeyKey,
+  });
+
+  const {
+    state: zodState,
+    columnFilters,
+    setColumnFilters,
+    resetFilters,
+  } = zodFiltersHook;
+
+  const {
+    tw: timeWindow,
+    ctr: isCustomTimeRange,
+    s: rawCreatedAfter,
+    u: finishedBefore,
+    st: selectedStatuses,
+    w: selectedWorkflowIds,
+    m: selectedAdditionalMetadata,
+    mo: selectedAdditionalMetadataOperator,
+    f: selectedFlattenDAGs,
+    rf: selectedRunningFilter,
+    i: selectedIdempotencyKeys,
+  } = zodState;
+
+  const createdAfter = useMemo(() => {
+    if (rawCreatedAfter) {
+      return rawCreatedAfter;
+    }
+    return getCreatedAfterFromTimeRange(timeWindow);
+  }, [rawCreatedAfter, timeWindow]);
+
+  const setZodState = useCallback(
+    (newState: Partial<typeof zodState>) => {
+      const updatedState = { ...zodState, ...newState };
+      setSearchParams((prev) => ({
+        ...Object.fromEntries(prev.entries()),
+        [paramKey]: updatedState,
+      }));
+    },
+    [zodState, setSearchParams, paramKey],
+  );
+
+  const setTimeWindow = useCallback(
+    (timeWindow: TimeWindow) => {
+      retentionGate.tryTimeWindow(timeWindow, () => {
+        setZodState({
+          tw: timeWindow,
+          ctr: false,
+          s: getCreatedAfterFromTimeRange(timeWindow),
+          u: undefined,
+        });
+      });
+    },
+    [setZodState, retentionGate],
+  );
+
+  const updateCurrentTimeWindow = useCallback(() => {
+    if (!isCustomTimeRange) {
+      setZodState({
+        ...zodState,
+        s: getCreatedAfterFromTimeRange(timeWindow),
+      });
+    }
+  }, [isCustomTimeRange, timeWindow, setZodState, zodState]);
+
+  const setCustomTimeRange = useCallback(
+    (range: { start: string; end: string } | null) => {
+      if (range) {
+        retentionGate.trySince(range.start, () => {
+          setZodState({
+            ctr: true,
+            s: range.start,
+            u: range.end,
+          });
+        });
+      } else {
+        setZodState({
+          ctr: false,
+          s: getCreatedAfterFromTimeRange(timeWindow),
+          u: undefined,
+        });
+      }
+    },
+    [setZodState, timeWindow, retentionGate],
+  );
+
+  useEffect(() => {
+    if (!retentionPeriod) {
+      return;
+    }
+    if (
+      rawCreatedAfter &&
+      isBeforeRetention(rawCreatedAfter, retentionPeriod)
+    ) {
+      const boundary = getRetentionBoundary(retentionPeriod);
+      if (boundary) {
+        setZodState({
+          ctr: true,
+          s: boundary.toISOString(),
+        });
+      }
+      return;
+    }
+    if (
+      !isCustomTimeRange &&
+      isTimeWindowOutsideRetention(timeWindow, retentionPeriod)
+    ) {
+      const next = largestAllowedTimeWindow(retentionPeriod);
+      setZodState({
+        tw: next,
+        ctr: false,
+        s: getCreatedAfterFromTimeRange(next),
+        u: undefined,
+      });
+    }
+  }, [
+    retentionPeriod,
+    rawCreatedAfter,
+    isCustomTimeRange,
+    timeWindow,
+    setZodState,
+  ]);
+
+  const setStatuses = useCallback(
+    (statuses: V1TaskStatus[]) => {
+      const finalStatuses =
+        statuses.length > 0 ? statuses : Object.values(V1TaskStatus);
+
+      const newColumnFilters = columnFilters
+        .filter((f) => f.id !== statusKey)
+        .concat([{ id: statusKey, value: finalStatuses }]);
+
+      setColumnFilters(newColumnFilters);
+    },
+    [setColumnFilters, columnFilters],
+  );
+
+  const setAdditionalMetadata = useCallback(
+    ({ key, value }: { key: string; value: string }) => {
+      const existing = selectedAdditionalMetadata || [];
+      const filtered = existing.filter((m: string) => m.split(':')[0] !== key);
+      const newMetadata = [...filtered, `${key}:${value}`];
+
+      const newColumnFilters = columnFilters
+        .filter((f) => f.id !== additionalMetadataKey)
+        .concat([{ id: additionalMetadataKey, value: newMetadata }]);
+
+      setColumnFilters(newColumnFilters);
+    },
+    [setColumnFilters, columnFilters, selectedAdditionalMetadata],
+  );
+
+  const setIdempotencyKey = useCallback(
+    (idempotencyKey: string) => {
+      const existing = selectedIdempotencyKeys || [];
+      const newKeys = existing.includes(idempotencyKey)
+        ? existing.filter((k: string) => k !== idempotencyKey)
+        : [...existing, idempotencyKey];
+
+      const newColumnFilters = columnFilters
+        .filter((f) => f.id !== idempotencyKeyKey)
+        .concat(
+          newKeys.length > 0 ? [{ id: idempotencyKeyKey, value: newKeys }] : [],
+        );
+
+      setColumnFilters(newColumnFilters);
+    },
+    [setColumnFilters, columnFilters, selectedIdempotencyKeys],
+  );
+
+  const setAdditionalMetadataOperator = useCallback(
+    (operator: V1AdditionalMetadataOperator) => {
+      const newColumnFilters = columnFilters
+        .filter((f) => f.id !== additionalMetadataOperatorKey)
+        .concat([{ id: additionalMetadataOperatorKey, value: operator }]);
+
+      setColumnFilters(newColumnFilters);
+    },
+    [setColumnFilters, columnFilters],
+  );
+
+  const apiFilters = useMemo(
+    () => ({
+      since: createdAfter || getCreatedAfterFromTimeRange('1d'),
+      until: finishedBefore,
+      statuses: selectedStatuses,
+      workflowIds: selectedWorkflowIds,
+      additionalMetadata: selectedAdditionalMetadata,
+      additionalMetadataOperator: selectedAdditionalMetadataOperator,
+      flattenDAGs: selectedFlattenDAGs || false,
+      runningFilter: selectedRunningFilter,
+      idempotencyKeys: selectedIdempotencyKeys,
+    }),
+    [
+      createdAfter,
+      finishedBefore,
+      selectedStatuses,
+      selectedWorkflowIds,
+      selectedAdditionalMetadata,
+      selectedAdditionalMetadataOperator,
+      selectedFlattenDAGs,
+      selectedRunningFilter,
+      selectedIdempotencyKeys,
+    ],
+  );
+
+  return {
+    columnFilters,
+    timeWindow,
+    isCustomTimeRange,
+    apiFilters,
+    setTimeWindow,
+    setCustomTimeRange,
+    updateCurrentTimeWindow,
+    setStatuses,
+    setAdditionalMetadata,
+    setIdempotencyKey,
+    setAdditionalMetadataOperator,
+    setColumnFilters,
+    resetFilters,
+    searchAllRetainedHistory: () =>
+      setTimeWindow(largestAllowedTimeWindow(retentionPeriod)),
+    retentionPeriod,
+    retentionGate,
+    isDefaultOneDayWindow:
+      !isCustomTimeRange &&
+      timeWindow === defaultTimeWindowForRetention(retentionPeriod),
+  };
+};

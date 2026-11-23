@@ -1,0 +1,604 @@
+import { Combobox } from '@/components/v1/molecules/combobox/combobox';
+import { ToolbarType } from '@/components/v1/molecules/data-table/data-table-toolbar';
+import { hasFormFields } from '@/components/v1/molecules/json-schema-form/prepare-schema';
+import { DateTimePicker } from '@/components/v1/molecules/time-picker/date-time-picker';
+import { Button } from '@/components/v1/ui/button';
+import { CodeEditor } from '@/components/v1/ui/code-editor';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/v1/ui/dialog';
+import { Input } from '@/components/v1/ui/input';
+import { Skeleton } from '@/components/v1/ui/skeleton';
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from '@/components/v1/ui/tabs';
+import useCanWrite from '@/hooks/use-can-write';
+import { useCurrentTenantId } from '@/hooks/use-tenant';
+import api, {
+  CronWorkflows,
+  queries,
+  ScheduledWorkflows,
+  V1WorkflowRunDetails,
+  Workflow,
+} from '@/lib/api';
+import { formatCron } from '@/lib/cron';
+import { useApiError } from '@/lib/hooks';
+import { appRoutes } from '@/router';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useNavigate } from '@tanstack/react-router';
+import { debounce } from 'lodash';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useMemo,
+  useState,
+  useEffect,
+} from 'react';
+import { BiDownArrowCircle } from 'react-icons/bi';
+
+const JsonSchemaForm = lazy(
+  () => import('@/components/v1/molecules/json-schema-form/json-schema-form'),
+);
+
+type TimingOption = 'now' | 'schedule' | 'cron';
+type InputMode = 'editor' | 'form';
+
+export function TriggerWorkflowForm({
+  defaultWorkflow,
+  defaultWorkflowId = defaultWorkflow?.metadata.id,
+  defaultInput = '{}',
+  defaultAddlMeta = '{}',
+  show,
+  onClose,
+  defaultTimingOption = 'now',
+}: {
+  defaultWorkflow?: Workflow;
+  defaultWorkflowId?: string;
+  defaultInput?: string;
+  defaultAddlMeta?: string;
+  show: boolean;
+  onClose: () => void;
+  defaultTimingOption?: TimingOption;
+}) {
+  const queryClient = useQueryClient();
+  const { tenantId } = useCurrentTenantId();
+  const navigate = useNavigate();
+  const canWrite = useCanWrite();
+
+  const [input, setInput] = useState<string | undefined>(defaultInput);
+  const [addlMeta, setAddlMeta] = useState<string | undefined>(defaultAddlMeta);
+  const [errors, setErrors] = useState<string[]>([]);
+
+  const [inputMode, setInputMode] = useState<InputMode>('editor');
+  // the form only reads its value on mount, so snapshot the input on switch
+  const [formInitialValue, setFormInitialValue] = useState<unknown>({});
+
+  const [timingOption, setTimingOption] =
+    useState<TimingOption>(defaultTimingOption);
+  const [scheduleTime, setScheduleTime] = useState<Date | undefined>(
+    new Date(),
+  );
+  const [cronExpression, setCronExpression] = useState<string>('* * * * *');
+  const [cronName, setCronName] = useState<string>('');
+
+  const [selectedWorkflowId, setSelectedWorkflowId] =
+    useState(defaultWorkflowId);
+
+  const [workflowSearch, setWorkflowSearch] = useState('');
+  const [debouncedWorkflowSearch, setDebouncedWorkflowSearch] = useState('');
+
+  const debouncedSetSearch = useMemo(
+    () => debounce((value: string) => setDebouncedWorkflowSearch(value), 300),
+    [],
+  );
+
+  const workflowVersionQuery = useQuery({
+    ...queries.workflows.getVersion(selectedWorkflowId || ''),
+    enabled: !!selectedWorkflowId,
+  });
+  const selectedWorkflow = workflowVersionQuery.data;
+  const isLoadingWorkflow = workflowVersionQuery.isLoading;
+
+  const handleSearchChange = useCallback(
+    (value: string) => {
+      setWorkflowSearch(value);
+      debouncedSetSearch(value);
+    },
+    [debouncedSetSearch],
+  );
+
+  useEffect(() => {
+    return () => {
+      debouncedSetSearch.cancel();
+    };
+  }, [debouncedSetSearch]);
+
+  const handleClose = useCallback(() => {
+    onClose();
+    setInput(defaultInput);
+    setAddlMeta(defaultAddlMeta);
+    setErrors([]);
+    setInputMode('editor');
+    setSelectedWorkflowId(defaultWorkflowId);
+    setTimingOption(defaultTimingOption);
+    setScheduleTime(new Date());
+    setCronExpression('* * * * *');
+    setCronName('');
+    setWorkflowSearch('');
+    setDebouncedWorkflowSearch('');
+    debouncedSetSearch.cancel();
+  }, [
+    onClose,
+    defaultWorkflowId,
+    defaultInput,
+    defaultAddlMeta,
+    defaultTimingOption,
+    debouncedSetSearch,
+  ]);
+
+  const cronPretty = useMemo(() => {
+    try {
+      return {
+        pretty: formatCron(cronExpression),
+      };
+    } catch (e) {
+      console.error(e);
+      return { error: e as string };
+    }
+  }, [cronExpression]);
+
+  const { handleApiError } = useApiError({
+    setErrors,
+  });
+
+  const { data: workflowKeys } = useQuery({
+    queryKey: [
+      'workflow:list',
+      tenantId,
+      {
+        limit: 200,
+        name: debouncedWorkflowSearch || undefined,
+      },
+    ],
+    queryFn: async () => {
+      const response = await api.workflowList(tenantId, {
+        limit: 200,
+        name: debouncedWorkflowSearch || undefined,
+      });
+      return response.data;
+    },
+    refetchInterval: 15000,
+  });
+
+  const jsonSchema = selectedWorkflow?.inputJsonSchema;
+  const hasJsonSchema = hasFormFields(jsonSchema);
+
+  const handleInputModeChange = (mode: InputMode) => {
+    if (mode === 'form') {
+      try {
+        setFormInitialValue(JSON.parse(input || '{}'));
+      } catch {
+        setErrors(['Input must be valid JSON to switch to the form.']);
+        return;
+      }
+    }
+
+    setErrors([]);
+    setInputMode(mode);
+  };
+
+  const handleFormChange = useCallback((value: unknown) => {
+    setInput(JSON.stringify(value ?? {}, null, 2));
+  }, []);
+
+  const triggerNowMutation = useMutation({
+    mutationKey: ['workflow-run:create', selectedWorkflow?.metadata.id],
+    mutationFn: async (data: { input: object; addlMeta: object }) => {
+      if (!selectedWorkflow || !selectedWorkflow.workflow) {
+        return;
+      }
+
+      const res = await api.v1WorkflowRunCreate(tenantId, {
+        workflowName: selectedWorkflow.workflow.name,
+        input: data.input,
+        additionalMetadata: data.addlMeta,
+        // note: see backend implementation - this is a hack
+        // because all we need on the FE to redirect is the id of the run
+        // and not any details, so we can short-circuit some OLAP DB lookups and
+        // avoid race conditions this way
+        return_only_id: true,
+      });
+
+      return res.data;
+    },
+    onMutate: () => {
+      setErrors([]);
+    },
+    onSuccess: (workflowRun: V1WorkflowRunDetails | undefined) => {
+      if (!workflowRun) {
+        return;
+      }
+
+      navigate({
+        to: appRoutes.tenantRunRoute.to,
+        params: { tenant: tenantId, run: workflowRun.run.metadata.id },
+        search: (prev) => ({ ...prev, wasRedirectedFromTrigger: true }),
+      });
+    },
+    onError: handleApiError,
+  });
+
+  const triggerScheduleMutation = useMutation({
+    mutationKey: ['workflow-run:schedule', selectedWorkflow?.metadata.id],
+    mutationFn: async (data: {
+      input: object;
+      addlMeta: object;
+      scheduledAt: string;
+    }) => {
+      if (!selectedWorkflow || !selectedWorkflow.workflow) {
+        return;
+      }
+
+      const res = await api.scheduledWorkflowRunCreate(
+        tenantId,
+        selectedWorkflow.workflow.name,
+        {
+          input: data.input,
+          additionalMetadata: data.addlMeta,
+          triggerAt: data.scheduledAt,
+        },
+      );
+
+      return res.data;
+    },
+    onMutate: () => {
+      setErrors([]);
+    },
+    onSuccess: async (workflowRun: ScheduledWorkflows | undefined) => {
+      if (!workflowRun) {
+        return;
+      }
+      handleClose();
+      await queryClient.invalidateQueries({
+        queryKey: ['scheduledRuns', 'list'],
+      });
+      navigate({
+        to: appRoutes.tenantScheduledRoute.to,
+        params: { tenant: tenantId },
+      });
+    },
+    onError: handleApiError,
+  });
+
+  const triggerCronMutation = useMutation({
+    mutationKey: ['workflow-run:cron', selectedWorkflow?.metadata.id],
+    mutationFn: async (data: {
+      input: object;
+      addlMeta: object;
+      cron: string;
+      cronName: string;
+    }) => {
+      if (!selectedWorkflow || !selectedWorkflow.workflow) {
+        return;
+      }
+
+      const res = await api.cronWorkflowTriggerCreate(
+        tenantId,
+        selectedWorkflow.workflow.name,
+        {
+          input: data.input,
+          additionalMetadata: data.addlMeta,
+          cronName: data.cronName,
+          cronExpression: data.cron,
+        },
+      );
+
+      return res.data;
+    },
+    onMutate: () => {
+      setErrors([]);
+    },
+    onSuccess: async (workflowRun: CronWorkflows | undefined) => {
+      if (!workflowRun) {
+        return;
+      }
+      handleClose();
+      await queryClient.invalidateQueries({
+        queryKey: ['cronJobs', 'list'],
+      });
+      navigate({
+        to: appRoutes.tenantCronJobsRoute.to,
+        params: { tenant: tenantId },
+      });
+    },
+    onError: handleApiError,
+  });
+
+  const handleSubmit = () => {
+    if (!selectedWorkflow) {
+      setErrors(['No workflow selected.']);
+      return;
+    }
+
+    const inputObj = JSON.parse(input || '{}');
+    const addlMetaObj = JSON.parse(addlMeta || '{}');
+
+    if (timingOption === 'now') {
+      triggerNowMutation.mutate({
+        input: inputObj,
+        addlMeta: addlMetaObj,
+      });
+    } else if (timingOption === 'schedule') {
+      if (!scheduleTime) {
+        setErrors(['Please select a date and time for scheduling.']);
+        return;
+      }
+      triggerScheduleMutation.mutate({
+        input: inputObj,
+        addlMeta: addlMetaObj,
+        scheduledAt: scheduleTime.toISOString(),
+      });
+    } else if (timingOption === 'cron') {
+      if (!cronExpression) {
+        setErrors(['Please enter a valid cron expression.']);
+        return;
+      }
+      triggerCronMutation.mutate({
+        input: inputObj,
+        addlMeta: addlMetaObj,
+        cron: cronExpression,
+        cronName: cronName,
+      });
+    }
+  };
+
+  return (
+    <Dialog
+      open={show && canWrite}
+      onOpenChange={(open) => {
+        if (!open) {
+          handleClose();
+        }
+      }}
+    >
+      <DialogContent className="max-h-[90%] overflow-auto py-12 sm:max-w-[625px]">
+        <DialogHeader className="gap-2">
+          <DialogTitle>Trigger Run</DialogTitle>
+          <DialogDescription className="text-muted-foreground">
+            Trigger a workflow to run now, at a scheduled time, or on a cron
+            schedule.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="font-bold">Workflow</div>
+        <Combobox
+          values={selectedWorkflowId ? [selectedWorkflowId] : []}
+          setValues={(values) => {
+            setSelectedWorkflowId(values[0]);
+            setInputMode('editor');
+          }}
+          title="Select Workflow"
+          options={workflowKeys?.rows?.map((w) => ({
+            value: w.metadata.id,
+            label: w.name,
+          }))}
+          type={ToolbarType.Radio}
+          icon={
+            <BiDownArrowCircle className="mr-2 h-5 w-5 text-gray-700 dark:text-gray-300" />
+          }
+          searchValue={workflowSearch}
+          onSearchChange={handleSearchChange}
+          emptyMessage={
+            debouncedWorkflowSearch
+              ? `No workflows matching "${debouncedWorkflowSearch}"`
+              : 'No workflows found'
+          }
+        />
+        <div className="flex items-center justify-between">
+          <div className="font-bold">
+            Input
+            {isLoadingWorkflow && (
+              <span className="ml-2 text-sm font-normal text-muted-foreground">
+                (Loading schema...)
+              </span>
+            )}
+          </div>
+          {hasJsonSchema && !isLoadingWorkflow && (
+            <Tabs
+              value={inputMode}
+              onValueChange={(value) =>
+                handleInputModeChange(value as InputMode)
+              }
+            >
+              <TabsList>
+                <TabsTrigger value="editor">Editor</TabsTrigger>
+                <TabsTrigger value="form">Form</TabsTrigger>
+              </TabsList>
+            </Tabs>
+          )}
+        </div>
+        {isLoadingWorkflow ? (
+          <Skeleton className="h-[180px] w-full" />
+        ) : hasJsonSchema && inputMode === 'form' ? (
+          <Suspense fallback={<Skeleton className="h-[180px] w-full" />}>
+            <JsonSchemaForm
+              key={selectedWorkflowId}
+              schema={jsonSchema}
+              initialValue={formInitialValue}
+              onChange={handleFormChange}
+            />
+          </Suspense>
+        ) : (
+          <CodeEditor
+            code={input || '{}'}
+            setCode={setInput}
+            language="json"
+            height="180px"
+            jsonSchema={jsonSchema}
+          />
+        )}
+        <div className="font-bold">Additional Metadata</div>
+        {isLoadingWorkflow ? (
+          <Skeleton className="h-[90px] w-full" />
+        ) : (
+          <CodeEditor
+            code={addlMeta || '{}'}
+            setCode={setAddlMeta}
+            height="90px"
+            language="json"
+          />
+        )}
+        <div>
+          <div className="mb-2 font-bold">Timing</div>
+          <Tabs
+            defaultValue={timingOption}
+            onValueChange={(value) =>
+              setTimingOption(value as 'now' | 'schedule' | 'cron')
+            }
+          >
+            <TabsList>
+              <TabsTrigger value="now">Now</TabsTrigger>
+              <TabsTrigger value="schedule">Schedule</TabsTrigger>
+              <TabsTrigger value="cron">Cron</TabsTrigger>
+            </TabsList>
+            <TabsContent value="now"></TabsContent>
+            <TabsContent value="schedule">
+              <div className="mt-4">
+                <div className="mb-2 font-bold">Select Date and Time</div>
+                <div className="flex gap-2">
+                  <DateTimePicker
+                    date={scheduleTime}
+                    setDate={setScheduleTime}
+                    label="Trigger at"
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setScheduleTime(new Date())}
+                  >
+                    Now
+                  </Button>
+                </div>
+                <div className="mt-2 flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const newTime = new Date(scheduleTime || new Date());
+                      newTime.setSeconds(newTime.getSeconds() + 15);
+                      setScheduleTime(newTime);
+                    }}
+                  >
+                    +15s
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const newTime = new Date(scheduleTime || new Date());
+                      newTime.setMinutes(newTime.getMinutes() + 1);
+                      setScheduleTime(newTime);
+                    }}
+                  >
+                    +1m
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const newTime = new Date(scheduleTime || new Date());
+                      newTime.setMinutes(newTime.getMinutes() + 5);
+                      setScheduleTime(newTime);
+                    }}
+                  >
+                    +5m
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const newTime = new Date(scheduleTime || new Date());
+                      newTime.setMinutes(newTime.getMinutes() + 15);
+                      setScheduleTime(newTime);
+                    }}
+                  >
+                    +15m
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const newTime = new Date(scheduleTime || new Date());
+                      newTime.setMinutes(newTime.getMinutes() + 60);
+                      setScheduleTime(newTime);
+                    }}
+                  >
+                    +60m
+                  </Button>
+                </div>
+              </div>
+            </TabsContent>
+            <TabsContent value="cron">
+              <div className="mt-4">
+                <div className="mb-2 font-bold">Cron Name</div>
+                <Input
+                  type="text"
+                  value={cronName}
+                  onChange={(e) => setCronName(e.target.value)}
+                  placeholder="e.g., cron-name"
+                  className="mb-2 w-full"
+                />
+                <div className="mb-2 font-bold">Cron Expression</div>
+                <Input
+                  type="text"
+                  value={cronExpression}
+                  onChange={(e) => setCronExpression(e.target.value)}
+                  placeholder="e.g., 0 0 * * *"
+                  className="w-full"
+                />
+                <div className="text-sm text-gray-500">
+                  {cronPretty?.error || `(runs ${cronPretty?.pretty})`}
+                </div>
+              </div>
+            </TabsContent>
+          </Tabs>
+        </div>
+
+        <div className="flex justify-end">
+          <Button
+            disabled={
+              triggerNowMutation.isPending ||
+              triggerScheduleMutation.isPending ||
+              triggerCronMutation.isPending ||
+              !selectedWorkflow ||
+              isLoadingWorkflow
+            }
+            onClick={handleSubmit}
+          >
+            Submit
+          </Button>
+        </div>
+        {(errors.length > 0 ||
+          triggerNowMutation.error ||
+          triggerScheduleMutation.error ||
+          triggerCronMutation.error) && (
+          <div className="mt-4">
+            {errors.map((error, index) => (
+              <div key={index} className="text-sm text-red-500">
+                {error}
+              </div>
+            ))}
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

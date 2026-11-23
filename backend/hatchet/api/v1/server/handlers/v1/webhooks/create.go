@@ -1,0 +1,257 @@
+package webhooksv1
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+
+	"github.com/hatchet-dev/hatchet/api/v1/server/oas/gen"
+	"github.com/hatchet-dev/hatchet/api/v1/server/oas/transformers/v1"
+	"github.com/hatchet-dev/hatchet/pkg/analytics"
+	"github.com/hatchet-dev/hatchet/pkg/encryption"
+	"github.com/hatchet-dev/hatchet/pkg/enums"
+	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
+	"github.com/hatchet-dev/hatchet/pkg/repository/sqlcv1"
+)
+
+func (w *V1WebhooksService) V1WebhookCreate(ctx echo.Context, request gen.V1WebhookCreateRequestObject) (gen.V1WebhookCreateResponseObject, error) {
+	tenant := ctx.Get("tenant").(*sqlcv1.Tenant)
+
+	canCreate, _, err := w.config.V1.TenantLimit().CanCreate(ctx.Request().Context(), enums.LimitResourceINCOMINGWEBHOOK, tenant.ID, 1)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if webhook can be created: %w", err)
+	}
+
+	if !canCreate {
+		return gen.V1WebhookCreate400JSONResponse{
+			Errors: []gen.APIError{
+				{
+					Description: "incoming webhook limit reached",
+				},
+			},
+		}, nil
+	}
+
+	params, err := w.constructCreateOpts(tenant.ID, *request.Body)
+	if err != nil {
+		var internal *webhookInternalError
+		if errors.As(err, &internal) {
+			return nil, err
+		}
+
+		return gen.V1WebhookCreate400JSONResponse{
+			Errors: []gen.APIError{
+				{
+					Description: err.Error(),
+				},
+			},
+		}, nil
+	}
+
+	webhook, err := w.config.V1.Webhooks().CreateWebhook(
+		ctx.Request().Context(),
+		tenant.ID,
+		params,
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create webhook: %w", err)
+	}
+
+	w.config.Analytics.Enqueue(
+		ctx.Request().Context(),
+		analytics.Webhook, analytics.Create,
+		webhook.Name,
+		nil,
+	)
+
+	transformed := transformers.ToV1Webhook(webhook)
+
+	return gen.V1WebhookCreate200JSONResponse(transformed), nil
+}
+
+func extractAuthType(request gen.V1CreateWebhookRequest) (enums.V1IncomingWebhookAuthType, error) {
+	j, err := request.MarshalJSON()
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get marshal request: %w", err)
+	}
+
+	parsedBody := make(map[string]interface{})
+	if err := json.Unmarshal(j, &parsedBody); err != nil {
+		return "", fmt.Errorf("failed to unmarshal request body: %w", err)
+	}
+
+	unparsedDiscriminator, ok := parsedBody["authType"]
+	if !ok {
+		return "", fmt.Errorf("authType field is missing in the request body")
+	}
+
+	discriminator := unparsedDiscriminator.(string)
+
+	authType := enums.V1IncomingWebhookAuthType(discriminator)
+	if authType == "" {
+		return "", fmt.Errorf("invalid auth type: %s", unparsedDiscriminator)
+	}
+
+	return authType, nil
+}
+
+func (w *V1WebhooksService) constructCreateOpts(tenantId uuid.UUID, request gen.V1CreateWebhookRequest) (v1.CreateWebhookOpts, error) {
+	params := v1.CreateWebhookOpts{
+		Tenantid: tenantId,
+	}
+
+	discriminator, err := extractAuthType(request)
+
+	if err != nil {
+		return params, fmt.Errorf("failed to get discriminator: %w", err)
+	}
+
+	authConfig := v1.AuthConfig{}
+
+	switch discriminator {
+	case enums.V1IncomingWebhookAuthTypeBASIC:
+		basicAuth, err := request.AsV1CreateWebhookRequestBasicAuth()
+		if err != nil {
+			return params, fmt.Errorf("failed to parse basic auth: %w", err)
+		}
+
+		authConfig.Type = enums.V1IncomingWebhookAuthTypeBASIC
+
+		passwordEncrypted, err := w.config.Encryption.Encrypt([]byte(basicAuth.Auth.Password), "v1_webhook_basic_auth_password")
+
+		if err != nil {
+			return params, &webhookInternalError{err: fmt.Errorf("failed to encrypt basic auth password: %w", err)}
+		}
+
+		authConfig.BasicAuth = &v1.BasicAuthCredentials{
+			Username:          basicAuth.Auth.Username,
+			EncryptedPassword: passwordEncrypted,
+		}
+
+		params.Sourcename = basicAuth.SourceName
+		params.Name = basicAuth.Name
+		params.Eventkeyexpression = basicAuth.EventKeyExpression
+		params.ScopeExpression = basicAuth.ScopeExpression
+		params.ReturnEventAsResponsePayload = returnEventResponsePayloadOrDefault(basicAuth.ReturnEventAsResponsePayload)
+		if basicAuth.StaticPayload != nil {
+			payloadBytes, err := json.Marshal(basicAuth.StaticPayload)
+			if err != nil {
+				return params, fmt.Errorf("failed to marshal static payload: %w", err)
+			}
+			params.StaticPayload = payloadBytes
+		}
+		params.AuthConfig = authConfig
+	case enums.V1IncomingWebhookAuthTypeAPIKEY:
+		apiKeyAuth, err := request.AsV1CreateWebhookRequestAPIKey()
+		if err != nil {
+			return params, fmt.Errorf("failed to parse api key auth: %w", err)
+		}
+
+		authConfig.Type = enums.V1IncomingWebhookAuthTypeAPIKEY
+
+		authConfig := v1.AuthConfig{
+			Type: enums.V1IncomingWebhookAuthTypeAPIKEY,
+		}
+
+		apiKeyEncrypted, err := w.config.Encryption.Encrypt([]byte(apiKeyAuth.Auth.ApiKey), "v1_webhook_api_key")
+
+		if err != nil {
+			return params, &webhookInternalError{err: fmt.Errorf("failed to encrypt api key: %w", err)}
+		}
+
+		authConfig.APIKeyAuth = &v1.APIKeyAuthCredentials{
+			HeaderName:   apiKeyAuth.Auth.HeaderName,
+			EncryptedKey: apiKeyEncrypted,
+		}
+
+		params.Sourcename = apiKeyAuth.SourceName
+		params.Name = apiKeyAuth.Name
+		params.Eventkeyexpression = apiKeyAuth.EventKeyExpression
+		params.ScopeExpression = apiKeyAuth.ScopeExpression
+		params.ReturnEventAsResponsePayload = returnEventResponsePayloadOrDefault(apiKeyAuth.ReturnEventAsResponsePayload)
+		if apiKeyAuth.StaticPayload != nil {
+			payloadBytes, err := json.Marshal(apiKeyAuth.StaticPayload)
+			if err != nil {
+				return params, fmt.Errorf("failed to marshal static payload: %w", err)
+			}
+			params.StaticPayload = payloadBytes
+		}
+		params.AuthConfig = authConfig
+	case enums.V1IncomingWebhookAuthTypeHMAC:
+		hmacAuth, err := request.AsV1CreateWebhookRequestHMAC()
+		if err != nil {
+			return params, fmt.Errorf("failed to parse hmac auth: %w", err)
+		}
+
+		if err := checkHMACAlgorithm(hmacAuth.Auth.Algorithm); err != nil {
+			return params, err
+		}
+
+		if err := encryption.CheckHMACKey([]byte(hmacAuth.Auth.SigningSecret)); err != nil {
+			return params, err
+		}
+
+		authConfig := v1.AuthConfig{
+			Type: enums.V1IncomingWebhookAuthTypeHMAC,
+		}
+
+		signingSecretEncrypted, err := w.config.Encryption.Encrypt([]byte(hmacAuth.Auth.SigningSecret), "v1_webhook_hmac_signing_secret")
+
+		if err != nil {
+			return params, &webhookInternalError{err: fmt.Errorf("failed to encrypt signing secret: %w", err)}
+		}
+
+		authConfig.HMACAuth = &v1.HMACAuthCredentials{
+			Algorithm:                     hmacAuth.Auth.Algorithm,
+			Encoding:                      hmacAuth.Auth.Encoding,
+			SignatureHeaderName:           hmacAuth.Auth.SignatureHeaderName,
+			EncryptedWebhookSigningSecret: signingSecretEncrypted,
+		}
+
+		params.Sourcename = hmacAuth.SourceName
+		params.Name = hmacAuth.Name
+		params.Eventkeyexpression = hmacAuth.EventKeyExpression
+		params.ScopeExpression = hmacAuth.ScopeExpression
+		params.ReturnEventAsResponsePayload = returnEventResponsePayloadOrDefault(hmacAuth.ReturnEventAsResponsePayload)
+		if hmacAuth.StaticPayload != nil {
+			payloadBytes, err := json.Marshal(hmacAuth.StaticPayload)
+			if err != nil {
+				return params, fmt.Errorf("failed to marshal static payload: %w", err)
+			}
+			params.StaticPayload = payloadBytes
+		}
+		params.AuthConfig = authConfig
+	default:
+		return params, fmt.Errorf("unsupported auth type: %s", discriminator)
+	}
+
+	return params, nil
+}
+
+// webhookInternalError is an encryption failure. Its text names key material handling, so the
+// handler returns it for the server error handler to replace.
+type webhookInternalError struct {
+	err error
+}
+
+func (e *webhookInternalError) Error() string {
+	return e.err.Error()
+}
+
+func (e *webhookInternalError) Unwrap() error {
+	return e.err
+}
+
+func returnEventResponsePayloadOrDefault(requestReturnEventAsResponsePayload *bool) bool {
+	if requestReturnEventAsResponsePayload == nil {
+		return true
+	}
+
+	return *requestReturnEventAsResponsePayload
+}

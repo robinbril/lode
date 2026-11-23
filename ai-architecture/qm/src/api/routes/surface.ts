@@ -1,0 +1,1578 @@
+import { atLeast } from "../../personas/persona-schema.ts";
+import { isSideChatAnchor } from "../../sessions/side-chat.ts";
+import type { CapabilityClaims } from "../../auth/capability-token.ts";
+import { memoryForRequest } from "./memory-access.ts";
+import {
+  turnAuthority,
+  type MemoryAuthority,
+  type MemoryEdit,
+  type MemoryService,
+} from "../../memory/memory-service.ts";
+import {
+  forgetFacts,
+  MAX_FACTS_PER_WRITE,
+  problemLine,
+  withProviders,
+  writeFacts,
+  type MemoryProviderProblem,
+} from "../../memory/provider-outcome.ts";
+import { suggestedActivityRoutes } from "./suggested-activities.ts";
+import { runtimeConfigBody, userRuntimeConfigBody, withAppEditRuntime } from "../runtime-config.ts";
+import { canReadNotebook, searchAcrossScopes } from "../../memory/cross-scope.ts";
+import { sessionSharingRoutes } from "./session-sharing.ts";
+import { SHARE_ERROR_STATUS } from "./sharing.ts";
+import type { Grant, PendingApproval, ScopeId, Session } from "../../types.ts";
+import { parseScopeId, scopeId as makeScopeId } from "../../types.ts";
+import type { Skill, SkillResolution } from "../../skills/skill-store.ts";
+import type { ItemKind } from "../../sessions/items-schema.ts";
+import { compactItem } from "../../sessions/items.ts";
+import {
+  defaultModel,
+  modelSupported,
+  modelOfferedInWebui,
+  thinkingLevelsFor,
+  fastModeModelIds,
+} from "../../model/pi-models.ts";
+import { builtInModelCatalog, selectableCatalog, selectableModelCatalog } from "../../model/model-catalog.ts";
+import { errMessage } from "../../util/errors.ts";
+import { isSafeSkillName, SKILL_NAME_RULE } from "../../skills/skill-name.ts";
+import { SideChatAnchorError, SoulUpdateDeniedError, type SessionPageStatus } from "../app-types.ts";
+import { renderAgentApis } from "../agent-api-catalog.ts";
+import { sendJson, sendProblem } from "../http.ts";
+import { resolveBranding } from "../../resolution/branding.ts";
+import { isOwnScopeBotWork, loadsScopeContext } from "../../resolution/context-filter.ts";
+import { audit, isObj, orgScope } from "./shared.ts";
+import { isSessionTurn } from "../../core/turn-origin.ts";
+import {
+  UI_STATE_KEY_PATTERN,
+  UI_STATE_MAX_BYTES,
+  UI_STATE_MAX_FUTURE_SKEW_MS,
+  storeUiState,
+  uiStateId,
+} from "../../surfaces/ui-state.ts";
+import { redactWebhook } from "./webhooks.ts";
+import { selfSpend } from "./admin/spend.ts";
+import { tenantOf, withActor, type ApiCtx, type Route } from "./route.ts";
+import {
+  ARTIFACT_TYPES,
+  authorPublishesSkill,
+  isArtifactType,
+  personAtKeyboard,
+  splitToScope,
+  SHARED_SKILL_TRIGGER_REFUSAL,
+} from "../artifact-share.ts";
+
+function isGrant(b: unknown): b is Grant {
+  return (
+    isObj(b) &&
+    typeof b.ownerScopeId === "string" &&
+    typeof b.ref === "string" &&
+    typeof b.granteeScopeId === "string" &&
+    (b.permission === "read" || b.permission === "write") &&
+    typeof b.grantedBy === "string"
+  );
+}
+
+function sharedSkillCreateBlock(capability: ApiCtx["capability"]): string | null {
+  if (!capability) return null;
+  if (parseScopeId(capability.scopeId).kind === "personal") return null;
+  if (personAtKeyboard(capability)) return null;
+  return SHARED_SKILL_TRIGGER_REFUSAL;
+}
+
+function isConversationColor(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value));
+}
+
+async function regenerateSessionTitle(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const id = ctx.params.id!;
+  const principalId = (body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  const out = await app.regenerateTitle(id, principalId);
+  if (!out) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, out);
+}
+
+async function suggestNextPrompt(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const principalId = (body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  const out = await app.suggestNextPrompt(ctx.params.id!, principalId);
+  if (!out) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, out);
+}
+
+async function detachSession(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const id = ctx.params.id!;
+  const principalId = (body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  const out = await app.detachSession(id, principalId);
+  if (!out) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, out);
+}
+
+async function cancelSessionGoal(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const principalId = (body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  const out = await app.cancelSessionGoal(ctx.params.id!, principalId);
+  if (!out) return sendJson(res, 404, { error: "not_found" });
+  if (!out.cancelled)
+    return sendJson(res, 409, {
+      error: out.reason,
+      message:
+        out.reason === "busy"
+          ? "The conversation is still finishing a reply. Try again in a moment."
+          : "This conversation has no active or paused goal to cancel.",
+    });
+  return sendJson(res, 200, out);
+}
+
+async function resumeSessionGoal(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const principalId = (body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  const out = await app.resumeSessionGoal(ctx.params.id!, principalId);
+  if (!out) return sendJson(res, 404, { error: "not_found" });
+  if (!out.resumed)
+    return sendJson(res, 409, {
+      error: out.reason,
+      message:
+        out.reason === "busy"
+          ? "The conversation is still working on a reply. Try again when it finishes."
+          : "This conversation has no active or paused goal to resume.",
+    });
+  return sendJson(res, 200, out);
+}
+
+async function spawnWebSession(ctx: ApiCtx): Promise<void> {
+  const b = (isObj(ctx.body) ? ctx.body : {}) as { principalId?: unknown; scopeId?: unknown };
+  if (typeof b.principalId !== "string" || !b.principalId || typeof b.scopeId !== "string" || !b.scopeId)
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "principalId and scopeId required" });
+  const out = await ctx.app.spawnSession(b.principalId, { scopeId: b.scopeId });
+  if (!out) return sendJson(ctx.res, 403, { error: "forbidden", message: "you can't start a conversation there" });
+  return sendJson(ctx.res, 201, out);
+}
+
+async function forkSession(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const id = ctx.params.id!;
+  const b = body as {
+    principalId?: unknown;
+    upToSeq?: unknown;
+    sideChat?: { entrySeq?: unknown; quote?: unknown; occurrence?: unknown };
+  };
+  if (typeof b.principalId !== "string" || !b.principalId) {
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  }
+  if (b.upToSeq !== undefined && (typeof b.upToSeq !== "number" || !Number.isInteger(b.upToSeq) || b.upToSeq < 0)) {
+    return sendJson(res, 400, { error: "bad_request", message: "upToSeq must be a non-negative integer" });
+  }
+  let sideChat: { entrySeq: number; quote: string; occurrence: number } | undefined;
+  if (b.sideChat !== undefined) {
+    if (!isSideChatAnchor(b.sideChat)) {
+      return sendJson(res, 400, {
+        error: "bad_request",
+        message: "sideChat requires a saved entry and a nonempty quote",
+      });
+    }
+    sideChat = {
+      entrySeq: b.sideChat.entrySeq,
+      quote: b.sideChat.quote,
+      occurrence: b.sideChat.occurrence,
+    };
+  }
+  let out: Awaited<ReturnType<typeof app.forkSession>>;
+  try {
+    out = await app.forkSession(id, b.principalId, {
+      ...(b.upToSeq !== undefined ? { upToSeq: b.upToSeq } : {}),
+      ...(sideChat ? { sideChat } : {}),
+    });
+  } catch (e) {
+    if (e instanceof SideChatAnchorError) return sendJson(res, 400, { error: "bad_request", message: e.message });
+    throw e;
+  }
+  if (!out) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, out);
+}
+
+function agentConversation(session: Session) {
+  return {
+    id: session.id,
+    title: session.title,
+    type: session.type,
+    scopeId: session.scopeId,
+    threadRef: session.threadRef,
+    surface: session.surface,
+    createdAt: session.createdAt,
+    archived: session.archived === true,
+    pinned: session.pinned === true,
+    color: session.color ?? null,
+    unread: session.unread === true,
+    lastActivityAt: session.lastActivityAt ?? session.createdAt,
+  };
+}
+
+function transcriptWindow(
+  url: URL,
+  defaultTailTurns?: number,
+): { tailTurns?: number; sinceSeq?: number; beforeSeq?: number } | null {
+  const windowParam = (name: "tailTurns" | "sinceSeq" | "beforeSeq", min: number): number | undefined | null => {
+    const raw = url.searchParams.get(name);
+    if (raw === null) return undefined;
+    const n = Number(raw);
+    return Number.isInteger(n) && n >= min ? n : null;
+  };
+  const requestedTailTurns = windowParam("tailTurns", 1);
+  const sinceSeq = windowParam("sinceSeq", 0);
+  const beforeSeq = windowParam("beforeSeq", 1);
+  if (requestedTailTurns === null || sinceSeq === null || beforeSeq === null) return null;
+  const tailTurns = requestedTailTurns ?? (sinceSeq === undefined ? defaultTailTurns : undefined);
+  if (tailTurns === undefined && sinceSeq === undefined && beforeSeq === undefined) return {};
+  return {
+    ...(tailTurns !== undefined ? { tailTurns } : {}),
+    ...(sinceSeq !== undefined ? { sinceSeq } : {}),
+    ...(beforeSeq !== undefined ? { beforeSeq } : {}),
+  };
+}
+
+async function getSession(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const id = ctx.params.id!;
+  const viewer = url.searchParams.get("viewer");
+  if (!viewer) return sendJson(res, 400, { error: "bad_request", message: "viewer required" });
+  const window = transcriptWindow(url);
+  if (!window) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "tailTurns and beforeSeq must be positive integers, sinceSeq a non-negative one",
+    });
+  }
+  const found = await app.getSessionForViewer(id, { actorId: viewer }, Object.keys(window).length ? window : undefined);
+  if (!found) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, found);
+}
+
+const AGENT_TRANSCRIPT_KINDS: ReadonlySet<ItemKind> = new Set<ItemKind>([
+  "UserMessage",
+  "SteeringMessage",
+  "AgentMessage",
+  "Reasoning",
+  "ToolCall",
+  "ToolResult",
+  "Elicitation",
+  "ElicitationResponse",
+]);
+
+async function getAgentConversation(ctx: ApiCtx): Promise<void> {
+  const { res, app, url, capability } = ctx;
+  if (!capability) {
+    return sendJson(res, 401, { error: "capability_required", message: "this endpoint is for the agent self-API" });
+  }
+  if (url.searchParams.has("sinceSeq")) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "agent transcript paging supports tailTurns and beforeSeq",
+    });
+  }
+  const window = transcriptWindow(url, 20);
+  if (!window) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "tailTurns and beforeSeq must be positive integers, sinceSeq a non-negative one",
+    });
+  }
+  const found = await app.getSessionForViewer(ctx.params.id!, capability, window);
+  if (!found) return sendJson(res, 404, { error: "not_found", message: "not a conversation you can see" });
+  return sendJson(res, 200, {
+    session: agentConversation(found.session),
+    items: found.items.filter((item) => AGENT_TRANSCRIPT_KINDS.has(item.kind)).map(compactItem),
+    ...(found.earlierItems ? { earlierItems: found.earlierItems } : {}),
+  });
+}
+
+async function getSessionItem(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const id = ctx.params.id!;
+  const viewer = url.searchParams.get("viewer");
+  if (!viewer) return sendJson(res, 400, { error: "bad_request", message: "viewer required" });
+  const seq = Number(ctx.params.seq);
+  if (!Number.isInteger(seq) || seq < 0) {
+    return sendJson(res, 400, { error: "bad_request", message: "seq must be a non-negative integer" });
+  }
+  const found = await app.getSessionItemForViewer(id, viewer, seq);
+  if (!found) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, found);
+}
+
+async function listSessionApprovals(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const id = ctx.params.id!;
+  const viewer = url.searchParams.get("viewer");
+  if (!viewer) return sendJson(res, 400, { error: "bad_request", message: "viewer required" });
+  const approvals = await app.listSessionApprovals(id, viewer);
+  return sendJson(res, 200, { approvals: [...approvals, ...(await credentialApprovals(ctx, id, viewer))] });
+}
+
+async function credentialApprovals(ctx: ApiCtx, sessionId: string, viewer: string): Promise<PendingApproval[]> {
+  const kc = ctx.deps.keychain;
+  const approvals = ctx.deps.keychainApprovals;
+  if (!kc || !approvals) return [];
+  const out: PendingApproval[] = [];
+  for (const ask of await kc.listAsks({ ownerId: viewer })) {
+    if (ask.status !== "pending") continue;
+    const view = await approvals.get(ask.id, viewer);
+    if (!view || (view.sessionId !== sessionId && view.requesterSessionId !== sessionId)) continue;
+    out.push({
+      requestId: `keychain:${ask.id}`,
+      command: view.accountLabel ? `${view.service} (${view.accountLabel})` : view.service,
+      summary: `Use your ${view.service} credential in ${view.conversation}`,
+      reason: "Credential approval",
+      grantModes: { session: false, always: true },
+      blocksInput: false,
+    });
+  }
+  return out;
+}
+
+async function getSessionBackground(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const id = ctx.params.id!;
+  const viewer = url.searchParams.get("viewer");
+  if (!viewer) return sendJson(res, 400, { error: "bad_request", message: "viewer required" });
+  const view = await app.sessionBackground(id, viewer);
+  if (!view) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, view);
+}
+
+async function getSessionBackgroundOutput(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const id = ctx.params.id!;
+  const processId = ctx.params.pid!;
+  const viewer = url.searchParams.get("viewer");
+  if (!viewer) return sendJson(res, 400, { error: "bad_request", message: "viewer required" });
+  const sinceCursor = Math.max(0, Number(url.searchParams.get("sinceCursor") ?? "0") || 0);
+  const read = await app.readSessionBackgroundOutput(id, processId, viewer, sinceCursor);
+  if (!read) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, read);
+}
+
+async function listFiles(ctx: ApiCtx): Promise<void> {
+  const { res, app, url, capability, actor } = ctx;
+  const viewer = capability?.actorId ?? actor?.p;
+  if (!viewer) return sendJson(res, 401, { error: "capability_required" });
+  const limitRaw = url.searchParams.get("limit");
+  const cursor = url.searchParams.get("cursor");
+  const scope = url.searchParams.get("scope");
+  const nameQuery = (url.searchParams.get("q") ?? "").trim();
+  const page = await app.listFilesForViewer(
+    tenantOf(ctx),
+    viewer,
+    {
+      ...(limitRaw ? { limit: Number(limitRaw) } : {}),
+      ...(cursor ? { cursor } : {}),
+      ...(nameQuery ? { nameQuery } : {}),
+    },
+    scope ? (scope as ScopeId) : undefined,
+    isOwnScopeBotWork(capability),
+  );
+  return sendJson(res, 200, page);
+}
+
+type SessionPatch = {
+  title?: string | null;
+  archived?: boolean;
+  pinned?: boolean;
+  color?: string | null;
+  readAt?: number;
+};
+
+function parseSessionPatch(b: Record<string, unknown>): { patch: SessionPatch } | { error: string } {
+  const patch: SessionPatch = {};
+  if ("unread" in b) {
+    if (typeof b.unread !== "boolean") return { error: "unread must be a boolean" };
+    patch.readAt = b.unread ? 0 : Date.now();
+  }
+  if ("title" in b) {
+    if (b.title !== null && typeof b.title !== "string") return { error: "title must be a string or null" };
+    const trimmed = typeof b.title === "string" ? b.title.trim().slice(0, 200) : null;
+    patch.title = trimmed ? trimmed : null;
+  }
+  if ("archived" in b) {
+    if (typeof b.archived !== "boolean") return { error: "archived must be a boolean" };
+    patch.archived = b.archived;
+  }
+  if ("pinned" in b) {
+    if (typeof b.pinned !== "boolean") return { error: "pinned must be a boolean" };
+    patch.pinned = b.pinned;
+  }
+  if ("color" in b) {
+    if (!isConversationColor(b.color)) return { error: "color must be '#rrggbb' or null" };
+    patch.color = typeof b.color === "string" ? b.color.toLowerCase() : null;
+  }
+  if (Object.keys(patch).length === 0) return { error: "title, archived, pinned, color, or unread required" };
+  return { patch };
+}
+
+async function patchSession(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const id = ctx.params.id!;
+  const b = isObj(body) ? body : {};
+  const principalId = typeof b.principalId === "string" ? b.principalId : null;
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const parsed = parseSessionPatch(b);
+  if ("error" in parsed) return sendJson(res, 400, { error: "bad_request", message: parsed.error });
+  const patch = parsed.patch;
+  const session = await app.updateSession(id, { actorId: principalId }, patch);
+  if (!session) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, { session });
+}
+
+async function listAgentConversations(ctx: ApiCtx): Promise<void> {
+  const { res, app, capability } = ctx;
+  if (!capability) {
+    return sendJson(res, 401, { error: "capability_required", message: "this endpoint is for the agent self-API" });
+  }
+  const sessions = await app.listSessions(capability);
+  return sendJson(res, 200, {
+    conversations: sessions.map(agentConversation),
+  });
+}
+
+async function patchAgentConversation(ctx: ApiCtx): Promise<void> {
+  const { res, app, capability, body } = ctx;
+  if (!capability) {
+    return sendJson(res, 401, { error: "capability_required", message: "this endpoint is for the agent self-API" });
+  }
+  const b = isObj(body) ? body : {};
+  const parsed = parseSessionPatch(b);
+  if ("error" in parsed) return sendJson(res, 400, { error: "bad_request", message: parsed.error });
+  const patch = parsed.patch;
+  const session = await app.updateSession(ctx.params.id!, capability, patch);
+  if (!session) return sendJson(res, 404, { error: "not_found", message: "not a conversation you can see" });
+  audit(ctx, {
+    principalId: capability.actorId,
+    action: "conversation.update",
+    resource: session.id,
+    scopeLabel: session.scopeId,
+    detail: JSON.stringify(patch),
+  });
+  return sendJson(res, 200, {
+    conversation: {
+      ...agentConversation(session),
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+    },
+  });
+}
+
+const DEFAULT_SESSION_PAGE = 50;
+
+async function listSessions(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const n = Number(url.searchParams.get("limit") ?? DEFAULT_SESSION_PAGE);
+  const before = parseSessionCursor(url.searchParams.get("before"));
+  const status = url.searchParams.get("status") ?? "active";
+  if (!Number.isInteger(n) || n < 1 || before === null || !isSessionPageStatus(status))
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "limit must be a positive integer, before a cursor, status active, archived or waiting",
+    });
+  const page = await app.listSessionPage(principalId, {
+    limit: n,
+    ...(before ? { before } : {}),
+    status,
+    ...(url.searchParams.get("surface") ? { surface: url.searchParams.get("surface")! } : {}),
+    ...(url.searchParams.get("scope") ? { scopeId: url.searchParams.get("scope")! } : {}),
+    ...(url.searchParams.get("q")?.trim() ? { titleQuery: url.searchParams.get("q")!.trim() } : {}),
+  });
+  return sendJson(res, 200, {
+    sessions: page.sessions,
+    ...(page.pinned ? { pinned: page.pinned } : {}),
+    ...(page.hasArchived !== undefined ? { hasArchived: page.hasArchived } : {}),
+    nextCursor: page.next ? `${page.next.activity}.${page.next.id}` : null,
+  });
+}
+
+function isSessionPageStatus(value: string): value is SessionPageStatus {
+  return value === "active" || value === "archived" || value === "waiting";
+}
+
+function parseSessionCursor(raw: string | null): { activity: number; id: string } | undefined | null {
+  if (raw === null || raw === "") return undefined;
+  const dot = raw.indexOf(".");
+  const activity = Number(raw.slice(0, dot));
+  const id = raw.slice(dot + 1);
+  return dot > 0 && Number.isSafeInteger(activity) && id ? { activity, id } : null;
+}
+
+async function listSideChats(ctx: ApiCtx): Promise<void> {
+  const principalId = ctx.url.searchParams.get("principalId");
+  if (!principalId) return sendJson(ctx.res, 400, { error: "bad_request" });
+  const sessions = await ctx.app.sideChats(principalId, ctx.params.id!);
+  return sessions ? sendJson(ctx.res, 200, { sessions }) : sendJson(ctx.res, 404, { error: "not_found" });
+}
+
+async function expandSideChat(ctx: ApiCtx): Promise<void> {
+  const principalId = (ctx.body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId) return sendJson(ctx.res, 400, { error: "bad_request" });
+  const session = await ctx.app.expandSideChat(principalId, ctx.params.id!);
+  return session ? sendJson(ctx.res, 200, { session }) : sendJson(ctx.res, 404, { error: "not_found" });
+}
+
+async function listSessionChildren(ctx: ApiCtx): Promise<void> {
+  const { res, app, url, params } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const children = await app.sessionChildren(principalId, params.id!);
+  if (!children) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, { sessions: children });
+}
+
+async function getSessionRow(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  const id = url.searchParams.get("id") ?? undefined;
+  const threadRef = url.searchParams.get("threadRef") ?? undefined;
+  if (!principalId || (!id && !threadRef))
+    return sendJson(res, 400, { error: "bad_request", message: "principalId and id or threadRef required" });
+  const session = await app.sessionRow(principalId, id ? { id } : { threadRef });
+  if (!session) return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, 200, { session });
+}
+
+async function searchResources(ctx: ApiCtx): Promise<void> {
+  const principalId = ctx.actor?.p ?? ctx.url.searchParams.get("principalId");
+  if (!principalId) return sendJson(ctx.res, 400, { error: "bad_request" });
+  const query = (ctx.url.searchParams.get("q") ?? "").slice(0, 500);
+  return sendJson(ctx.res, 200, await ctx.app.searchResources(tenantOf(ctx), principalId, query));
+}
+
+async function searchSessions(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const query = url.searchParams.get("q") ?? "";
+  const rawLimit = Number(url.searchParams.get("limit") ?? "");
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+  return sendJson(res, 200, { hits: await app.searchSessions({ actorId: principalId }, query, limit) });
+}
+
+async function listContexts(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  return sendJson(res, 200, { contexts: await app.listContexts(principalId) });
+}
+
+async function listScopeResources(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  const scope = url.searchParams.get("scope");
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  if (!scope) return sendJson(res, 400, { error: "bad_request", message: "scope required" });
+  const out = await app.listScopeResources(tenantOf(ctx), principalId, scope as ScopeId);
+  if (!out) return sendJson(res, 404, { error: "not_found", message: "not a context you can see" });
+  return sendJson(res, 200, {
+    files: out.files,
+    crons: out.crons,
+    webhooks: out.webhooks.map(redactWebhook),
+    apps: out.apps,
+    skills: out.skills,
+    manageable: out.manageable,
+  });
+}
+
+async function getUiState(ctx: ApiCtx): Promise<void> {
+  const { res, deps, url } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  const key = url.searchParams.get("key") ?? "";
+  if (!principalId || !UI_STATE_KEY_PATTERN.test(key))
+    return sendJson(res, 400, { error: "bad_request", message: "principalId and a valid key required" });
+  if (!deps.uiState) return sendJson(res, 404, { error: "not_found" });
+  const rec = await deps.uiState.get(uiStateId(principalId, key));
+  return sendJson(res, 200, rec ?? { value: null, updatedAt: 0 });
+}
+
+async function putUiState(ctx: ApiCtx): Promise<void> {
+  const { res, deps, body } = ctx;
+  const b = body as { principalId?: unknown; key?: unknown; value?: unknown; updatedAt?: unknown };
+  const principalId = typeof b.principalId === "string" ? b.principalId : "";
+  const key = typeof b.key === "string" ? b.key : "";
+  if (!principalId || !UI_STATE_KEY_PATTERN.test(key))
+    return sendJson(res, 400, { error: "bad_request", message: "principalId and a valid key required" });
+  if (b.value === undefined) return sendJson(res, 400, { error: "bad_request", message: "value required" });
+  if (Buffer.byteLength(JSON.stringify(b.value)) > UI_STATE_MAX_BYTES)
+    return sendJson(res, 413, { error: "payload_too_large", message: "ui state too large" });
+  if (!deps.uiState) return sendJson(res, 404, { error: "not_found" });
+  const claimed = typeof b.updatedAt === "number" && Number.isFinite(b.updatedAt) ? b.updatedAt : Date.now();
+  const updatedAt = Math.min(claimed, Date.now() + UI_STATE_MAX_FUTURE_SKEW_MS);
+  const result = await storeUiState(deps.uiState, uiStateId(principalId, key), { value: b.value, updatedAt });
+  return sendJson(res, 200, result);
+}
+
+export async function memoryFacts(memory: MemoryService, scope: ScopeId) {
+  return ((await memory.facts?.(scope)) ?? []).map(({ id, text, createdAt, updatedAt }) => ({
+    id,
+    text,
+    createdAt,
+    updatedAt,
+  }));
+}
+
+export function parseEdits(body: unknown): MemoryEdit[] | string {
+  const facts = (isObj(body) ? body : {}).facts;
+  if (!Array.isArray(facts) || !facts.length) return "facts (non-empty array of {id, text}) required";
+  const edits = facts.flatMap((fact): MemoryEdit[] =>
+    isObj(fact) && typeof fact.id === "string" && typeof fact.text === "string" && fact.text.trim()
+      ? [{ id: fact.id, text: fact.text }]
+      : [],
+  );
+  return edits.length === facts.length ? edits : "every fact needs a string id and non-empty text";
+}
+
+export function parseIds(body: unknown): string[] | string {
+  const ids = (isObj(body) ? body : {}).ids;
+  return Array.isArray(ids) && ids.length && ids.every((id) => typeof id === "string" && id.trim())
+    ? (ids as string[])
+    : "ids (non-empty string array) required";
+}
+
+async function selfMemory(ctx: ApiCtx): Promise<void> {
+  const { res, url, method, body } = ctx;
+  const principalId =
+    method === "GET" ? url.searchParams.get("principalId") : (body as { principalId?: unknown }).principalId;
+  if (typeof principalId !== "string" || !principalId)
+    return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const memory = memoryForRequest(ctx, principalId);
+  if (!memory) return sendJson(res, 404, { error: "not_found" });
+  const scope = makeScopeId("personal", principalId);
+  const by: MemoryAuthority = { actorId: principalId, context: "self" };
+  if (method === "PATCH") {
+    const edits = parseEdits(body);
+    if (typeof edits === "string") return sendJson(res, 400, { error: "bad_request", message: edits });
+    await memory.edit?.(scope, edits, by);
+  } else if (method === "DELETE") {
+    const ids = parseIds(body);
+    if (typeof ids === "string") return sendJson(res, 400, { error: "bad_request", message: ids });
+    await memory.delete?.(scope, ids, by);
+  }
+  const action = method === "GET" ? "memory.self.read" : "memory.self.update";
+  audit(ctx, { principalId, action, resource: "memory", scopeLabel: scope });
+  return sendJson(res, 200, { scopeId: scope, facts: await memoryFacts(memory, scope) });
+}
+
+async function listAgentApis(ctx: ApiCtx): Promise<void> {
+  const { res, deps, capability } = ctx;
+  if (!capability) return sendJson(res, 401, { error: "unauthorized", message: "agent capability token required" });
+  const admin: { isAdmin: boolean; role?: string } = deps.admin
+    ? await deps.admin
+        .adminStatusOf(tenantOf(ctx), { id: capability.actorId, type: "internal" })
+        .catch(() => ({ isAdmin: false }))
+    : { isAdmin: false };
+  audit(ctx, {
+    principalId: capability.actorId,
+    action: "apis.list",
+    resource: "apis",
+    scopeLabel: capability.scopeId,
+  });
+  return sendJson(
+    res,
+    200,
+    renderAgentApis(
+      capability,
+      { isAdmin: admin.isAdmin, ...(admin.role ? { role: admin.role } : {}) },
+      {
+        swarmsEnabled: Boolean(await ctx.app.swarms?.authorizes(capability)),
+        personasEnabled: Boolean(await ctx.app.personas?.enabledFor(capability.actorId)),
+      },
+      ctx.url.searchParams.get("q") ?? "",
+    ),
+  );
+}
+
+export function parseFacts(body: unknown): string[] | string {
+  const b = (isObj(body) ? body : {}) as { facts?: unknown };
+  const facts = Array.isArray(b.facts)
+    ? b.facts.filter((f): f is string => typeof f === "string" && f.trim() !== "")
+    : [];
+  if (facts.length === 0) return "facts (non-empty string array) required";
+  if (facts.length > MAX_FACTS_PER_WRITE) return `at most ${MAX_FACTS_PER_WRITE} facts per call`;
+  return facts;
+}
+
+type AgentMemoryHandler = (
+  ctx: ApiCtx,
+  memory: NonNullable<ReturnType<typeof memoryForRequest>>,
+  capability: CapabilityClaims,
+) => Promise<void>;
+
+const agentMemory =
+  (handle: AgentMemoryHandler) =>
+  async (ctx: ApiCtx): Promise<void> => {
+    const memory = memoryForRequest(ctx);
+    const { res, body, capability } = ctx;
+    if (!capability) return sendJson(res, 401, { error: "unauthorized", message: "agent capability token required" });
+    if (!memory) return sendJson(res, 404, { error: "not_found" });
+    if (isObj(body) && ["recipient", "channel", "participants"].some((key) => key in body)) {
+      return sendJson(res, 400, {
+        error: "bad_request",
+        message: "memory can only be changed from its own conversation",
+      });
+    }
+    return handle(ctx, memory, capability);
+  };
+
+function sendProviderProblem(res: ApiCtx["res"], problems: MemoryProviderProblem[], partial: Record<string, unknown>) {
+  return sendProblem(res, 502, {
+    title: "Memory provider failed",
+    detail: problems.map(problemLine).join(" "),
+    problems,
+    ...partial,
+  });
+}
+
+const searchMemory = agentMemory(async (ctx, memory, capability) => {
+  const { res, body } = ctx;
+  const b = body as { query?: unknown; limit?: unknown; scope?: unknown };
+  if (typeof b.query !== "string" || !b.query.trim()) {
+    return sendJson(res, 400, { error: "bad_request", message: "query (string) required" });
+  }
+  const allowed = capability.memory?.read ?? [];
+  if (b.scope !== undefined && typeof b.scope !== "string")
+    return sendJson(res, 400, { error: "bad_request", message: "scope must be a string" });
+  if (typeof b.scope === "string" && !allowed.includes(b.scope))
+    return sendJson(res, 403, { error: "forbidden", message: "notebook is not readable here" });
+  const scopes = typeof b.scope === "string" ? [b.scope] : allowed;
+  if (scopes.length === 0) {
+    return sendJson(res, 403, { error: "forbidden", message: "memory recall is not enabled for this conversation" });
+  }
+  const query = b.query;
+  const { value: results, problems } = await withProviders("search", (report) =>
+    searchAcrossScopes(memory, scopes, query, typeof b.limit === "number" ? b.limit : 20, {
+      actorId: capability.actorId,
+      ...(capability.audienceScopeId ? { audienceScopeId: capability.audienceScopeId } : {}),
+      ...(capability.sessionId ? { sessionId: capability.sessionId } : {}),
+      report,
+    }),
+  );
+  audit(ctx, {
+    principalId: capability.actorId,
+    action: "memory.agent.search",
+    resource: "memory",
+    scopeLabel: scopes.join(","),
+  });
+  if (problems.length) return sendProviderProblem(res, problems, results ? { results } : {});
+  return sendJson(res, 200, { results });
+});
+
+const readOwnNotebook = agentMemory(async (ctx, memory, capability) => {
+  const { res } = ctx;
+  const requested = ctx.url.searchParams.get("scope");
+  const read = capability.memory?.read ?? [];
+  const target =
+    requested === "org"
+      ? (capability.memory?.orgWrite ?? read.find((scope) => scope.startsWith("org:")))
+      : (requested ?? capability.memory?.write ?? capability.scopeId);
+  if (!target || !canReadNotebook({ ...capability.memory, read }, target)) {
+    return sendJson(res, 403, { error: "forbidden", message: "notebook is not readable here" });
+  }
+  audit(ctx, {
+    principalId: capability.actorId,
+    action: "memory.agent.read",
+    resource: "memory",
+    scopeLabel: target,
+  });
+  return sendJson(res, 200, { scopeId: target, facts: await memoryFacts(memory, target) });
+});
+
+const writeMemory = (handle: (...args: [...Parameters<AgentMemoryHandler>, write: string]) => Promise<void>) =>
+  agentMemory(async (ctx, memory, capability) => {
+    const requestedScope = (ctx.body as { scope?: unknown } | undefined)?.scope;
+    const personaScope: ScopeId | undefined =
+      typeof requestedScope === "string" && parseScopeId(requestedScope as ScopeId).kind === "persona"
+        ? (requestedScope as ScopeId)
+        : undefined;
+    if (requestedScope !== undefined && requestedScope !== "org" && !personaScope) {
+      return sendJson(ctx.res, 400, {
+        error: "bad_request",
+        message: 'scope must be "org" or persona:<id> when present',
+      });
+    }
+    let write: string | undefined;
+    if (requestedScope === "org") write = capability.memory?.orgWrite;
+    else if (personaScope) {
+      if (
+        capability.memory?.write &&
+        personAtKeyboard(capability) &&
+        (await ctx.app.managesScope(capability.actorId, personaScope))
+      )
+        write = personaScope;
+    } else write = capability.memory?.write;
+    if (!write) {
+      let message = "memory capture is not enabled for this conversation";
+      if (requestedScope === "org")
+        message = "org memory writes need an org admin's own turn while it is still running";
+      else if (personaScope && capability.memory?.write)
+        message = "persona memory writes need a persona owner or write holder on a live turn";
+      return sendJson(ctx.res, 403, { error: "forbidden", message });
+    }
+    return handle(ctx, memory, capability, write);
+  });
+
+const captureFacts = writeMemory(async ({ res, deps, tenant, body }, memory, capability, write) => {
+  const facts = parseFacts(body);
+  if (typeof facts === "string") return sendJson(res, 400, { error: "bad_request", message: facts });
+  const { added, outcomes, problems } = await writeFacts(
+    memory,
+    write,
+    facts,
+    turnAuthority(capability.actorId, capability.memory),
+    {
+      mode: "explicit",
+      ...(capability.audienceScopeId ? { audienceScopeId: capability.audienceScopeId } : {}),
+      conversationScopeId: capability.scopeId,
+      ...(capability.sessionId ? { sessionId: capability.sessionId } : {}),
+    },
+    capability.runId,
+  );
+  audit(
+    { deps, tenant },
+    {
+      principalId: capability.actorId,
+      action: "memory.agent.capture",
+      resource: "memory",
+      scopeLabel: write,
+    },
+  );
+  if (problems.length) return sendProviderProblem(res, problems, { added, scopeId: write, outcomes });
+  return sendJson(res, 200, { ok: true, added, scopeId: write, ...(outcomes.length ? { outcomes } : {}) });
+});
+
+const editFacts = writeMemory(async ({ res, deps, tenant, body }, memory, capability, write) => {
+  const edits = parseEdits(body);
+  if (typeof edits === "string") return sendJson(res, 400, { error: "bad_request", message: edits });
+  await memory.edit?.(write, edits, turnAuthority(capability.actorId, capability.memory), {
+    conversationScopeId: capability.scopeId,
+  });
+  audit(
+    { deps, tenant },
+    {
+      principalId: capability.actorId,
+      action: "memory.agent.edit",
+      resource: "memory",
+      scopeLabel: write,
+    },
+  );
+  return sendJson(res, 200, { ok: true, scopeId: write });
+});
+
+const deleteFacts = writeMemory(async (ctx, memory, capability, write) => {
+  const { res, deps, tenant, body } = ctx;
+  const ids = parseIds(body);
+  if (typeof ids === "string") return sendJson(res, 400, { error: "bad_request", message: ids });
+  const { forgotten, outcomes, problems } = await forgetFacts(
+    memory,
+    write,
+    ids,
+    turnAuthority(
+      capability.actorId,
+      capability.memory,
+      personAtKeyboard(capability) && !isSessionTurn((await deps.runs!.get(capability.runId!))!.request),
+    ),
+    capability.audienceScopeId ? { audienceScopeId: capability.audienceScopeId } : {},
+    capability.sessionId && capability.runId && `${capability.sessionId}:${capability.runId}`,
+  );
+  audit(
+    { deps, tenant },
+    {
+      principalId: capability.actorId,
+      action: "memory.agent.delete",
+      resource: "memory",
+      scopeLabel: write,
+    },
+  );
+  const result = { forgotten, scopeId: write, ...(outcomes.length ? { outcomes } : {}) };
+  if (problems.length) return sendProviderProblem(res, problems, result);
+  return sendJson(res, 200, { ok: true, ...result });
+});
+
+async function listSkills(ctx: ApiCtx): Promise<void> {
+  const { res, app, url } = ctx;
+  const principalId = url.searchParams.get("principalId");
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const includeShadowed = url.searchParams.get("includeShadowed") === "1";
+  const resolved = (await app.listVisibleSkills(principalId, false)).filter(
+    (r): r is SkillResolution & { skill: Skill } => r.skill !== null,
+  );
+  const archivedAll = (await app.listSkills()).filter((skill) => skill.status === "archived");
+  const visible = resolved.flatMap((row) => [
+    { skill: row.skill, shadowed: row.shadowed },
+    ...(includeShadowed ? row.shadowed.map((skill) => ({ skill, shadowed: [] })) : []),
+  ]);
+  const manageable = await app.manageableSkills(
+    tenantOf(ctx),
+    [...archivedAll, ...visible.map((r) => r.skill)],
+    principalId,
+    false,
+  );
+  const archived = archivedAll.filter((skill) => manageable.has(skill.id)).map((skill) => ({ skill, shadowed: [] }));
+  const skills = await Promise.all(
+    [...visible, ...archived].map(async (r) => ({
+      id: r.skill.id,
+      name: r.skill.manifest.name,
+      description: r.skill.manifest.description,
+      scope: parseScopeId(r.skill.scopeId).kind ?? r.skill.scopeId,
+      scopeId: r.skill.scopeId,
+      shadowed: r.shadowed.length > 0,
+      status: r.skill.status,
+      version: r.skill.version,
+      source: r.skill.pack ? "pack" : "native",
+      pack: r.skill.pack,
+      assetCount: r.skill.manifest.files?.length ?? 0,
+      requiredCapabilities: r.skill.manifest.requiredCapabilities,
+      editable: manageable.has(r.skill.id),
+    })),
+  );
+  return sendJson(res, 200, { skills });
+}
+
+async function getSkillDetail(ctx: ApiCtx): Promise<void> {
+  const { res, app, url, capability, actor } = ctx;
+  const principalId = capability?.actorId ?? actor?.p ?? url.searchParams.get("principalId");
+  if (!capability && !actor && ctx.secret) {
+    return sendJson(res, 401, { error: "capability_required" });
+  }
+  if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const ownScopeBotWork = isOwnScopeBotWork(capability);
+  const skill = await app.getSkill(ctx.params.id!);
+  if (
+    !skill ||
+    (!(await app.canManageSkill(skill, principalId, ownScopeBotWork)) &&
+      !(await app.listVisibleSkills(principalId, ownScopeBotWork))
+        .flatMap((row) => row.shadowed.concat(row.skill ?? []))
+        .some((visible) => visible.id === skill.id))
+  ) {
+    return sendJson(res, 404, { error: "not_found" });
+  }
+  return sendJson(res, 200, {
+    skill: {
+      id: skill.id,
+      name: skill.manifest.name,
+      description: skill.manifest.description,
+      body: skill.manifest.body,
+      scope: parseScopeId(skill.scopeId).kind ?? skill.scopeId,
+      scopeId: skill.scopeId,
+      status: skill.status,
+      version: skill.version,
+      createdBy: skill.createdBy,
+      pack: skill.pack,
+      files: (skill.manifest.files ?? []).map((file) => ({ path: file.path, executable: file.executable === true })),
+      requiredCapabilities: skill.manifest.requiredCapabilities,
+      grantedCapabilities: skill.grantedCapabilities,
+      createdAt: skill.createdAt,
+      updatedAt: skill.updatedAt,
+      editable: await app.canManageSkill(skill, principalId, capability?.botActor === true),
+    },
+  });
+}
+
+async function restoreSkill(ctx: ApiCtx): Promise<void> {
+  const b = (ctx.body ?? {}) as { principalId?: unknown };
+  const principalId =
+    ctx.capability?.actorId ?? ctx.actor?.p ?? (typeof b.principalId === "string" ? b.principalId : "");
+  if (!ctx.capability && !ctx.actor && ctx.secret) {
+    return sendJson(ctx.res, 401, { error: "capability_required" });
+  }
+  if (!principalId) return sendJson(ctx.res, 400, { error: "bad_request", message: "principalId required" });
+  const liveActor = ctx.capability ? personAtKeyboard(ctx.capability) : true;
+  const restored = await ctx.app.restoreOwnedSkill(ctx.params.id!, principalId, {
+    liveActor,
+    botActor: ctx.capability?.botActor === true,
+  });
+  if (restored === "trigger_blocked")
+    return sendJson(ctx.res, 403, { error: "forbidden", message: SHARED_SKILL_TRIGGER_REFUSAL });
+  if (restored === "exists")
+    return sendJson(ctx.res, 409, {
+      error: "exists",
+      message: "a live skill of that name already exists here — archive it first",
+    });
+  return restored ? sendJson(ctx.res, 200, { ok: true }) : sendJson(ctx.res, 404, { error: "not_found" });
+}
+
+async function updateSkill(ctx: ApiCtx): Promise<void> {
+  const { res, app, body, capability } = ctx;
+  const id = ctx.params.id!;
+  const b = (body ?? {}) as { principalId?: unknown; description?: unknown; body?: unknown };
+
+  let principalId: string;
+  if (capability) {
+    principalId = capability.actorId;
+  } else {
+    if (typeof b.principalId !== "string" || !b.principalId) {
+      return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+    }
+    principalId = b.principalId;
+  }
+  if (b.description !== undefined && typeof b.description !== "string") {
+    return sendJson(res, 400, { error: "bad_request", message: "description must be a string" });
+  }
+  if (b.body !== undefined && typeof b.body !== "string") {
+    return sendJson(res, 400, { error: "bad_request", message: "body must be a string" });
+  }
+  const patch: { description?: string; body?: string } = {};
+  if (typeof b.description === "string") patch.description = b.description;
+  if (typeof b.body === "string") patch.body = b.body;
+  if (patch.description === undefined && patch.body === undefined) {
+    return sendJson(res, 400, { error: "bad_request", message: "description or body required" });
+  }
+  if (patch.description?.trim() === "" || patch.body?.trim() === "") {
+    return sendJson(res, 400, { error: "bad_request", message: "description and body can't be blank" });
+  }
+  const liveActor = capability ? personAtKeyboard(capability) : true;
+  const updated = await app.updateOwnedSkill(id, principalId, patch, {
+    liveActor,
+    botActor: capability?.botActor === true,
+  });
+  if (updated === "trigger_blocked")
+    return sendJson(res, 403, { error: "forbidden", message: SHARED_SKILL_TRIGGER_REFUSAL });
+  if (!updated) return sendJson(res, 404, { error: "not_found", message: "no such skill, or it isn't yours to edit" });
+  return sendJson(res, 200, {
+    skill: {
+      id: updated.id,
+      name: updated.manifest.name,
+      description: updated.manifest.description,
+      body: updated.manifest.body,
+      status: updated.status,
+      version: updated.version,
+    },
+  });
+}
+
+async function deleteSkill(ctx: ApiCtx): Promise<void> {
+  const { res, app, body, capability } = ctx;
+  const id = ctx.params.id!;
+  const b = (body ?? {}) as { principalId?: unknown };
+
+  let principalId: string;
+  if (capability) {
+    principalId = capability.actorId;
+  } else {
+    if (typeof b.principalId !== "string" || !b.principalId) {
+      return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+    }
+    principalId = b.principalId;
+  }
+  const liveActor = capability ? personAtKeyboard(capability) : true;
+  const outcome = await app.deleteOwnedSkill({
+    principalId,
+    id,
+    liveActor,
+    botActor: capability?.botActor === true,
+  });
+  if (outcome === "missing") return sendJson(res, 404, { error: "not_found", message: "no such skill" });
+  if (outcome === "trigger_blocked")
+    return sendJson(res, 403, { error: "forbidden", message: SHARED_SKILL_TRIGGER_REFUSAL });
+  if (outcome === "forbidden")
+    return sendJson(res, 403, { error: "forbidden", message: "that skill isn't yours to archive" });
+  return sendJson(res, 200, { ok: true });
+}
+
+async function createSkill(ctx: ApiCtx): Promise<void> {
+  const { res, app, body, capability } = ctx;
+  const b = (body ?? {}) as {
+    principalId?: unknown;
+    scopeId?: unknown;
+    name?: unknown;
+    description?: unknown;
+    body?: unknown;
+  };
+
+  const blocked = sharedSkillCreateBlock(capability);
+  if (blocked) return sendJson(res, 403, { error: "forbidden", message: blocked });
+
+  let principalId: string;
+  let homeScope: ScopeId | undefined;
+  if (capability) {
+    principalId = capability.actorId;
+    homeScope = capability.scopeId;
+    if (typeof b.scopeId === "string" && b.scopeId !== homeScope) {
+      if (!(await app.managesScope(principalId, b.scopeId as ScopeId))) {
+        return sendJson(res, 403, { error: "forbidden", message: "you cannot create a skill in that context" });
+      }
+      homeScope = b.scopeId as ScopeId;
+    }
+  } else {
+    if (typeof b.principalId !== "string" || !b.principalId) {
+      return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+    }
+    principalId = b.principalId;
+    if (typeof b.scopeId === "string" && b.scopeId !== makeScopeId("personal", principalId)) {
+      if (!(await app.managesScope(principalId, b.scopeId as ScopeId))) {
+        return sendJson(res, 403, { error: "forbidden", message: "you cannot create a skill in that context" });
+      }
+      homeScope = b.scopeId as ScopeId;
+    }
+  }
+  if (homeScope && !authorPublishesSkill(homeScope)) {
+    return sendJson(res, 403, {
+      error: "forbidden",
+      message: "a skill cannot be created in an org or team scope — promote a published skill instead",
+    });
+  }
+  if (homeScope && !loadsScopeContext(principalId, homeScope, capability?.botActor === true)) {
+    return sendJson(res, 403, {
+      error: "forbidden",
+      message: "a Slack bot's work cannot add skills to a person's own library",
+    });
+  }
+  if (typeof b.name !== "string" || !b.name.trim()) {
+    return sendJson(res, 400, { error: "bad_request", message: "name required" });
+  }
+  if (!isSafeSkillName(b.name.trim())) return sendJson(res, 400, { error: "bad_request", message: SKILL_NAME_RULE });
+  if (typeof b.description !== "string" || !b.description.trim()) {
+    return sendJson(res, 400, { error: "bad_request", message: "description required" });
+  }
+  if (typeof b.body !== "string" || !b.body.trim()) {
+    return sendJson(res, 400, { error: "bad_request", message: "body required" });
+  }
+  const created = await app.createOwnedSkill({
+    principalId,
+    ...(homeScope ? { homeScope } : {}),
+    name: b.name,
+    description: b.description,
+    body: b.body,
+  });
+  if (!created)
+    return sendJson(res, 409, {
+      error: "exists",
+      message: "a skill of that name already exists here — edit it instead",
+    });
+  return sendJson(res, 201, {
+    skill: {
+      id: created.id,
+      name: created.manifest.name,
+      description: created.manifest.description,
+      body: created.manifest.body,
+      status: created.status,
+      version: created.version,
+    },
+  });
+}
+
+async function createGrant(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  if (!isGrant(body)) return sendJson(res, 400, { error: "bad_request", message: "expected a Grant" });
+  try {
+    await app.grant(tenantOf(ctx), body);
+    return sendJson(res, 200, { ok: true });
+  } catch (e) {
+    return sendJson(res, 400, { error: "grant_failed", message: errMessage(e) });
+  }
+}
+
+async function revokeGrant(ctx: ApiCtx): Promise<void> {
+  const { res, app, body } = ctx;
+  const b = body as { ownerScopeId?: string; ref?: string; granteeScopeId?: string; revokedBy?: string };
+  if (!b.ownerScopeId || !b.ref || !b.granteeScopeId || typeof b.revokedBy !== "string" || !b.revokedBy) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "ownerScopeId, ref, granteeScopeId, revokedBy required",
+    });
+  }
+  try {
+    await app.revokeGrant(tenantOf(ctx), b.ownerScopeId, b.ref, b.granteeScopeId, b.revokedBy);
+    return sendJson(res, 200, { ok: true });
+  } catch (e) {
+    return sendJson(res, 400, { error: "revoke_failed", message: errMessage(e) });
+  }
+}
+
+export async function shareArtifact(ctx: ApiCtx): Promise<void> {
+  const { res, deps, body, capability } = ctx;
+  if (!capability)
+    return sendJson(res, 403, { error: "forbidden", message: "sharing requires an agent capability token" });
+  const b = (isObj(body) ? body : {}) as {
+    type?: unknown;
+    id?: unknown;
+    toScope?: unknown;
+    email?: unknown;
+    permission?: unknown;
+    move?: unknown;
+    notify?: unknown;
+  };
+  if (typeof b.type !== "string" || !isArtifactType(b.type)) {
+    return sendJson(res, 400, { error: "bad_request", message: `type must be one of: ${ARTIFACT_TYPES.join(", ")}` });
+  }
+  if (typeof b.id !== "string" || !b.id.trim())
+    return sendJson(res, 400, { error: "bad_request", message: "id required" });
+  if (
+    b.email !== undefined &&
+    (typeof b.email !== "string" || b.toScope !== undefined || b.type !== "deploy" || b.move === true)
+  )
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: "email is only supported for app sharing, instead of toScope",
+    });
+  if (b.email === undefined && (typeof b.toScope !== "string" || !b.toScope.trim())) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: 'toScope required ("org", a scope id, or a teammate\'s name)',
+    });
+  }
+  if (b.permission !== undefined && b.permission !== "read" && b.permission !== "write" && b.permission !== "none") {
+    return sendJson(res, 400, { error: "bad_request", message: 'permission must be "read", "write" or "none"' });
+  }
+  if (b.notify !== undefined && typeof b.notify !== "boolean")
+    return sendJson(res, 400, { error: "bad_request", message: "notify must be a boolean" });
+  const result = await deps.control.shareArtifact(
+    {
+      type: b.type,
+      id: b.id,
+      ...(typeof b.toScope === "string" ? splitToScope(b.toScope) : {}),
+      ...(typeof b.email === "string" ? { email: b.email } : {}),
+      ...(b.permission === "read" || b.permission === "write" || b.permission === "none"
+        ? { permission: b.permission }
+        : {}),
+      ...(b.move === true ? { move: true } : {}),
+      ...(typeof b.notify === "boolean" ? { notify: b.notify } : {}),
+    },
+    capability,
+  );
+  if (!result.ok) {
+    return sendJson(res, SHARE_ERROR_STATUS[result.code] ?? 400, {
+      error: result.code,
+      message: result.message,
+      ...(result.candidates ? { candidates: result.candidates } : {}),
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    verb: result.verb,
+    type: result.type,
+    id: result.id,
+    target: result.target,
+    permission: result.permission,
+    ...(result.invitation ? { invitation: result.invitation } : {}),
+  });
+}
+
+async function getCustomEmoji(ctx: ApiCtx): Promise<void> {
+  const catalog = await ctx.deps.config?.getSlackEmojiCatalogDurable(orgScope(ctx.deps));
+  const raw = catalog?.emoji ?? {};
+  const emoji: Record<string, string> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    const url = value.startsWith("alias:") ? raw[value.slice("alias:".length)] : value;
+    if (url?.startsWith("https://")) emoji[name] = url;
+  }
+  ctx.res.setHeader("cache-control", "private, max-age=300");
+  return sendJson(ctx.res, 200, { emoji });
+}
+
+async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
+  await ctx.deps.refreshModels?.();
+  const { res, deps } = ctx;
+  if (!deps.config) return sendJson(res, 404, { error: "not_found" });
+  const [webuiModels, baseModel, externalSlackParticipants, branding] = await Promise.all([
+    deps.config.getWebuiModelsDurable(orgScope(deps)),
+    deps.config.getBaseModelDurable(orgScope(deps)),
+    deps.config.getExternalSlackParticipantsDurable(orgScope(deps)),
+    resolveBranding(deps.config, orgScope(deps), deps.brandingDefault),
+  ]);
+  const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : null;
+  const providerStatus = managedKeys ?? deps.providerKeys;
+  const catalog = managedKeys?.openrouter
+    ? await selectableModelCatalog(deps.modelCredentialFetch)
+    : builtInModelCatalog();
+  const allowed = selectableCatalog(catalog)
+    .filter((model) => modelOfferedInWebui(model.id))
+    .map((model) => model.id);
+  const configuredPicker = webuiModels?.filter((id) => modelSupported(id)) ?? [];
+  const resolvedBase = modelSupported(baseModel ?? undefined) ? baseModel! : defaultModel(deps.baseModelDefault);
+  const resolvedBranding = {
+    ...(branding.orgName ? { orgName: branding.orgName } : {}),
+    ...(branding.accent ? { accent: branding.accent } : {}),
+    ...(branding.mark ? { mark: branding.mark } : {}),
+    ...(branding.markUrl ? { markUrl: branding.markUrl } : {}),
+    ...(branding.selfLabel ? { selfLabel: branding.selfLabel } : {}),
+  };
+  return sendJson(res, 200, {
+    webuiModels: webuiModels != null ? configuredPicker : allowed,
+    baseModel: resolvedBase,
+    ...(providerStatus && {
+      modelProviderConfigured: Boolean(
+        providerStatus.anthropic ||
+        providerStatus.openai ||
+        providerStatus.openrouter ||
+        providerStatus.modelIds?.size ||
+        deps.companySubscriptionAuth,
+      ),
+    }),
+    externalSlackParticipants,
+    ...(Object.keys(resolvedBranding).length ? { branding: resolvedBranding } : {}),
+  });
+}
+
+async function runtimeTarget(ctx: ApiCtx): Promise<{ actorId: string; scope: ScopeId } | null> {
+  const param = (name: string): string | null => {
+    const value = isObj(ctx.body) ? ctx.body[name] : undefined;
+    return typeof value === "string" ? value : ctx.url.searchParams.get(name);
+  };
+  const actorId = ctx.capability?.actorId ?? param("principalId");
+  if (!actorId) return null;
+  const scope = param("scopeId") || ctx.capability?.scopeId || makeScopeId("personal", actorId);
+  const parsed = parseScopeId(scope);
+  if (parsed.kind === "personal" && parsed.ref === actorId) return { actorId, scope: scope as ScopeId };
+  if (parsed.kind === "persona") {
+    const role = await ctx.app.personas?.role(actorId, parsed.ref!);
+    return atLeast(role, ctx.method === "GET" ? "read" : "write") ? { actorId, scope: scope as ScopeId } : null;
+  }
+  if (ctx.capability?.scopeId === scope && parsed.kind !== "org") return { actorId, scope: scope as ScopeId };
+  if (parsed.kind !== "org" && (await ctx.app.belongsToScope(actorId, scope as ScopeId)))
+    return { actorId, scope: scope as ScopeId };
+  return null;
+}
+
+async function getRuntimeConfig(ctx: ApiCtx): Promise<void> {
+  const account = ctx.url.searchParams.get("account");
+  if (account !== null && account !== "company") return sendJson(ctx.res, 400, { error: "invalid_account" });
+  if (!ctx.deps.config) return sendJson(ctx.res, 404, { error: "not_found" });
+  const target = await runtimeTarget(ctx);
+  if (!target) return sendJson(ctx.res, 403, { error: "forbidden" });
+  await ctx.deps.refreshModels?.();
+  return sendJson(
+    ctx.res,
+    200,
+    await withAppEditRuntime(
+      ctx,
+      ctx.url.searchParams.get("account") === "company"
+        ? await runtimeConfigBody(ctx, target.scope)
+        : await userRuntimeConfigBody(ctx, target.scope, target.actorId),
+    ),
+  );
+}
+
+async function putRuntimeConfig(ctx: ApiCtx): Promise<void> {
+  if (!ctx.deps.config || !isObj(ctx.body)) return sendJson(ctx.res, 400, { error: "bad_request" });
+  if (ctx.capability && !personAtKeyboard(ctx.capability))
+    return sendJson(ctx.res, 403, { error: "live_actor_required" });
+  const target = await runtimeTarget(ctx);
+  if (!target) return sendJson(ctx.res, 403, { error: "forbidden" });
+  await ctx.deps.refreshModels?.();
+  const config = ctx.deps.config;
+  const offered = async (modelId: string) =>
+    (await userRuntimeConfigBody(ctx, target.scope, target.actorId)).models.includes(modelId);
+  if (ctx.body.inherit === true) await config.setRuntimeSelection(target.scope, null);
+  else if (ctx.body.keep === true) {
+    const runtime = await config.getRuntimeSelectionDurable(target.scope);
+    const legacyModel = runtime ? null : await config.getBaseModelOwnDurable(target.scope);
+    if (runtime || (legacyModel && modelSupported(legacyModel) && (await offered(legacyModel))))
+      await config.acknowledgeRuntimeSelection(target.scope);
+  } else {
+    const modelId = ctx.body.modelId;
+    if (typeof modelId !== "string" || !modelSupported(modelId))
+      return sendJson(ctx.res, 400, { error: "model_not_supported" });
+    if (!(await offered(modelId))) return sendJson(ctx.res, 400, { error: "model_not_enabled" });
+    const effortLevel = ctx.body.effortLevel ?? "auto";
+    if (typeof effortLevel !== "string" || !thinkingLevelsFor(modelId).includes(effortLevel))
+      return sendJson(ctx.res, 400, { error: "effort_not_supported" });
+    const fastMode = ctx.body.fastMode ?? false;
+    if (typeof fastMode !== "boolean") return sendJson(ctx.res, 400, { error: "fast_mode_invalid" });
+    const choice = { modelId, effortLevel, fastMode: fastMode && fastModeModelIds().includes(modelId) };
+    await config.setRuntimeSelection(target.scope, choice);
+  }
+  audit(ctx, {
+    principalId: target.actorId,
+    action: "runtime-config.update",
+    resource: "runtime-config",
+    scopeLabel: target.scope,
+  });
+  return sendJson(
+    ctx.res,
+    200,
+    await withAppEditRuntime(ctx, await userRuntimeConfigBody(ctx, target.scope, target.actorId)),
+  );
+}
+
+async function getChannelHeaderPin(ctx: ApiCtx): Promise<void> {
+  if (!ctx.deps.config) return sendJson(ctx.res, 404, { error: "not_found" });
+  const target = await runtimeTarget(ctx);
+  if (!target) return sendJson(ctx.res, 403, { error: "forbidden" });
+  const [on, configured, def] = await Promise.all([
+    ctx.deps.config.getChannelHeaderPinDurable(target.scope),
+    ctx.deps.config.getChannelHeaderPinOverrideDurable(target.scope),
+    ctx.deps.config.getChannelHeaderPinDefaultDurable(),
+  ]);
+  return sendJson(ctx.res, 200, { scopeId: target.scope, on, configured, default: def });
+}
+
+async function putChannelHeaderPin(ctx: ApiCtx): Promise<void> {
+  if (!ctx.deps.config || !isObj(ctx.body)) return sendJson(ctx.res, 400, { error: "bad_request" });
+  if (ctx.capability && !personAtKeyboard(ctx.capability))
+    return sendJson(ctx.res, 403, { error: "live_actor_required" });
+  const target = await runtimeTarget(ctx);
+  if (!target) return sendJson(ctx.res, 403, { error: "forbidden" });
+  if (typeof ctx.body.on !== "boolean" && ctx.body.on !== null)
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "expected { on: boolean | null } (null reverts to the org default)",
+    });
+  await ctx.deps.config.setChannelHeaderPin(target.scope, ctx.body.on);
+  audit(ctx, {
+    principalId: target.actorId,
+    action: "channel-header-pin.update",
+    resource: "channel-header-pin",
+    scopeLabel: target.scope,
+  });
+  return sendJson(ctx.res, 200, {
+    scopeId: target.scope,
+    on: ctx.body.on ?? (await ctx.deps.config.getChannelHeaderPinDefaultDurable()),
+    configured: ctx.body.on,
+  });
+}
+
+async function getSoul(ctx: ApiCtx): Promise<void> {
+  const { res, app, url, capability } = ctx;
+  if (capability)
+    return sendJson(
+      res,
+      200,
+      app.getSoul(capability.scopeId, { actorId: capability.actorId, ownScopeBotWork: isOwnScopeBotWork(capability) }),
+    );
+  const scopeIdVal = url.searchParams.get("scopeId");
+  const principalId = url.searchParams.get("principalId");
+  if (!scopeIdVal || !principalId)
+    return sendJson(res, 400, { error: "bad_request", message: "scopeId and principalId required" });
+  if (!(await app.belongsToScope(principalId, scopeIdVal as ScopeId)))
+    return sendJson(res, 403, { error: "forbidden" });
+  return sendJson(res, 200, app.getSoul(scopeIdVal as ScopeId, { actorId: principalId, ownScopeBotWork: false }));
+}
+
+export async function postSoul(ctx: ApiCtx): Promise<void> {
+  const { res, app, body, capability } = ctx;
+  let scopeIdVal: string;
+  let content: string;
+  let actorId: string;
+  if (capability) {
+    const b = body as { content?: unknown };
+    if (typeof b.content !== "string")
+      return sendJson(res, 400, { error: "bad_request", message: "content (string) required" });
+    actorId = capability.actorId;
+    scopeIdVal = capability.scopeId;
+    content = b.content;
+  } else {
+    const b = body as { scopeId?: string; content?: string; actorId?: string };
+    if (typeof b.scopeId !== "string" || typeof b.content !== "string" || typeof b.actorId !== "string") {
+      return sendJson(res, 400, { error: "bad_request", message: "scopeId, content, actorId required" });
+    }
+    scopeIdVal = b.scopeId;
+    content = b.content;
+    actorId = b.actorId;
+  }
+  const allowSharedScope = capability
+    ? capability.botActor !== true
+    : parseScopeId(scopeIdVal).kind !== "personal" && (await app.managesScope(actorId, scopeIdVal as ScopeId));
+  try {
+    const version = await app.updateSoul(scopeIdVal, content, actorId, {
+      ...(allowSharedScope ? { allowSharedScope: true } : {}),
+      botActor: capability?.botActor === true,
+    });
+    return sendJson(res, 200, { ok: true, version });
+  } catch (e) {
+    if (e instanceof SoulUpdateDeniedError)
+      return sendJson(res, 403, { error: "soul_update_denied", message: e.message });
+    return sendJson(res, 500, { error: "soul_update_failed", message: errMessage(e) });
+  }
+}
+
+export const surfaceRoutes: ReadonlyArray<Route<ApiCtx>> = [
+  ...sessionSharingRoutes,
+  ...suggestedActivityRoutes,
+  { method: "GET", path: "/v1/conversations", auth: "either", handle: listAgentConversations },
+  { method: "GET", path: "/v1/conversations/:id", auth: "either", handle: getAgentConversation },
+  { method: "POST", path: "/v1/conversations/:id", auth: "either", handle: patchAgentConversation },
+  { method: "GET", path: "/v1/apis", auth: "either", handle: listAgentApis },
+  { method: "GET", path: "/v1/memory/self", auth: "either", handle: readOwnNotebook },
+  { method: "POST", path: "/v1/memory/facts", auth: "either", handle: captureFacts },
+  { method: "PATCH", path: "/v1/memory/facts", auth: "either", handle: editFacts },
+  { method: "DELETE", path: "/v1/memory/facts", auth: "either", handle: deleteFacts },
+  { method: "POST", path: "/v1/memory/search", auth: "either", allowedInStrict: true, handle: searchMemory },
+  { method: "POST", path: "/v1/grants", actor: "system", auth: "source", handle: createGrant },
+  { method: "POST", path: "/v1/grants/revoke", actor: "system", auth: "source", handle: revokeGrant },
+  { method: "POST", path: "/v1/share", auth: "either", handle: shareArtifact },
+  { method: "GET", path: "/v1/surface-config", auth: "source", handle: getSurfaceConfig },
+  { method: "GET", path: "/v1/custom-emoji", browser: true, actor: "person", auth: "source", handle: getCustomEmoji },
+  { method: "GET", path: "/v1/soul", actor: "query.principalId", auth: "either", handle: getSoul },
+  { method: "POST", path: "/v1/soul", actor: "body.actorId", auth: "either", handle: postSoul },
+  ...withActor("body.principalId", [
+    { method: "PUT", path: "/v1/ui-state", browser: true, auth: "source", handle: putUiState },
+    { method: "PUT", path: "/v1/runtime-config", browser: true, auth: "either", handle: putRuntimeConfig },
+    { method: "PUT", path: "/v1/channel-header-pin", browser: true, auth: "either", handle: putChannelHeaderPin },
+    { method: "POST", path: "/v1/sessions/:id/title", browser: true, auth: "source", handle: regenerateSessionTitle },
+    { method: "POST", path: "/v1/sessions/:id/next-prompt", browser: true, auth: "source", handle: suggestNextPrompt },
+    { method: "POST", path: "/v1/sessions/:id/expand", browser: true, auth: "source", handle: expandSideChat },
+    { method: "POST", path: "/v1/sessions", browser: true, auth: "source", handle: spawnWebSession },
+    { method: "POST", path: "/v1/sessions/:id/fork", browser: true, auth: "source", handle: forkSession },
+    { method: "POST", path: "/v1/sessions/:id/detach", browser: true, auth: "source", handle: detachSession },
+    { method: "POST", path: "/v1/sessions/:id/goal/cancel", browser: true, auth: "source", handle: cancelSessionGoal },
+    { method: "POST", path: "/v1/sessions/:id/goal/resume", browser: true, auth: "source", handle: resumeSessionGoal },
+    { method: "POST", path: "/v1/sessions/:id", browser: true, auth: "source", handle: patchSession },
+    { method: "PATCH", path: "/v1/memory", browser: true, auth: "source", handle: selfMemory },
+    { method: "DELETE", path: "/v1/memory", browser: true, auth: "source", handle: selfMemory },
+    { method: "POST", path: "/v1/skills", browser: true, auth: "either", handle: createSkill },
+    { method: "PUT", path: "/v1/skills/:id", browser: true, auth: "either", handle: updateSkill },
+    { method: "DELETE", path: "/v1/skills/:id", browser: true, auth: "either", handle: deleteSkill },
+    {
+      method: "POST",
+      path: "/v1/skills/:id/restore",
+      browser: true,
+      auth: "either",
+      allowedInStrict: true,
+      handle: restoreSkill,
+    },
+  ]),
+  ...withActor("query.principalId", [
+    { method: "GET", path: "/v1/ui-state", browser: true, auth: "source", handle: getUiState },
+    { method: "GET", path: "/v1/runtime-config", browser: true, auth: "either", handle: getRuntimeConfig },
+    { method: "GET", path: "/v1/channel-header-pin", browser: true, auth: "either", handle: getChannelHeaderPin },
+    { method: "GET", path: "/v1/sessions/:id/side-chats", browser: true, auth: "source", handle: listSideChats },
+    { method: "GET", path: "/v1/resources/search", browser: true, auth: "source", handle: searchResources },
+    { method: "GET", path: "/v1/sessions/search", browser: true, auth: "source", handle: searchSessions },
+    { method: "GET", path: "/v1/sessions", browser: true, auth: "source", handle: listSessions },
+    { method: "GET", path: "/v1/sessions/row", browser: true, auth: "source", handle: getSessionRow },
+    { method: "GET", path: "/v1/sessions/:id/children", browser: true, auth: "source", handle: listSessionChildren },
+    { method: "GET", path: "/v1/contexts", browser: true, auth: "source", handle: listContexts },
+    { method: "GET", path: "/v1/scope-resources", browser: true, auth: "source", handle: listScopeResources },
+    { method: "GET", path: "/v1/memory", browser: true, auth: "source", handle: selfMemory },
+    { method: "GET", path: "/v1/spend", browser: true, auth: "source", handle: selfSpend },
+    { method: "GET", path: "/v1/skills", browser: true, auth: "source", handle: listSkills },
+    { method: "GET", path: "/v1/skills/:id", browser: true, auth: "either", handle: getSkillDetail },
+  ]),
+  ...withActor("query.viewer", [
+    { method: "GET", path: "/v1/sessions/:id/approvals", browser: true, auth: "source", handle: listSessionApprovals },
+    { method: "GET", path: "/v1/sessions/:id/background", browser: true, auth: "source", handle: getSessionBackground },
+    {
+      method: "GET",
+      path: "/v1/sessions/:id/background/:pid/output",
+      browser: true,
+      auth: "source",
+      handle: getSessionBackgroundOutput,
+    },
+    { method: "GET", path: "/v1/sessions/:id/items/:seq", browser: true, auth: "source", handle: getSessionItem },
+    { method: "GET", path: "/v1/sessions/:id", browser: true, auth: "source", handle: getSession },
+    { method: "GET", path: "/v1/files", browser: true, auth: "either", handle: listFiles },
+  ]),
+];

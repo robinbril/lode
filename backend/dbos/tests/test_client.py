@@ -1,0 +1,2634 @@
+import asyncio
+import importlib
+import math
+import os
+import runpy
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    TypedDict,
+    cast,
+)
+
+import psycopg
+import pytest
+import sqlalchemy as sa
+from opentelemetry import context as otel_context
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.orm import Session
+
+from dbos import (
+    DBOS,
+    ClientScheduleInput,
+    DBOSClient,
+    DBOSConfig,
+    EnqueueOptions,
+    SendMessage,
+    SetWorkflowID,
+)
+from dbos._context import DBOSContext, child_workflow_id
+from dbos._dbos import WorkflowHandle, WorkflowHandleAsync
+from dbos._error import (
+    DBOSException,
+    DBOSNonExistentWorkflowError,
+    DBOSWorkflowIDInUseError,
+)
+from dbos._outcome import NoResult
+from dbos._queue import Queue, QueueRateLimit
+from dbos._schemas.system_database import SystemSchema
+from dbos._shard_keys import bound_shard_key
+from dbos._sys_db import db_retry
+from dbos._utils import retriable_sqlite_exception
+from tests import client_collateral
+from tests.client_collateral import event_test, retrieve_test, send_test
+from tests.conftest import TestOtelType, using_sharding, wait_for_client_listener
+
+
+class Person(TypedDict):
+    first: str
+    last: str
+    age: int
+
+
+@pytest.mark.parametrize("cancel_waiter", [False, True], ids=["waiting", "cancelled"])
+def test_wait_first_async_does_not_starve_client_executor(
+    dbos: DBOS, client: DBOSClient, monkeypatch: pytest.MonkeyPatch, cancel_waiter: bool
+) -> None:
+    release = threading.Event()
+
+    @DBOS.workflow()
+    def blocked_workflow() -> str:
+        assert release.wait(timeout=15)
+        return "finished"
+
+    handle = DBOS.start_workflow(blocked_workflow)
+
+    async def run_client() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        first_poll = asyncio.Event()
+        check_first = client._sys_db.check_first_workflow_id
+
+        def observe_poll(workflow_ids: list[str]) -> NoResult | str:
+            result = check_first(workflow_ids)
+            loop.call_soon_threadsafe(first_poll.set)
+            return result
+
+        monkeypatch.setattr(client._sys_db, "check_first_workflow_id", observe_poll)
+        client_handle: WorkflowHandleAsync[str] = await client.retrieve_workflow_async(
+            handle.get_workflow_id()
+        )
+        waiter = asyncio.create_task(
+            client.wait_first_async([client_handle], polling_interval_sec=0.01)
+        )
+        try:
+            await asyncio.wait_for(first_poll.wait(), timeout=5)
+            if cancel_waiter:
+                waiter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiter
+
+            # This real database read shares the client's bounded executor.
+            # A polling thread held until workflow completion would starve it,
+            # including after its wait_first_async caller has been cancelled.
+            status = await asyncio.wait_for(client_handle.get_status(), timeout=2)
+            assert status.status == "PENDING"
+            release.set()
+            if not cancel_waiter:
+                assert await asyncio.wait_for(waiter, timeout=5) is client_handle
+            assert (
+                await asyncio.wait_for(client_handle.get_result(), timeout=5)
+                == "finished"
+            )
+        finally:
+            release.set()
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+
+    try:
+        # A client-only event loop keeps DBOS's workflow executor separate.
+        asyncio.run(run_client())
+    finally:
+        release.set()
+        assert handle.get_result() == "finished"
+
+
+def run_client_collateral() -> None:
+    dirname = os.path.dirname(__file__)
+    filename = os.path.join(dirname, "client_collateral.py")
+    runpy.run_path(filename)
+
+
+def _workflow_exists(client: DBOSClient, workflow_id: str) -> bool:
+    with client._sys_db.engine.connect() as conn:
+        row = conn.execute(
+            sa.select(SystemSchema.workflow_status.c.workflow_uuid).where(
+                SystemSchema.workflow_status.c.workflow_uuid == workflow_id
+            )
+        ).fetchone()
+        return row is not None
+
+
+def _count_notifications(client: DBOSClient, workflow_id: str) -> int:
+    with client._sys_db.engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(SystemSchema.notifications.c.message_uuid).where(
+                SystemSchema.notifications.c.destination_uuid == workflow_id
+            )
+        ).fetchall()
+        return len(rows)
+
+
+def test_client_no_migrate(
+    dbos: DBOS, config: DBOSConfig, skip_with_sqlite: None, skip_with_sharding: None
+) -> None:
+    # Drop the system database
+    DBOS.destroy()
+    DBOS(config=config)
+    DBOS.reset_system_database()
+
+    # The client should not be able to connect to the system database
+    with pytest.raises(Exception) as exc_info:
+        assert config["system_database_url"]
+        client = DBOSClient(system_database_url=config["system_database_url"])
+        client.list_workflows()
+    system_database_url = config["system_database_url"]
+    assert system_database_url is not None
+    database = sa.make_url(system_database_url).database
+    assert f'database "{database}" does not exist' in str(exc_info.value)
+
+
+def test_client_enqueue_and_get_result(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    wfid = str(uuid.uuid4())
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "workflow_id": wfid,
+    }
+
+    handle: WorkflowHandle[str] = client.enqueue(options, 42, "test", johnDoe)
+    result = handle.get_result()
+    assert result == '42-test-{"first": "John", "last": "Doe", "age": 30}'
+
+    list_results = client.list_workflows()
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status == "SUCCESS"
+    assert list_results[0].output == result
+    assert list_results[0].input is not None
+
+    # Skip loading input and output
+    list_results = client.list_workflows(load_input=False, load_output=False)
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status == "SUCCESS"
+    assert list_results[0].output is None
+    assert list_results[0].input is None
+
+
+def test_client_enqueue_with_otel_context(
+    dbos: DBOS, client: DBOSClient, setup_in_memory_otlp_collector: TestOtelType
+) -> None:
+    """otel_context is recorded as a trace carrier beside the caller's own attributes.
+
+    Needs a real TracerProvider: without one the span context is invalid and
+    inject() has nothing to serialize.
+    """
+    from opentelemetry import trace
+
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    my_tracer = trace.get_tracer_provider().get_tracer("dbos")
+    with my_tracer.start_as_current_span(
+        "caller"
+    ):  # pyright: ignore[reportAttributeAccessIssue]
+        options: EnqueueOptions = {
+            "queue_name": "test_queue",
+            "workflow_name": "enqueue_test",
+            "otel_context": otel_context.get_current(),
+            "attributes": {"customer": "acme"},
+        }
+        handle: WorkflowHandle[str] = client.enqueue(options, 42, "test", johnDoe)
+    assert handle.get_result() is not None
+
+    attributes = client.retrieve_workflow(handle.workflow_id).get_status().attributes
+    assert attributes is not None
+    # The caller's own attributes survive alongside the carrier.
+    assert attributes["customer"] == "acme"
+    assert "traceparent" in attributes["dbos.otelContext"]
+
+
+def test_client_enqueue_without_otel_context(dbos: DBOS, client: DBOSClient) -> None:
+    """Omitting otel_context leaves attributes exactly as the caller passed them."""
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "attributes": {"customer": "acme"},
+    }
+    handle: WorkflowHandle[str] = client.enqueue(options, 42, "test", johnDoe)
+    assert handle.get_result() is not None
+
+    attributes = client.retrieve_workflow(handle.workflow_id).get_status().attributes
+    assert attributes == {"customer": "acme"}
+
+
+def test_client_enqueue_otel_context_without_active_span(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    """An empty context has nothing to propagate, so no carrier is recorded."""
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "otel_context": otel_context.Context(),
+    }
+    handle: WorkflowHandle[str] = client.enqueue(options, 42, "test", johnDoe)
+    assert handle.get_result() is not None
+
+    assert client.retrieve_workflow(handle.workflow_id).get_status().attributes is None
+
+
+@pytest.mark.parametrize("bad_id", ["", "   ", "\t\n"])
+def test_client_enqueue_rejects_empty_workflow_id(
+    dbos: DBOS, client: DBOSClient, bad_id: str
+) -> None:
+    # An empty/whitespace workflow_id must be rejected, not inserted verbatim (#759).
+    run_client_collateral()
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "workflow_id": bad_id,
+    }
+
+    with pytest.raises(Exception) as exc_info:
+        client.enqueue(options, 42, "test", {"first": "John", "last": "Doe", "age": 30})
+    assert "workflow ID" in str(exc_info.value)
+    assert not _workflow_exists(client, bad_id)
+
+
+@pytest.mark.parametrize("bad_id", ["", "   "])
+def test_set_workflow_id_rejects_empty(bad_id: str) -> None:
+    # SetWorkflowID is the public choke point; an empty ID must raise, not silently fork (#759).
+    with pytest.raises(Exception) as exc_info:
+        SetWorkflowID(bad_id)
+    assert "workflow ID" in str(exc_info.value)
+
+
+def test_enqueue_with_timeout(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "blocked_workflow",
+        "workflow_timeout": 1,
+        "workflow_id": wfid,
+    }
+
+    handle: WorkflowHandle[str] = client.enqueue(options)
+
+    list_results = client.list_queued_workflows()
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status in ["PENDING", "ENQUEUED"]
+
+    with pytest.raises(Exception) as exc_info:
+        handle.get_result()
+    assert "was cancelled" in str(exc_info.value)
+
+
+def test_client_enqueue_appver_not_set(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    wfid = str(uuid.uuid4())
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "workflow_id": wfid,
+    }
+
+    client.enqueue(options, 42, "test", johnDoe)
+
+    handle: WorkflowHandle[str] = DBOS.retrieve_workflow(wfid)
+    result = handle.get_result()
+    assert result == '42-test-{"first": "John", "last": "Doe", "age": 30}'
+
+    wf_status = dbos.get_workflow_status(wfid)
+    assert wf_status is not None
+    assert wf_status.status == "SUCCESS"
+    assert wf_status.name == "enqueue_test"
+    assert wf_status.app_version == DBOS.application_version
+
+
+def test_client_enqueue_appver_set(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    wfid = str(uuid.uuid4())
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "workflow_id": wfid,
+        "app_version": DBOS.application_version,
+    }
+
+    client.enqueue(options, 42, "test", johnDoe)
+
+    handle: WorkflowHandle[str] = DBOS.retrieve_workflow(wfid)
+    result = handle.get_result()
+    assert result == '42-test-{"first": "John", "last": "Doe", "age": 30}'
+
+    wf_status = dbos.get_workflow_status(wfid)
+    assert wf_status is not None
+    assert wf_status.status == "SUCCESS"
+    assert wf_status.name == "enqueue_test"
+    assert wf_status.app_version == DBOS.application_version
+
+
+def test_client_enqueue_wrong_appver(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    wfid = str(uuid.uuid4())
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "workflow_id": wfid,
+        "app_version": "0123456789abcdef",
+    }
+
+    client.enqueue(options, 42, "test", johnDoe)
+
+    time.sleep(5)
+
+    wf_status = dbos.get_workflow_status(wfid)
+    assert wf_status is not None
+    assert wf_status.status == "ENQUEUED"
+    assert wf_status.name == "enqueue_test"
+    assert wf_status.app_version == options["app_version"]
+
+
+def test_client_enqueue_idempotent(config: DBOSConfig, client: DBOSClient) -> None:
+    DBOS.destroy(destroy_registry=True)
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    wfid = str(uuid.uuid4())
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "workflow_id": wfid,
+    }
+
+    client.enqueue(options, 42, "test", johnDoe)
+    client.enqueue(options, 42, "test", johnDoe)
+
+    DBOS(config=config)
+    DBOS.launch()
+    run_client_collateral()
+
+    handle: WorkflowHandle[str] = DBOS.retrieve_workflow(wfid)
+    result = handle.get_result()
+    assert result == '42-test-{"first": "John", "last": "Doe", "age": 30}'
+
+    wf_status = DBOS.retrieve_workflow(handle.get_workflow_id()).get_status()
+    assert wf_status is not None
+    assert wf_status.status == "SUCCESS"
+    assert wf_status.name == "enqueue_test"
+    assert wf_status.app_version == DBOS.application_version
+
+    DBOS.destroy(destroy_registry=True)
+
+
+def test_client_send_with_topic(client: DBOSClient, dbos: DBOS) -> None:
+
+    from tests.client_collateral import send_test
+
+    run_client_collateral()
+
+    now = time.time_ns()
+    wfid = str(uuid.uuid4())
+    topic = f"test-topic-{now}"
+    message = f"Hello, DBOS! {now}"
+
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(send_test, topic)
+
+    client.send(handle.get_workflow_id(), message, topic)
+
+    result = handle.get_result()
+    assert result == message
+
+
+def test_client_send_no_topic(client: DBOSClient, dbos: DBOS) -> None:
+
+    run_client_collateral()
+
+    now = time.time_ns()
+    wfid = str(uuid.uuid4())
+    message = f"Hello, DBOS! {now}"
+
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(send_test)
+
+    client.send(handle.get_workflow_id(), message)
+
+    result = handle.get_result()
+    assert result == message
+
+
+def test_client_send_bulk(client: DBOSClient, dbos: DBOS) -> None:
+
+    from tests.client_collateral import send_test
+
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+
+    wfid_a = str(uuid.uuid4())
+    wfid_b = str(uuid.uuid4())
+    with SetWorkflowID(wfid_a):
+        handle_a = DBOS.start_workflow(send_test, topic)
+    with SetWorkflowID(wfid_b):
+        handle_b = DBOS.start_workflow(send_test, topic)
+
+    client.send_bulk(
+        [
+            SendMessage(wfid_a, f"to_a {now}", topic),
+            SendMessage(wfid_b, f"to_b {now}", topic),
+        ]
+    )
+
+    assert handle_a.get_result() == f"to_a {now}"
+    assert handle_b.get_result() == f"to_b {now}"
+
+
+def run_send_worker(
+    sqlite_path: Path, wfid: str, topic: Optional[str], app_ver: str
+) -> None:
+    script_path = os.path.join(os.path.dirname(__file__), "client_worker.py")
+    args = [sys.executable, script_path, str(sqlite_path), wfid]
+    if topic is not None:
+        args.append(topic)
+
+    env = os.environ.copy()
+    env["DBOS__APPVERSION"] = app_ver
+    result = subprocess.run(args, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, f"Worker failed with error: {result.stderr}"
+    DBOS.logger.info(result.stdout)
+
+
+def test_client_send_idempotent(
+    dbos: DBOS,
+    client: DBOSClient,
+    sqlite_path: Path,
+    skip_with_sqlite: None,
+    skip_with_sharding: None,
+) -> None:
+    run_client_collateral()
+
+    now = math.floor(time.time())
+    wfid = f"test-send-{now}"
+    topic = f"test-topic-{now}"
+    message = f"Hello, DBOS! {now}"
+    idempotency_key = f"test-idempotency-{now}"
+
+    run_send_worker(sqlite_path, wfid, topic, DBOS.application_version)
+
+    client.send(wfid, message, topic, idempotency_key)
+    client.send(wfid, message, topic, idempotency_key)
+
+    with dbos._sys_db.engine.connect() as conn:
+        nresult = conn.execute(
+            sa.text(
+                "SELECT * FROM dbos.notifications WHERE destination_uuid = :wfid"
+            ).bindparams(wfid=wfid)
+        ).fetchall()
+        assert len(nresult) == 1
+
+    DBOS._recover_pending_workflows()
+    handle: WorkflowHandle[str] = DBOS.retrieve_workflow(wfid)
+    result2 = handle.get_result()
+    assert result2 == message
+
+
+def test_client_get_event(client: DBOSClient, dbos: DBOS) -> None:
+    run_client_collateral()
+
+    now = math.floor(time.time())
+    wfid = f"test-client-event-{now}"
+    key = f"key-{now}"
+    value = f"value-{now}"
+
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(event_test, key, value, None)
+
+    client_value = client.get_event(wfid, key, 10)
+    assert client_value == value
+    result = handle.get_result()
+    assert result == f"{key}-{value}"
+
+
+def test_client_get_event_prompt_delivery(client: DBOSClient, dbos: DBOS) -> None:
+    """The client runs no notification listener, so get_event must poll the
+    database while waiting: a value set mid-wait should be delivered promptly,
+    not discovered only when the full timeout expires."""
+
+    @DBOS.workflow()
+    def delayed_event_workflow(key: str, value: str) -> None:
+        DBOS.sleep(2.0)
+        DBOS.set_event(key, value)
+
+    key = "prompt_key"
+    value = "prompt_value"
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(delayed_event_workflow, key, value)
+
+    start = time.time()
+    assert client.get_event(wfid, key, 60) == value
+    elapsed = time.time() - start
+    handle.get_result()
+
+    # The event is set ~2s in and the client re-checks every ~1s, so delivery
+    # stays far below the 60s timeout a reader blocked on a notification that
+    # never arrives would consume.
+    assert elapsed < 30, f"client.get_event took {elapsed:.1f}s"
+
+
+@pytest.mark.asyncio
+async def test_client_get_event_async_prompt_delivery(
+    client: DBOSClient, dbos: DBOS
+) -> None:
+    """get_event_async on the client takes the same no-listener path as the sync
+    version: nothing ever signals its in-memory event, so the database re-check is
+    the only delivery mechanism. Every other get_event_async test runs in-process
+    with a listener, exercising only the notification branch."""
+
+    @DBOS.workflow()
+    def delayed_event_workflow(key: str, value: str) -> None:
+        DBOS.sleep(2.0)
+        DBOS.set_event(key, value)
+
+    key = "prompt_key_async"
+    value = "prompt_value_async"
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(delayed_event_workflow, key, value)
+
+    start = time.time()
+    assert await client.get_event_async(wfid, key, 60) == value
+    elapsed = time.time() - start
+    handle.get_result()
+
+    # Same bound as the sync test: a broken re-check waits out the full 60s timeout.
+    assert elapsed < 30, f"client.get_event_async took {elapsed:.1f}s"
+
+
+def test_client_no_listener_by_default(client: DBOSClient) -> None:
+    assert client._notification_listener_thread is None
+
+
+# Nothing listens here, so connecting fails fast.
+_UNREACHABLE_SYSTEM_DATABASE_URL = (
+    "postgresql://postgres:dbos@127.0.0.1:59999/dbostestpy_lazy_dbos_sys"
+)
+
+
+def test_client_lazy_defers_connecting() -> None:
+    """A lazy client constructs while the system database is unreachable; an eager one raises."""
+    client = DBOSClient(system_database_url=_UNREACHABLE_SYSTEM_DATABASE_URL, lazy=True)
+    try:
+        with pytest.raises(Exception):
+            client.check_connection()
+        with pytest.raises(Exception):
+            asyncio.run(client.check_connection_async())
+    finally:
+        client.destroy()
+
+    with pytest.raises(Exception):
+        DBOSClient(system_database_url=_UNREACHABLE_SYSTEM_DATABASE_URL)
+
+
+def test_client_lazy_connects_on_first_use(config: DBOSConfig, dbos: DBOS) -> None:
+    """Against a live database, a lazy client behaves like an eager one."""
+    assert config["system_database_url"] is not None
+    client = DBOSClient(system_database_url=config["system_database_url"], lazy=True)
+    try:
+        client.check_connection()
+        run_client_collateral()
+
+        wfid = str(uuid.uuid4())
+        options: EnqueueOptions = {
+            "queue_name": "test_queue",
+            "workflow_name": "enqueue_test",
+            "workflow_id": wfid,
+        }
+        johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+        handle: WorkflowHandle[str] = client.enqueue(options, 42, "test", johnDoe)
+        assert (
+            handle.get_result() == '42-test-{"first": "John", "last": "Doe", "age": 30}'
+        )
+    finally:
+        client.destroy()
+
+
+def test_client_lazy_rejects_listen_notify(config: DBOSConfig) -> None:
+    """The listener thread connects immediately, so it cannot combine with lazy."""
+    assert config["system_database_url"] is not None
+    with pytest.raises(DBOSException) as exc_info:
+        DBOSClient(
+            system_database_url=config["system_database_url"],
+            use_listen_notify=True,
+            lazy=True,
+        )
+    assert "lazy" in str(exc_info.value)
+
+
+def _connection_error() -> DBAPIError:
+    return OperationalError(
+        "SELECT 1", None, psycopg.OperationalError("connection failed")
+    )
+
+
+def test_db_retry_connection_error_opt_out() -> None:
+    """db_retry rides out connection errors by default and raises when opted out,
+    but SQLite lock contention is not a connection error and always retries."""
+
+    class FakeSystemDatabase:
+        def __init__(
+            self, retry_connection_errors: bool, is_sqlite: bool = True
+        ) -> None:
+            self._retry_connection_errors = retry_connection_errors
+            self._is_sqlite = is_sqlite
+
+    calls = 0
+
+    @db_retry(initial_backoff=0.01)
+    def flaky(sys_db: Any, error: Exception) -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise error
+        return "ok"
+
+    assert flaky(FakeSystemDatabase(True), _connection_error()) == "ok"
+    assert calls == 3
+
+    calls = 0
+    with pytest.raises(DBAPIError):
+        flaky(FakeSystemDatabase(False), _connection_error())
+    assert calls == 1
+
+    # A pool checkout timeout is retried like a connection error, and the opt-out covers it too.
+    pool_timeout = PoolTimeoutError("QueuePool limit of size 1 overflow 0 reached")
+    calls = 0
+    assert flaky(FakeSystemDatabase(True, is_sqlite=False), pool_timeout) == "ok"
+    assert calls == 3
+
+    calls = 0
+    with pytest.raises(PoolTimeoutError):
+        flaky(FakeSystemDatabase(False), pool_timeout)
+    assert calls == 1
+
+    calls = 0
+    locked = OperationalError("SELECT 1", None, Exception("database is locked"))
+    assert flaky(FakeSystemDatabase(False), locked) == "ok"
+    assert calls == 3
+
+    # On Postgres, "database is locked" can only be rendered program data, so it is not retriable at all.
+    calls = 0
+    with pytest.raises(OperationalError):
+        flaky(FakeSystemDatabase(True, is_sqlite=False), locked)
+    assert calls == 1
+
+    # A DBAPIError renders its parameters, so program data must not read as lock contention.
+    calls = 0
+    lookalike = OperationalError(
+        "INSERT INTO dbos.workflow_status (inputs) VALUES (%(inputs)s)",
+        {"inputs": '{"args": ["database is locked"]}'},
+        psycopg.OperationalError("connection failed"),
+    )
+    assert not retriable_sqlite_exception(lookalike)
+    with pytest.raises(DBAPIError):
+        flaky(FakeSystemDatabase(False), lookalike)
+    assert calls == 1
+
+    # The same payload on SQLite, where no connection-error opt-out would stop the retry.
+    calls = 0
+    fatal = IntegrityError(
+        "INSERT INTO streams (value) VALUES (?)",
+        ("database is locked",),
+        Exception("FOREIGN KEY constraint failed"),
+    )
+    with pytest.raises(DBAPIError):
+        flaky(FakeSystemDatabase(True), fatal)
+    assert calls == 1
+
+
+def test_client_no_retry_raises_on_unreachable_database() -> None:
+    """retry_connection_errors=False surfaces an unreachable database as an error, not a wait."""
+    client = DBOSClient(
+        system_database_url=_UNREACHABLE_SYSTEM_DATABASE_URL,
+        lazy=True,
+        retry_connection_errors=False,
+    )
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+    }
+    raised: list[Exception] = []
+
+    def enqueue() -> None:
+        try:
+            client.enqueue(options)
+        except Exception as e:
+            raised.append(e)
+
+    # Retrying would never return, so bound the wait instead of hanging the suite.
+    thread = threading.Thread(target=enqueue, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    try:
+        assert not thread.is_alive()
+        assert isinstance(raised[0], DBAPIError)
+    finally:
+        client.destroy()
+
+
+def test_client_listen_notify_get_event(
+    config: DBOSConfig, dbos: DBOS, skip_with_sqlite: None, skip_with_sharding: None
+) -> None:
+    """With use_listen_notify=True the client runs a listener thread, so waits stop
+    polling the database and rely on notifications: the fallback re-check is 60s, so
+    only a delivered NOTIFY can return the value within the bound asserted below."""
+    assert config["system_database_url"] is not None
+    client = DBOSClient(
+        system_database_url=config["system_database_url"],
+        use_listen_notify=True,
+    )
+    try:
+        listener = client._notification_listener_thread
+        assert listener is not None and listener.is_alive()
+
+        @DBOS.workflow()
+        def listen_notify_event_workflow(key: str, value: str) -> None:
+            DBOS.sleep(2.0)
+            DBOS.set_event(key, value)
+
+        key = "listen_notify_key"
+        value = "listen_notify_value"
+        # A live thread does not mean its LISTENs landed; subscribe before the
+        # workflow can fire the notification, or it is dropped and this waits 60s.
+        wait_for_client_listener(client)
+        wfid = str(uuid.uuid4())
+        with SetWorkflowID(wfid):
+            handle = DBOS.start_workflow(listen_notify_event_workflow, key, value)
+
+        start = time.time()
+        assert client.get_event(wfid, key, 60) == value
+        elapsed = time.time() - start
+        handle.get_result()
+
+        # The event is set ~2s in. Without a working notification the wait would
+        # run out the full 60s timeout, since the re-check no longer polls.
+        assert elapsed < 30, f"client.get_event took {elapsed:.1f}s"
+    finally:
+        client.destroy()
+    assert not listener.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_client_get_event_async_does_not_pin_a_thread_per_wait(
+    client: DBOSClient, dbos: DBOS
+) -> None:
+    """get_event_async awaits its event rather than parking the whole wait in a worker
+    thread, so waits are no longer capped by the default executor's thread count.
+    Holding a thread each, more waits than the executor has workers can only run in
+    batches, and the wall time is a multiple of the timeout instead of equal to it."""
+
+    # These keys are never set, so every wait runs its full timeout.
+    waiters = 64  # comfortably over the executor's min(32, cpu + 4) workers
+    timeout = 5.0
+    ids = [str(uuid.uuid4()) for _ in range(waiters)]
+
+    start = time.time()
+    results = await asyncio.gather(
+        *(client.get_event_async(wfid, "k", timeout) for wfid in ids)
+    )
+    elapsed = time.time() - start
+
+    assert results == [None] * waiters
+    # Awaiting: all 64 time out together at ~timeout. Thread-per-wait: two batches, ~2x.
+    assert elapsed < timeout * 1.5, (
+        f"{waiters} concurrent get_event_async took {elapsed:.1f}s "
+        f"for a {timeout:.0f}s timeout -- waits are not running concurrently"
+    )
+
+
+def test_client_get_event_finished(client: DBOSClient, dbos: DBOS) -> None:
+    run_client_collateral()
+
+    now = math.floor(time.time())
+    wfid = f"test-client-event-{now}"
+    key = f"key-{now}"
+    value = f"value-{now}"
+
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(event_test, key, value, None)
+        result = handle.get_result()
+        assert result == f"{key}-{value}"
+
+    client_value = client.get_event(wfid, key, 10)
+    assert client_value == value
+
+
+def test_client_get_event_update(client: DBOSClient, dbos: DBOS) -> None:
+    run_client_collateral()
+
+    now = math.floor(time.time())
+    wfid = f"test-client-event-{now}"
+    key = f"key-{now}"
+    value = f"value-{now}"
+
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(event_test, key, value, 10)
+
+    # Wait (non-blocking, timeout=0) for the workflow's initial set_event to
+    # become visible so the assertion below does not race the first commit and
+    # instead read the later "updated-" value.
+    start = time.time()
+    while client.get_event(wfid, key, 0) != value:
+        assert time.time() - start < 10, "workflow did not publish initial event"
+        time.sleep(0.05)
+
+    client_value = client.get_event(wfid, key, 10)
+    assert client_value == value
+    result = handle.get_result()
+    assert result == f"{key}-{value}"
+    client_value = client.get_event(wfid, key, 10)
+    assert client_value == f"updated-{value}"
+
+
+def test_client_get_event_update_finished(client: DBOSClient, dbos: DBOS) -> None:
+    run_client_collateral()
+
+    now = math.floor(time.time())
+    wfid = f"test-client-event-{now}"
+    key = f"key-{now}"
+    value = f"value-{now}"
+
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(event_test, key, value, 10)
+        result = handle.get_result()
+        assert result == f"{key}-{value}"
+
+    client_value = client.get_event(wfid, key, 10)
+    assert client_value == f"updated-{value}"
+
+
+def test_client_retrieve_wf(client: DBOSClient, dbos: DBOS) -> None:
+    run_client_collateral()
+
+    message = f"Hello, DBOS! {time.time_ns()}"
+    handle1 = DBOS.start_workflow(retrieve_test, message)
+
+    handle2: WorkflowHandle[str] = client.retrieve_workflow(handle1.get_workflow_id())
+    assert handle1.get_workflow_id() == handle2.get_workflow_id()
+    status = handle2.get_status()
+    assert status.status == "PENDING"
+
+    result = handle2.get_result()
+    assert result == message
+
+
+def test_client_retrieve_wf_done(client: DBOSClient, dbos: DBOS) -> None:
+    run_client_collateral()
+
+    message = f"Hello, DBOS! {time.time_ns()}"
+    handle1 = DBOS.start_workflow(retrieve_test, message)
+    result1 = handle1.get_result()
+    assert result1 == message
+
+    handle2: WorkflowHandle[str] = client.retrieve_workflow(handle1.get_workflow_id())
+    assert handle1.get_workflow_id() == handle2.get_workflow_id()
+    result2 = handle2.get_result()
+    assert result2 == message
+
+
+def test_client_fork(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "fork_test",
+    }
+
+    input = 5
+    handle: WorkflowHandle[int] = client.enqueue(options, input)
+    assert handle.get_result() == input * 2
+    steps = client.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 2
+    assert all(s["output"] == input for s in steps)
+    # load_output=False skips deserializing outputs
+    steps = client.list_workflow_steps(handle.workflow_id, load_output=False)
+    assert len(steps) == 2
+    assert all(s["output"] is None for s in steps)
+
+    fork_id = str(uuid.uuid4())
+    with SetWorkflowID(fork_id):
+        forked_handle: WorkflowHandle[int] = client.fork_workflow(handle.workflow_id, 1)
+    assert forked_handle.workflow_id == fork_id
+    assert forked_handle.get_result() == input * 2
+
+    forked_handle = client.fork_workflow(handle.workflow_id, 2)
+    assert (
+        forked_handle.workflow_id != handle.workflow_id
+        and forked_handle.workflow_id != fork_id
+    )
+    assert forked_handle.get_result() == input * 2
+
+    assert len(client.list_workflows()) == 3
+
+
+@pytest.mark.asyncio
+async def test_client_fork_async(dbos: DBOS, client: DBOSClient) -> None:
+    await asyncio.to_thread(run_client_collateral)
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "fork_test",
+    }
+
+    input = 5
+    handle: WorkflowHandleAsync[int] = await client.enqueue_async(options, input)
+    assert await handle.get_result() == input * 2
+    steps = await client.list_workflow_steps_async(handle.workflow_id)
+    assert len(steps) == 2
+    assert all(s["output"] == input for s in steps)
+    # load_output=False skips deserializing outputs
+    steps = await client.list_workflow_steps_async(
+        handle.workflow_id, load_output=False
+    )
+    assert len(steps) == 2
+    assert all(s["output"] is None for s in steps)
+
+    forked_handle: WorkflowHandleAsync[int] = await client.fork_workflow_async(
+        handle.workflow_id, 1
+    )
+    assert forked_handle.workflow_id != handle.workflow_id
+    assert await forked_handle.get_result() == input * 2
+
+    forked_handle = await client.fork_workflow_async(handle.workflow_id, 2)
+    assert forked_handle.workflow_id != handle.workflow_id
+    assert await forked_handle.get_result() == input * 2
+
+    assert len(await client.list_workflows_async()) == 3
+
+
+def test_enqueue_with_deduplication(
+    dbos: DBOS, client: DBOSClient, skip_with_sharding: None
+) -> None:
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    dedup_id = f"dedup-{wfid}"
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+        "deduplication_id": dedup_id,
+    }
+
+    handle: WorkflowHandle[str] = client.enqueue(options, "abc")
+    # Enqueue itself again should not raise an error
+    handle2: WorkflowHandle[str] = client.enqueue(options, "def")
+
+    # Enqueue with the same deduplication ID but different workflow ID should raise an error
+    wfid2 = str(uuid.uuid4())
+    options["workflow_id"] = wfid2
+    with pytest.raises(Exception) as exc_info:
+        client.enqueue(options, "def")
+    assert (
+        f"Workflow {wfid2} was deduplicated due to an existing workflow in queue test_queue with deduplication ID {dedup_id}."
+        in str(exc_info.value)
+    )
+
+    list_results = client.list_queued_workflows()
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status in ["PENDING", "ENQUEUED"]
+    assert list_results[0].input is not None
+    assert list_results[0].output is None
+
+    # Skip loading input
+    list_results = client.list_queued_workflows(load_input=False)
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status in ["PENDING", "ENQUEUED"]
+    assert list_results[0].input is None
+    assert list_results[0].output is None
+
+    assert handle.get_result() == "abc"
+    assert handle2.get_result() == "abc"
+
+
+def test_enqueue_in_transaction_commit(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+    }
+
+    with client._sys_db.engine.connect() as conn:
+        with conn.begin():
+            handle: WorkflowHandle[str] = client.enqueue_in_transaction(
+                conn, options, "tx-commit"
+            )
+            assert handle.get_workflow_id() == wfid
+            row = conn.execute(
+                sa.select(SystemSchema.workflow_status.c.workflow_uuid).where(
+                    SystemSchema.workflow_status.c.workflow_uuid == wfid
+                )
+            ).fetchone()
+            assert row is not None
+
+    result = handle.get_result()
+    assert result == "tx-commit"
+
+    list_results = client.list_workflows()
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status == "SUCCESS"
+
+
+def test_enqueue_in_transaction_rollback(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+    }
+
+    with client._sys_db.engine.connect() as conn:
+        trans = conn.begin()
+        client.enqueue_in_transaction(conn, options, "tx-rollback")
+        trans.rollback()
+
+    assert not _workflow_exists(client, wfid)
+    with pytest.raises(DBOSNonExistentWorkflowError):
+        client.retrieve_workflow(wfid)
+
+
+def test_enqueue_in_transaction_pre_commit_invisible(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+    }
+    engine = client._sys_db.engine
+
+    with engine.connect() as conn:
+        with conn.begin():
+            client.enqueue_in_transaction(conn, options, "tx-invisible")
+            with engine.connect() as other_conn:
+                row = other_conn.execute(
+                    sa.select(SystemSchema.workflow_status.c.workflow_uuid).where(
+                        SystemSchema.workflow_status.c.workflow_uuid == wfid
+                    )
+                ).fetchone()
+                assert row is None
+
+
+def test_enqueue_in_transaction_deduplication(
+    dbos: DBOS, client: DBOSClient, skip_with_sharding: None
+) -> None:
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    dedup_id = f"dedup-{wfid}"
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+        "deduplication_id": dedup_id,
+    }
+
+    with client._sys_db.engine.connect() as conn:
+        with conn.begin():
+            handle: WorkflowHandle[str] = client.enqueue_in_transaction(
+                conn, options, "abc"
+            )
+            handle2: WorkflowHandle[str] = client.enqueue_in_transaction(
+                conn, options, "def"
+            )
+
+    wfid2 = str(uuid.uuid4())
+    options["workflow_id"] = wfid2
+    with client._sys_db.engine.connect() as conn:
+        with conn.begin():
+            with pytest.raises(Exception) as exc_info:
+                client.enqueue_in_transaction(conn, options, "def")
+    assert (
+        f"Workflow {wfid2} was deduplicated due to an existing workflow in queue test_queue with deduplication ID {dedup_id}."
+        in str(exc_info.value)
+    )
+
+    list_results = client.list_queued_workflows()
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert handle.get_result() == "abc"
+    assert handle2.get_result() == "abc"
+
+
+def test_enqueue_in_transaction_session(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+    }
+
+    with Session(client._sys_db.engine) as session:
+        with session.begin():
+            handle: WorkflowHandle[str] = client.enqueue_in_transaction(
+                session, options, "session-commit"
+            )
+    assert handle.get_result() == "session-commit"
+
+    wfid2 = str(uuid.uuid4())
+    options["workflow_id"] = wfid2
+    session = Session(client._sys_db.engine)
+    try:
+        trans = session.begin()
+        client.enqueue_in_transaction(session, options, "session-rollback")
+        trans.rollback()
+    finally:
+        session.close()
+    assert not _workflow_exists(client, wfid2)
+
+
+def test_enqueue_in_transaction_session_after_statement(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    # Regression: a caller brings its own engine/Session (which does not carry DBOS's
+    # internal schema_translate_map) and runs a statement before the DBOS call, procuring
+    # its connection. Session.connection(execution_options=...) is silently ignored once a
+    # connection is established, so _apply_caller_schema must translate the placeholder
+    # schema on the underlying Connection directly or the enqueue targets a nonexistent schema.
+    run_client_collateral()
+
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+    }
+
+    engine = sa.create_engine(client._sys_db.engine.url)
+    try:
+        with Session(engine) as session:
+            with session.begin():
+                session.execute(sa.text("SELECT 1"))  # procure the connection first
+                handle: WorkflowHandle[str] = client.enqueue_in_transaction(
+                    session, options, "after-statement"
+                )
+    finally:
+        engine.dispose()
+    assert handle.get_result() == "after-statement"
+
+
+def test_enqueue_in_transaction_on_another_driver(
+    dbos: DBOS, client: DBOSClient, skip_with_sqlite: None
+) -> None:
+    # A caller's engine may use another driver than DBOS's, here psycopg2; its connection
+    # must compile DBOS's statements itself rather than receive psycopg 3's.
+    run_client_collateral()
+
+    url = client._sys_db.engine.url.set(drivername="postgresql+psycopg2")
+    engine = sa.create_engine(url)
+    try:
+        with engine.begin() as conn:
+            options: EnqueueOptions = {
+                "queue_name": "test_queue",
+                "workflow_name": "retrieve_test",
+                "workflow_id": str(uuid.uuid4()),
+            }
+            via_conn: WorkflowHandle[str] = client.enqueue_in_transaction(
+                conn, options, "psycopg2-connection"
+            )
+        with Session(engine) as session:
+            with session.begin():
+                options["workflow_id"] = str(uuid.uuid4())
+                via_session: WorkflowHandle[str] = client.enqueue_in_transaction(
+                    session, options, "psycopg2-session"
+                )
+    finally:
+        engine.dispose()
+    assert via_conn.get_result() == "psycopg2-connection"
+    assert via_session.get_result() == "psycopg2-session"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_in_transaction_run_sync(
+    dbos: DBOS, client: DBOSClient, skip_with_sqlite: None
+) -> None:
+    # Async applications use a caller-owned async transaction by bridging to the
+    # synchronous enqueue_in_transaction via AsyncConnection.run_sync, which hands
+    # the callable the underlying sync Connection bound to the same transaction.
+    await asyncio.to_thread(run_client_collateral)
+
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "retrieve_test",
+        "workflow_id": wfid,
+    }
+
+    async_engine = create_async_engine(client._sys_db.engine.url)
+    try:
+        async with async_engine.connect() as conn:
+            async with conn.begin():
+                handle: WorkflowHandle[str] = await conn.run_sync(
+                    lambda sync_conn: client.enqueue_in_transaction(
+                        sync_conn, options, "run-sync-tx"
+                    )
+                )
+                assert handle.get_workflow_id() == wfid
+    finally:
+        await async_engine.dispose()
+
+    async_handle: WorkflowHandleAsync[str] = await client.retrieve_workflow_async(wfid)
+    result = await async_handle.get_result()
+    assert result == "run-sync-tx"
+
+    list_results = client.list_workflows()
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status == "SUCCESS"
+
+
+def test_send_in_transaction_commit(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+    message = f"Hello, DBOS! {now}"
+
+    with SetWorkflowID(str(uuid.uuid4())):
+        handle = DBOS.start_workflow(send_test, topic)
+    wfid = handle.get_workflow_id()
+
+    with client._sys_db.engine.connect() as conn:
+        with conn.begin():
+            client.send_in_transaction(conn, wfid, message, topic)
+            row = conn.execute(
+                sa.select(SystemSchema.notifications.c.destination_uuid).where(
+                    SystemSchema.notifications.c.destination_uuid == wfid
+                )
+            ).fetchone()
+            assert row is not None
+
+    assert handle.get_result() == message
+
+
+def test_send_in_transaction_session_after_statement(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    # Regression: a caller brings its own engine/Session (which does not carry DBOS's
+    # internal schema_translate_map) and runs a statement before the DBOS call, procuring
+    # its connection. _apply_caller_schema must still translate the placeholder schema on
+    # the underlying Connection; otherwise the send targets a nonexistent placeholder schema.
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+    message = f"Hello, DBOS! {now}"
+
+    with SetWorkflowID(str(uuid.uuid4())):
+        handle = DBOS.start_workflow(send_test, topic)
+    wfid = handle.get_workflow_id()
+
+    engine = sa.create_engine(client._sys_db.engine.url)
+    try:
+        with Session(engine) as session:
+            with session.begin():
+                session.execute(sa.text("SELECT 1"))  # procure the connection first
+                client.send_in_transaction(session, wfid, message, topic)
+    finally:
+        engine.dispose()
+
+    assert handle.get_result() == message
+
+
+def test_send_in_transaction_rollback(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+
+    with SetWorkflowID(str(uuid.uuid4())):
+        handle = DBOS.start_workflow(send_test, topic)
+    wfid = handle.get_workflow_id()
+
+    with client._sys_db.engine.connect() as conn:
+        trans = conn.begin()
+        client.send_in_transaction(conn, wfid, f"rolled-back {now}", topic)
+        trans.rollback()
+
+    assert _count_notifications(client, wfid) == 0
+
+    # The workflow receives only a message sent after the rollback.
+    client.send(wfid, f"delivered {now}", topic)
+    assert handle.get_result() == f"delivered {now}"
+
+
+def test_send_in_transaction_pre_commit_invisible(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+    message = f"Hello, DBOS! {now}"
+
+    with SetWorkflowID(str(uuid.uuid4())):
+        handle = DBOS.start_workflow(send_test, topic)
+    wfid = handle.get_workflow_id()
+    engine = client._sys_db.engine
+
+    with engine.connect() as conn:
+        with conn.begin():
+            client.send_in_transaction(conn, wfid, message, topic)
+            with engine.connect() as other_conn:
+                row = other_conn.execute(
+                    sa.select(SystemSchema.notifications.c.destination_uuid).where(
+                        SystemSchema.notifications.c.destination_uuid == wfid
+                    )
+                ).fetchone()
+                assert row is None
+
+    assert handle.get_result() == message
+
+
+def test_send_in_transaction_idempotent(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+    message = f"Hello, DBOS! {now}"
+    idempotency_key = f"test-idempotency-{now}"
+
+    with SetWorkflowID(str(uuid.uuid4())):
+        handle = DBOS.start_workflow(send_test, topic)
+    wfid = handle.get_workflow_id()
+
+    # Sending twice with the same idempotency key in the same transaction
+    # inserts a single message. Counting on the sending connection is
+    # deterministic because the workflow cannot consume uncommitted rows.
+    with client._sys_db.engine.connect() as conn:
+        with conn.begin():
+            client.send_in_transaction(conn, wfid, message, topic, idempotency_key)
+            client.send_in_transaction(conn, wfid, message, topic, idempotency_key)
+            rows = conn.execute(
+                sa.select(SystemSchema.notifications.c.message_uuid).where(
+                    SystemSchema.notifications.c.destination_uuid == wfid
+                )
+            ).fetchall()
+            assert len(rows) == 1
+
+    assert handle.get_result() == message
+
+
+def test_send_in_transaction_session(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+
+    with SetWorkflowID(str(uuid.uuid4())):
+        handle = DBOS.start_workflow(send_test, topic)
+    wfid = handle.get_workflow_id()
+
+    with Session(client._sys_db.engine) as session:
+        with session.begin():
+            client.send_in_transaction(session, wfid, f"session-commit {now}", topic)
+    assert handle.get_result() == f"session-commit {now}"
+
+    with SetWorkflowID(str(uuid.uuid4())):
+        handle2 = DBOS.start_workflow(send_test, topic)
+    wfid2 = handle2.get_workflow_id()
+
+    session = Session(client._sys_db.engine)
+    try:
+        trans = session.begin()
+        client.send_in_transaction(session, wfid2, f"session-rollback {now}", topic)
+        trans.rollback()
+    finally:
+        session.close()
+    assert _count_notifications(client, wfid2) == 0
+
+    client.send(wfid2, f"delivered {now}", topic)
+    assert handle2.get_result() == f"delivered {now}"
+
+
+def test_send_bulk_in_transaction(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+
+    wfid_a = str(uuid.uuid4())
+    wfid_b = str(uuid.uuid4())
+    with SetWorkflowID(wfid_a):
+        handle_a = DBOS.start_workflow(send_test, topic)
+    with SetWorkflowID(wfid_b):
+        handle_b = DBOS.start_workflow(send_test, topic)
+
+    with client._sys_db.engine.connect() as conn:
+        trans = conn.begin()
+        client.send_bulk_in_transaction(
+            conn,
+            [
+                SendMessage(wfid_a, f"rolled-back-a {now}", topic),
+                SendMessage(wfid_b, f"rolled-back-b {now}", topic),
+            ],
+        )
+        trans.rollback()
+
+    assert _count_notifications(client, wfid_a) == 0
+    assert _count_notifications(client, wfid_b) == 0
+
+    with client._sys_db.engine.connect() as conn:
+        with conn.begin():
+            client.send_bulk_in_transaction(
+                conn,
+                [
+                    SendMessage(wfid_a, f"to_a {now}", topic),
+                    SendMessage(wfid_b, f"to_b {now}", topic),
+                ],
+            )
+
+    assert handle_a.get_result() == f"to_a {now}"
+    assert handle_b.get_result() == f"to_b {now}"
+
+
+def test_enqueue_and_send_in_transaction(dbos: DBOS, client: DBOSClient) -> None:
+    # Atomically enqueue a workflow and send it a message in one transaction.
+    # The workflow row inserted by the enqueue satisfies the foreign key
+    # constraint on the notification within the same transaction.
+    run_client_collateral()
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+    message = f"Hello, DBOS! {now}"
+    wfid = str(uuid.uuid4())
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "send_test",
+        "workflow_id": wfid,
+    }
+
+    with client._sys_db.engine.connect() as conn:
+        with conn.begin():
+            handle: WorkflowHandle[str] = client.enqueue_in_transaction(
+                conn, options, topic
+            )
+            client.send_in_transaction(conn, wfid, message, topic)
+
+    assert handle.get_result() == message
+
+
+@pytest.mark.asyncio
+async def test_send_in_transaction_run_sync(
+    dbos: DBOS, client: DBOSClient, skip_with_sqlite: None
+) -> None:
+    # Async applications use a caller-owned async transaction by bridging to the
+    # synchronous send_in_transaction via AsyncConnection.run_sync, which hands
+    # the callable the underlying sync Connection bound to the same transaction.
+    await asyncio.to_thread(run_client_collateral)
+
+    now = time.time_ns()
+    topic = f"test-topic-{now}"
+    message = f"run-sync-tx {now}"
+
+    def start_workflow() -> WorkflowHandle[str]:
+        with SetWorkflowID(str(uuid.uuid4())):
+            return DBOS.start_workflow(send_test, topic)
+
+    handle = await asyncio.to_thread(start_workflow)
+    wfid = handle.get_workflow_id()
+
+    async_engine = create_async_engine(client._sys_db.engine.url)
+    try:
+        async with async_engine.connect() as conn:
+            async with conn.begin():
+                await conn.run_sync(
+                    lambda sync_conn: client.send_in_transaction(
+                        sync_conn, wfid, message, topic
+                    )
+                )
+    finally:
+        await async_engine.dispose()
+
+    result = await asyncio.to_thread(handle.get_result)
+    assert result == message
+
+
+def test_enqueue_with_priority(dbos: DBOS, client: DBOSClient) -> None:
+    importlib.reload(client_collateral)
+    from tests.client_collateral import inorder_results
+
+    options: EnqueueOptions = {
+        "queue_name": "inorder_queue",
+        "workflow_name": "retrieve_test",
+        "priority": -1,
+    }
+
+    with pytest.raises(Exception) as exc_info:
+        client.enqueue(options, "abc")
+    assert "Invalid priority" in str(exc_info.value)
+
+    # Without priority should work
+    del options["priority"]
+    handle: WorkflowHandle[str] = client.enqueue(options, "abc")
+
+    # Enqueue with a lower priority
+    options["priority"] = 5
+    handle2: WorkflowHandle[str] = client.enqueue(options, "def")
+
+    # Enqueue with a higher priority
+    options["priority"] = 1
+    handle3: WorkflowHandle[str] = client.enqueue(options, "ghi")
+
+    assert handle.get_result() == "abc"
+    assert handle3.get_result() == "ghi"
+    assert handle2.get_result() == "def"
+
+    # Should be in the order of priority
+    assert inorder_results == ["abc", "ghi", "def"]
+
+
+def test_client_bad_url() -> None:
+    with pytest.raises(DBAPIError) as exc_info:
+        DBOSClient(
+            system_database_url="postgresql://postgres:fakepassword@localhost:5433/fake_database"
+        )
+
+
+def test_client_auth(dbos: DBOS, client: DBOSClient) -> None:
+    run_client_collateral()
+
+    johnDoe: Person = {"first": "John", "last": "Doe", "age": 30}
+    wfid = str(uuid.uuid4())
+
+    user = "testuser"
+    roles = ["role1", "role2"]
+
+    options: EnqueueOptions = {
+        "queue_name": "test_queue",
+        "workflow_name": "enqueue_test",
+        "workflow_id": wfid,
+        "authenticated_user": user,
+        "authenticated_roles": roles,
+    }
+
+    handle: WorkflowHandle[str] = client.enqueue(options, 42, "test", johnDoe)
+    result = handle.get_result()
+    assert result == '42-test-{"first": "John", "last": "Doe", "age": 30}'
+
+    list_results = client.list_workflows()
+    assert len(list_results) == 1
+    assert list_results[0].workflow_id == wfid
+    assert list_results[0].status == "SUCCESS"
+    assert list_results[0].output == result
+    assert list_results[0].input is not None
+    assert list_results[0].authenticated_user == user
+    assert list_results[0].authenticated_roles == roles
+    assert list_results[0].assumed_role is None
+
+
+def test_client_list_workflows_is_a_step_in_a_workflow(
+    dbos: DBOS, client: DBOSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listings = 0
+    failing = False
+    list_workflows = client._sys_db.list_workflows
+
+    def counting_list_workflows(**filters: Any) -> Any:
+        nonlocal listings
+        listings += 1
+        if failing:
+            raise RuntimeError("listing failed")
+        return list_workflows(**filters)
+
+    monkeypatch.setattr(client._sys_db, "list_workflows", counting_list_workflows)
+
+    @DBOS.step()
+    def listing_step(target: str) -> int:
+        return len(client.list_workflows(workflow_ids=[target]))
+
+    @DBOS.workflow()
+    def listed_workflow() -> str:
+        return "listed"
+
+    @DBOS.workflow()
+    def listing_workflow(target: str) -> list[str]:
+        found = client.list_workflows(workflow_ids=[target])
+        assert listing_step(target) == 1
+        return [w.workflow_id for w in found]
+
+    @DBOS.workflow()
+    def failing_workflow() -> str:
+        try:
+            client.list_workflows()
+        except RuntimeError as e:
+            return str(e)
+        return "listed"
+
+    target = DBOS.start_workflow(listed_workflow)
+    assert target.get_result() == "listed"
+
+    handle = DBOS.start_workflow(listing_workflow, target.workflow_id)
+    assert handle.get_result() == [target.workflow_id]
+    assert listings == 2
+
+    # The call from the workflow body is a step; the call from inside a step is not.
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == [
+        (1, "DBOSClient.listWorkflows"),
+        (2, listing_step.__qualname__),
+    ]
+    recorded = steps[0]["output"]
+    assert recorded is not None
+    assert [w.workflow_id for w in recorded] == [target.workflow_id]
+    assert recorded[0].status == "SUCCESS"
+    assert steps[0]["error"] is None
+
+    # A replay returns the recorded listing instead of asking the client again.
+    forked = DBOS.fork_workflow(handle.workflow_id, 3)
+    assert forked.get_result() == [target.workflow_id]
+    assert listings == 2
+
+    # A listing that fails is recorded as the step's error and raised unchanged.
+    failing = True
+    failed = DBOS.start_workflow(failing_workflow)
+    assert failed.get_result() == "listing failed"
+    assert listings == 3
+    steps = DBOS.list_workflow_steps(failed.workflow_id)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == [
+        (1, "DBOSClient.listWorkflows")
+    ]
+    assert isinstance(steps[0]["error"], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_client_list_workflows_async_is_a_step_in_a_workflow(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    @DBOS.step()
+    async def a_step() -> str:
+        return "stepped"
+
+    @DBOS.workflow()
+    async def listed_workflow() -> str:
+        return "listed"
+
+    @DBOS.workflow()
+    async def listing_workflow(target: str) -> list[str]:
+        with pytest.raises(RuntimeError, match="list_workflows_async"):
+            client.list_workflows(workflow_ids=[target])
+
+        # A sync handle has no async variant of its own; its blocking calls are refused too.
+        def retrieve() -> WorkflowHandle[str]:
+            return client.retrieve_workflow(target)
+
+        sync_handle = await asyncio.to_thread(retrieve)
+        with pytest.raises(RuntimeError, match=r"get_result\(\) was called"):
+            sync_handle.get_result()
+        with pytest.raises(RuntimeError, match=r"get_status\(\) was called"):
+            sync_handle.get_status()
+        found = await client.list_workflows_async(workflow_ids=[target])
+        await a_step()
+        return [w.workflow_id for w in found]
+
+    target = await DBOS.start_workflow_async(listed_workflow)
+    assert await target.get_result() == "listed"
+
+    handle = await DBOS.start_workflow_async(listing_workflow, target.workflow_id)
+    assert await handle.get_result() == [target.workflow_id]
+
+    steps = await DBOS.list_workflow_steps_async(handle.workflow_id)
+    # A refused call reserves no step.
+    assert [(s["function_id"], s["function_name"]) for s in steps] == [
+        (1, "DBOSClient.retrieveWorkflow"),
+        (2, "DBOSClient.listWorkflows"),
+        (3, a_step.__qualname__),
+    ]
+    recorded = steps[1]["output"]
+    assert recorded is not None
+    assert [w.workflow_id for w in recorded] == [target.workflow_id]
+
+
+@dataclass
+class _StepTargets:
+    workflow_id: str
+    workflow_name: str
+    queue: str
+    schedule: str
+
+
+# Fires once a year, so no test sees it fire.
+_YEARLY = "0 0 0 1 1 *"
+
+
+class _ClientStepCase(NamedTuple):
+    steps: List[str]
+    call: Callable[[DBOSClient, _StepTargets], Any]
+    call_async: Callable[[DBOSClient, _StepTargets], Awaitable[Any]]
+
+
+async def _get_result_async(c: DBOSClient, t: _StepTargets) -> Any:
+    handle: WorkflowHandleAsync[str] = await c.retrieve_workflow_async(t.workflow_id)
+    return await handle.get_result()
+
+
+async def _get_status_async(c: DBOSClient, t: _StepTargets) -> Any:
+    handle: WorkflowHandleAsync[str] = await c.retrieve_workflow_async(t.workflow_id)
+    return await handle.get_status()
+
+
+async def _wait_first_async(c: DBOSClient, t: _StepTargets) -> Any:
+    return await c.wait_first_async([await c.retrieve_workflow_async(t.workflow_id)])
+
+
+def _schedule_input(t: _StepTargets) -> ClientScheduleInput:
+    return {
+        "schedule_name": f"{t.schedule}-applied",
+        "workflow_name": t.workflow_name,
+        "schedule": _YEARLY,
+    }
+
+
+# One row per wrapped client method: the steps a workflow records when it makes the call.
+def _child_enqueue_options_for(t: _StepTargets) -> EnqueueOptions:
+    options: EnqueueOptions = {"queue_name": t.queue, "workflow_name": t.workflow_name}
+    # A child takes no key from its parent, so it is enqueued under the parent's explicitly.
+    if DBOS.shard_key is not None:
+        options["shard_key"] = DBOS.shard_key
+    return options
+
+
+_CLIENT_STEP_CASES: Dict[str, _ClientStepCase] = {
+    "enqueue": _ClientStepCase(
+        ["DBOSClient.enqueue"],
+        lambda c, t: c.enqueue(_child_enqueue_options_for(t)),
+        lambda c, t: c.enqueue_async(_child_enqueue_options_for(t)),
+    ),
+    "retrieve_workflow": _ClientStepCase(
+        ["DBOSClient.retrieveWorkflow"],
+        lambda c, t: c.retrieve_workflow(t.workflow_id),
+        lambda c, t: c.retrieve_workflow_async(t.workflow_id),
+    ),
+    "get_result": _ClientStepCase(
+        ["DBOSClient.retrieveWorkflow", "DBOSClient.getResult"],
+        lambda c, t: c.retrieve_workflow(t.workflow_id).get_result(),
+        _get_result_async,
+    ),
+    "get_status": _ClientStepCase(
+        ["DBOSClient.retrieveWorkflow", "DBOSClient.getStatus"],
+        lambda c, t: c.retrieve_workflow(t.workflow_id).get_status(),
+        _get_status_async,
+    ),
+    "wait_first": _ClientStepCase(
+        ["DBOSClient.retrieveWorkflow", "DBOSClient.waitFirst"],
+        lambda c, t: c.wait_first([c.retrieve_workflow(t.workflow_id)]),
+        _wait_first_async,
+    ),
+    "send": _ClientStepCase(
+        ["DBOSClient.send"],
+        lambda c, t: c.send(t.workflow_id, "message"),
+        lambda c, t: c.send_async(t.workflow_id, "message"),
+    ),
+    "send_bulk": _ClientStepCase(
+        ["DBOSClient.sendBulk"],
+        lambda c, t: c.send_bulk([SendMessage(t.workflow_id, "message")]),
+        lambda c, t: c.send_bulk_async([SendMessage(t.workflow_id, "message")]),
+    ),
+    "get_event": _ClientStepCase(
+        ["DBOSClient.getEvent"],
+        lambda c, t: c.get_event(t.workflow_id, "key"),
+        lambda c, t: c.get_event_async(t.workflow_id, "key"),
+    ),
+    "cancel_workflow": _ClientStepCase(
+        ["DBOSClient.cancelWorkflow"],
+        lambda c, t: c.cancel_workflow(t.workflow_id),
+        lambda c, t: c.cancel_workflow_async(t.workflow_id),
+    ),
+    "cancel_workflows": _ClientStepCase(
+        ["DBOSClient.cancelWorkflows"],
+        lambda c, t: c.cancel_workflows([t.workflow_id]),
+        lambda c, t: c.cancel_workflows_async([t.workflow_id]),
+    ),
+    "update_workflow_attributes": _ClientStepCase(
+        ["DBOSClient.updateWorkflowAttributes"],
+        lambda c, t: c.update_workflow_attributes(t.workflow_id, {"a": 1}),
+        lambda c, t: c.update_workflow_attributes_async(t.workflow_id, {"a": 1}),
+    ),
+    "delete_workflow": _ClientStepCase(
+        ["DBOSClient.deleteWorkflow"],
+        lambda c, t: c.delete_workflow(t.workflow_id),
+        lambda c, t: c.delete_workflow_async(t.workflow_id),
+    ),
+    "delete_workflows": _ClientStepCase(
+        ["DBOSClient.deleteWorkflows"],
+        lambda c, t: c.delete_workflows([t.workflow_id]),
+        lambda c, t: c.delete_workflows_async([t.workflow_id]),
+    ),
+    "resume_workflow": _ClientStepCase(
+        ["DBOSClient.resumeWorkflow"],
+        lambda c, t: c.resume_workflow(t.workflow_id),
+        lambda c, t: c.resume_workflow_async(t.workflow_id),
+    ),
+    "resume_workflows": _ClientStepCase(
+        ["DBOSClient.resumeWorkflows"],
+        lambda c, t: c.resume_workflows([t.workflow_id]),
+        lambda c, t: c.resume_workflows_async([t.workflow_id]),
+    ),
+    "rewind_workflow": _ClientStepCase(
+        ["DBOSClient.rewindWorkflow"],
+        lambda c, t: c.rewind_workflow(t.workflow_id),
+        lambda c, t: c.rewind_workflow_async(t.workflow_id),
+    ),
+    "set_workflow_delay": _ClientStepCase(
+        ["DBOSClient.setWorkflowDelay"],
+        lambda c, t: c.set_workflow_delay(t.workflow_id, delay_seconds=1),
+        lambda c, t: c.set_workflow_delay_async(t.workflow_id, delay_seconds=1),
+    ),
+    "list_workflows": _ClientStepCase(
+        ["DBOSClient.listWorkflows"],
+        lambda c, t: c.list_workflows(),
+        lambda c, t: c.list_workflows_async(),
+    ),
+    "list_queued_workflows": _ClientStepCase(
+        ["DBOSClient.listQueuedWorkflows"],
+        lambda c, t: c.list_queued_workflows(),
+        lambda c, t: c.list_queued_workflows_async(),
+    ),
+    "list_workflow_steps": _ClientStepCase(
+        ["DBOSClient.listWorkflowSteps"],
+        lambda c, t: c.list_workflow_steps(t.workflow_id),
+        lambda c, t: c.list_workflow_steps_async(t.workflow_id),
+    ),
+    "fork_workflow": _ClientStepCase(
+        ["DBOSClient.forkWorkflow"],
+        lambda c, t: c.fork_workflow(t.workflow_id, 1),
+        lambda c, t: c.fork_workflow_async(t.workflow_id, 1),
+    ),
+    "read_stream_offset": _ClientStepCase(
+        ["DBOSClient.readStreamOffset"],
+        lambda c, t: c.read_stream_offset(t.workflow_id, "stream", 0),
+        lambda c, t: c.read_stream_offset_async(t.workflow_id, "stream", 0),
+    ),
+    "register_queue": _ClientStepCase(
+        ["DBOSClient.registerQueue"],
+        lambda c, t: c.register_queue(f"{t.queue}-registered"),
+        lambda c, t: c.register_queue_async(f"{t.queue}-registered"),
+    ),
+    "delete_queue": _ClientStepCase(
+        ["DBOSClient.deleteQueue"],
+        lambda c, t: c.delete_queue(t.queue),
+        lambda c, t: c.delete_queue_async(t.queue),
+    ),
+    "list_queues": _ClientStepCase(
+        ["DBOSClient.listQueues"],
+        lambda c, t: c.list_queues(),
+        lambda c, t: c.list_queues_async(),
+    ),
+    "create_schedule": _ClientStepCase(
+        ["DBOSClient.createSchedule"],
+        lambda c, t: c.create_schedule(
+            schedule_name=f"{t.schedule}-created",
+            workflow_name=t.workflow_name,
+            schedule=_YEARLY,
+        ),
+        lambda c, t: c.create_schedule_async(
+            schedule_name=f"{t.schedule}-created",
+            workflow_name=t.workflow_name,
+            schedule=_YEARLY,
+        ),
+    ),
+    "list_schedules": _ClientStepCase(
+        ["DBOSClient.listSchedules"],
+        lambda c, t: c.list_schedules(),
+        lambda c, t: c.list_schedules_async(),
+    ),
+    "get_schedule": _ClientStepCase(
+        ["DBOSClient.getSchedule"],
+        lambda c, t: c.get_schedule(t.schedule),
+        lambda c, t: c.get_schedule_async(t.schedule),
+    ),
+    "delete_schedule": _ClientStepCase(
+        ["DBOSClient.deleteSchedule"],
+        lambda c, t: c.delete_schedule(t.schedule),
+        lambda c, t: c.delete_schedule_async(t.schedule),
+    ),
+    # Without an async variant, an async workflow calls it in a thread.
+    "pause_schedule": _ClientStepCase(
+        ["DBOSClient.pauseSchedule"],
+        lambda c, t: c.pause_schedule(t.schedule),
+        lambda c, t: c.pause_schedule_async(t.schedule),
+    ),
+    "resume_schedule": _ClientStepCase(
+        ["DBOSClient.resumeSchedule"],
+        lambda c, t: c.resume_schedule(t.schedule),
+        lambda c, t: c.resume_schedule_async(t.schedule),
+    ),
+    "apply_schedules": _ClientStepCase(
+        ["DBOSClient.applySchedules"],
+        lambda c, t: c.apply_schedules([_schedule_input(t)]),
+        lambda c, t: c.apply_schedules_async([_schedule_input(t)]),
+    ),
+    "list_application_versions": _ClientStepCase(
+        ["DBOSClient.listApplicationVersions"],
+        lambda c, t: c.list_application_versions(),
+        lambda c, t: c.list_application_versions_async(),
+    ),
+    "get_latest_application_version": _ClientStepCase(
+        ["DBOSClient.getLatestApplicationVersion"],
+        lambda c, t: c.get_latest_application_version(),
+        lambda c, t: c.get_latest_application_version_async(),
+    ),
+    "set_latest_application_version": _ClientStepCase(
+        ["DBOSClient.setLatestApplicationVersion"],
+        lambda c, t: c.set_latest_application_version(DBOS.application_version),
+        lambda c, t: c.set_latest_application_version_async(DBOS.application_version),
+    ),
+    "rename_application": _ClientStepCase(
+        ["DBOSClient.renameApplication"],
+        lambda c, t: c.rename_application("client-steps-old-app", "client-steps-app"),
+        lambda c, t: c.rename_application_async(
+            "client-steps-old-app", "client-steps-app"
+        ),
+    ),
+    "store_external_object": _ClientStepCase(
+        ["DBOSClient.storeExternalObject"],
+        lambda c, t: c.store_external_object("value", owner_workflow_id=t.workflow_id),
+        lambda c, t: c.store_external_object_async(
+            "value", owner_workflow_id=t.workflow_id
+        ),
+    ),
+}
+
+
+class _FakeExternalStorage:
+    """Stands in for the Transact Enterprise external storage, returning a ref per store
+    and a fixed value per load."""
+
+    def __init__(self) -> None:
+        self.stored = 0
+
+    def store(self, value: Any, **kwargs: Any) -> Dict[str, Any]:
+        self.stored += 1
+        return {
+            "version": 1,
+            "store": "fake://bucket",
+            "key": f"{kwargs['owner_workflow_id']}/{self.stored}",
+            "size": len(value),
+            "sha256": "",
+            "serialization": "py_pickle",
+            "encoding": "raw",
+        }
+
+    async def store_async(self, value: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self.store(value, **kwargs)
+
+    def get(self, ref: Any) -> str:
+        return "loaded"
+
+    async def get_async(self, ref: Any) -> str:
+        return self.get(ref)
+
+
+@pytest.mark.parametrize("case_name", list(_CLIENT_STEP_CASES))
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_client_calls_are_steps_in_a_workflow(
+    dbos: DBOS,
+    client: DBOSClient,
+    mode: str,
+    case_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if case_name == "rename_application" and using_sharding():
+        pytest.skip(
+            "A sharded system database does not support renaming an application"
+        )
+    case = _CLIENT_STEP_CASES[case_name]
+    storage = _FakeExternalStorage()
+    monkeypatch.setattr(client, "_external_storage_field", storage)
+
+    @DBOS.workflow()
+    def target_workflow() -> str:
+        DBOS.set_event("key", "value")
+        DBOS.write_stream("stream", "value")
+        return "done"
+
+    @DBOS.workflow()
+    def calling_workflow(targets: _StepTargets) -> None:
+        case.call(client, targets)
+
+    @DBOS.workflow()
+    async def calling_workflow_async(targets: _StepTargets) -> None:
+        await case.call_async(client, targets)
+
+    target = DBOS.start_workflow(target_workflow)
+    assert target.get_result() == "done"
+    client.register_queue("client-steps-queue")
+    client.create_schedule(
+        schedule_name="client-steps-schedule",
+        workflow_name=target_workflow.__qualname__,
+        schedule=_YEARLY,
+    )
+    targets = _StepTargets(
+        workflow_id=target.workflow_id,
+        workflow_name=target_workflow.__qualname__,
+        queue="client-steps-queue",
+        schedule="client-steps-schedule",
+    )
+
+    caller = calling_workflow if mode == "sync" else calling_workflow_async
+    handle = DBOS.start_workflow(caller, targets)
+    handle.get_result()
+
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert [s["function_name"] for s in steps] == case.steps
+    assert [s["function_id"] for s in steps] == list(range(1, len(case.steps) + 1))
+    assert [s["error"] for s in steps] == [None] * len(case.steps)
+
+    if case_name == "enqueue":
+        # The enqueued workflow is a child of the calling workflow, with a child's ID,
+        # and the calling workflow's step names it.
+        children = client.list_workflows(parent_workflow_id=handle.workflow_id)
+        assert [w.workflow_id for w in children] == [f"{handle.workflow_id}-1"]
+        assert children[0].parent_workflow_id == handle.workflow_id
+        assert steps[0]["child_workflow_id"] == f"{handle.workflow_id}-1"
+        assert steps[0]["output"] is None
+
+    if case_name == "set_latest_application_version":
+        # A replay returns the recorded step without promoting the version again.
+        promoted_at = client.get_latest_application_version()["version_timestamp"]
+        time.sleep(0.01)
+        DBOS.fork_workflow(handle.workflow_id, 2).get_result()
+        latest = client.get_latest_application_version()
+        assert latest["version_name"] == DBOS.application_version
+        assert latest["version_timestamp"] == promoted_at
+
+    if case_name == "store_external_object":
+        # The step records the ref, not the value, and a replay returns it without
+        # storing the value again.
+        assert storage.stored == 1
+        ref = cast(Dict[str, Any], steps[0]["output"])
+        assert ref["key"] == f"{target.workflow_id}/1"
+        DBOS.fork_workflow(handle.workflow_id, 2).get_result()
+        assert storage.stored == 1
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_client_queue_in_a_workflow_is_rebuilt_from_its_step(
+    dbos: DBOS, client: DBOSClient, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upserts = 0
+    upsert_queue = client._sys_db.upsert_queue
+
+    def counting_upsert_queue(*args: Any, **kwargs: Any) -> Any:
+        nonlocal upserts
+        upserts += 1
+        return upsert_queue(*args, **kwargs)
+
+    monkeypatch.setattr(client._sys_db, "upsert_queue", counting_upsert_queue)
+    name = "client-recorded-queue"
+    limiter: QueueRateLimit = {"limit": 5, "period": 2}
+
+    @DBOS.step()
+    def a_step() -> None:
+        return None
+
+    def described(queue: Queue) -> List[Any]:
+        # The cached fields, as the public getters read the database again.
+        return [
+            queue.name,
+            queue._worker_concurrency,
+            queue._limiter,
+            queue._client_system_database is client._sys_db,
+        ]
+
+    @DBOS.workflow()
+    def registering_workflow() -> List[Any]:
+        queue = client.register_queue(name, worker_concurrency=3, limiter=limiter)
+        # A plain read that takes no step.
+        assert client.retrieve_queue(name) is not None
+        a_step()
+        return described(queue)
+
+    @DBOS.workflow()
+    async def registering_workflow_async() -> List[Any]:
+        queue = await client.register_queue_async(
+            name, worker_concurrency=3, limiter=limiter
+        )
+        assert await client.retrieve_queue_async(name) is not None
+        a_step()
+        return described(queue)
+
+    registering = registering_workflow if mode == "sync" else registering_workflow_async
+    handle = DBOS.start_workflow(registering)
+    recorded = [name, 3, {"limit": 5, "period": 2}, True]
+    assert handle.get_result() == recorded
+    assert upserts == 1
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert [s["function_name"] for s in steps] == [
+        "DBOSClient.registerQueue",
+        a_step.__qualname__,
+    ]
+
+    # A replay rebuilds the recorded queue on the client instead of registering it again.
+    client.register_queue(name, worker_concurrency=4)
+    upserts = 0
+    replay = DBOS.fork_workflow(handle.workflow_id, 2)
+    assert replay.get_result() == recorded
+    assert upserts == 0
+
+
+def _in_transaction(c: DBOSClient, write: Callable[[sa.Connection], Any]) -> None:
+    with c._sys_db.engine.begin() as conn:
+        write(conn)
+
+
+_BACKFILL_START = datetime(2024, 12, 31, 12, tzinfo=timezone.utc)
+
+# One row per refused client method: the call a workflow body may not make.
+_CLIENT_REFUSED_CASES: Dict[str, Callable[[DBOSClient, _StepTargets], Any]] = {
+    "check_connection": lambda c, t: c.check_connection(),
+    "check_connection_async": lambda c, t: c.check_connection_async(),
+    "load_external_object": lambda c, t: c.load_external_object(cast(Any, {})),
+    "load_external_object_async": lambda c, t: c.load_external_object_async(
+        cast(Any, {})
+    ),
+    "enqueue_in_transaction": lambda c, t: _in_transaction(
+        c,
+        lambda conn: c.enqueue_in_transaction(conn, _child_enqueue_options_for(t)),
+    ),
+    "send_in_transaction": lambda c, t: _in_transaction(
+        c, lambda conn: c.send_in_transaction(conn, t.workflow_id, "message")
+    ),
+    "send_bulk_in_transaction": lambda c, t: _in_transaction(
+        c,
+        lambda conn: c.send_bulk_in_transaction(
+            conn, [SendMessage(t.workflow_id, "message")]
+        ),
+    ),
+    "backfill_schedule": lambda c, t: c.backfill_schedule(
+        t.schedule, _BACKFILL_START, _BACKFILL_START + timedelta(days=1)
+    ),
+    "trigger_schedule": lambda c, t: c.trigger_schedule(t.schedule),
+}
+
+
+@pytest.mark.parametrize("method", list(_CLIENT_REFUSED_CASES))
+def test_client_calls_are_refused_in_a_workflow(
+    dbos: DBOS, client: DBOSClient, method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = _CLIENT_REFUSED_CASES[method]
+    refused = pytest.raises(
+        DBOSException, match=f"DBOSClient.{method} cannot be called from a workflow"
+    )
+    monkeypatch.setattr(client, "_external_storage_field", _FakeExternalStorage())
+
+    @DBOS.workflow()
+    def target_workflow(
+        scheduled_at: Optional[datetime] = None, context: Any = None
+    ) -> None:
+        pass
+
+    @DBOS.step()
+    def calling_step(targets: _StepTargets) -> None:
+        call(client, targets)
+
+    @DBOS.step()
+    async def calling_step_async(targets: _StepTargets) -> None:
+        await call(client, targets)
+
+    @DBOS.workflow()
+    def calling_workflow(targets: _StepTargets) -> None:
+        with refused:
+            call(client, targets)
+        calling_step(targets)
+
+    @DBOS.workflow()
+    async def calling_workflow_async(targets: _StepTargets) -> None:
+        with refused:
+            await call(client, targets)
+        await calling_step_async(targets)
+
+    target = DBOS.start_workflow(target_workflow)
+    target.get_result()
+    client.create_schedule(
+        schedule_name="client-refused-schedule",
+        workflow_name=target_workflow.__qualname__,
+        schedule=_YEARLY,
+    )
+    targets = _StepTargets(
+        workflow_id=target.workflow_id,
+        workflow_name=target_workflow.__qualname__,
+        queue="client-refused-queue",
+        schedule="client-refused-schedule",
+    )
+
+    is_async = method.endswith("_async")
+    caller = calling_workflow_async if is_async else calling_workflow
+    step = calling_step_async if is_async else calling_step
+    handle = DBOS.start_workflow(caller, targets)
+    handle.get_result()
+
+    # Refused in the workflow body, before it takes a step ID, but allowed in a step.
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert [(s["function_id"], s["function_name"], s["error"]) for s in steps] == [
+        (1, step.__qualname__, None)
+    ]
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_client_read_stream_is_checkpointed_in_a_workflow(
+    dbos: DBOS, client: DBOSClient, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads = 0
+    read_stream_values = client._sys_db.read_stream_values
+
+    def counting_read_stream_values(*args: Any) -> Any:
+        nonlocal reads
+        reads += 1
+        return read_stream_values(*args)
+
+    def record_on_the_client(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a stream read is recorded to the workflow's database")
+
+    monkeypatch.setattr(
+        client._sys_db, "read_stream_values", counting_read_stream_values
+    )
+    monkeypatch.setattr(client._sys_db, "record_operation_result", record_on_the_client)
+    monkeypatch.setattr(
+        client._sys_db, "check_operation_execution", record_on_the_client
+    )
+
+    @DBOS.workflow()
+    def writing_workflow() -> None:
+        DBOS.write_stream("stream", "first")
+        DBOS.write_stream("stream", "second")
+        DBOS.close_stream("stream")
+
+    @DBOS.step()
+    def reading_step(target: str) -> List[str]:
+        return list(client.read_stream(target, "stream"))
+
+    @DBOS.workflow()
+    def reading_workflow(target: str) -> List[str]:
+        values = list(client.read_stream(target, "stream"))
+        assert reading_step(target) == values
+        return values
+
+    @DBOS.workflow()
+    async def reading_workflow_async(target: str) -> List[str]:
+        # The blocking read is refused on the event loop, before it takes a step ID.
+        with pytest.raises(RuntimeError, match=r"read_stream\(\) was called"):
+            next(client.read_stream(target, "stream"))
+        values = [v async for v in client.read_stream_async(target, "stream")]
+        assert await asyncio.to_thread(reading_step, target) == values
+        return values
+
+    target = DBOS.start_workflow(writing_workflow)
+    target.get_result()
+
+    workflow = reading_workflow if mode == "sync" else reading_workflow_async
+    handle = DBOS.start_workflow(workflow, target.workflow_id)
+    assert handle.get_result() == ["first", "second"]
+
+    # One step per value read from the workflow body, and one for the end of the
+    # stream; the read from inside a step records nothing of its own.
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == [
+        (1, "DBOSClient.readStream"),
+        (2, "DBOSClient.readStream"),
+        (3, "DBOSClient.readStream"),
+        (4, reading_step.__qualname__),
+    ]
+    assert [s["output"] for s in steps[:2]] == ["first", "second"]
+
+    # A replay yields the recorded values instead of reading the stream again.
+    reads_before_replay = reads
+    forked = DBOS.fork_workflow(handle.workflow_id, 5)
+    assert forked.get_result() == ["first", "second"]
+    assert reads == reads_before_replay
+
+
+@pytest.mark.asyncio
+async def test_client_sync_method_is_refused_on_an_event_loop(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    @DBOS.workflow()
+    async def pausing_workflow() -> str:
+        with pytest.raises(RuntimeError, match="Use await pause_schedule_async"):
+            client.pause_schedule("client-steps-schedule")
+        return "refused"
+
+    handle = await DBOS.start_workflow_async(pausing_workflow)
+    assert await handle.get_result() == "refused"
+    # A refused call reserves no step.
+    assert await DBOS.list_workflow_steps_async(handle.workflow_id) == []
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_client_enqueue_in_a_workflow_records_its_child(
+    dbos: DBOS,
+    client: DBOSClient,
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+    skip_with_sharding: None,
+) -> None:
+    inserts = 0
+    init_workflow = client._sys_db.init_workflow
+
+    def counting_init_workflow(status: Any, **kwargs: Any) -> Any:
+        nonlocal inserts
+        inserts += 1
+        return init_workflow(status, **kwargs)
+
+    monkeypatch.setattr(client._sys_db, "init_workflow", counting_init_workflow)
+
+    @DBOS.workflow()
+    def child_workflow() -> str:
+        return "child"
+
+    client.register_queue("client-child-queue")
+    options: EnqueueOptions = {
+        "queue_name": "client-child-queue",
+        "workflow_name": child_workflow.__qualname__,
+    }
+
+    @DBOS.step()
+    def a_step() -> None:
+        return None
+
+    @DBOS.workflow()
+    def parent_workflow() -> str:
+        child: WorkflowHandle[str] = client.enqueue(options)
+        a_step()
+        return child.workflow_id
+
+    @DBOS.workflow()
+    async def parent_workflow_async() -> str:
+        child: WorkflowHandleAsync[str] = await client.enqueue_async(options)
+        a_step()
+        return child.workflow_id
+
+    parent = parent_workflow if mode == "sync" else parent_workflow_async
+    handle = DBOS.start_workflow(parent)
+    child_id = handle.get_result()
+    assert child_id == f"{handle.workflow_id}-1"
+    assert inserts == 1
+
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert [(s["function_name"], s["child_workflow_id"]) for s in steps] == [
+        ("DBOSClient.enqueue", child_id),
+        (a_step.__qualname__, None),
+    ]
+
+    # A replay returns the recorded child instead of enqueueing again.
+    forked = DBOS.fork_workflow(handle.workflow_id, 2)
+    assert forked.get_result() == child_id
+    assert inserts == 1
+
+    # An enqueue that fails is recorded as the step's error, and names no child.
+    def failing_init_workflow(status: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("enqueue failed")
+
+    monkeypatch.setattr(client._sys_db, "init_workflow", failing_init_workflow)
+    failed = DBOS.start_workflow(parent)
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        failed.get_result()
+    steps = DBOS.list_workflow_steps(failed.workflow_id)
+    assert [(s["function_name"], s["child_workflow_id"]) for s in steps] == [
+        ("DBOSClient.enqueue", None)
+    ]
+    assert isinstance(steps[0]["error"], RuntimeError)
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_client_fork_in_a_workflow_takes_the_assigned_id(
+    dbos: DBOS, client: DBOSClient, mode: str
+) -> None:
+    @DBOS.workflow()
+    def target_workflow() -> str:
+        return "target"
+
+    @DBOS.step()
+    def a_step() -> None:
+        return None
+
+    @DBOS.workflow()
+    def forking_workflow(target_id: str, fork_id: str) -> str:
+        with SetWorkflowID(fork_id):
+            forked = client.fork_workflow(target_id, 1)
+        a_step()
+        return forked.workflow_id
+
+    @DBOS.workflow()
+    async def forking_workflow_async(target_id: str, fork_id: str) -> str:
+        with SetWorkflowID(fork_id):
+            forked = await client.fork_workflow_async(target_id, 1)
+        a_step()
+        return forked.workflow_id
+
+    target = DBOS.start_workflow(target_workflow)
+    assert target.get_result() == "target"
+
+    fork_id = str(uuid.uuid4())
+    forking = forking_workflow if mode == "sync" else forking_workflow_async
+    handle = DBOS.start_workflow(forking, target.workflow_id, fork_id)
+    assert handle.get_result() == fork_id
+    assert DBOS.retrieve_workflow(fork_id).get_result() == "target"
+
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert [s["function_name"] for s in steps] == [
+        "DBOSClient.forkWorkflow",
+        a_step.__qualname__,
+    ]
+    assert steps[0]["output"] == fork_id
+
+    # A replay returns the recorded fork instead of forking again.
+    replay = DBOS.fork_workflow(handle.workflow_id, 2)
+    assert replay.get_result() == fork_id
+    forks = client.list_workflows(forked_from=target.workflow_id)
+    assert [w.workflow_id for w in forks] == [fork_id]
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_client_fork_replay_leaves_the_assigned_id_consumed(
+    dbos: DBOS, client: DBOSClient, mode: str
+) -> None:
+    @DBOS.workflow()
+    def source() -> str:
+        return "source"
+
+    @DBOS.workflow()
+    def child() -> str:
+        return "child"
+
+    @DBOS.workflow()
+    def parent(source_id: str, fork_id: str) -> List[str]:
+        with SetWorkflowID(fork_id):
+            forked_id = client.fork_workflow(source_id, 1).workflow_id
+            # The block's ID went to the fork, so the child takes a derived ID.
+            return [forked_id, DBOS.start_workflow(child).workflow_id]
+
+    @DBOS.workflow()
+    async def parent_async(source_id: str, fork_id: str) -> List[str]:
+        with SetWorkflowID(fork_id):
+            forked = await client.fork_workflow_async(source_id, 1)
+            return [forked.workflow_id, DBOS.start_workflow(child).workflow_id]
+
+    source_handle = DBOS.start_workflow(source)
+    source_handle.get_result()
+    fork_id = str(uuid.uuid4())
+    forking = parent if mode == "sync" else parent_async
+    handle = DBOS.start_workflow(forking, source_handle.workflow_id, fork_id)
+    forked_id, child_id = cast(List[str], handle.get_result())
+    assert forked_id == fork_id
+    child_step = next(
+        s["function_id"]
+        for s in DBOS.list_workflow_steps(handle.workflow_id)
+        if s["child_workflow_id"] == child_id
+    )
+    assert child_id == f"{handle.workflow_id}-{child_step}"
+
+    # Replay the fork and start the child live, as recovery from a crash between them would.
+    replay = DBOS.fork_workflow(handle.workflow_id, child_step)
+    assert replay.get_result() == [fork_id, f"{replay.workflow_id}-{child_step}"]
+
+
+def test_client_enqueue_binds_its_parents_shard_key(
+    client: DBOSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: List[Any] = []
+
+    def recording_init_workflow(status: Any, **kwargs: Any) -> Any:
+        parent_id = status["parent_workflow_id"]
+        seen.append((status["workflow_uuid"], parent_id, bound_shard_key(parent_id)))
+
+    monkeypatch.setattr(client._sys_db, "init_workflow", recording_init_workflow)
+
+    parent = DBOSContext()
+    parent.workflow_id = "parent"
+    parent.function_id = 3
+    parent.shard_key = "parent-key"
+    options: EnqueueOptions = {"queue_name": "q", "workflow_name": "w"}
+
+    # A child does not take its parent's key. The parent's key is bound while the child's
+    # row is written, and only then.
+    resolved: EnqueueOptions = {
+        **options,
+        "workflow_id": child_workflow_id("parent", 3, "parent-key", None),
+    }
+    assert client._enqueue_from(parent, resolved, (), {}) == "parent-3"
+    assert seen == [("parent-3", "parent", "parent-key")]
+    assert bound_shard_key("parent") is None
+
+    # A child under another key keeps it, and carries its parent's key in its ID.
+    other: EnqueueOptions = {
+        **options,
+        "shard_key": "child-key",
+        "workflow_id": child_workflow_id("parent", 3, "parent-key", "child-key"),
+    }
+    assert client._enqueue_from(parent, other, (), {}) == "10:parent-key:parent-3"
+    assert seen[-1] == ("10:parent-key:parent-3", "parent", "parent-key")
+
+
+def test_client_enqueue_step_recognizes_its_own_child_when_run_again(
+    dbos: DBOS,
+    client: DBOSClient,
+    skip_with_sharding: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.register_queue("client-rerun-queue")
+    workflow_id = f"rerun-{uuid.uuid4()}"
+    options: EnqueueOptions = {
+        "queue_name": "client-rerun-queue",
+        "workflow_name": "w",
+        "workflow_id": workflow_id,
+        "workflow_id_reuse_policy": "reject",
+    }
+
+    def step(function_id: int) -> DBOSContext:
+        ctx = DBOSContext()
+        ctx.workflow_id = "parent"
+        ctx.function_id = function_id
+        return ctx
+
+    # The step enqueued its child, then crashed before it was recorded: running it again is no reuse.
+    assert client._enqueue_from(step(1), options, (), {}) == workflow_id
+    assert client._enqueue_from(step(1), options, (), {}) == workflow_id
+    assert len(client.list_workflows(workflow_ids=[workflow_id])) == 1
+
+    # Another step, or a caller outside a workflow, did not create the row.
+    with pytest.raises(DBOSWorkflowIDInUseError):
+        client._enqueue_from(step(2), options, (), {})
+    with pytest.raises(DBOSWorkflowIDInUseError):
+        client.enqueue(options)
+
+    # Nor did the same step of a workflow with the same ID in another application, whose
+    # own database is free to hold that ID.
+    monkeypatch.setattr(dbos._sys_db, "app_name", "another-app")
+    with pytest.raises(DBOSWorkflowIDInUseError):
+        client._enqueue_from(step(1), options, (), {})

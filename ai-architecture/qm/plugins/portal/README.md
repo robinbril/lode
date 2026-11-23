@@ -1,0 +1,295 @@
+# Portal — the public SSO front door
+
+The portal is the public front door of a QM deployment. Core runs it in-process on its public port
+(`PUBLIC_PORT`, see `src/web/front-door.ts`); it does provider-neutral **OIDC** sign-in (Google
+Workspace is the email-first deployment default) and hands signed-in requests to core in-process:
+
+| Path        | → handled by       | Notes                                                                           |
+| ----------- | ------------------ | ------------------------------------------------------------------------------- |
+| `/api/*`    | core's cookie lane | `/api` aliases of browser-enabled `/v1` routes; core binds the signed-in person |
+| `/*` (root) | core's web shell   | Web UI release, root-mounted (`/web-ui/*` 308-redirects to root for old links)  |
+| `/settings` | core's web shell   | Administrator settings; core checks admin                                       |
+
+User deployments are never served on this authenticated origin; they use the dedicated apps domain.
+
+Set `PORTAL_APPS_DOMAIN` to a child domain of the company portal, with matching
+core `DEPLOY_APPS_DOMAIN`, gateway/session secrets, wildcard DNS and TLS. App
+hostnames can point at the same portal ingress: portal forwards them to core's
+deployment gateway before its own routes. Core authorizes each app request and
+removes gateway cookies before forwarding to the app. Each app has a separate
+browser origin; cross-origin browser writes are rejected. Keep the session cookie
+domain within the company, never a parent shared with other companies.
+For companies using the additional trusted OIDC entry, set core
+`DEPLOY_APPS_LOGIN_PATH=/auth/trusted/login` so app sign-in uses that identity
+provider. The default remains `/auth/login`.
+
+It is a thin `node:http` server (native TS type-stripping), like the other
+surfaces. Core imports it; it does **not** import the core and talks to core only over core's HTTP API.
+
+## How a request flows
+
+1. **Sign in** — `GET /auth/login` starts an OIDC Authorization-Code flow with PKCE(S256) +
+   `state` + `nonce`, all sealed into a short-lived signed `portal_oidc_tmp` cookie.
+2. **Callback** — `GET /auth/callback` exchanges the code over the TLS back-channel
+   (confidential client, `client_secret_basic` + the PKCE verifier), then binds the id_token
+   signature and payload (`nonce`/`aud`/`iss`/`sub`/timestamps and, for Slack, the `team_id`
+   workspace pin) against the configured HTTPS JWKS, then reads
+   the subject from userinfo. The verified `sub` **is** the core principal id. It mints a
+   signed `portal_session` cookie (`{sub, org, auth, exp}`, HMAC, 7-day sliding lifetime with a
+   30-day absolute maximum by default).
+3. **Hand-off** — every other path requires a valid session. Aliased `/api` paths go to core's
+   request handler, which reads the `portal_session` cookie itself and binds the signed-in (or
+   admin-impersonated) person; everything else goes to core's web shell (`src/web/shell.ts`), which
+   serves the live web UI release. Before handing off, the portal asks core for the session subject's canonical principal
+   (`GET /v1/principals/:id/canonical`, cached for a minute). A sign-in that an org admin has
+   linked to another identity therefore acts as that person's canonical principal; see
+   [`docs/principal-links.md`](../../docs/principal-links.md).
+
+## Additional trusted entry (PoC)
+
+An optional OIDC entry route at `/auth/trusted/login` operates alongside the
+existing `/auth/login` provider. Configure `PORTAL_TRUSTED_OIDC` as JSON with
+`issuer`, `authEndpoint`, `tokenEndpoint`, `userinfoEndpoint`, `jwksUri`, and
+`clientId`; supply its distinct `PORTAL_TRUSTED_OIDC_CLIENT_SECRET` separately.
+Register the exact `${PUBLIC_WEB_URL}/auth/trusted/callback` URL at that provider.
+Endpoints must use HTTPS in production. This is an operator-configured trust
+relationship: the additional provider must enforce the destination company's
+admission policy before issuing tokens. Primary-provider email and workspace
+restrictions do not apply to this separate route.
+
+The route verifies OIDC signature, issuer, audience, nonce, PKCE and subject binding,
+and consumes login state through core's durable replay store. Principals are scoped
+to the issuer and subject, without automatic linking to email or Slack identities.
+No administrator role is assigned by default. To provision administrators on this
+entry path, set `PORTAL_TRUSTED_OIDC_ADMIN=1` on portal and set core's
+`TRUSTED_OIDC_ADMIN_ISSUER` to the exact trusted issuer. This requires a distinct
+`PORTAL_IDENTITY_SECRET` and durable replay storage. After verified provider login,
+portal submits a short-lived, single-use, purpose-bound assertion; core creates a
+normal durable organization-admin grant before portal issues the session. Outside the
+deployment's own boot tenant, core grants only in a tenant the subject already belongs to. Primary
+login and impersonation cannot request this promotion. Deactivated users stay blocked.
+Existing sessions need a fresh trusted sign-in. Revoking a grant removes admin access
+until the next successful trusted sign-in; disabling provisioning prevents future
+grants but does not remove existing ones. Company login and Slack integration retain their
+existing configuration. Deployment CLI secret wiring, account linking, and live
+qualification are pending; this is not a released deployment feature.
+
+Self-serve workspaces are available on a multitenant deployment whose core sets
+`WORKSPACE_PROVISIONER_URL` and whose trusted sign-in is configured with a distinct
+`PORTAL_IDENTITY_SECRET`. Core then reports self-serve as available in its sign-in
+lookups, and the trusted provider may return an `orgs` claim in userinfo (or the ID
+token): an array of `{ "id": string, "name": string }` naming the
+organizations the person may open a workspace for. When a trusted sign-in finds no
+workspace for the person and carries organizations, portal submits a short-lived,
+single-use, purpose-bound assertion for the chosen organization; with one organization it
+is chosen automatically, with several the workspace picker lists them. Core creates the
+organization's workspace on first use, keyed by issuer and organization id so concurrent
+sign-ins share one workspace, or joins the existing one, then records the person (and
+links their verified email) and, the first time they join, grants them organization admin.
+The name becomes the workspace brand. A person an admin removed from the
+workspace is refused. Self-serve never creates a deployment's first workspace, never
+reopens a workspace an operator switched off, and never runs on a deployment with a boot
+tenant.
+
+A new workspace starts switched off. Core POSTs `{ tenant, brandName, issuer, externalOrg,
+nonce }` to `WORKSPACE_PROVISIONER_URL`, source-signed with the key
+`HMAC-SHA256(CORE_SIGNING_SECRET, "workspace-provisioner")` (hex). A 200 reply of
+`{ "settings": { "modelGatewayKey": "…" } }` (nothing else) gives the workspace its own
+model gateway key and switches it on, once. Until a call succeeds sign-in fails and the
+next sign-in retries, so the provisioner must answer repeated calls for a tenant with the
+same key. A self-served workspace carries `deploymentModelKey: false`, so it never falls
+back to the deployment's model key: without a key of its own its model calls fail. Core
+refuses to start with `WORKSPACE_PROVISIONER_URL` alongside deployment-wide model provider
+credentials (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
+`CLAUDE_AUTH_CREDENTIAL`, `CODEX_AUTH_CREDENTIAL`).
+
+When `PORTAL_TRUSTED_OIDC_LABEL` is explicitly set, successful trusted sign-in
+makes the portal remember the configured issuer in a
+host-only, HttpOnly browser preference for one year. Ordinary
+`/auth/login` requests then return to the trusted route, including after logout
+or session expiry. Session renewal and logout also remember existing trusted
+sessions. A successful primary or operator sign-in clears the preference. The
+preference only selects a provider; it grants no identity or administrator access.
+A new browser or cleared cookies still uses the primary provider by default.
+Use `/auth/login?provider=primary` to explicitly select the primary provider; the
+trusted sign-in error page offers this alternative.
+
+## Operator admin login without email
+
+Run `qm admin-login` with the deployment's configuration and secrets to generate
+a private admin login URL. Open it and confirm the displayed email. The URL
+expires after five minutes and works once. With multiple email-based
+`ADMIN_GRANTS` administrators, use `qm admin-login --email admin@example.com`.
+The command can also run with `PUBLIC_WEB_URL`, `PORTAL_SESSION_SECRET`, and
+`ADMIN_GRANTS` in its environment, without a deployment config file.
+
+`GET /auth/admin-login` only renders the confirmation page. Its script moves the
+token out of the URL fragment into the form and clears the fragment. Nothing
+signs in until the user submits that same-origin form. `POST /auth/admin-login`
+verifies the token's purpose, portal origin, signature and lifetime, checks the
+account's current admin status, and consumes its unique ID through core's
+durable Postgres replay store. It then issues the ordinary portal session and
+clears any old impersonation cookie, then redirects to `/settings/history`. No
+account or role is created.
+
+This is an operator capability: keep deployment secrets and generated URLs
+private. It does not prove an email inbox, replace another user's login, or
+depend on a hosting provider. Leave the built-in broker's sender and selected
+email credentials unset to run without email; configure them later and restart
+to enable ordinary email sign-in. Existing external OIDC login is unchanged.
+
+Live integration checks require a running core, Postgres, web-ui, portal and
+built-in auth broker with email unset. Set `QM_ADMIN_LOGIN_ENV_FILE` to a private
+JSON file containing that deployment's environment and run
+`node --test test/integration/admin-login.test.ts` from the repository root. Use a
+disposable test deployment: the test redeems real links for its configured admin.
+
+## Security model (the parts that must be right)
+
+- **Identity comes from verified OIDC or an operator-issued admin link.** The browser cannot assert an unsigned identity:
+  core derives the person from the sealed `portal_session` cookie and strips client-sent identity headers
+  (`x-admin-actor`, `x-as-principal`, …) before any handler runs.
+- **Routing decides once.** The router rejects pathologically-encoded targets (`%2f`, `%5c`,
+  `%2e%2e`, `\`, `//`, NUL → 400) and selects the upstream by exact segment. Every path that is
+  not a deployment, auth or core passthrough goes to core as the signed-in user, so no path
+  spelling reaches a more privileged upstream.
+- **Admin is derived from ONE source — the core's `admin_grants`.** Settings pages live in web-ui
+  under `/settings`, and every admin action is checked **per action** at the core — the live
+  boundary. The portal itself needs admin status only for impersonation, operator admin login
+  and the unconfigured-deployment redirect to `/settings/onboarding`. For those it calls core
+  `GET /v1/admin/whoami` with source-auth signed headers, `x-admin-actor: <sub>@<org>` and the
+  signed portal identity. It caches the answer ~60s, retries once, and **fails closed**: an
+  outage or malformed answer counts as not-admin and is not cached. There is **no portal id
+  list**; the only place an admin is named is the core's `ADMIN_GRANTS`.
+- **Non-admin users need no per-id config.** `PORTAL_EXPECTED_TEAM_ID` pins the workspace, so any
+  verified member is a valid user.
+- **CSRF / open-redirect.** Every non-GET requires a same-origin `Origin`; `returnTo` is reduced
+  to a same-origin path (rejects `//evil`, `/\evil`, `https:/evil`, `%2f%2f`/`%5c`). The one
+  exception is an origin listed in `PORTAL_API_ALLOWED_ORIGINS`, and only on the chat API (below).
+- **Embedding the chat from another app.** `PORTAL_API_ALLOWED_ORIGINS` lists the exact
+  origins (comma-separated, bare `https://host[:port]`, no wildcards) that may call the web
+  surface's chat API from their own pages with the user's portal session: `/me`, sending a turn,
+  following, cancelling and withdrawing runs, listing and reading sessions and their approvals,
+  deciding an approval, uploading attachment blobs, and downloading files. Those routes answer CORS preflights
+  for listed origins and grant them credentialed reads and writes. Every other route keeps the
+  same-origin rule, and unlisted origins get nothing. The session cookie is `SameSite=Lax`, so a
+  browser only sends it on these calls when the embedding app is on the same site as the portal
+  (for example `internal.example.com` beside `qm.example.com`). Listing an origin trusts every
+  page on it to act as any signed-in user who visits it, so list only first-party apps.
+- **Secret hygiene.** In production the portal refuses to boot unless `PORTAL_SESSION_SECRET`,
+  `PORTAL_IDENTITY_SECRET`, and `OIDC_CLIENT_SECRET` are set and distinct from core ingress auth.
+  Public and OIDC endpoints must use HTTPS. Session and temporary cookies use domain-separated keys.
+
+### Documented trade-offs & residual risks (v1)
+
+- **Surface isolation.** The private surface hop carries a signed portal identity; core verifies
+  it independently, so a synthesized cookie alone confers no user authority. User deployments
+  stay on a dedicated apps hostname and are never proxied through the portal origin.
+- **Local logout.** `POST /auth/logout` clears the portal cookies and returns
+  `redirectTo`; browsers follow it to `/auth/signed-out`, a terminal page that
+  never redirects to the provider. Sign-out is local to this portal: it does not
+  contact the OIDC provider or end the provider session, so choosing **Sign in**
+  may complete silently through an existing provider session. Sign out of the
+  provider directly to end it everywhere. Built-in broker logout retains its
+  existing flow. Local-development logout also stops on the
+  signed-out page until the user chooses **Sign in**.
+- **Stateless session limits.** Clearing browser cookies does not revoke a copied
+  portal session before `exp`; the core's `canAdminister` (re-read per request)
+  remains the live admin revocation path.
+
+## Apps domain and cookie domain
+
+`PORTAL_APPS_DOMAIN` defaults to `DEPLOY_APPS_DOMAIN`, and `PORTAL_COOKIE_DOMAIN`
+to the portal host itself when the apps domain sits directly under it
+(`apps.<portal host>`), so one core-side variable configures both processes. Any
+other layout needs an explicit `PORTAL_COOKIE_DOMAIN` — deriving a shared parent
+by guesswork risks landing on a public suffix browsers refuse.
+
+## Env
+
+Non-secret (`[env]`): `PORT` (8097 local / 8080 image), `PUBLIC_WEB_URL`, `CORE_API_URL`,
+`CORE_ORG_ID`,
+`OIDC_AUTH_ENDPOINT` / `OIDC_TOKEN_ENDPOINT` / `OIDC_USERINFO_ENDPOINT` / `OIDC_ISSUER` /
+`OIDC_JWKS_URI` / `OIDC_SCOPES` / `OIDC_CLIENT_ID`, `PORTAL_EXPECTED_TEAM_ID`,
+`PORTAL_SESSION_TTL_S`, `PORTAL_SESSION_MAX_TTL_S`. `PORTAL_SESSION_MAX_TTL_S` caps a session's total life from authentication; it defaults to the larger of 30 days and `PORTAL_SESSION_TTL_S`, and boot fails if it is set below the TTL.
+There is no `PORTAL_ADMIN_PRINCIPALS` — admin
+access is derived from the core (see the security model above).
+`PORTAL_API_ALLOWED_ORIGINS` (default empty) opens the chat API to other first-party origins;
+see the security model. Boot fails on an entry that is not a bare https origin (plain http only for localhost).
+For local development only, `PORTAL_LOCAL_AUTH_BYPASS=1` mints a local session as
+`PORTAL_DEV_PRINCIPAL` without contacting OIDC. The portal refuses this in production
+and only accepts it when `PUBLIC_WEB_URL` is loopback.
+
+Identity: `OIDC_PRINCIPAL_CLAIM` — `email` (default; the org-canonical id: the
+verified work email, lowercased; sign-in fails unless the IdP marks the email verified) or `sub`
+(the IdP's opaque subject, e.g. the Slack U… id — only for deployments still keyed on Slack ids).
+`OIDC_ALLOWED_EMAIL_DOMAIN` — with `email`, additionally reject any account outside this domain
+(checked against the email suffix and Google's `hd` claim).
+An address those rules reject still signs in when an org admin has invited it as an
+external user: the callback asks core over the signed core client
+(`GET /v1/auth/broker/email-allowed`) and accepts an active invitation, `hd` notwithstanding.
+An address the env rules permit never triggers the lookup; core unreachable means not allowed.
+Deployments keyed on `sub` never consult it, so external users cannot sign in there.
+The invitation email also carries a single-use `/auth/invite` link that signs the invited
+address in without the provider, for people the provider itself turns away (Slack, for
+example, won't let a workspace guest authorize an app).
+
+### Google Workspace SSO with the email principal
+
+The OIDC client is generic, so Google is pure config. One-time setup:
+
+1. In a Google Cloud project under the org's Workspace: **APIs & Services → Credentials →
+   Create OAuth client ID** (type "Web application"), authorized redirect URI
+   `https://<portal-host>/auth/callback`. On the consent screen choose **Internal** (members
+   of the Workspace only).
+2. Point the portal at Google:
+   ```
+   OIDC_AUTH_ENDPOINT=https://accounts.google.com/o/oauth2/v2/auth
+   OIDC_TOKEN_ENDPOINT=https://oauth2.googleapis.com/token
+   OIDC_USERINFO_ENDPOINT=https://openidconnect.googleapis.com/v1/userinfo
+   OIDC_ISSUER=https://accounts.google.com
+   OIDC_JWKS_URI=https://www.googleapis.com/oauth2/v3/certs
+   OIDC_SCOPES="openid email profile"
+   OIDC_CLIENT_ID=<client id>
+   OIDC_ALLOWED_EMAIL_DOMAIN=<org domain, e.g. example.com>
+   ```
+   (unset `PORTAL_EXPECTED_TEAM_ID` — it's a Slack-OIDC concept).
+3. The Slack plugin keys on emails by default too (bot scope `users:read.email`, already in the
+   repo manifest — reinstall the app if it predates the scope), so Slack turns and web logins
+   resolve to the same principal.
+4. A deployment whose state predates email keying (Slack U… ids in the DB) must be re-keyed
+   **once**: `scripts/migrate-principals-to-email.mjs` (dry-run by default; see its header).
+   Update the core's `ADMIN_GRANTS` to emails in the same change.
+
+Secrets: `OIDC_CLIENT_SECRET`, `PORTAL_SESSION_SECRET`, and `PORTAL_IDENTITY_SECRET`; each must be
+distinct from `CORE_SIGNING_SECRET`.
+
+## Run / test
+
+Core starts the portal in-process on `PUBLIC_PORT`.
+
+```bash
+npm run typecheck
+npm test
+```
+
+See **`deploy/README.md` → Portal** for the public bring-up (IPs + cert, DNS, the Slack OIDC
+app, and secrets) and the public `[http_service]` in `cli/templates/fly/core.toml`.
+
+With embedded auth, trusted OIDC, and `PORTAL_TRUSTED_OIDC_LABEL` explicitly set,
+all email sign-in pages offer a link
+to the trusted provider, including the email-unavailable and link-sent pages.
+The label is the provider display name. Without it, the email page and primary
+login routing retain their existing behavior. Switching keeps the destination
+from the signed email login transaction.
+The link is available without a remembered browser preference.
+
+The proxy also signs the original authenticated subject as `authenticatedAs`. Core verifies that it still belongs to the canonical person, rejecting stale claims after unlinking. Trusted-entry failures offer retry of that provider without an alternate email sign-in link; invitation authentication remains unchanged.
+
+The portal always issues `portal_session_x`, a `SameSite=None` twin of the
+session cookie that lets opted-in apps be framed by named origins. The cores
+serving the portal must include `f75cfd1c` (#1503), which strips
+`portal_session_x` before forwarding requests to deployed apps. Once this portal
+is deployed, do not roll core back below `f75cfd1c` on its own: an older core
+forwards that cookie's session bearer to app code, and cookies already issued
+stay in browsers until they expire (`PORTAL_SESSION_TTL_S`, 7 days by default).

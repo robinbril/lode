@@ -1,0 +1,64 @@
+import { openai } from "@ai-sdk/openai";
+import { frontendTools } from "@assistant-ui/ai-sdk";
+import {
+  type JSONSchema7,
+  streamText,
+  convertToModelMessages,
+  type UIMessage,
+} from "ai";
+import { isAllowedRequestContext } from "../request-context";
+
+export const maxDuration = 30;
+
+export async function POST(req: Request) {
+  if (!isAllowedRequestContext(req)) {
+    return Response.json(
+      { error: "Cross-origin requests are not allowed." },
+      { status: 403 },
+    );
+  }
+
+  const {
+    messages,
+    system,
+    tools,
+  }: {
+    messages: UIMessage[];
+    system?: string;
+    tools?: Record<string, { description?: string; parameters: JSONSchema7 }>;
+  } = await req.json();
+
+  const aiSDKTools = { ...frontendTools(tools ?? {}) };
+  const result = streamText({
+    abortSignal: req.signal,
+    model: openai.responses("gpt-6-luna"),
+    messages: await convertToModelMessages(messages, { tools: aiSDKTools }),
+    system,
+    tools: aiSDKTools,
+    providerOptions: {
+      openai: {
+        reasoningEffort: "low",
+        reasoningSummary: "auto",
+      },
+    },
+  });
+
+  return result.toUIMessageStreamResponse({
+    sendReasoning: true,
+    onError: (error) =>
+      error instanceof Error ? error.message : String(error),
+    messageMetadata: ({ part }) => {
+      if (part.type === "finish") {
+        return {
+          usage: part.totalUsage,
+        };
+      }
+      if (part.type === "finish-step") {
+        return {
+          modelId: part.response.modelId,
+        };
+      }
+      return undefined;
+    },
+  });
+}

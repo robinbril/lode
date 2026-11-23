@@ -1,0 +1,4548 @@
+# mypy: disable-error-code="no-redef"
+
+import asyncio
+import contextvars
+import datetime
+import logging
+import os
+import random
+import sys
+import threading
+import time
+import types
+import uuid
+from collections import deque
+from functools import wraps
+from typing import Any, Callable, List, Optional, Set, Tuple, TypeVar, cast
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy.exc import OperationalError
+
+# Public API
+from dbos import (
+    DBOS,
+    DBOSConfig,
+    DBOSContextEnsure,
+    DBOSContextSetAuth,
+    EnqueueOptions,
+    Queue,
+    SendMessage,
+    SetWorkflowID,
+    SetWorkflowTimeout,
+    StepOptions,
+    StepReservation,
+    WorkflowHandle,
+    WorkflowHandleAsync,
+    WorkflowStatusString,
+)
+from dbos import _enterprise as enterprise_module
+from dbos import (
+    _sys_db_postgres,
+    _workflow_commands,
+)
+
+# Private API because this is a test
+from dbos._client import DBOSClient
+from dbos._context import (
+    SetEnqueueOptions,
+    SetShardKey,
+    assert_current_dbos_context,
+    get_local_dbos_context,
+    get_workflow_start_options,
+)
+from dbos._enqueue_options import validate_enqueue_options
+from dbos._error import (
+    DBOSAwaitedWorkflowCancelledError,
+    DBOSException,
+    DBOSNonExistentWorkflowError,
+    DBOSStepTimeoutError,
+)
+from dbos._schemas.system_database import SystemSchema
+from dbos._serialization import DefaultSerializer
+from dbos._shard_keys import bind_shard_keys, shard_key_scope
+from dbos._sys_db import SystemDatabase, _dbos_null_topic, advisory_lock_key
+from dbos._utils import INTERNAL_QUEUE_NAME, GlobalParams
+from dbos._workflow_commands import (
+    BACKGROUND_JOBS_THREAD_NAME,
+    BackgroundLease,
+    _run_background_jobs,
+    background_jobs_thread,
+)
+from tests.conftest import (
+    reexecute_workflow_by_id,
+    retry_until_success,
+    set_workflow_status,
+    using_sqlite,
+)
+
+
+def test_simple_workflow(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+    wf_counter: int = 0
+    step_counter: int = 0
+
+    @DBOS.workflow()
+    def test_workflow(var: str, var2: str) -> str:
+        nonlocal wf_counter
+        wf_counter += 1
+        res = test_other_step(var2)
+        res2 = test_step(var)
+        DBOS.logger.info("I'm test_workflow " + var + var2)
+        return res + res2
+
+    @DBOS.step()
+    def test_other_step(var2: str) -> str:
+        assert DBOS.step_id == 1
+        nonlocal other_step_counter
+        other_step_counter += 1
+        DBOS.logger.info("I'm test_other_step " + var2)
+        return var2 + "1"
+
+    @DBOS.step()
+    def test_step(var: str) -> str:
+        assert DBOS.step_id == 2
+        step_status = DBOS.step_status
+        assert step_status is not None
+        assert step_status.step_id == 2
+        assert step_status.current_attempt is None
+        assert step_status.max_attempts is None
+        nonlocal step_counter
+        step_counter += 1
+        DBOS.logger.info("I'm test_step " + var)
+        return var
+
+    assert test_workflow("bob", "bob") == "bob1bob"
+
+    # Test OAOO
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("alice", "alice") == "alice1alice"
+    assert wf_counter == 2
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("alice", "alice") == "alice1alice"
+    assert other_step_counter == 2  # Only increment once
+    assert step_counter == 2  # Only increment once
+    assert wf_counter == 2  # Only increment once
+
+    # Starting a completed workflow by ID returns its recorded result
+    with SetWorkflowID(wfuuid):
+        handle = DBOS.start_workflow(test_workflow, "alice", "alice")
+    assert handle.get_result() == "alice1alice"
+    assert wf_counter == 2
+
+
+def test_simple_workflow_attempts_counter(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def noop() -> None:
+        time.sleep(2)
+
+    wfuuid = str(uuid.uuid4())
+    with dbos._sys_db.engine.connect() as c:
+        stmt = sa.select(
+            SystemSchema.workflow_status.c.recovery_attempts,
+            SystemSchema.workflow_status.c.created_at,
+            SystemSchema.workflow_status.c.updated_at,
+        ).where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        for i in range(10):
+            with SetWorkflowID(wfuuid):
+                noop()
+            result = c.execute(stmt).fetchone()
+            assert result is not None
+            recovery_attempts, created_at, updated_at = result
+            assert (
+                recovery_attempts == 1
+            )  # This is just runs, and does not imply recovery retries
+            assert updated_at >= created_at
+
+
+def test_child_workflow(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def child_workflow(var: str) -> str:
+        return var + "_child"
+
+    @DBOS.workflow()
+    def parent_workflow() -> tuple[str, str, str]:
+        parent_id = DBOS.workflow_id
+        assert parent_id is not None
+        result = child_workflow("test")
+        child_handle = dbos.start_workflow(child_workflow, "async")
+        child_result = child_handle.get_result()
+        return parent_id, child_handle.workflow_id, result + child_result
+
+    # Run the parent workflow and get its ID
+    handle = dbos.start_workflow(parent_workflow)
+    parent_id, async_child_id, result = handle.get_result()
+
+    assert result == "test_childasync_child"
+
+    # Verify parent workflow has no parent
+    parent_status = DBOS.get_workflow_status(parent_id)
+    assert parent_status is not None
+    assert parent_status.parent_workflow_id is None
+
+    # The synchronous child workflow ID follows the pattern: parent_id-function_id
+    sync_child_id = f"{parent_id}-1"
+    sync_child_status = DBOS.get_workflow_status(sync_child_id)
+    assert sync_child_status is not None
+    assert sync_child_status.parent_workflow_id == parent_id
+
+    # The async child workflow should also have the parent ID set
+    async_child_status = DBOS.get_workflow_status(async_child_id)
+    assert async_child_status is not None
+    assert async_child_status.parent_workflow_id == parent_id
+
+
+def test_child_workflow_assigned_id(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+
+    @DBOS.step()
+    def test_other_step(var: str) -> str:
+        nonlocal other_step_counter
+        other_step_counter += 1
+        return var + "1"
+
+    @DBOS.workflow()
+    def child_with_assigned_id(var: str) -> str:
+        assert DBOS.workflow_id == "assigned_child_id"
+        return test_other_step(var)
+
+    @DBOS.workflow()
+    def parent_with_assigned_child() -> str:
+        with SetWorkflowID("assigned_child_id"):
+            res1 = child_with_assigned_id("first")
+        # Call again with same ID - should return cached result
+        with SetWorkflowID("assigned_child_id"):
+            handle = dbos.start_workflow(child_with_assigned_id, "second")
+            res2 = handle.get_result()
+        return res1 + res2
+
+    # Run twice - the step should only execute once due to idempotency
+    original_parent_id = str(uuid.uuid4())
+    with SetWorkflowID(original_parent_id):
+        assert parent_with_assigned_child() == "first1first1"
+    assert parent_with_assigned_child() == "first1first1"
+    assert other_step_counter == 1  # The step only ran once
+
+    # Verify the assigned child has parent_workflow_id set
+    child_status = DBOS.get_workflow_status("assigned_child_id")
+    assert child_status is not None
+    assert child_status.parent_workflow_id == original_parent_id
+
+
+def test_exception_workflow(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+    wf_counter: int = 0
+    step_counter: int = 0
+
+    @DBOS.step()
+    def exception_other_step(var: str) -> str:
+        nonlocal other_step_counter
+        other_step_counter += 1
+        raise Exception(var)
+
+    @DBOS.step()
+    def exception_step(var: str) -> str:
+        nonlocal step_counter
+        step_counter += 1
+        raise Exception(var)
+
+    @DBOS.workflow()
+    def exception_workflow() -> None:
+        nonlocal wf_counter
+        wf_counter += 1
+        err1 = None
+        err2 = None
+        try:
+            exception_other_step("test error")
+        except Exception as e:
+            err1 = e
+
+        try:
+            exception_step("test error")
+        except Exception as e:
+            err2 = e
+        assert err1 is not None and err2 is not None
+        assert str(err1) == str(err2)
+
+        raise err1
+
+    with pytest.raises(Exception) as exc_info:
+        exception_workflow()
+
+    assert "test error" in str(exc_info.value)
+
+    # Test OAOO
+    wfuuid = str(uuid.uuid4())
+    with pytest.raises(Exception) as exc_info:
+        with SetWorkflowID(wfuuid):
+            exception_workflow()
+    assert "test error" == str(exc_info.value)
+
+    with pytest.raises(Exception) as exc_info:
+        with SetWorkflowID(wfuuid):
+            exception_workflow()
+    assert "test error" == str(exc_info.value)
+    assert other_step_counter == 2  # Only increment once
+    assert step_counter == 2  # Only increment once
+
+    # Starting a failed workflow by ID surfaces its recorded error, not a new run
+    with SetWorkflowID(wfuuid):
+        handle = DBOS.start_workflow(exception_workflow)
+    with pytest.raises(Exception) as exc_info:
+        handle.get_result()
+    assert "test error" == str(exc_info.value)
+    assert wf_counter == 2  # The workflow error is directly returned without running
+
+
+def test_temp_workflow(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+    step_counter: int = 0
+
+    @DBOS.step()
+    def test_other_step(var2: str) -> str:
+        nonlocal other_step_counter
+        other_step_counter += 1
+        return var2 + "1"
+
+    @DBOS.step()
+    def test_step(var: str) -> str:
+        nonlocal step_counter
+        step_counter += 1
+        return var
+
+    @DBOS.step()
+    def call_step(var: str) -> str:
+        return test_step(var)
+
+    assert get_local_dbos_context() is None
+    res = DBOS.start_workflow(test_other_step, "var2").get_result()
+    assert res == "var21"
+    assert get_local_dbos_context() is None
+    # Called directly, a step outside a workflow runs as a plain function
+    res = test_step("var")
+    assert res == "var"
+
+    wfs = DBOS.list_workflows()
+    assert len(wfs) == 1
+
+    wfi1 = dbos._sys_db.get_workflow_status(wfs[0].workflow_id)
+    assert wfi1
+    assert wfi1["name"].startswith("<temp>")
+
+    assert other_step_counter == 1
+    assert step_counter == 1
+
+    res = call_step("var2")
+    assert res == "var2"
+    assert step_counter == 2
+
+
+def test_temp_workflow_errors(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+    step_counter: int = 0
+    retried_step_counter: int = 0
+
+    @DBOS.step()
+    def test_other_step(var2: str) -> str:
+        nonlocal other_step_counter
+        other_step_counter += 1
+        raise Exception(var2)
+
+    @DBOS.step()
+    def test_step(var: str) -> str:
+        nonlocal step_counter
+        step_counter += 1
+        raise Exception(var)
+
+    @DBOS.step(retries_allowed=True)
+    def test_retried_step(var: str) -> str:
+        nonlocal retried_step_counter
+        retried_step_counter += 1
+        raise ValueError(var)
+
+    with pytest.raises(Exception) as exc_info:
+        test_other_step("tval")
+    assert "tval" == str(exc_info.value)
+
+    with pytest.raises(Exception) as exc_info:
+        test_step("cval")
+    assert "cval" == str(exc_info.value)
+
+    with pytest.raises(ValueError) as exc_info:
+        test_retried_step("rval")
+
+    assert other_step_counter == 1
+    assert step_counter == 1
+    assert retried_step_counter == 1
+
+
+def test_recovery_workflow(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+    other_step_return_none_counter: int = 0
+    wf_counter: int = 0
+
+    @DBOS.workflow()
+    def test_workflow(var: str, var2: str) -> str:
+        nonlocal wf_counter
+        wf_counter += 1
+        res = test_other_step(var2)
+        should_be_none = test_other_step_return_none()
+        assert should_be_none is None
+        return res + var
+
+    @DBOS.step()
+    def test_other_step(var2: str) -> str:
+        nonlocal other_step_counter
+        other_step_counter += 1
+        return var2 + "1"
+
+    @DBOS.step()
+    def test_other_step_return_none() -> None:
+        nonlocal other_step_return_none_counter
+        other_step_return_none_counter += 1
+        return
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("bob", "bob") == "bob1bob"
+
+    # Change the workflow status to pending
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"status": "PENDING", "name": test_workflow.__qualname__})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    # Recovery should execute the workflow again but skip the step
+    workflow_handles = DBOS._recover_pending_workflows()
+    assert len(workflow_handles) == 1
+    assert workflow_handles[0].get_result() == "bob1bob"
+    assert wf_counter == 2
+    assert other_step_counter == 1
+    assert other_step_return_none_counter == 1
+
+    # Test that there was a recovery attempt of this
+    stat = workflow_handles[0].get_status()
+    assert stat
+    assert stat.recovery_attempts == 2  # original attempt + recovery attempt
+
+
+def test_recovery_reenqueue_is_ownership_conditional(dbos: DBOS) -> None:
+    """Recovery only re-enqueues workflows still owned by an executor it declared dead.
+
+    Once a live executor dequeues a recovered workflow, the dequeue stamps its own
+    ID on the row, so a duplicate (or delayed) recovery sweep for the dead executor
+    must not yank the running workflow back to ENQUEUED.
+    """
+
+    blocker = threading.Event()
+
+    @DBOS.workflow()
+    def blocked_workflow(var: str) -> str:
+        blocker.wait()
+        return var
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        handle = DBOS.start_workflow(blocked_workflow, "bob")
+
+    # Orphan the workflow: PENDING, owned by an executor that is now dead.
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"status": "PENDING", "executor_id": "deadexecutor"})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    # The workflow stays blocked for the whole check, so release it even on
+    # failure: an assertion that escapes with the workflow still running wedges
+    # DBOS.destroy() in fixture teardown and hangs the suite instead of failing.
+    try:
+        # A sweep naming a different executor must not touch the row.
+        assert (
+            dbos._sys_db.reenqueue_for_recovery(
+                wfuuid, ["someotherexecutor"], INTERNAL_QUEUE_NAME
+            )
+            is False
+        )
+        unchanged = DBOS.get_workflow_status(wfuuid)
+        assert unchanged and unchanged.status == "PENDING"
+
+        # A sweep naming the dead executor re-enqueues it onto the internal queue.
+        assert (
+            dbos._sys_db.reenqueue_for_recovery(
+                wfuuid, ["deadexecutor"], INTERNAL_QUEUE_NAME
+            )
+            is True
+        )
+
+        # Wait for the queue to dequeue it. The row returns to PENDING, now
+        # stamped with this live executor's ID -- the state the claim rests on.
+        def dequeued_by_live_executor() -> None:
+            status = DBOS.get_workflow_status(wfuuid)
+            assert status is not None
+            assert status.status == WorkflowStatusString.PENDING.value
+            assert status.executor_id == GlobalParams.executor_id
+
+        retry_until_success(dequeued_by_live_executor)
+
+        # Because the row is PENDING again, only the executor predicate can
+        # reject this duplicate sweep. It must not yank the running workflow.
+        assert (
+            dbos._sys_db.reenqueue_for_recovery(
+                wfuuid, ["deadexecutor"], INTERNAL_QUEUE_NAME
+            )
+            is False
+        )
+        still_running = DBOS.get_workflow_status(wfuuid)
+        assert (
+            still_running and still_running.status == WorkflowStatusString.PENDING.value
+        )
+    finally:
+        blocker.set()
+
+    assert handle.get_result() == "bob"
+
+
+def test_recovery_redispatches_running_workflow_once_per_sweep(dbos: DBOS) -> None:
+    """Recovery hands a running workflow back to the queue, and each sweep yields exactly one dequeue.
+
+    A workflow that was never enqueued acquires the internal queue's name and is
+    restarted by the queue, which takes ownership from the still-running execution.
+    """
+    start_count = 0
+    blocker = threading.Event()
+
+    @DBOS.workflow()
+    def blocked_workflow() -> str:
+        nonlocal start_count
+        start_count += 1
+        blocker.wait()
+        return "done"
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        handle = DBOS.start_workflow(blocked_workflow)
+
+    # Release the workflow even on failure: an assertion that escapes while it is
+    # still blocked wedges DBOS.destroy() in teardown and hangs the suite.
+    try:
+
+        def check_running() -> None:
+            assert start_count == 1
+
+        retry_until_success(check_running)
+
+        # Started directly, so it carries no queue at all.
+        before = DBOS.get_workflow_status(wfuuid)
+        assert before is not None and before.queue_name is None
+
+        # Each sweep re-enqueues the running workflow (recovering a live executor
+        # is not prevented).
+        for expected_attempts in (2, 3):
+            DBOS._recover_pending_workflows([GlobalParams.executor_id])
+
+            # Recovery re-enqueued rather than executing: the row now belongs to
+            # the internal queue, which is what restarts it. queue_name is never
+            # cleared afterwards, so reading it here is not a race.
+            requeued = DBOS.get_workflow_status(wfuuid)
+            assert requeued is not None
+            assert requeued.queue_name == INTERNAL_QUEUE_NAME
+
+            # The queue restarts it exactly once per sweep: the ENQUEUED->PENDING
+            # dequeue admits a single runner, so recovery_attempts advances by one.
+            def dequeued(expected: int = expected_attempts) -> None:
+                status = DBOS.get_workflow_status(wfuuid)
+                assert status is not None
+                assert status.recovery_attempts == expected
+                assert status.status == WorkflowStatusString.PENDING.value
+
+            retry_until_success(dequeued)
+
+            # The dequeue runs the workflow again alongside the stale execution,
+            # which loses ownership and parks at its next write.
+            def redispatched(expected: int = expected_attempts) -> None:
+                assert start_count == expected
+
+            retry_until_success(redispatched)
+    finally:
+        blocker.set()
+
+    # Only the last dispatch owns the workflow: the earlier ones have their outcome
+    # writes rejected and adopt its result.
+    assert handle.get_result() == "done"
+    # Bounded by the dispatches that exist: the original plus the two recovery sweeps
+    # above. Anything more means a sweep restarted the workflow it should have skipped.
+    assert start_count == 3
+    final = DBOS.get_workflow_status(wfuuid)
+    assert final is not None
+    assert final.status == WorkflowStatusString.SUCCESS.value
+
+
+def test_recovery_empty_id_dead_letters(dbos: DBOS) -> None:
+    # A poisoned empty-string workflow_uuid must be dead-lettered as ERROR, never ghost-forked under a fresh UUID (#759).
+    wf_counter: int = 0
+
+    @DBOS.workflow()
+    def test_workflow(var: str) -> str:
+        nonlocal wf_counter
+        wf_counter += 1
+        return var
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("bob") == "bob"
+    assert wf_counter == 1
+
+    # Poison the row: rename its id to the empty string and mark it PENDING.
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"workflow_uuid": "", "status": "PENDING"})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    # Recovery must dead-letter the poisoned row, not silently fork a new execution.
+    DBOS._recover_pending_workflows()
+
+    def poisoned_row_is_dead_lettered() -> None:
+        empty_status = dbos._sys_db.get_workflow_status("")
+        assert empty_status is not None
+        assert empty_status["status"] == WorkflowStatusString.ERROR.value
+
+    retry_until_success(poisoned_row_is_dead_lettered, interval=0.5, max_attempts=20)
+
+    # The workflow body did not run again.
+    assert wf_counter == 1
+
+
+def test_recovery_workflow_step(dbos: DBOS) -> None:
+    step_counter: int = 0
+    wf_counter: int = 0
+
+    @DBOS.workflow()
+    def test_workflow(var: str, var2: str) -> str:
+        nonlocal wf_counter
+        wf_counter += 1
+        should_be_none = test_step(var2)
+        assert should_be_none is None
+        return var
+
+    @DBOS.step()
+    def test_step(var2: str) -> None:
+        nonlocal step_counter
+        step_counter += 1
+        print(f"I'm a test_step {var2}!")
+        return
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("bob", "bob") == "bob"
+
+    # Change the workflow status to pending
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"status": "PENDING", "name": test_workflow.__qualname__})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    # Recovery should execute the workflow again but skip the step
+    workflow_handles = DBOS._recover_pending_workflows()
+    assert len(workflow_handles) == 1
+    assert workflow_handles[0].get_result() == "bob"
+    assert wf_counter == 2
+    assert step_counter == 1
+
+    # Test that there was a recovery attempt of this
+    stat = workflow_handles[0].get_status()
+    assert stat
+    assert stat.recovery_attempts == 2
+
+
+def test_workflow_returns_none(dbos: DBOS) -> None:
+    wf_counter: int = 0
+
+    @DBOS.workflow()
+    def test_workflow(var: str, var2: str) -> None:
+        nonlocal wf_counter
+        wf_counter += 1
+        assert var == var2 == "bob"
+        return
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("bob", "bob") is None
+    assert wf_counter == 1
+
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("bob", "bob") is None
+    assert wf_counter == 1
+
+    handle: WorkflowHandle[None] = DBOS.retrieve_workflow(wfuuid)
+    assert handle.get_result() == None
+    assert wf_counter == 1
+
+    # Change the workflow status to pending
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"status": "PENDING", "name": test_workflow.__qualname__})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    workflow_handles = DBOS._recover_pending_workflows()
+    assert len(workflow_handles) == 1
+    assert workflow_handles[0].get_result() is None
+    assert wf_counter == 2
+
+    # Test that there was a recovery attempt of this
+    stat = workflow_handles[0].get_status()
+    assert stat
+    assert (
+        stat.recovery_attempts == 2
+    )  # 1 actual call to test_workflow + 1 recovery attempt
+
+
+def test_recovery_temp_workflow(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+
+    @DBOS.step()
+    def test_other_step(var2: str) -> str:
+        nonlocal other_step_counter
+        other_step_counter += 1
+        return var2 + "1"
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert DBOS.start_workflow(test_other_step, "bob").get_result() == "bob1"
+
+    wfs = DBOS.list_workflows()
+    assert len(wfs) == 1
+    assert wfs[0].workflow_id == wfuuid
+
+    wfi = dbos._sys_db.get_workflow_status(wfs[0].workflow_id)
+    assert wfi
+    assert wfi["name"].startswith("<temp>")
+
+    # Change the workflow status to pending
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"status": "PENDING", "name": wfi["name"]})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    # Recovery should execute the workflow again but skip the step
+    workflow_handles = DBOS._recover_pending_workflows()
+    assert len(workflow_handles) == 1
+    assert workflow_handles[0].get_result() == "bob1"
+
+    wfs = DBOS.list_workflows()
+    assert len(wfs) == 1
+    assert wfs[0].workflow_id == wfuuid
+
+    wfi = dbos._sys_db.get_workflow_status(wfs[0].workflow_id)
+    assert wfi
+    assert wfi["name"].startswith("<temp>")
+    assert wfi["status"] == "SUCCESS"
+
+    assert other_step_counter == 1
+
+
+def test_recovery_thread(config: DBOSConfig) -> None:
+    wf_counter: int = 0
+    test_var = "dbos"
+
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def test_workflow(var: str) -> str:
+        nonlocal wf_counter
+        if var == test_var:
+            wf_counter += 1
+        return var
+
+    DBOS.launch()
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert test_workflow(test_var) == test_var
+
+    # Change the workflow status to pending
+    set_workflow_status(dbos._sys_db, wfuuid, "PENDING")
+
+    DBOS.destroy(destroy_registry=True)
+    DBOS(config=config)
+
+    @DBOS.workflow()
+    def test_workflow(var: str) -> str:
+        nonlocal wf_counter
+        if var == test_var:
+            wf_counter += 1
+        return var
+
+    DBOS.launch()
+
+    # Upon re-launch, the background thread should recover the workflow safely.
+    max_retries = 10
+    success = False
+    for i in range(max_retries):
+        try:
+            assert wf_counter == 2
+            success = True
+        except AssertionError:
+            time.sleep(1)
+    assert success
+
+
+def test_start_workflow(dbos: DBOS) -> None:
+    other_step_counter: int = 0
+    wf_counter: int = 0
+
+    @DBOS.workflow()
+    def test_workflow(var: str, var2: str) -> str:
+        nonlocal wf_counter
+        wf_counter += 1
+        res = test_other_step(var2)
+        return res + var
+
+    @DBOS.step()
+    def test_other_step(var2: str) -> str:
+        nonlocal other_step_counter
+        other_step_counter += 1
+        return var2 + "1"
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        handle = dbos.start_workflow(test_workflow, "bob", "bob")
+        context = assert_current_dbos_context()
+        assert not context.is_within_workflow()
+        assert handle.get_result() == "bob1bob"
+    with SetWorkflowID(wfuuid):
+        handle = dbos.start_workflow(test_workflow, "bob", "bob")
+        context = assert_current_dbos_context()
+        assert not context.is_within_workflow()
+        assert handle.get_result() == "bob1bob"
+    with SetWorkflowID(wfuuid):
+        assert test_workflow("bob", "bob") == "bob1bob"
+        context = assert_current_dbos_context()
+        assert not context.is_within_workflow()
+    assert other_step_counter == 1
+    assert wf_counter == 1
+
+
+def test_retrieve_workflow(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def test_sleep_workflow(secs: float) -> str:
+        dbos.sleep(secs)
+        workflow_id = DBOS.workflow_id
+        assert workflow_id is not None
+        return workflow_id
+
+    @DBOS.workflow()
+    def test_sleep_workthrow(secs: float) -> str:
+        dbos.sleep(secs)
+        raise Exception("Wake Up!")
+
+    @DBOS.workflow()
+    def test_workflow(x: int) -> int:
+        return x
+
+    dest_uuid = "aaaa"
+    with pytest.raises(Exception) as exc_info:
+        dbos.retrieve_workflow(dest_uuid)
+    pattern = f"Non-existent target workflow ID: {dest_uuid}"
+    assert pattern in str(exc_info.value)
+
+    # These return
+    sleep_wfh = dbos.start_workflow(test_sleep_workflow, 1.5)
+    istat = sleep_wfh.get_status()
+    assert istat
+    assert istat.status == str(WorkflowStatusString.PENDING.value)
+
+    sleep_pwfh: WorkflowHandle[str] = dbos.retrieve_workflow(sleep_wfh.workflow_id)
+    assert sleep_wfh.workflow_id == sleep_pwfh.workflow_id
+    dbos.logger.info(f"UUID: {sleep_pwfh.get_workflow_id()}")
+    hres = sleep_pwfh.get_result()
+    assert hres == sleep_pwfh.get_workflow_id()
+    dbos.logger.info(f"RES: {hres}")
+    istat = sleep_pwfh.get_status()
+    assert istat
+    assert istat.status == str(WorkflowStatusString.SUCCESS.value)
+
+    assert sleep_wfh.get_result() == sleep_wfh.get_workflow_id()
+    istat = sleep_wfh.get_status()
+    assert istat
+    assert istat.status == str(WorkflowStatusString.SUCCESS.value)
+    assert istat.output == sleep_wfh.get_workflow_id()
+
+    # These throw
+    sleep_wfh = dbos.start_workflow(test_sleep_workthrow, 1.5)
+    istat = sleep_wfh.get_status()
+    assert istat
+    assert istat.status == str(WorkflowStatusString.PENDING.value)
+    sleep_pwfh = dbos.retrieve_workflow(sleep_wfh.workflow_id)
+    assert sleep_wfh.workflow_id == sleep_pwfh.workflow_id
+
+    with pytest.raises(Exception) as exc_info:
+        sleep_pwfh.get_result()
+    assert str(exc_info.value) == "Wake Up!"
+    istat = sleep_pwfh.get_status()
+    assert istat
+    assert istat.status == str(WorkflowStatusString.ERROR.value)
+    assert istat.output is None
+    assert istat.error is not None
+    assert isinstance(istat.error, Exception)
+    assert str(istat.error) == "Wake Up!"
+
+    with pytest.raises(Exception) as exc_info:
+        sleep_wfh.get_result()
+    assert str(exc_info.value) == "Wake Up!"
+    istat = sleep_wfh.get_status()
+    assert istat
+    assert istat.status == str(WorkflowStatusString.ERROR.value)
+
+    # Validate the status properly stores the output of the workflow
+    x = 5
+    handle = DBOS.start_workflow(test_workflow, x)
+    assert handle.get_result() == x
+    retrieved_handle: WorkflowHandle[int] = DBOS.retrieve_workflow(
+        handle.get_workflow_id()
+    )
+    assert retrieved_handle.get_result() == x
+    assert retrieved_handle.get_status().output == x
+    assert retrieved_handle.get_status().error is None
+
+
+def test_retrieve_workflow_in_workflow(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def test_sleep_workflow(secs: float) -> str:
+        dbos.sleep(secs)
+        workflow_id = DBOS.workflow_id
+        assert workflow_id is not None
+        return workflow_id
+
+    @DBOS.workflow()
+    def test_workflow_status_a() -> str:
+        with SetWorkflowID("run_this_once_a"):
+            dbos.start_workflow(test_sleep_workflow, 1.5)
+
+        fstat1 = dbos.get_workflow_status("run_this_once_a")
+        assert fstat1
+        fres: str = dbos.retrieve_workflow("run_this_once_a").get_result()
+        fstat2 = dbos.get_workflow_status("run_this_once_a")
+        assert fstat2
+        return fstat1.status + fres + fstat2.status
+
+    @DBOS.workflow()
+    def test_workflow_status_b() -> str:
+        assert DBOS.workflow_id == "parent_b"
+        with SetWorkflowID("run_this_once_b"):
+            wfh = dbos.start_workflow(test_sleep_workflow, 1.5)
+        assert DBOS.workflow_id == "parent_b"
+
+        fstat1 = wfh.get_status()
+        assert fstat1
+        fres = wfh.get_result()
+        fstat2 = wfh.get_status()
+        assert fstat2
+        return fstat1.status + fres + fstat2.status
+
+    with SetWorkflowID("parent_a"):
+        assert test_workflow_status_a() == "PENDINGrun_this_once_aSUCCESS"
+    with SetWorkflowID("parent_a"):
+        assert test_workflow_status_a() == "PENDINGrun_this_once_aSUCCESS"
+
+    with SetWorkflowID("parent_b"):
+        assert test_workflow_status_b() == "PENDINGrun_this_once_bSUCCESS"
+    with SetWorkflowID("parent_b"):
+        assert test_workflow_status_b() == "PENDINGrun_this_once_bSUCCESS"
+
+    # Test that the number of attempts matches the number of calls requiring work (1)
+    stat = dbos.get_workflow_status("parent_a")
+    assert stat
+    assert stat.recovery_attempts == 1
+    stat = dbos.get_workflow_status("parent_b")
+    assert stat
+    assert stat.recovery_attempts == 1
+    stat = dbos.get_workflow_status("run_this_once_a")
+    assert stat
+    assert (
+        stat.recovery_attempts == 1
+    )  # because we now return based on parent child reln
+    stat = dbos.get_workflow_status("run_this_once_b")
+    assert stat
+    assert (
+        stat.recovery_attempts == 1
+    )  # because we now return based on parent child reln
+
+
+def test_sleep(dbos: DBOS) -> None:
+    sleep_counter = 0
+
+    @DBOS.workflow()
+    def test_sleep_workflow(secs: float) -> str:
+        nonlocal sleep_counter
+        sleep_counter += 1
+        dbos.sleep(secs)
+        workflow_id = DBOS.workflow_id
+        assert workflow_id is not None
+        return workflow_id
+
+    start_time = time.time()
+    sleep_uuid = test_sleep_workflow(1.5)
+    assert time.time() - start_time > 1.4
+
+    # Test sleep OAOO, skip sleep
+    with SetWorkflowID(sleep_uuid):
+        assert test_sleep_workflow(1.5) == sleep_uuid
+    # Completed replay returns the recorded result without re-running the sleep.
+    assert sleep_counter == 1
+
+
+def test_send_recv(dbos: DBOS, config: DBOSConfig) -> None:
+    for use_listen_notify in [True, False]:
+        # Test using both LISTEN/NOTIFY and polling
+        DBOS.destroy(destroy_registry=True)
+        config["use_listen_notify"] = use_listen_notify
+        dbos = DBOS(config=config)
+        DBOS.launch()
+
+        send_counter: int = 0
+        recv_counter: int = 0
+
+        @DBOS.workflow()
+        def test_send_workflow(dest_uuid: str, topic: str) -> str:
+            DBOS.send(dest_uuid, "test1")
+            DBOS.send(dest_uuid, "test2", topic=topic)
+            DBOS.send(dest_uuid, "test3")
+            nonlocal send_counter
+            send_counter += 1
+            return dest_uuid
+
+        @DBOS.workflow()
+        def test_recv_workflow(topic: str) -> str:
+            msg1 = DBOS.recv(topic, timeout_seconds=10)
+            msg2 = DBOS.recv(timeout_seconds=10)
+            msg3 = DBOS.recv(timeout_seconds=10)
+            nonlocal recv_counter
+            recv_counter += 1
+            return "-".join([str(msg1), str(msg2), str(msg3)])
+
+        @DBOS.workflow()
+        def test_recv_timeout(timeout_seconds: float) -> None:
+            msg = DBOS.recv(timeout_seconds=timeout_seconds)
+            assert msg is None
+
+        @DBOS.workflow()
+        def test_send_none(dest_uuid: str) -> None:
+            DBOS.send(dest_uuid, None)
+
+        dest_uuid = str(uuid.uuid4())
+
+        # Send to non-existent uuid should fail
+        with pytest.raises(Exception) as exc_info:
+            test_send_workflow(dest_uuid, "testtopic")
+        assert f"Non-existent `send` destination workflow ID: {dest_uuid}" in str(
+            exc_info.value
+        )
+
+        with SetWorkflowID(dest_uuid):
+            handle = DBOS.start_workflow(test_recv_workflow, "testtopic")
+            assert handle.get_workflow_id() == dest_uuid
+
+        send_uuid = str(uuid.uuid4())
+        with SetWorkflowID(send_uuid):
+            res = test_send_workflow(handle.get_workflow_id(), "testtopic")
+            assert res == dest_uuid
+        begin_time = time.time()
+        assert handle.get_result() == "test2-test1-test3"
+        duration = time.time() - begin_time
+        assert duration < 9.0
+
+        # Test send 'None'
+        none_uuid = str(uuid.uuid4())
+        none_handle = None
+        with SetWorkflowID(none_uuid):
+            none_handle = dbos.start_workflow(test_recv_timeout, 10.0)
+        test_send_none(none_uuid)
+        begin_time = time.time()
+        assert none_handle.get_result() is None
+        duration = time.time() - begin_time
+        assert duration < 9.0
+
+        timeout_uuid = str(uuid.uuid4())
+        with SetWorkflowID(timeout_uuid):
+            begin_time = time.time()
+            timeoutres = test_recv_timeout(1.0)
+            duration = time.time() - begin_time
+            assert duration > 0.7
+            assert timeoutres is None
+
+        # Test OAOO
+        with SetWorkflowID(send_uuid):
+            res = test_send_workflow(handle.get_workflow_id(), "testtopic")
+            assert res == dest_uuid
+            assert send_counter == 1
+
+        with SetWorkflowID(dest_uuid):
+            begin_time = time.time()
+            res = test_recv_workflow("testtopic")
+            duration = time.time() - begin_time
+            assert duration < 3.0
+            assert res == "test2-test1-test3"
+            assert recv_counter == 1
+
+        with SetWorkflowID(timeout_uuid):
+            begin_time = time.time()
+            timeoutres = test_recv_timeout(1.0)
+            duration = time.time() - begin_time
+            # This is an OAOO re-execution: the workflow already completed, so it
+            # returns the recorded result without re-waiting the recv timeout. The
+            # bound only needs to be well under that timeout to confirm we didn't
+            # re-wait; keep it generous since the cached path's DB overhead can be
+            # ~1s under heavy CI load. (Strict OAOO is covered by recv_counter above.)
+            assert duration < 3.0
+            assert timeoutres is None
+
+        # Test recv outside of a workflow
+        with pytest.raises(Exception) as exc_info:
+            DBOS.recv("test1")
+        assert "recv() must be called from within a workflow" in str(exc_info.value)
+
+
+def test_send_recv_temp_wf(dbos: DBOS) -> None:
+    recv_counter: int = 0
+
+    @DBOS.workflow()
+    def test_send_recv_workflow(topic: str) -> str:
+        msg1 = dbos.recv(topic, timeout_seconds=10)
+        nonlocal recv_counter
+        recv_counter += 1
+        # TODO Set event back
+        return "-".join([str(msg1)])
+
+    dest_uuid = str(uuid.uuid4())
+
+    with SetWorkflowID(dest_uuid):
+        handle = dbos.start_workflow(test_send_recv_workflow, "testtopic")
+        assert handle.get_workflow_id() == dest_uuid
+
+    dbos.send(dest_uuid, "testsend1", "testtopic")
+    assert handle.get_result() == "testsend1"
+
+    wfs = DBOS.list_workflows()
+    assert len(wfs) == 1
+    assert wfs[0].workflow_id == dest_uuid
+
+    assert recv_counter == 1
+
+    # Test substring search
+    wfs = DBOS.list_workflows(workflow_id_prefix=dest_uuid)
+    assert wfs[0].workflow_id == dest_uuid
+
+    wfs = DBOS.list_workflows(workflow_id_prefix=dest_uuid[0:10])
+    assert dest_uuid in [w.workflow_id for w in wfs]
+
+    wfs = DBOS.list_workflows(workflow_id_prefix=dest_uuid[0:10])
+    assert dest_uuid in [w.workflow_id for w in wfs]
+
+    x = DBOS.list_workflows(
+        start_time=datetime.datetime.now().isoformat(),
+        workflow_id_prefix=dest_uuid[0:10],
+    )
+    assert len(x) == 0
+
+    x = DBOS.list_workflows(workflow_id_prefix=dest_uuid[0:10])
+    assert len(x) >= 1
+    assert dest_uuid in [w.workflow_id for w in x]
+
+    x = DBOS.list_workflows(workflow_id_prefix=dest_uuid + "thisdoesnotexist")
+    assert len(x) == 0
+
+    x = DBOS.list_workflows(workflow_id_prefix="1" + dest_uuid)
+    assert len(x) == 0
+
+
+def test_send_idempotency_key(dbos: DBOS) -> None:
+    recv_two_messages_event = threading.Event()
+
+    @DBOS.workflow()
+    def recv_two_msgs() -> str:
+        msg1 = DBOS.recv(timeout_seconds=10)
+        recv_two_messages_event.set()
+        msg2 = DBOS.recv(timeout_seconds=2)
+        return f"{msg1}-{msg2}"
+
+    # Test 1: Sending with the same idempotency key twice delivers only one message.
+    dest_uuid = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid):
+        handle = dbos.start_workflow(recv_two_msgs)
+
+    idem_key = str(uuid.uuid4())
+    DBOS.send(dest_uuid, "hello", idempotency_key=idem_key)
+    recv_two_messages_event.wait()
+    # Duplicate send with the same key should be silently ignored.
+    DBOS.send(dest_uuid, "hello_duplicate", idempotency_key=idem_key)
+    # The second recv times out (returns None), proving only one message was delivered.
+    assert handle.get_result() == "hello-None"
+
+    # Test 2: Different idempotency keys deliver separate messages.
+    dest_uuid2 = str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def recv_two_workflow() -> str:
+        msg1 = DBOS.recv("t", timeout_seconds=10)
+        msg2 = DBOS.recv("t", timeout_seconds=10)
+        return f"{msg1}-{msg2}"
+
+    with SetWorkflowID(dest_uuid2):
+        handle2 = dbos.start_workflow(recv_two_workflow)
+
+    DBOS.send(dest_uuid2, "a", "t", idempotency_key=str(uuid.uuid4()))
+    DBOS.send(dest_uuid2, "b", "t", idempotency_key=str(uuid.uuid4()))
+    assert handle2.get_result() == "a-b"
+
+    # Test 3: Send from a workflow with same idempotency key twice delivers only one message.
+    recv_wf_event = threading.Event()
+
+    @DBOS.workflow()
+    def recv_two_msgs_wf_idem() -> str:
+        msg1 = DBOS.recv(timeout_seconds=10)
+        recv_wf_event.set()
+        msg2 = DBOS.recv(timeout_seconds=2)
+        return f"{msg1}-{msg2}"
+
+    dest_uuid_wf = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid_wf):
+        handle_wf = dbos.start_workflow(recv_two_msgs_wf_idem)
+
+    wf_idem_key = str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def send_with_key_wf(dest: str, msg: str, key: str) -> None:
+        DBOS.send(dest, msg, idempotency_key=key)
+
+    send_with_key_wf(dest_uuid_wf, "hello_wf", wf_idem_key)
+    recv_wf_event.wait()
+    # Duplicate send with the same key should be silently ignored.
+    send_with_key_wf(dest_uuid_wf, "hello_wf_dup", wf_idem_key)
+    assert handle_wf.get_result() == "hello_wf-None"
+
+    # Test 4: Send from a step (without idempotency key).
+    @DBOS.step()
+    def send_from_step(dest: str, msg: str, topic: Optional[str] = None) -> None:
+        DBOS.send(dest, msg, topic)
+
+    dest_uuid3 = str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def recv_one_msg_wf() -> str:
+        return str(DBOS.recv("s", timeout_seconds=10))
+
+    with SetWorkflowID(dest_uuid3):
+        handle3 = dbos.start_workflow(recv_one_msg_wf)
+
+    @DBOS.workflow()
+    def send_from_step_wf() -> None:
+        send_from_step(dest_uuid3, "from_step", "s")
+
+    send_from_step_wf()
+    assert handle3.get_result() == "from_step"
+
+    # Test 5: Send from a step with same idempotency key twice delivers only one message.
+    recv_step_event = threading.Event()
+
+    @DBOS.workflow()
+    def recv_two_msgs_step() -> str:
+        msg1 = DBOS.recv(timeout_seconds=10)
+        recv_step_event.set()
+        msg2 = DBOS.recv(timeout_seconds=2)
+        return f"{msg1}-{msg2}"
+
+    @DBOS.step()
+    def send_from_step_with_key(dest: str, msg: str, key: str) -> None:
+        DBOS.send(dest, msg, idempotency_key=key)
+
+    dest_uuid4 = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid4):
+        handle4 = dbos.start_workflow(recv_two_msgs_step)
+
+    step_idem_key = str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def send_from_step_idem_wf() -> None:
+        send_from_step_with_key(dest_uuid4, "hello_step", step_idem_key)
+
+    send_from_step_idem_wf()
+    recv_step_event.wait()
+
+    # Duplicate send with the same key should be silently ignored.
+    send_from_step_idem_wf()
+    # The second recv times out (returns None), proving only one message was delivered.
+    assert handle4.get_result() == "hello_step-None"
+
+
+def test_send_bulk(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def recv_three() -> str:
+        msg1 = DBOS.recv("t", timeout_seconds=10)
+        msg2 = DBOS.recv("t", timeout_seconds=10)
+        msg3 = DBOS.recv(timeout_seconds=10)
+        return f"{msg1}-{msg2}-{msg3}"
+
+    # Test 1: Bulk send to a single destination across topics, from outside a workflow.
+    dest_uuid = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid):
+        handle = dbos.start_workflow(recv_three)
+
+    DBOS.send_bulk(
+        [
+            SendMessage(dest_uuid, "a", "t"),
+            SendMessage(dest_uuid, "b", "t"),
+            SendMessage(dest_uuid, "c"),
+        ]
+    )
+    assert handle.get_result() == "a-b-c"
+
+    # Test 2: Bulk send to multiple destinations in one transaction.
+    dest_a = str(uuid.uuid4())
+    dest_b = str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def recv_one() -> str:
+        return str(DBOS.recv(timeout_seconds=10))
+
+    with SetWorkflowID(dest_a):
+        handle_a = dbos.start_workflow(recv_one)
+    with SetWorkflowID(dest_b):
+        handle_b = dbos.start_workflow(recv_one)
+
+    DBOS.send_bulk(
+        [
+            SendMessage(dest_a, "to_a"),
+            SendMessage(dest_b, "to_b"),
+        ]
+    )
+    assert handle_a.get_result() == "to_a"
+    assert handle_b.get_result() == "to_b"
+
+    # Test 3: A bulk send including a non-existent destination is atomic - nothing is sent.
+    dest_real = str(uuid.uuid4())
+    with SetWorkflowID(dest_real):
+        handle_real = dbos.start_workflow(recv_one)
+    dest_fake = str(uuid.uuid4())
+
+    with pytest.raises(Exception) as exc_info:
+        DBOS.send_bulk(
+            [
+                SendMessage(dest_real, "should_not_arrive"),
+                SendMessage(dest_fake, "to_nowhere"),
+            ]
+        )
+    assert "Non-existent `send` destination" in str(exc_info.value)
+    # Because the transaction rolled back, no message was delivered: the recv
+    # times out and returns None (stringified by recv_one).
+    assert handle_real.get_result() == "None"
+
+
+def test_send_bulk_from_workflow(dbos: DBOS) -> None:
+    send_counter = 0
+
+    @DBOS.workflow()
+    def recv_two() -> str:
+        msg1 = DBOS.recv(timeout_seconds=10)
+        msg2 = DBOS.recv(timeout_seconds=10)
+        return f"{msg1}-{msg2}"
+
+    dest_uuid = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid):
+        handle = dbos.start_workflow(recv_two)
+
+    @DBOS.workflow()
+    def send_bulk_wf(dest: str) -> None:
+        nonlocal send_counter
+        send_counter += 1
+        DBOS.send_bulk(
+            [
+                SendMessage(dest, "one"),
+                SendMessage(dest, "two"),
+            ]
+        )
+
+    send_uuid = str(uuid.uuid4())
+    with SetWorkflowID(send_uuid):
+        send_bulk_wf(dest_uuid)
+    assert handle.get_result() == "one-two"
+    assert send_counter == 1
+
+    # Re-invoking with the same workflow ID replays the recorded result without
+    # re-running the body, so the bulk send is not executed a second time.
+    with SetWorkflowID(send_uuid):
+        send_bulk_wf(dest_uuid)
+    assert send_counter == 1
+
+
+def test_send_bulk_idempotency_key(dbos: DBOS) -> None:
+    recv_event = threading.Event()
+
+    @DBOS.workflow()
+    def recv_two() -> str:
+        msg1 = DBOS.recv(timeout_seconds=10)
+        recv_event.set()
+        msg2 = DBOS.recv(timeout_seconds=2)
+        return f"{msg1}-{msg2}"
+
+    dest_uuid = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid):
+        handle = dbos.start_workflow(recv_two)
+
+    idem_key = str(uuid.uuid4())
+    DBOS.send_bulk([SendMessage(dest_uuid, "hello", idempotency_key=idem_key)])
+    recv_event.wait()
+    # A later bulk send reusing a message's idempotency key is silently deduplicated.
+    DBOS.send_bulk([SendMessage(dest_uuid, "duplicate", idempotency_key=idem_key)])
+    assert handle.get_result() == "hello-None"
+
+
+def test_send_bulk_duplicate_key_within_batch(dbos: DBOS) -> None:
+    """Two messages sharing an idempotency key in a single bulk call is rejected
+    before the transaction starts, so nothing is delivered."""
+
+    @DBOS.workflow()
+    def recv_one() -> str:
+        return str(DBOS.recv(timeout_seconds=3))
+
+    dest_uuid = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid):
+        handle = dbos.start_workflow(recv_one)
+
+    key = str(uuid.uuid4())
+    with pytest.raises(Exception) as exc_info:
+        DBOS.send_bulk(
+            [
+                SendMessage(dest_uuid, "first", idempotency_key=key),
+                SendMessage(dest_uuid, "second", idempotency_key=key),
+            ]
+        )
+    assert "duplicate idempotency keys" in str(exc_info.value)
+    assert key in str(exc_info.value)
+    # Nothing was sent: the recv times out and returns None.
+    assert handle.get_result() == "None"
+
+
+def test_send_missing_destination_replays_recorded_error(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def destination() -> None:
+        pass
+
+    dest_id = str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def sender() -> str:
+        try:
+            DBOS.send(dest_id, "hello")
+        except DBOSNonExistentWorkflowError:
+            return "missing"
+        return "sent"
+
+    handle = DBOS.start_workflow(sender)
+    assert handle.get_result() == "missing"
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert isinstance(steps[0]["error"], DBOSNonExistentWorkflowError)
+
+    # Once the destination exists, a replay still takes the recorded branch and delivers nothing.
+    with SetWorkflowID(dest_id):
+        destination()
+    assert reexecute_workflow_by_id(dbos, handle.workflow_id).get_result() == "missing"
+    with dbos._sys_db.engine.begin() as c:
+        rows = c.execute(
+            sa.select(SystemSchema.notifications.c.message_uuid).where(
+                SystemSchema.notifications.c.destination_uuid == dest_id
+            )
+        ).all()
+    assert rows == []
+
+
+def test_send_bulk_empty(dbos: DBOS) -> None:
+    """An empty bulk send is a no-op and must not raise, in or out of a workflow."""
+    DBOS.send_bulk([])
+
+    @DBOS.workflow()
+    def send_empty_wf() -> str:
+        DBOS.send_bulk([])
+        return "ok"
+
+    assert send_empty_wf() == "ok"
+
+
+def _notification_destinations(dbos: DBOS, message_uuids: bool = False) -> Set[str]:
+    col = (
+        SystemSchema.notifications.c.message_uuid
+        if message_uuids
+        else SystemSchema.notifications.c.destination_uuid
+    )
+    with dbos._sys_db.engine.begin() as c:
+        return {r[0] for r in c.execute(sa.select(col)).all()}
+
+
+def test_send_bulk_send_to_forks(dbos: DBOS) -> None:
+    """send_to_forks fans each message out to its destination plus every workflow
+    recursively forked from it. A single bulk send resolves all destinations at
+    once, each reaching only its own fork subtree."""
+
+    @DBOS.step()
+    def step_a() -> int:
+        return 1
+
+    @DBOS.workflow()
+    def forkable() -> int:
+        return step_a()
+
+    def run_root() -> str:
+        wfid = str(uuid.uuid4())
+        with SetWorkflowID(wfid):
+            assert forkable() == 1
+        return wfid
+
+    def fork(wfid: str) -> str:
+        handle = DBOS.fork_workflow(wfid, 1)
+        assert handle.get_result() == 1
+        assert handle.get_status().forked_from == wfid
+        return handle.workflow_id
+
+    # Destination A: a fork and a fork-of-a-fork (recursive).
+    a = run_root()
+    a_fork = fork(a)
+    a_fork_fork = fork(a_fork)
+    # Destination B: a single fork.
+    b = run_root()
+    b_fork = fork(b)
+    # Unrelated workflow C with a fork: never a send target.
+    c = run_root()
+    c_fork = fork(c)
+
+    # One bulk send to A and B, with an idempotency key on A.
+    key = str(uuid.uuid4())
+    DBOS.send_bulk(
+        [SendMessage(a, "to_a", idempotency_key=key), SendMessage(b, "to_b")],
+        send_to_forks=True,
+    )
+
+    dests = _notification_destinations(dbos)
+    # A and B each reach their full (recursive) fork subtree...
+    assert {a, a_fork, a_fork_fork, b, b_fork} <= dests
+    # ...while C's subtree is untouched: each destination only reaches its own forks.
+    assert c not in dests and c_fork not in dests
+
+    # A's idempotency key derives one distinct message_uuid per recipient.
+    uuids = _notification_destinations(dbos, message_uuids=True)
+    assert {f"{key}::{a}", f"{key}::{a_fork}", f"{key}::{a_fork_fork}"} <= uuids
+
+    # Re-sending A with the same key is idempotent: nothing new appears.
+    DBOS.send_bulk([SendMessage(a, "x", idempotency_key=key)], send_to_forks=True)
+    assert _notification_destinations(dbos, message_uuids=True) == uuids
+
+    # Without send_to_forks, only the named destination is reached.
+    d = run_root()
+    d_fork = fork(d)
+    DBOS.send_bulk([SendMessage(d, "to_d")])
+    dests = _notification_destinations(dbos)
+    assert d in dests and d_fork not in dests
+
+
+def test_set_get_events(
+    dbos: DBOS, config: DBOSConfig, skip_with_sqlite_imprecise_time: None
+) -> None:
+    for use_listen_notify in [True, False]:
+        # Test using both LISTEN/NOTIFY and polling
+        DBOS.destroy(destroy_registry=True)
+        config["use_listen_notify"] = use_listen_notify
+        dbos = DBOS(config=config)
+        DBOS.launch()
+
+        @DBOS.workflow()
+        def test_setevent_workflow() -> None:
+            DBOS.set_event("key1", "value1")
+            DBOS.set_event("key2", "value2")
+            DBOS.set_event("key3", None)
+            set_event_step()
+
+        @DBOS.step()
+        def set_event_step() -> None:
+            DBOS.set_event("key4", "badvalue")
+            DBOS.set_event("key4", "value4")
+
+        getevent_counter = 0
+
+        @DBOS.workflow()
+        def test_getevent_workflow(
+            target_uuid: str, key: str, timeout: float = 0.0
+        ) -> Optional[str]:
+            nonlocal getevent_counter
+            getevent_counter += 1
+            msg = dbos.get_event(target_uuid, key, timeout)
+            return str(msg) if msg is not None else None
+
+        wfid = str(uuid.uuid4())
+        with SetWorkflowID(wfid):
+            test_setevent_workflow()
+        with SetWorkflowID(wfid):
+            test_setevent_workflow()
+
+        value1 = test_getevent_workflow(wfid, "key1")
+        assert value1 == "value1"
+
+        value2 = test_getevent_workflow(wfid, "key2")
+        assert value2 == "value2"
+
+        # Run getEvent outside of a workflow
+        value1 = DBOS.get_event(wfid, "key1", 0)
+        assert value1 == "value1"
+
+        value2 = DBOS.get_event(wfid, "key2", 0)
+        assert value2 == "value2"
+
+        begin_time = time.time()
+        value3 = test_getevent_workflow(wfid, "key3")
+        assert value3 is None
+
+        value4 = DBOS.get_event(wfid, "key4", 0)
+        assert value4 == "value4"
+
+        steps = DBOS.list_workflow_steps(wfid)
+        assert len(steps) == 4
+        assert (
+            steps[0]["function_name"]
+            == steps[1]["function_name"]
+            == steps[2]["function_name"]
+            == "DBOS.setEvent"
+        )
+        assert steps[3]["function_name"] == set_event_step.__qualname__
+
+        # Test OAOO
+        timeout_uuid = str(uuid.uuid4())
+        with SetWorkflowID(timeout_uuid):
+            begin_time = time.time()
+            res = test_getevent_workflow("non-existent-uuid", "key1", 1.0)
+            duration = time.time() - begin_time
+            assert duration > 0.7
+            assert res is None
+
+        calls_before_replay = getevent_counter
+        with SetWorkflowID(timeout_uuid):
+            res = test_getevent_workflow("non-existent-uuid", "key1", 1.0)
+            assert res is None
+        # Completed replay returns the recorded result without re-running the wait.
+        assert getevent_counter == calls_before_replay
+
+        # No OAOO for getEvent outside of a workflow
+        begin_time = time.time()
+        res = DBOS.get_event("non-existent-uuid", "key1", 1.0)
+        duration = time.time() - begin_time
+        assert duration > 0.7
+        assert res is None
+
+        begin_time = time.time()
+        res = DBOS.get_event("non-existent-uuid", "key1", 1.0)
+        duration = time.time() - begin_time
+        assert duration > 0.7
+        assert res is None
+
+        # Test setEvent outside of a workflow
+        with pytest.raises(Exception) as exc_info:
+            DBOS.set_event("key1", "value1")
+        assert "set_event() must be called from within a workflow" in str(
+            exc_info.value
+        )
+
+        # Test timing when listening for an event that has not yet been set
+        event = threading.Event()
+
+        @DBOS.workflow()
+        def set_event_workflow() -> None:
+            event.wait()
+            DBOS.set_event("key", "value")
+
+        @DBOS.workflow()
+        def get_event_workflow(id: str) -> Any:
+            return DBOS.get_event(id, "key", timeout_seconds=60.0)
+
+        start_time = time.time()
+        set_event_handle = DBOS.start_workflow(set_event_workflow)
+        get_event_handle = DBOS.start_workflow(
+            get_event_workflow, set_event_handle.workflow_id
+        )
+        time.sleep(1)
+        event.set()
+        set_event_handle.get_result()
+        assert get_event_handle.get_result() == "value"
+        assert time.time() - start_time < 5
+
+
+def test_nonserializable_values(dbos: DBOS) -> None:
+    def invalid_return() -> str:
+        return "literal"
+
+    @DBOS.step()
+    def test_ns_other_step(var2: str) -> str:
+        return invalid_return  # type: ignore
+
+    @DBOS.step()
+    def test_ns_step(var: str) -> str:
+        return invalid_return  # type: ignore
+
+    @DBOS.workflow()
+    def test_ns_wf(var: str) -> str:
+        return invalid_return  # type: ignore
+
+    @DBOS.step()
+    def test_reg_other_step(var2: str) -> str:
+        return var2
+
+    @DBOS.step()
+    def test_reg_step(var: str) -> str:
+        return var
+
+    @DBOS.workflow()
+    def test_reg_wf(var: str) -> str:
+        return test_reg_step(var) + test_reg_other_step(var)
+
+    @DBOS.workflow()
+    def test_ns_event(var: str) -> str:
+        DBOS.set_event("aaa", invalid_return)
+        return test_reg_step(var) + test_reg_other_step(var)
+
+    @DBOS.workflow()
+    def test_bad_wf1(var: str) -> str:
+        return test_reg_step(invalid_return) + test_reg_other_step(var)  # type: ignore
+
+    @DBOS.workflow()
+    def test_bad_wf2(var: str) -> str:
+        return test_reg_step(var) + test_reg_other_step(invalid_return)  # type: ignore
+
+    @DBOS.workflow()
+    def test_bad_wf3(var: str) -> str:
+        return test_ns_other_step(var)
+
+    @DBOS.workflow()
+    def test_bad_wf4(var: str) -> str:
+        return test_ns_step(var)
+
+    with pytest.raises(Exception):
+        DBOS.start_workflow(test_ns_other_step, "h").get_result()
+    with pytest.raises(Exception):
+        test_ns_wf("g")
+
+    wfh = DBOS.start_workflow(test_reg_wf, "a")
+    with pytest.raises(Exception):
+        DBOS.send(wfh.workflow_id, invalid_return, "sss")
+    wfh.get_result()
+
+    with pytest.raises(Exception):
+        test_ns_event("e")
+
+    with pytest.raises(Exception):
+        test_bad_wf1("a")
+    with pytest.raises(Exception):
+        test_bad_wf2("b")
+    with pytest.raises(Exception):
+        test_bad_wf3("c")
+    with pytest.raises(Exception):
+        test_bad_wf4("d")
+
+
+def test_multi_set_event(dbos: DBOS) -> None:
+    event = threading.Event()
+
+    wfid = str(uuid.uuid4())
+
+    workflow_key = "workflow_key"
+    step_key = "step_key"
+    value1 = "value1"
+    value2 = "value2"
+
+    @DBOS.step()
+    def set_event_step(value: str) -> None:
+        DBOS.set_event(step_key, value)
+
+    @DBOS.workflow()
+    def set_event_workflow() -> None:
+        assert DBOS.workflow_id == wfid
+        DBOS.set_event(workflow_key, value1)
+        set_event_step(value1)
+        event.wait()
+        DBOS.set_event(workflow_key, value2)
+        set_event_step(value2)
+
+    with SetWorkflowID(wfid):
+        handle = DBOS.start_workflow(set_event_workflow)
+    assert DBOS.get_event(wfid, workflow_key) == value1
+    assert DBOS.get_event(wfid, step_key) == value1
+    event.set()
+    assert handle.get_result() == None
+    assert DBOS.get_event(wfid, workflow_key) == value2
+    assert DBOS.get_event(wfid, step_key) == value2
+    assert DBOS.get_all_events(wfid) == {workflow_key: value2, step_key: value2}
+
+
+def test_debug_logging(
+    dbos: DBOS, caplog: pytest.LogCaptureFixture, config: DBOSConfig
+) -> None:
+    wfid = str(uuid.uuid4())
+    dest_wfid = str(uuid.uuid4())
+
+    @DBOS.step()
+    def step_function(message: str) -> str:
+        return f"Step: {message}"
+
+    @DBOS.workflow()
+    def test_workflow() -> str:
+        dbos.set_event("test_event", "event_value")
+        step_result = step_function("Hello")
+        dbos.send(dest_wfid, "test_message", topic="test_topic")
+        dbos.sleep(1)
+        return step_result
+
+    @DBOS.workflow()
+    def test_workflow_dest() -> str:
+        event_value = dbos.get_event(wfid, "test_event")
+        msg_value = dbos.recv(topic="test_topic")
+        return ", ".join([event_value, msg_value])
+
+    original_propagate = logging.getLogger("dbos").propagate
+    caplog.set_level(logging.DEBUG, "dbos")
+    logging.getLogger("dbos").propagate = True
+
+    # First run
+    with SetWorkflowID(dest_wfid):
+        dest_handle = dbos.start_workflow(test_workflow_dest)
+
+    with SetWorkflowID(wfid):
+        result1 = test_workflow()
+
+    assert result1 == "Step: Hello"
+    assert (
+        "Running step" in caplog.text
+        and f"name: {step_function.__qualname__}" in caplog.text
+    )
+    assert "Running sleep" in caplog.text
+    assert "Running set_event" in caplog.text
+    assert "Running DBOS.send" in caplog.text
+
+    result2 = dest_handle.get_result()
+    assert result2 == "event_value, test_message"
+    assert "Running get_event" in caplog.text
+    assert "Running recv" in caplog.text
+    caplog.clear()
+
+    # Second run
+    with SetWorkflowID(dest_wfid):
+        dest_handle_2 = dbos.start_workflow(test_workflow_dest)
+
+    with SetWorkflowID(wfid):
+        result3 = test_workflow()
+
+    assert result3 == result1
+    assert "already run with status SUCCESS" in caplog.text
+
+    result4 = dest_handle_2.get_result()
+    assert result4 == result2
+    caplog.clear()
+
+    # Reset logging
+    logging.getLogger("dbos").propagate = original_propagate
+
+
+def test_destroy_semantics(dbos: DBOS, config: DBOSConfig) -> None:
+
+    @DBOS.workflow()
+    def test_workflow(var: str) -> str:
+        return var
+
+    var = "test"
+    assert test_workflow(var) == var
+
+    # Start the workflow asynchornously
+    wf = dbos.start_workflow(test_workflow, var)
+    assert wf.get_result() == var
+
+    DBOS.destroy()
+    DBOS(config=config)
+    DBOS.launch()
+
+    assert test_workflow(var) == var
+
+    wf = dbos.start_workflow(test_workflow, var)
+    assert wf.get_result() == var
+
+
+def test_deferred_poller(config: DBOSConfig, cleanup_test_databases: None) -> None:
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    poller_started = threading.Event()
+    deferred_stop = threading.Event()
+
+    def deferred_poller(stop_event: threading.Event) -> None:
+        poller_started.set()
+        stop_event.wait()
+
+    dbos._registry.register_poller(deferred_stop, deferred_poller, deferred_stop)
+    # Deferred, so it must not run until launch
+    assert not poller_started.is_set()
+
+    try:
+        DBOS.launch()
+        assert deferred_stop in dbos.background_thread_stop_events
+
+        def check_poller_started() -> None:
+            assert poller_started.is_set()
+
+        retry_until_success(check_poller_started)
+        assert not deferred_stop.is_set()
+    finally:
+        DBOS.destroy(destroy_registry=True)
+    # Destroy stops the deferred poller
+    assert deferred_stop.is_set()
+
+
+def test_destroy_preserves_the_process_identity(
+    config: DBOSConfig, cleanup_test_databases: None
+) -> None:
+    """Shutdown leaves the identity a checkpoint stamps rows with alone.
+
+    Resetting it raced work still in flight: a dequeue reads the identity only
+    once it is about to write, so one landing during shutdown claimed workflows
+    for "local", which the replacement executor never recovers."""
+    executor_id = "test-executor"
+    config["executor_id"] = executor_id
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def enqueued_workflow() -> None:
+        pass
+
+    DBOS.launch()
+    app_version = GlobalParams.app_version
+    # Long poll: this test dequeues by hand, at the moment of its choosing.
+    queue = DBOS.register_queue("test-shutdown-queue", polling_interval_sec=3600)
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        queue.enqueue(enqueued_workflow)
+
+    # As the queue worker does: resolve the system database, then read the
+    # identity when the claim is written. Shut down in between.
+    sys_db = dbos._sys_db
+    DBOS.destroy()
+    assert GlobalParams.executor_id == executor_id
+    assert GlobalParams.app_version == app_version
+    sys_db.start_queued_workflows(
+        queue, GlobalParams.executor_id, GlobalParams.app_version, None, 0
+    )
+
+    status = sys_db.get_workflow_status(wfid)
+    assert status is not None
+    assert status["status"] == WorkflowStatusString.PENDING.value
+    # Claimed for this executor, so its replacement recovers the workflow.
+    assert status["executor_id"] == executor_id
+    assert status["app_version"] == app_version
+    assert sys_db.get_pending_workflows(executor_id, app_version) != []
+    # Dispose the pool the claim above re-created, and drop the registry this test filled.
+    sys_db.destroy()
+    DBOS.destroy(destroy_registry=True)
+
+
+@pytest.mark.asyncio
+async def test_destroy_semantics_async(dbos: DBOS, config: DBOSConfig) -> None:
+
+    @DBOS.workflow()
+    async def test_workflow(var: str) -> str:
+        return var
+
+    var = "test"
+    assert await test_workflow(var) == var
+
+    # Start the workflow asynchornously
+    wf = await dbos.start_workflow_async(test_workflow, var)
+    assert await wf.get_result() == var
+
+    DBOS.destroy()
+    DBOS(config=config)
+    DBOS.launch()
+
+    assert await test_workflow(var) == var
+
+    wf = await dbos.start_workflow_async(test_workflow, var)
+    assert await wf.get_result() == var
+
+
+def test_duplicate_registration(
+    dbos: DBOS,
+    caplog: pytest.LogCaptureFixture,
+    config: DBOSConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(logging.WARNING, "dbos")
+    monkeypatch.setattr(logging.getLogger("dbos"), "propagate", True)
+
+    @DBOS.step()
+    def my_first_step() -> None:
+        pass
+
+    @DBOS.step()
+    def my_first_step() -> None:
+        pass
+
+    assert (
+        "Duplicate registration of function 'test_duplicate_registration.<locals>.my_first_step'"
+        in caplog.text
+    )
+
+    @DBOS.step()
+    def my_step() -> None:
+        pass
+
+    @DBOS.step()
+    def my_step() -> None:
+        pass
+
+    assert (
+        "Duplicate registration of function 'test_duplicate_registration.<locals>.my_step'"
+        in caplog.text
+    )
+
+    @DBOS.workflow()
+    def my_workflow() -> None:
+        my_step()
+        my_first_step()
+
+    @DBOS.workflow()
+    def my_workflow() -> None:
+        my_step()
+        my_first_step()
+
+    assert (
+        "Duplicate registration of function 'test_duplicate_registration.<locals>.my_workflow'"
+        in caplog.text
+    )
+
+    DBOS.destroy()
+    DBOS(config=config)
+    DBOS.launch()
+
+
+def test_app_version(
+    config: DBOSConfig,
+    cleanup_test_databases: None,
+    skip_with_sqlite_imprecise_time: None,
+) -> None:
+    def is_hex(s: str) -> bool:
+        return all(c in "0123456789abcdefABCDEF" for c in s)
+
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def workflow_one(x: int) -> int:
+        return x
+
+    @DBOS.workflow()
+    def workflow_two(y: int) -> int:
+        return y
+
+    DBOS.launch()
+
+    # Verify that app version is correctly set to a hex string
+    version_one = DBOS.application_version
+    assert len(version_one) > 0
+    assert is_hex(version_one)
+
+    # Track all distinct versions created during this test
+    created_versions = [version_one]
+
+    DBOS.destroy(destroy_registry=True)
+    # Shutdown leaves the identity alone; constructing the next DBOS clears it.
+    assert DBOS.application_version == version_one
+    dbos = DBOS(config=config)
+    assert DBOS.application_version == ""
+
+    @DBOS.workflow()
+    def workflow_one(x: int) -> int:
+        return x
+
+    @DBOS.workflow()
+    def workflow_two(y: int) -> int:
+        return y
+
+    DBOS.launch()
+
+    # Verify stability--the same workflow source produces the same app version.
+    assert DBOS.application_version == version_one
+
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def workflow_one(x: int) -> int:
+        return x
+
+    # Verify that changing the workflow source changes the workflow version
+    DBOS.launch()
+    version_two = DBOS.application_version
+    assert version_two != version_one
+    created_versions.append(version_two)
+
+    # Verify that version can be overriden with an environment variable
+    version_three = str(uuid.uuid4())
+    os.environ["DBOS__APPVERSION"] = version_three
+
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def workflow_one(x: int) -> int:
+        return x
+
+    DBOS.launch()
+    assert DBOS.application_version == version_three
+    created_versions.append(version_three)
+
+    del os.environ["DBOS__APPVERSION"]
+
+    # An exported but empty DBOS__VMID is an unset one: the executor ID is "local"
+    os.environ["DBOS__VMID"] = ""
+    DBOS.destroy(destroy_registry=True)
+    assert GlobalParams.executor_id == "local"
+    DBOS(config=config)
+    DBOS.launch()
+    assert DBOS.executor_id == "local"
+    created_versions.append(DBOS.application_version)
+    del os.environ["DBOS__VMID"]
+
+    # Verify that version and executor ID can be overriden with a config parameter
+    version_four = str(uuid.uuid4())
+    executor_id = str(uuid.uuid4())
+
+    DBOS.destroy(destroy_registry=True)
+    config["application_version"] = version_four
+    config["executor_id"] = executor_id
+    DBOS(config=config)
+
+    @DBOS.workflow()
+    def test_workflow() -> str:
+        assert DBOS.workflow_id
+        return DBOS.workflow_id
+
+    DBOS.launch()
+    assert DBOS.application_version == version_four
+    assert GlobalParams.executor_id == executor_id == DBOS.executor_id
+    wfid = test_workflow()
+    handle: WorkflowHandle[str] = DBOS.retrieve_workflow(wfid)
+    assert handle.get_status().app_version == version_four
+    assert handle.get_status().executor_id == executor_id
+    created_versions.append(version_four)
+
+    # ── Test version CRUD via DBOS API ───────────────────────────
+
+    # Create another version by relaunching with a different app_version
+    version_five = str(uuid.uuid4())
+    DBOS.destroy(destroy_registry=True)
+    config["application_version"] = version_five
+    DBOS(config=config)
+
+    @DBOS.workflow()
+    def test_workflow() -> str:
+        return "hello"
+
+    DBOS.launch()
+    created_versions.append(version_five)
+
+    # Verify list_application_versions returns exactly the versions we created
+    versions = DBOS.list_application_versions()
+    version_names = set(v["version_name"] for v in versions)
+    assert version_names == set(created_versions)
+
+    # Verify created_at is set on all versions
+    for v in versions:
+        assert "created_at" in v
+        assert isinstance(v["created_at"], int)
+        assert v["created_at"] > 0
+
+    # get_latest_application_version should return the most recently launched version
+    latest = DBOS.get_latest_application_version()
+    assert latest["version_name"] == version_five
+    assert "created_at" in latest
+
+    # Record created_at before set_latest to verify it doesn't change
+    version_four_created_at = next(
+        v["created_at"] for v in versions if v["version_name"] == version_four
+    )
+
+    # set_latest_application_version changes which version is latest
+    DBOS.set_latest_application_version(version_four)
+    latest = DBOS.get_latest_application_version()
+    assert latest["version_name"] == version_four
+    # created_at should not change when updating timestamp
+    assert latest["created_at"] == version_four_created_at
+    # First entry should be the latest (highest timestamp)
+    versions = DBOS.list_application_versions()
+    assert versions[0]["version_name"] == version_four
+
+    # ── Test version CRUD via Client API ─────────────────────────
+
+    assert config["system_database_url"] is not None
+    client = DBOSClient(system_database_url=config["system_database_url"])
+
+    # Verify client sees exactly the same versions
+    client_versions = client.list_application_versions()
+    client_version_names = set(v["version_name"] for v in client_versions)
+    assert client_version_names == set(created_versions)
+
+    # Verify created_at is present in client results
+    for v in client_versions:
+        assert "created_at" in v
+        assert isinstance(v["created_at"], int)
+        assert v["created_at"] > 0
+
+    client_latest = client.get_latest_application_version()
+    assert client_latest["version_name"] == version_four
+    assert "created_at" in client_latest
+
+    # Record created_at before client update
+    version_five_created_at = next(
+        v["created_at"] for v in client_versions if v["version_name"] == version_five
+    )
+
+    # Set version_five as latest via client
+    client.set_latest_application_version(version_five)
+    client_latest = client.get_latest_application_version()
+    assert client_latest["version_name"] == version_five
+    # created_at should not change when updating timestamp via client
+    assert client_latest["created_at"] == version_five_created_at
+
+    # Verify DBOS API sees the same change
+    assert DBOS.get_latest_application_version()["version_name"] == version_five
+
+    client.destroy()
+    DBOS.destroy(destroy_registry=True)
+
+
+def test_recovery_appversion(config: DBOSConfig) -> None:
+    input = 5
+    os.environ["DBOS__VMID"] = "testexecutor"
+
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def test_workflow(x: int) -> int:
+        return x
+
+    DBOS.launch()
+
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert test_workflow(input) == input
+
+    # Change the workflow status to pending
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"status": "PENDING", "name": test_workflow.__qualname__})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    # Reconstruct an identical environment to simulate a restart
+    os.environ["DBOS__VMID"] = "testexecutor_another"
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def test_workflow(x: int) -> int:
+        return x
+
+    DBOS.launch()
+
+    # The workflow should successfully recover
+    workflow_handles = DBOS._recover_pending_workflows(["testexecutor"])
+    assert len(workflow_handles) == 1
+    assert workflow_handles[0].get_result() == input
+
+    # Mark it pending on the dead executor again
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values(
+                {
+                    "status": "PENDING",
+                    "name": test_workflow.__qualname__,
+                    "executor_id": "testexecutor",
+                }
+            )
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+    old_version = GlobalParams.app_version
+
+    # Now reconstruct a "modified application" with a different application version
+    DBOS.destroy(destroy_registry=True)
+    dbos = DBOS(config=config)
+
+    @DBOS.workflow()
+    def test_workflow(x: int) -> int:
+        return x + 1
+
+    DBOS.launch()
+
+    # It is re-enqueued on its own version, which this process does not run
+    assert GlobalParams.app_version != old_version
+    workflow_handles = DBOS._recover_pending_workflows(["testexecutor"])
+    assert [h.get_workflow_id() for h in workflow_handles] == [wfuuid]
+    stat = workflow_handles[0].get_status()
+    assert stat.status == "ENQUEUED"
+    assert stat.app_version == old_version
+
+    # Clean up the environment variable
+    del os.environ["DBOS__VMID"]
+
+
+def test_recover_workflows(dbos: DBOS) -> None:
+    wf_counter = 0
+
+    @DBOS.workflow()
+    def target_workflow(x: int) -> int:
+        nonlocal wf_counter
+        wf_counter += 1
+        return x
+
+    @DBOS.workflow()
+    def recovering_workflow(executor_ids: List[str]) -> List[str]:
+        return [h.get_workflow_id() for h in DBOS.recover_workflows(executor_ids)]
+
+    @DBOS.step()
+    def recovering_step(executor_ids: List[str]) -> List[str]:
+        return [h.get_workflow_id() for h in DBOS.recover_workflows(executor_ids)]
+
+    @DBOS.workflow()
+    def workflow_with_recovering_step(executor_ids: List[str]) -> List[str]:
+        return recovering_step(executor_ids)
+
+    def mark_pending(wfid: str, executor_id: str) -> None:
+        with dbos._sys_db.engine.begin() as c:
+            c.execute(
+                sa.update(SystemSchema.workflow_status)
+                .values({"status": "PENDING", "executor_id": executor_id})
+                .where(SystemSchema.workflow_status.c.workflow_uuid == wfid)
+            )
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert target_workflow(5) == 5
+    mark_pending(wfid, "dead-executor")
+
+    # Only the named executors' workflows are recovered
+    assert DBOS.recover_workflows(["other-executor"]) == []
+    handles = DBOS.recover_workflows(["dead-executor"])
+    assert [h.get_workflow_id() for h in handles] == [wfid]
+    assert handles[0].get_result() == 5
+    assert wf_counter == 2
+    stat = handles[0].get_status()
+    assert stat.executor_id == GlobalParams.executor_id
+    assert stat.recovery_attempts == 2
+
+    # A workflow owned by a live executor is not recovered for the dead one
+    mark_pending(wfid, GlobalParams.executor_id)
+    assert DBOS.recover_workflows(["dead-executor"]) == []
+
+    # Recovery is rejected from within a workflow or step and re-enqueues nothing
+    mark_pending(wfid, "dead-executor")
+    with pytest.raises(DBOSException, match="within a workflow or step"):
+        recovering_workflow(["dead-executor"])
+    with pytest.raises(DBOSException, match="within a workflow or step"):
+        workflow_with_recovering_step(["dead-executor"])
+    untouched = DBOS.get_workflow_status(wfid)
+    assert untouched is not None
+    assert untouched.status == "PENDING"
+    assert untouched.executor_id == "dead-executor"
+    assert wf_counter == 2
+
+
+def test_recover_workflows_skips_stale_rows(
+    dbos: DBOS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @DBOS.workflow()
+    def target_workflow(x: int) -> int:
+        return x
+
+    def set_row(wfid: str, values: dict[str, str]) -> None:
+        with dbos._sys_db.engine.begin() as c:
+            c.execute(
+                sa.update(SystemSchema.workflow_status)
+                .values(values)
+                .where(SystemSchema.workflow_status.c.workflow_uuid == wfid)
+            )
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert target_workflow(5) == 5
+    set_row(wfid, {"status": "PENDING", "executor_id": "dead-executor"})
+    stale = dbos._sys_db.get_pending_workflows(
+        "dead-executor", GlobalParams.app_version
+    )
+    assert [w.workflow_id for w in stale] == [wfid]
+
+    # The workflow completes between recovery's select and its re-enqueue
+    set_row(wfid, {"status": "SUCCESS"})
+    monkeypatch.setattr(
+        dbos._sys_db, "get_pending_workflows", lambda *args, **kwargs: stale
+    )
+    assert DBOS.recover_workflows(["dead-executor"]) == []
+    stat = DBOS.get_workflow_status(wfid)
+    assert stat is not None
+    assert stat.status == "SUCCESS"
+
+
+def test_recover_workflows_any_version(
+    config: DBOSConfig, cleanup_test_databases: None
+) -> None:
+    queue_name = "recover-any-version"
+
+    def launch(version: str) -> Tuple[DBOS, Queue, Callable[[str], str]]:
+        config["application_version"] = version
+        DBOS.destroy(destroy_registry=True)
+        dbos = DBOS(config=config)
+
+        @DBOS.workflow()
+        def target_workflow(x: str) -> str:
+            return x
+
+        DBOS.launch()
+        queue = DBOS.register_queue(queue_name, global_concurrency=1)
+        return dbos, queue, target_workflow
+
+    dbos, queue, target_workflow = launch("v1")
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert queue.enqueue(target_workflow, "v1").get_result() == "v1"
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values(
+                {
+                    "status": "PENDING",
+                    "executor_id": "dead-executor",
+                    "queue_name": queue_name,
+                }
+            )
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfid)
+        )
+
+    # A v2 process recovers the dead executor's v1 workflow, freeing the queue's only slot
+    dbos, queue, target_workflow = launch("v2")
+    assert dbos._sys_db.count_pending_queue_workflows(queue_name) == 1
+    handles = DBOS.recover_workflows(["dead-executor"])
+    assert [h.get_workflow_id() for h in handles] == [wfid]
+    assert dbos._sys_db.count_pending_queue_workflows(queue_name) == 0
+
+    # v2 runs its own work but skips the older v1 workflow ahead of it
+    assert queue.enqueue(target_workflow, "v2").get_result() == "v2"
+    stat = DBOS.get_workflow_status(wfid)
+    assert stat is not None
+    assert stat.status == "ENQUEUED"
+    assert stat.app_version == "v1"
+
+    # A v1 process runs it
+    launch("v1")
+    assert DBOS.retrieve_workflow(wfid).get_result() == "v1"
+
+
+def test_conductor_key_keeps_cloud_executor_id(
+    config: DBOSConfig, monkeypatch: pytest.MonkeyPatch, skip_with_sharding: None
+) -> None:
+    # Only the executor identity is under test, so stand in for the enterprise client.
+    class _NoopConductor:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        enterprise_module,
+        "load",
+        lambda: types.SimpleNamespace(ConductorWebsocket=_NoopConductor),
+    )
+    monkeypatch.setenv("DBOS__VMID", "cloud-vm")
+
+    # Off DBOS Cloud, Conductor assigns its own executor ID
+    DBOS.destroy(destroy_registry=True)
+    DBOS(config=config, conductor_key="test-key", conductor_url="ws://127.0.0.1:1")
+    DBOS.launch()
+    assert DBOS.executor_id != "cloud-vm"
+    uuid.UUID(DBOS.executor_id)
+
+    # On DBOS Cloud the platform names the process, and a key passed in code is not used
+    monkeypatch.setattr(GlobalParams, "dbos_cloud", True)
+    # DBOS Cloud always provides these; cloud mode takes the name and system database from them
+    monkeypatch.setenv("DBOS_APP_NAME", config["name"])
+    sys_db_url = config["system_database_url"]
+    assert sys_db_url is not None
+    monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", sys_db_url)
+    DBOS.destroy(destroy_registry=True)
+    DBOS(config=config, conductor_key="test-key", conductor_url="ws://127.0.0.1:1")
+    DBOS.launch()
+    assert DBOS.executor_id == "cloud-vm"
+    DBOS.destroy(destroy_registry=True)
+
+
+def test_workflow_timeout(dbos: DBOS) -> None:
+
+    @DBOS.workflow()
+    def blocked_workflow() -> None:
+        assert get_workflow_start_options().workflow_timeout_ms is None
+        assert assert_current_dbos_context().workflow_deadline_epoch_ms is not None
+        while True:
+            DBOS.sleep(0.1)
+
+    # Verify a blocked workflow called with a timeout is cancelled
+    wfid = str(uuid.uuid4())
+    with SetWorkflowTimeout(0.1):
+        with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+            with SetWorkflowID(wfid):
+                blocked_workflow()
+        assert assert_current_dbos_context().workflow_deadline_epoch_ms is None
+        start_time = time.time() * 1000
+        handle = DBOS.start_workflow(blocked_workflow)
+        status = handle.get_status()
+        assert status.workflow_timeout_ms == 100
+        assert (
+            status.workflow_deadline_epoch_ms is not None
+            and status.workflow_deadline_epoch_ms > start_time
+        )
+        with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+            handle.get_result()
+
+    # Change the workflow status to pending. Its deadline goes far enough ahead that
+    # the timeout sweep cannot cancel the row before recovery claims it.
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values(
+                {
+                    "status": "PENDING",
+                    "workflow_deadline_epoch_ms": int(time.time() * 1000) + 10000,
+                }
+            )
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfid)
+        )
+    # Recover the workflow, verify it still times out
+    handles = DBOS._recover_pending_workflows()
+    assert len(handles) == 1
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"workflow_deadline_epoch_ms": int(time.time() * 1000)})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfid)
+        )
+    with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+        handles[0].get_result()
+
+    @DBOS.workflow()
+    def parent_workflow_with_timeout() -> None:
+        assert assert_current_dbos_context().workflow_deadline_epoch_ms is None
+        with SetWorkflowTimeout(0.1):
+            with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+                blocked_workflow()
+            handle = DBOS.start_workflow(blocked_workflow)
+            with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+                handle.get_result()
+        assert assert_current_dbos_context().workflow_deadline_epoch_ms is None
+
+    # Verify if a parent calls a blocked workflow with a timeout, the child is cancelled
+    assert parent_workflow_with_timeout() == None
+
+    start_child, direct_child = str(uuid.uuid4()), str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def parent_workflow() -> None:
+        assert get_workflow_start_options().workflow_timeout_ms is None
+        assert assert_current_dbos_context().workflow_deadline_epoch_ms is not None
+        with SetWorkflowID(start_child):
+            DBOS.start_workflow(blocked_workflow)
+        with SetWorkflowID(direct_child):
+            blocked_workflow()
+
+    # Verify if a parent called with a timeout calls a blocked child
+    # the deadline propagates and the children are also cancelled.
+    with SetWorkflowTimeout(1.0):
+        with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+            parent_workflow()
+
+    with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+        DBOS.retrieve_workflow(start_child).get_result()
+
+    with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+        DBOS.retrieve_workflow(direct_child).get_result()
+
+    # Verify the context variables are set correctly
+    with SetWorkflowTimeout(1.0):
+        assert get_workflow_start_options().workflow_timeout_ms == 1000
+        with SetWorkflowTimeout(2.0):
+            assert get_workflow_start_options().workflow_timeout_ms == 2000
+        with SetWorkflowTimeout(None):
+            assert get_workflow_start_options().workflow_timeout_ms is None
+        assert get_workflow_start_options().workflow_timeout_ms == 1000
+    assert get_local_dbos_context() is None
+
+
+def test_background_jobs_stop_on_destroy(dbos: DBOS, config: DBOSConfig) -> None:
+    """The background jobs thread stops on its own event, not the one the other
+    background threads share, so destroy has to set it."""
+    jobs_threads = [
+        t for t in dbos._background_threads if t.name == BACKGROUND_JOBS_THREAD_NAME
+    ]
+    assert len(jobs_threads) == 1 and jobs_threads[0].is_alive()
+
+    DBOS.destroy(destroy_registry=True)
+    assert not jobs_threads[0].is_alive()
+
+    # Re-initialize for fixture teardown
+    dbos = DBOS(config=config)
+    DBOS.launch()
+
+
+def test_timeout_sweep_cancels_unowned_workflows(dbos: DBOS) -> None:
+    """The sweep cancels every expired workflow of this application, whatever its
+    active status and whether or not a local runner holds it, and leaves other
+    applications' workflows alone."""
+
+    @DBOS.workflow()
+    def noop_workflow() -> None:
+        pass
+
+    own_id, unclaimed_id, other_app_id, unexpired_id, enqueued_id, delayed_id = (
+        str(uuid.uuid4()) for _ in range(6)
+    )
+    ids = [own_id, unclaimed_id, other_app_id, unexpired_id, enqueued_id, delayed_id]
+    for wfid in ids:
+        with SetWorkflowID(wfid):
+            noop_workflow()
+
+    # A sweep that raises must not kill the thread: the rows below still get cancelled.
+    real_sweep = dbos._sys_db.cancel_timed_out_workflows
+    injected = threading.Event()
+
+    def sweep_failing_once(limit: int) -> List[str]:
+        if not injected.is_set():
+            injected.set()
+            raise Exception("injected sweep failure")
+        return real_sweep(limit)
+
+    dbos._sys_db.cancel_timed_out_workflows = sweep_failing_once  # type: ignore[method-assign]
+
+    # Rewrite rows only after the failure, so a pre-patch sweep can't cancel them first.
+    def failure_injected() -> None:
+        assert injected.is_set()
+
+    retry_until_success(failure_injected, interval=0.1, max_attempts=50)
+
+    # Rewrite the finished rows into active workflows of a dead executor. The
+    # enqueued and delayed rows stand in for children carrying a parent's deadline,
+    # on a queue no worker polls so only the sweep can touch them.
+    app_name = dbos._sys_db.app_name
+    assert app_name
+    past = int(time.time() * 1000) - 1000
+    hour_ahead = past + 3_600_000
+    ws = SystemSchema.workflow_status
+    with dbos._sys_db.engine.begin() as c:
+        for wfid, status, owner, deadline, queue, delay in [
+            (own_id, "PENDING", app_name, past, None, None),
+            (unclaimed_id, "PENDING", None, past, None, None),
+            (other_app_id, "PENDING", f"{app_name}-other", past, None, None),
+            (unexpired_id, "PENDING", app_name, hour_ahead, None, None),
+            (enqueued_id, "ENQUEUED", app_name, past, "unpolled-queue", None),
+            (delayed_id, "DELAYED", app_name, past, "unpolled-queue", hour_ahead),
+        ]:
+            c.execute(
+                sa.update(ws)
+                .where(ws.c.workflow_uuid == wfid)
+                .values(
+                    status=status,
+                    executor_id="dead-executor",
+                    application_name=owner,
+                    workflow_deadline_epoch_ms=deadline,
+                    queue_name=queue,
+                    delay_until_epoch_ms=delay,
+                )
+            )
+
+    def rows() -> dict[str, Any]:
+        with dbos._sys_db.engine.begin() as c:
+            fetched = c.execute(
+                sa.select(ws.c.workflow_uuid, ws.c.status, ws.c.queue_name).where(
+                    ws.c.workflow_uuid.in_(ids)
+                )
+            ).fetchall()
+        return {row[0]: row for row in fetched}
+
+    def expired_cancelled() -> None:
+        current = rows()
+        for wfid in (own_id, unclaimed_id, enqueued_id, delayed_id):
+            assert current[wfid][1] == "CANCELLED"
+
+    retry_until_success(expired_cancelled, interval=0.1, max_attempts=50)
+    # One sweep cancelled them all, so it would have taken the other app's row too.
+    current = rows()
+    assert current[other_app_id][1] == "PENDING"
+    assert current[unexpired_id][1] == "PENDING"
+    # Cancelling keeps a workflow's queue for a later resume.
+    assert current[enqueued_id][2] == "unpolled-queue"
+    assert current[delayed_id][2] == "unpolled-queue"
+    dbos._sys_db.cancel_timed_out_workflows = real_sweep  # type: ignore[method-assign]
+
+
+def test_timeout_sweep_query_plan(dbos: DBOS, skip_with_sharding: None) -> None:
+    """The sweep runs every poll, so it must reach expired rows through idx_workflow_status_deadline_v2."""
+    from sqlalchemy import event
+
+    captured: list[Any] = []
+    test_thread = threading.current_thread()
+
+    def before_cursor_execute(
+        conn: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        # The background jobs thread runs the same sweep on this engine.
+        if (
+            threading.current_thread() is test_thread
+            and statement.strip().startswith("UPDATE")
+            and "deadline_epoch_ms <=" in statement
+        ):
+            captured.append((statement, parameters))
+
+    event.listen(dbos._sys_db.engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        # A batch smaller than the rows the planner expects to match tempts it into a scan that stops early.
+        dbos._sys_db.cancel_timed_out_workflows(10)
+    finally:
+        event.remove(
+            dbos._sys_db.engine, "before_cursor_execute", before_cursor_execute
+        )
+    assert captured
+    statement, parameters = captured[0]
+
+    # Finished workflows keep their past deadlines, so the planner expects many rows to match.
+    ws = SystemSchema.workflow_status
+    now = int(time.time() * 1000)
+    rows = [
+        {
+            "workflow_uuid": f"deadline-plan-{i}-{uuid.uuid4()}",
+            "name": "plan_probe",
+            "status": "PENDING" if i % 20 == 0 else "SUCCESS",
+            "created_at": now,
+            "updated_at": now,
+            "priority": 0,
+            "workflow_deadline_epoch_ms": (
+                now + 3_600_000 + i if i % 20 == 0 else now - 60_000 - i
+            ),
+        }
+        for i in range(5000)
+    ]
+    # Deadlines uncorrelated with heap order, as in production, make index fetches look costly.
+    random.Random(0).shuffle(rows)
+    with dbos._sys_db.engine.begin() as conn:
+        conn.execute(sa.insert(ws), rows)
+    if using_sqlite():
+        with dbos._sys_db.engine.begin() as conn:
+            conn.exec_driver_sql("ANALYZE")
+            plan = conn.exec_driver_sql(
+                f"EXPLAIN QUERY PLAN {statement}", parameters
+            ).fetchall()
+        details = [str(row[-1]) for row in plan]
+        assert any(
+            "idx_workflow_status_deadline_v2" in d
+            and "workflow_deadline_epoch_ms<" in d
+            for d in details
+        ), details
+        assert not [d for d in details if d.startswith("SCAN")], details
+    else:
+        with dbos._sys_db.engine.begin() as conn:
+            conn.exec_driver_sql(f'ANALYZE "{dbos._sys_db.schema}".workflow_status')
+            plan = conn.exec_driver_sql(f"EXPLAIN {statement}", parameters).fetchall()
+        details = [str(row[0]) for row in plan]
+        assert any("idx_workflow_status_deadline_v2" in d for d in details), details
+        # The deadline bound rides the index as a condition, not a filter over every active row.
+        assert any(
+            "Index Cond" in d and "workflow_deadline_epoch_ms" in d for d in details
+        ), details
+        assert not [d for d in details if "Seq Scan" in d], details
+
+
+def test_background_jobs_run_once_per_interval_across_processes(
+    dbos: DBOS, config: DBOSConfig, skip_with_sqlite: None
+) -> None:
+    """Two processes' loops: whichever holds the lock runs the jobs, so their runs start
+    at least an interval apart, a failing job skips no other, and when the holder stops
+    the other takes over."""
+    peer = SystemDatabase.create(
+        system_database_url=cast(str, config["system_database_url"]),
+        engine_kwargs={},
+        engine=None,
+        schema=dbos._sys_db.schema,
+        serializer=DefaultSerializer(),
+        executor_id="peer",
+        use_listen_notify=False,
+        app_name=dbos._sys_db.app_name,
+        sharding=bool(config.get("sharding")),
+    )
+    interval = 0.2
+    runs: List[Tuple[str, float]] = []
+    # Recorded, as the loop catches a job's exceptions: an assert in the job could never fail the test.
+    unheld: List[str] = []
+    stops = {"local": threading.Event(), "peer": threading.Event()}
+    leases = {"local": BackgroundLease(), "peer": BackgroundLease()}
+
+    def loop(name: str, sys_db: SystemDatabase) -> None:
+        def failing() -> None:
+            raise Exception("injected job failure")
+
+        def job() -> None:
+            # A holder's lease is held while its jobs run.
+            if not leases[name].held():
+                unheld.append(name)
+            runs.append((name, time.monotonic()))
+
+        process = cast(Any, types.SimpleNamespace(_sys_db=sys_db, logger=dbos.logger))
+        jobs = {"failing": failing, "job": job}
+        _run_background_jobs(
+            stops[name], process, "test_jobs", interval, jobs, leases[name]
+        )
+
+    threads = {
+        "local": threading.Thread(target=loop, args=("local", dbos._sys_db)),
+        "peer": threading.Thread(target=loop, args=("peer", peer)),
+    }
+    try:
+        for thread in threads.values():
+            thread.start()
+
+        def ran(times: int) -> None:
+            assert len(runs) >= times
+
+        retry_until_success(lambda: ran(8), interval=0.1, max_attempts=50)
+        assert not unheld, unheld
+        # A holder keeps the lock an interval past its start; the bounds allow for timer slack.
+        starts = [at for _, at in runs]
+        assert starts[-1] - starts[0] >= (len(starts) - 1) * interval * 0.9, runs
+        assert all(b - a >= interval / 2 for a, b in zip(starts, starts[1:])), runs
+
+        holder = runs[-1][0]
+        other = "peer" if holder == "local" else "local"
+        stops[holder].set()
+        threads[holder].join()
+        assert not leases[holder].held()
+
+        def taken_over() -> None:
+            assert runs[-1][0] == other
+            assert leases[other].held()
+
+        retry_until_success(taken_over, interval=0.1, max_attempts=50)
+    finally:
+        for stop in stops.values():
+            stop.set()
+        for thread in threads.values():
+            thread.join()
+        peer.destroy()
+
+
+def test_background_jobs_hold_one_lock_session_across_intervals(
+    dbos: DBOS, monkeypatch: pytest.MonkeyPatch, skip_with_sqlite: None
+) -> None:
+    """A holder keeps its lock session across intervals, renewing it in place past the idle
+    timeout, so a peer retrying as fast as it can never finds the lock free mid-hold."""
+    # Short, so a hold that went idle instead of renewing would lose its session mid-test; also
+    # where an override imports it by name, as Enterprise's sharded lock does.
+    for module in {_sys_db_postgres, sys.modules[type(dbos._sys_db).__module__]}:
+        monkeypatch.setattr(
+            module, "BACKGROUND_JOB_LOCK_IDLE_TIMEOUT_MS", 500, raising=False
+        )
+    interval = 0.1
+    runs: List[float] = []
+    stop = threading.Event()
+    lease = BackgroundLease()
+    process = cast(Any, types.SimpleNamespace(_sys_db=dbos._sys_db, logger=dbos.logger))
+    thread = threading.Thread(
+        target=_run_background_jobs,
+        args=(stop, process, "hold_jobs", interval, {"job": lambda: runs.append(1)}),
+        kwargs={"lease": lease, "hold_sec": 3.0},
+    )
+    try:
+        thread.start()
+
+        def holding() -> None:
+            assert lease.held()
+
+        retry_until_success(holding, interval=0.05, max_attempts=50)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with dbos._sys_db.background_job_lock("hold_jobs") as renew:
+                assert renew is None
+            assert lease.held()
+        assert len(runs) >= 10, runs
+    finally:
+        stop.set()
+        thread.join()
+
+
+def test_background_jobs_lock_is_per_application_version(
+    dbos: DBOS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each application version takes its own background-jobs lock, so every live version
+    runs the jobs and fires schedules, the latest code included."""
+    names: List[str] = []
+    monkeypatch.setattr(
+        _workflow_commands,
+        "_run_background_jobs",
+        lambda stop, process, lock_name, *rest: names.append(lock_name),
+    )
+    for version in ("v1", "v2"):
+        monkeypatch.setattr(GlobalParams, "app_version", version)
+        background_jobs_thread(threading.Event(), dbos)
+    assert names == ["background_jobs.v1", "background_jobs.v2"]
+
+
+def test_background_job_lock_session_holds_no_snapshot(
+    dbos: DBOS, skip_with_sqlite: None, skip_with_sharding: None
+) -> None:
+    """A held lock's idle session holds no xmin, even past psycopg's prepare threshold, so
+    it never holds back vacuum."""
+    sys_db = dbos._sys_db
+    key = advisory_lock_key(
+        f"dbos.background_job.{sys_db.schema}.{sys_db.app_name or ''}.xmin_job"
+    )
+    with sys_db.background_job_lock("xmin_job") as renew:
+        assert renew is not None
+        for _ in range(8):
+            renew()
+        with sys_db.engine.connect() as c:
+            sessions = c.execute(
+                sa.text(
+                    "SELECT a.backend_xmin, a.state FROM pg_stat_activity a "
+                    "JOIN pg_locks l ON l.pid = a.pid WHERE l.locktype = 'advisory' "
+                    "AND l.granted AND l.classid::int8 = :hi AND l.objid::int8 = :lo "
+                    "AND l.objsubid = 1"
+                ),
+                {"hi": (key >> 32) & 0xFFFFFFFF, "lo": key & 0xFFFFFFFF},
+            ).fetchall()
+    assert [tuple(row) for row in sessions] == [(None, "idle in transaction")], sessions
+
+
+def test_concurrent_index_builds_do_not_wait_on_the_background_job_lock(
+    dbos: DBOS, skip_with_sqlite: None, skip_with_sharding: None
+) -> None:
+    """An online migration's CREATE INDEX CONCURRENTLY waits for older snapshots' transactions
+    to end; the lock's idle transaction holds none, so a build never waits out a hold.
+    """
+    # Its own engine, so the statement timeout stays off the shared pool.
+    engine = sa.create_engine(dbos._sys_db.engine.url, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as c:
+            c.execute(sa.text("SET statement_timeout = '10s'"))
+            c.execute(sa.text("DROP TABLE IF EXISTS cic_probe"))
+            c.execute(sa.text("CREATE TABLE cic_probe (id int)"))
+            with dbos._sys_db.background_job_lock("cic_job") as renew:
+                assert renew is not None
+                for _ in range(8):
+                    renew()
+                started = time.monotonic()
+                c.execute(
+                    sa.text("CREATE INDEX CONCURRENTLY cic_probe_idx ON cic_probe (id)")
+                )
+                assert time.monotonic() - started < 3
+            c.execute(sa.text("DROP TABLE cic_probe"))
+    finally:
+        engine.dispose()
+
+
+def test_custom_names(dbos: DBOS) -> None:
+    workflow_name = "workflow_name"
+    step_name = "step_name"
+    DBOS.register_queue("test-queue")
+
+    @DBOS.workflow(name=workflow_name)
+    def workflow() -> str:
+        workflow_id = DBOS.workflow_id
+        assert workflow_id is not None
+        return workflow_id
+
+    handle = DBOS.enqueue_workflow("test-queue", workflow)
+    assert handle.get_status().name == workflow_name
+    assert handle.get_result() == handle.workflow_id
+    assert DBOS.get_result(handle.workflow_id) == handle.workflow_id
+
+    @DBOS.step(name=step_name)
+    def step() -> str:
+        workflow_id = DBOS.workflow_id
+        assert workflow_id is not None
+        return workflow_id
+
+    handle = DBOS.enqueue_workflow("test-queue", step)
+    assert handle.get_status().name == f"<temp>.{step_name}"
+    assert handle.get_result() == handle.workflow_id
+
+    # Verify we can declare another workflow with the same function name
+    # but a different custom name
+
+    another_workflow = "another_workflow"
+
+    @DBOS.workflow(name=another_workflow)
+    def workflow(x: int) -> int:
+        return x
+
+    value = 5
+    handle = DBOS.start_workflow(workflow, value)  # type: ignore
+    assert handle.get_status().name == another_workflow
+    assert handle.get_result() == value  # type: ignore
+
+
+@pytest.mark.asyncio
+async def test_step_without_dbos(dbos: DBOS, config: DBOSConfig) -> None:
+    DBOS.destroy(destroy_registry=True)
+
+    @DBOS.step()
+    def step(x: int) -> int:
+        assert DBOS.workflow_id is None
+        return x
+
+    @DBOS.step()
+    async def async_step(x: int) -> int:
+        assert DBOS.workflow_id is None
+        return x
+
+    assert await asyncio.to_thread(step, 5) == 5
+    assert await async_step(5) == 5
+
+    DBOS(config=config)
+
+    assert await asyncio.to_thread(step, 5) == 5
+    assert await async_step(5) == 5
+
+    DBOS.launch()
+
+    assert await asyncio.to_thread(step, 5) == 5
+    assert await async_step(5) == 5
+
+    assert len(await DBOS.list_workflows_async()) == 0
+
+
+def test_nested_steps(dbos: DBOS) -> None:
+
+    @DBOS.step()
+    def outer_step() -> str:
+        return inner_step()
+
+    @DBOS.step()
+    def inner_step() -> str:
+        id = DBOS.workflow_id
+        assert id is not None
+        return id
+
+    @DBOS.workflow()
+    def workflow() -> str:
+        return outer_step()
+
+    id = workflow()
+    steps = DBOS.list_workflow_steps(id)
+    assert len(steps) == 1
+    assert steps[0]["function_name"] == outer_step.__qualname__
+
+
+def test_destroy(dbos: DBOS, config: DBOSConfig) -> None:
+
+    @DBOS.workflow()
+    def unblocked_workflow() -> None:
+        return
+
+    blocking_event = threading.Event()
+
+    @DBOS.workflow()
+    def blocked_workflow() -> None:
+        blocking_event.wait()
+
+    unblocked_workflow()
+
+    # Destroy DBOS with no active workflows, verify it is destroyed immediately
+    start = time.time()
+    DBOS.destroy(workflow_completion_timeout_sec=60)
+    assert time.time() - start < 5
+
+    DBOS(config=config)
+    DBOS.launch()
+
+    handle = DBOS.start_workflow(blocked_workflow)
+
+    # Destroy DBOS with an active workflow, verify it waits out the timeout
+    start = time.time()
+    DBOS.destroy(workflow_completion_timeout_sec=3)
+    assert time.time() - start > 3
+    blocking_event.set()
+    with pytest.raises(DBOSException):
+        handle.get_result()
+
+
+def test_destroy_closes_connections_checked_in_late(dbos: DBOS) -> None:
+    engine = dbos._sys_db.engine
+
+    # A connection still checked out when destroy disposes the pool, as a step's write would be.
+    straggler = engine.connect()
+    straggler.execute(sa.text("SELECT 1"))
+    straggler_raw = straggler.connection.dbapi_connection
+    DBOS.destroy()
+    straggler.close()
+
+    # A checkout made through the engine after destroy, by work still holding the system database.
+    with engine.connect() as late:
+        late.execute(sa.text("SELECT 1"))
+        late_raw = late.connection.dbapi_connection
+
+    # Both are closed on checkin, not left open in a pool until GC.
+    for raw in (straggler_raw, late_raw):
+        assert raw is not None
+        with pytest.raises(Exception):
+            raw.cursor().execute("SELECT 1")
+
+
+def test_custom_database(
+    config: DBOSConfig,
+    db_engine: sa.Engine,
+    cleanup_test_databases: None,
+    skip_with_sharding: None,
+) -> None:
+    DBOS.destroy(destroy_registry=True)
+    assert config["system_database_url"]
+    custom_database = "F8nny_dAtaB@s3@-n@m3.sqlite"
+    url = sa.make_url(config["system_database_url"])
+    url = url.set(database=custom_database)
+    config["system_database_url"] = url.render_as_string(hide_password=False)
+    # Destroy the database if it exists
+    if using_sqlite():
+        parsed_url = sa.make_url(config["system_database_url"])
+        db_path = parsed_url.database
+        assert db_path is not None
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    else:
+        with db_engine.connect() as connection:
+            connection.execution_options(isolation_level="AUTOCOMMIT")
+            connection.execute(
+                sa.text(f'DROP DATABASE IF EXISTS "{custom_database}" WITH (FORCE)')
+            )
+    DBOS(config=config)
+    DBOS.launch()
+
+    key = "key"
+    val = "val"
+    ready_evt = threading.Event()
+    send_evt = threading.Event()
+
+    @DBOS.step()
+    def first_step() -> None:
+        return
+
+    @DBOS.workflow()
+    def recv_workflow() -> Any:
+        first_step()
+        DBOS.set_event(key, val)
+        ready_evt.set()
+        send_evt.wait()
+        return DBOS.recv()
+
+    handle = DBOS.start_workflow(recv_workflow)
+    ready_evt.wait()
+    DBOS.send(handle.workflow_id, val)
+    send_evt.set()
+    assert handle.get_result() == val
+    assert len(DBOS.list_workflows()) == 1
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 4
+    assert "first_step" in steps[0]["function_name"]
+    DBOS.destroy(destroy_registry=True)
+
+    # Test custom database with client
+    client = DBOSClient(system_database_url=config["system_database_url"])
+    assert len(client.list_workflows()) == 1
+    steps = client.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 4
+    assert "first_step" in steps[0]["function_name"]
+
+
+def test_custom_schema(
+    config: DBOSConfig, drop_test_databases: None, skip_with_sqlite: None
+) -> None:
+    # Needs a dropped database: it asserts the default "dbos" schema is absent.
+    DBOS.destroy(destroy_registry=True)
+    config["dbos_system_schema"] = "F8nny_sCHem@-n@m3"
+    dbos = DBOS(config=config)
+    DBOS.launch()
+    with dbos._sys_db.engine.connect() as connection:
+        # Check that the 'dbos' schema does not exist
+        result = connection.execute(
+            sa.text(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'dbos'"
+            )
+        )
+        rows = result.fetchall()
+        assert len(rows) == 0
+
+    key = "key"
+    val = "val"
+    ready_evt = threading.Event()
+    send_evt = threading.Event()
+
+    @DBOS.step()
+    def first_step() -> None:
+        return
+
+    @DBOS.workflow()
+    def recv_workflow() -> Any:
+        first_step()
+        DBOS.set_event(key, val)
+        ready_evt.set()
+        send_evt.wait()
+        return DBOS.recv()
+
+    handle = DBOS.start_workflow(recv_workflow)
+    ready_evt.wait()
+    DBOS.send(handle.workflow_id, val)
+    send_evt.set()
+    assert handle.get_result() == val
+    assert len(DBOS.list_workflows()) == 1
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 4
+    assert "first_step" in steps[0]["function_name"]
+    DBOS.destroy(destroy_registry=True)
+
+    # Test custom schema with client
+    client = DBOSClient(
+        system_database_url=config["system_database_url"],
+        dbos_system_schema=config["dbos_system_schema"],
+    )
+    assert len(client.list_workflows()) == 1
+    steps = client.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 4
+    assert "first_step" in steps[0]["function_name"]
+    # A live client would outlive the teardown drop and reconnect to the next test's database
+    client.destroy()
+
+
+def test_custom_engine(
+    config: DBOSConfig,
+    drop_test_databases: None,
+    db_engine: sa.Engine,
+    skip_with_sqlite: None,
+    skip_with_sharding: None,
+) -> None:
+    # Needs a dropped database: it asserts launch fails before the database exists.
+    DBOS.destroy(destroy_registry=True)
+    assert config["system_database_url"]
+    system_database_url = config["system_database_url"]
+
+    # Create a custom engine
+    engine = sa.create_engine(system_database_url)
+    config["system_database_engine"] = engine
+
+    # Launch DBOS with the engine. It should fail because the database does not exist.
+    dbos = DBOS(config=config)
+    with pytest.raises(OperationalError):
+        DBOS.launch()
+    DBOS.destroy(destroy_registry=True)
+
+    # Create the database
+    with db_engine.connect() as c:
+        c.execution_options(isolation_level="AUTOCOMMIT")
+        sysdb_name = sa.make_url(config["system_database_url"]).database
+        c.execute(sa.text(f"CREATE DATABASE {sysdb_name}"))
+
+    # Launch DBOS again using the custom pool. It should succeed despite the bogus URL.
+    config["system_database_url"] = "postgresql://bogus:url@not:42/fake"
+    dbos = DBOS(config=config)
+    DBOS.launch()
+
+    key = "key"
+    val = "val"
+    ready_evt = threading.Event()
+    send_evt = threading.Event()
+
+    @DBOS.workflow()
+    def recv_workflow() -> Any:
+        DBOS.set_event(key, val)
+        ready_evt.set()
+        send_evt.wait()
+        return DBOS.recv()
+
+    # DBOS derives a schema-aware engine sharing the custom engine's pool.
+    assert dbos._sys_db.engine.pool is engine.pool
+    handle = DBOS.start_workflow(recv_workflow)
+    ready_evt.wait()
+    DBOS.send(handle.workflow_id, val)
+    send_evt.set()
+    assert handle.get_result() == val
+    assert len(DBOS.list_workflows()) == 1
+    steps = DBOS.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 3
+    assert "setEvent" in steps[0]["function_name"]
+    DBOS.destroy(destroy_registry=True)
+
+    # Also verify a custom engine works with no URL
+    config["system_database_url"] = None
+    dbos = DBOS(config=config)
+    DBOS.launch()
+    DBOS.destroy()
+
+    # Test custom engine with client and a bogus URL
+    client = DBOSClient(
+        system_database_url="postgresql://bogus:url@not:42/fake",
+        system_database_engine=config["system_database_engine"],
+    )
+    assert len(client.list_workflows()) == 1
+    steps = client.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 3
+    assert "setEvent" in steps[0]["function_name"]
+    client.destroy()
+
+    # Test custom engine with client and no URL
+    client = DBOSClient(
+        system_database_engine=config["system_database_engine"],
+    )
+    assert len(client.list_workflows()) == 1
+    steps = client.list_workflow_steps(handle.workflow_id)
+    assert len(steps) == 3
+    assert "setEvent" in steps[0]["function_name"]
+    # A live client would outlive the teardown drop and reconnect to the next test's database
+    client.destroy()
+    # DBOS never disposes an engine it was handed, so this test owns it
+    engine.dispose()
+
+
+def test_get_events(dbos: DBOS) -> None:
+
+    @DBOS.workflow()
+    def events_workflow() -> str:
+        # Set multiple events
+        DBOS.set_event("event1", "badvalue")
+        DBOS.set_event("event1", "value1")
+        DBOS.set_event("event2", {"nested": "data", "count": 42})
+        DBOS.set_event("event3", [1, 2, 3, 4, 5])
+        return "completed"
+
+    # Execute the workflow
+    handle = DBOS.start_workflow(events_workflow)
+    result = handle.get_result()
+    assert result == "completed"
+
+    # Get events, verify they are present with correct values
+    def get_events() -> None:
+        events = DBOS.get_all_events(handle.workflow_id)
+
+        assert len(events) == 3
+        assert events["event1"] == "value1"
+        assert events["event2"] == {"nested": "data", "count": 42}
+        assert events["event3"] == [1, 2, 3, 4, 5]
+
+    # Verify it works
+    get_events()
+
+    # Run it as a workflow, verify it still works
+    get_events_workflow = DBOS.workflow()(get_events)
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        get_events_workflow()
+    steps = DBOS.list_workflow_steps(wfid)
+    assert len(steps) == 1
+    assert steps[0]["function_name"] == "DBOS.get_events"
+
+    # Test with a workflow that has no events
+    @DBOS.workflow()
+    def no_events_workflow() -> str:
+        return "no events"
+
+    handle2 = DBOS.start_workflow(no_events_workflow)
+    handle2.get_result()
+
+    # Should return empty dict for workflow with no events
+    events2 = DBOS.get_all_events(handle2.workflow_id)
+    assert events2 == {}
+
+
+def test_run_step(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def test_workflow(var: str, var2: str) -> str:
+        res1 = DBOS.run_step(None, test_step, var, 1)
+        res2 = DBOS.run_step({"name": "test_step"}, test_step, var2, 2)
+        res3 = DBOS.run_step({"name": "concat"}, lambda: res1 + res2)
+        return res1 + res2 + res3
+
+    def test_step(var: str, sn: int) -> str:
+        assert DBOS.step_id == sn
+        step_status = DBOS.step_status
+        assert step_status is not None
+        assert step_status.step_id == sn
+        assert step_status.current_attempt is None
+        assert step_status.max_attempts is None
+        return var
+
+    def test_step_nwf(var: str) -> str:
+        assert DBOS.step_status is None
+        return var
+
+    assert DBOS.run_step(None, test_step_nwf, "ha") == "ha"
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert test_workflow("bob", "bob") == "bobbobbobbob"
+    steps = DBOS.list_workflow_steps(wfid)
+    assert len(steps) == 3
+    assert steps[0]["function_name"] == "test_run_step.<locals>.test_step"
+    assert steps[1]["function_name"] == "test_step"
+    assert steps[2]["function_name"] == "concat"
+
+    assert (
+        DBOS.start_workflow(test_workflow, "bob", "bob").get_result() == "bobbobbobbob"
+    )
+
+    @DBOS.workflow()
+    def test_workflow_sca(var: str, var2: str) -> str:
+        res1: str = DBOS.run_step(None, test_step_async, var, 1)
+        res2: str = DBOS.run_step({"name": "test_step"}, test_step_async, var2, 2)
+        return res1 + res2
+
+    async def test_step_async(var: str, sn: int) -> str:
+        assert DBOS.step_id == sn
+        step_status = DBOS.step_status
+        assert step_status is not None
+        assert step_status.step_id == sn
+        assert step_status.current_attempt is None
+        assert step_status.max_attempts is None
+        return var
+
+    async def test_step_async_nwf(var: str) -> str:
+        assert DBOS.step_status == None
+        return var
+
+    assert DBOS.run_step(None, test_step_async_nwf, "ha") == "ha"
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert test_workflow_sca("joe", "joe") == "joejoe"
+    steps = DBOS.list_workflow_steps(wfid)
+    assert len(steps) == 2
+    assert steps[0]["function_name"] == "test_run_step.<locals>.test_step_async"
+    assert steps[1]["function_name"] == "test_step"
+
+    assert DBOS.start_workflow(test_workflow_sca, "joe", "joe").get_result() == "joejoe"
+
+    @DBOS.workflow()
+    async def test_workflow_acs(var: str, var2: str) -> str:
+        res1 = await DBOS.run_step_async(None, test_step, var, 1)
+        res2 = await DBOS.run_step_async({"name": "test_step"}, test_step, var2, 2)
+        return res1 + res2
+
+    def test_step(var: str, sn: int) -> str:
+        assert DBOS.step_id == sn
+        step_status = DBOS.step_status
+        assert step_status is not None
+        assert step_status.step_id == sn
+        assert step_status.current_attempt is None
+        assert step_status.max_attempts is None
+        return var
+
+    assert DBOS.start_workflow(test_workflow_acs, "bob", "bob").get_result() == "bobbob"  # type: ignore
+
+    @DBOS.workflow()
+    def test_errors_wf() -> None:
+        n_thrown_errors = 0
+
+        def test_step_error() -> None:
+            nonlocal n_thrown_errors
+            n_thrown_errors += 1
+            raise Exception()
+
+        async def test_step_error_async() -> None:
+            nonlocal n_thrown_errors
+            n_thrown_errors += 1
+            raise Exception()
+
+        with pytest.raises(Exception) as exc_info:
+            DBOS.run_step(
+                {
+                    "retries_allowed": True,
+                    "max_attempts": 2,
+                    "interval_seconds": 0.1,
+                    "backoff_rate": 1,
+                },
+                test_step_error,
+            )
+        assert n_thrown_errors == 2
+        with pytest.raises(Exception) as exc_info:
+            DBOS.run_step(
+                {
+                    "retries_allowed": True,
+                    "max_attempts": 2,
+                    "interval_seconds": 0.1,
+                    "backoff_rate": 1,
+                },
+                test_step_error_async,
+            )
+        assert n_thrown_errors == 4
+        with pytest.raises(Exception) as exc_info:
+            DBOS.run_step(
+                {
+                    "retries_allowed": False,
+                    "max_attempts": 2,
+                    "interval_seconds": 0.1,
+                    "backoff_rate": 1,
+                },
+                test_step_error_async,
+            )
+        assert n_thrown_errors == 5
+
+    test_errors_wf()
+
+
+@pytest.mark.asyncio
+async def test_run_step_async(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    async def test_workflow_acs(var: str, var2: str) -> str:
+        res1 = await DBOS.run_step_async(None, test_step, var, 1)
+        res2 = await DBOS.run_step_async({"name": "test_step"}, test_step, var2, 2)
+        return res1 + res2
+
+    def test_step(var: str, sn: int) -> str:
+        assert DBOS.step_id == sn
+        step_status = DBOS.step_status
+        assert step_status is not None
+        assert step_status.step_id == sn
+        assert step_status.current_attempt is None
+        assert step_status.max_attempts is None
+        return var
+
+    def test_step_nwf(var: str) -> str:
+        assert DBOS.step_status is None
+        return var
+
+    assert (await DBOS.run_step_async(None, test_step_nwf, "ha")) == "ha"
+    with pytest.raises(RuntimeError) as exc_info:
+        DBOS.run_step(None, test_step_nwf, "ha")
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert (await test_workflow_acs("bob", "bob")) == "bobbob"
+    steps = await DBOS.list_workflow_steps_async(wfid)
+    assert len(steps) == 2
+    assert steps[0]["function_name"] == "test_run_step_async.<locals>.test_step"
+    assert steps[1]["function_name"] == "test_step"
+
+    assert (
+        await (
+            await DBOS.start_workflow_async(test_workflow_acs, "bob", "bob")
+        ).get_result()
+        == "bobbob"
+    )
+
+    @DBOS.workflow()
+    async def test_workflow(var: str, var2: str) -> str:
+        res1: str = await DBOS.run_step_async(None, test_step_async, var, 1)
+        res2: str = await DBOS.run_step_async(
+            {"name": "test_step"}, test_step_async, var2, 2
+        )
+        return res1 + res2
+
+    async def test_step_async(var: str, sn: int) -> str:
+        assert DBOS.step_id == sn
+        step_status = DBOS.step_status
+        assert step_status is not None
+        assert step_status.step_id == sn
+        assert step_status.current_attempt is None
+        assert step_status.max_attempts is None
+        return var
+
+    async def test_step_async_nwf(var: str) -> str:
+        assert DBOS.step_status == None
+        return var
+
+    assert (await DBOS.run_step_async(None, test_step_async_nwf, "ha")) == "ha"
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert (await test_workflow("joe", "joe")) == "joejoe"
+    steps = await DBOS.list_workflow_steps_async(wfid)
+    assert len(steps) == 2
+    assert steps[0]["function_name"] == "test_run_step_async.<locals>.test_step_async"
+    assert steps[1]["function_name"] == "test_step"
+
+    assert (
+        await (
+            await DBOS.start_workflow_async(test_workflow, "joe", "joe")
+        ).get_result()
+        == "joejoe"
+    )
+
+    @DBOS.workflow()
+    async def test_errors_wf_async() -> None:
+        n_thrown_errors = 0
+
+        async def test_step_error() -> None:
+            nonlocal n_thrown_errors
+            n_thrown_errors += 1
+            raise Exception()
+
+        async def test_step_error_async() -> None:
+            nonlocal n_thrown_errors
+            n_thrown_errors += 1
+            raise Exception()
+
+        with pytest.raises(Exception) as exc_info:
+            await DBOS.run_step_async(
+                {
+                    "retries_allowed": True,
+                    "max_attempts": 2,
+                    "interval_seconds": 0.1,
+                    "backoff_rate": 1,
+                },
+                test_step_error,
+            )
+        assert n_thrown_errors == 2
+        with pytest.raises(Exception) as exc_info:
+            await DBOS.run_step_async(
+                {
+                    "retries_allowed": True,
+                    "max_attempts": 2,
+                    "interval_seconds": 0.1,
+                    "backoff_rate": 1,
+                },
+                test_step_error_async,
+            )
+        assert n_thrown_errors == 4
+        with pytest.raises(Exception) as exc_info:
+            await DBOS.run_step_async(
+                {
+                    "retries_allowed": False,
+                    "max_attempts": 2,
+                    "interval_seconds": 0.1,
+                    "backoff_rate": 1,
+                },
+                test_step_error_async,
+            )
+        assert n_thrown_errors == 5
+
+    await test_errors_wf_async()
+
+
+@pytest.mark.asyncio
+async def test_reserve_step_event_stream(dbos: DBOS) -> None:
+    # Models pydantic-ai's DBOS event dispatch (pydantic/pydantic-ai#10300): emit reserves a handler step that a consumer task runs later.
+    handler_options: StepOptions = {
+        "name": "event_stream_handler",
+        "retries_allowed": True,
+        "max_attempts": 3,
+        "interval_seconds": 0.01,
+    }
+    attempts: dict[str, int] = {}
+    store_reads = 0
+
+    @DBOS.step(name="get_item")
+    async def get_item(item: str) -> str:
+        nonlocal store_reads
+        store_reads += 1
+        # Live-only latency, so replay timing differs from the live run.
+        await asyncio.sleep(0.02)
+        return f"item-{item}"
+
+    async def handle_event(event: str) -> str:
+        attempts[event] = attempts.get(event, 0) + 1
+        await asyncio.sleep(0.01)
+        status = DBOS.step_status
+        assert status is not None
+        # Fails the first attempt of every live execution, so forks retry it too.
+        if event == "flaky" and status.current_attempt == 0:
+            raise ConnectionError("transient handler failure")
+        if event == "bad":
+            raise ValueError("handler rejected event")
+        return f"handled-{event}"
+
+    @DBOS.workflow()
+    async def agent_run() -> List[str]:
+        queue: asyncio.Queue[Optional[Tuple[str, bool]]] = asyncio.Queue()
+        # One FIFO of reservations per event, since the same event can be emitted twice.
+        reservations: dict[str, deque[StepReservation]] = {}
+        handled: List[str] = []
+
+        def emit(event: str, deliver: bool = True) -> None:
+            reservations.setdefault(event, deque()).append(DBOS.reserve_step())
+            queue.put_nowait((event, deliver))
+
+        async def consume() -> None:
+            while (item := await queue.get()) is not None:
+                event, deliver = item
+                reservation = reservations[event].popleft()
+                if not deliver:
+                    continue  # The handler never starts, leaving a gap at its step.
+                try:
+                    handled.append(
+                        await reservation.run_async(
+                            handler_options, handle_event, event
+                        )
+                    )
+                except Exception as e:
+                    handled.append(type(e).__name__)
+
+        consumer = asyncio.create_task(consume())
+        # A plan tool: emit a burst of events, then make durable store reads while the handlers run.
+        for event in ("plan", "plan", "flaky", "bad", "dropped"):
+            emit(event, deliver=event != "dropped")
+        reads = [await get_item("a"), await get_item("b")]
+        emit("progress")
+        reads.append(await get_item("c"))
+        queue.put_nowait(None)
+        await consumer
+        return reads + handled
+
+    expected = [
+        "item-a",
+        "item-b",
+        "item-c",
+        "handled-plan",
+        "handled-plan",
+        "handled-flaky",
+        "DBOSMaxStepRetriesExceeded",
+        "handled-progress",
+    ]
+    expected_journal = [
+        (1, "event_stream_handler"),
+        (2, "event_stream_handler"),
+        (3, "event_stream_handler"),
+        (4, "event_stream_handler"),
+        (6, "get_item"),
+        (7, "get_item"),
+        (8, "event_stream_handler"),
+        (9, "get_item"),
+    ]
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert await agent_run() == expected
+    assert attempts == {"plan": 2, "flaky": 2, "bad": 3, "progress": 1}
+    steps = await DBOS.list_workflow_steps_async(wfid)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == expected_journal
+
+    # Live attempts of the handler at each step ID, and the step IDs of the store reads.
+    handler_attempts = {
+        1: ("plan", 1),
+        2: ("plan", 1),
+        3: ("flaky", 2),
+        4: ("bad", 3),
+        8: ("progress", 1),
+    }
+    read_ids = [6, 7, 9]
+
+    def after_rerun(before: dict[str, int], rerun: List[int]) -> dict[str, int]:
+        expected_attempts = dict(before)
+        for fid in rerun:
+            if fid in handler_attempts:
+                event, n = handler_attempts[fid]
+                expected_attempts[event] += n
+        return expected_attempts
+
+    # Recovery replays every step, at its reserved ID, without running it again.
+    live_attempts, live_reads = dict(attempts), store_reads
+    recovered = await asyncio.to_thread(
+        lambda: reexecute_workflow_by_id(dbos, wfid).get_result()
+    )
+    assert recovered == expected
+    assert attempts == live_attempts and store_reads == live_reads
+
+    # A crash can leave reserved handlers unrecorded below recorded steps; recovery reruns only those.
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.delete(SystemSchema.operation_outputs).where(
+                SystemSchema.operation_outputs.c.workflow_uuid == wfid,
+                SystemSchema.operation_outputs.c.function_id.in_([2, 4]),
+            )
+        )
+    before = dict(attempts)
+    recovered = await asyncio.to_thread(
+        lambda: reexecute_workflow_by_id(dbos, wfid).get_result()
+    )
+    assert recovered == expected
+    assert attempts == after_rerun(before, [2, 4]) and store_reads == live_reads
+    steps = await DBOS.list_workflow_steps_async(wfid)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == expected_journal
+
+    # Forking at every step replays a prefix and runs the rest live, under different timing.
+    for start_step in [s["function_id"] for s in steps] + [1000]:
+        before, reads_before = dict(attempts), store_reads
+        handle = await DBOS.fork_workflow_async(wfid, start_step)
+        assert await handle.get_result() == expected
+        rerun = [fid for fid, _ in expected_journal if fid >= start_step]
+        assert attempts == after_rerun(before, rerun)
+        assert store_reads == reads_before + len([f for f in read_ids if f in rerun])
+        forked = await DBOS.list_workflow_steps_async(handle.workflow_id)
+        assert [(s["function_id"], s["function_name"]) for s in forked] == (
+            expected_journal
+        )
+
+
+@pytest.mark.asyncio
+async def test_reserve_step_misuse(dbos: DBOS) -> None:
+    with pytest.raises(DBOSException, match="outside any step or transaction"):
+        DBOS.reserve_step()
+
+    leaked: List[StepReservation] = []
+
+    def fail() -> None:
+        raise ValueError("step failed")
+
+    @DBOS.workflow()
+    async def reserving_workflow() -> None:
+        # A thread that does not inherit the workflow context cannot reserve.
+        with pytest.raises(DBOSException, match="outside any step or transaction"):
+            await asyncio.get_running_loop().run_in_executor(None, DBOS.reserve_step)
+        reservation = DBOS.reserve_step()
+        # Sync run inside an event loop is rejected without using up the reservation.
+        with pytest.raises(RuntimeError, match="run_async"):
+            reservation.run(None, lambda: None)
+        step_id = await reservation.run_async(
+            {"name": "sync_step"}, lambda: DBOS.step_id
+        )
+        assert step_id == reservation.step_id == 1
+        with pytest.raises(DBOSException, match="only be run once"):
+            await reservation.run_async(None, lambda: None)
+        failing = DBOS.reserve_step()
+        with pytest.raises(ValueError, match="step failed"):
+            await failing.run_async({"name": "fail"}, fail)
+        with pytest.raises(DBOSException, match="only be run once"):
+            await failing.run_async(None, lambda: None)
+        leaked.append(DBOS.reserve_step())
+
+    @DBOS.step()
+    async def step_running_reservation(reservation: StepReservation) -> None:
+        await reservation.run_async(None, lambda: None)
+
+    @DBOS.workflow()
+    async def other_workflow() -> None:
+        with pytest.raises(DBOSException, match="must be run from that workflow"):
+            await leaked[0].run_async(None, lambda: None)
+
+    @DBOS.workflow()
+    async def step_workflow() -> None:
+        with pytest.raises(DBOSException, match="must be run from that workflow"):
+            await step_running_reservation(DBOS.reserve_step())
+
+    @DBOS.step()
+    async def reserving_step() -> None:
+        DBOS.reserve_step()
+
+    @DBOS.workflow()
+    async def nested_workflow() -> None:
+        with pytest.raises(DBOSException, match="outside any step or transaction"):
+            await reserving_step()
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        await reserving_workflow()
+    steps = await DBOS.list_workflow_steps_async(wfid)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == [
+        (1, "sync_step"),
+        (2, "fail"),
+    ]
+    await other_workflow()
+    await step_workflow()
+    await nested_workflow()
+    with pytest.raises(DBOSException, match="must be run from that workflow"):
+        await leaked[0].run_async(None, lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_reserve_step_lifecycle(dbos: DBOS) -> None:
+    # A consumer task that outlives its workflow cannot run the workflow's reservation.
+    gate = asyncio.Event()
+    orphans: List["asyncio.Task[None]"] = []
+
+    async def run_late(reservation: StepReservation) -> None:
+        await gate.wait()
+        await reservation.run_async(None, lambda: None)
+
+    @DBOS.workflow()
+    async def orphaning_workflow() -> None:
+        orphans.append(asyncio.create_task(run_late(DBOS.reserve_step())))
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        await orphaning_workflow()
+    gate.set()
+    with pytest.raises(DBOSException, match="must be run from that workflow"):
+        await orphans[0]
+    assert await DBOS.list_workflow_steps_async(wfid) == []
+
+    # Timeout and preemption options apply to a reserved step.
+    async def current_step() -> Optional[int]:
+        return DBOS.step_id
+
+    async def slow() -> None:
+        await asyncio.sleep(60)
+
+    @DBOS.workflow()
+    async def options_workflow() -> List[Any]:
+        timed = DBOS.reserve_step()
+        preemptible = DBOS.reserve_step()
+        out: List[Any] = [
+            await preemptible.run_async(
+                {"name": "preemptible", "preemptible": True}, current_step
+            )
+        ]
+        with pytest.raises(DBOSStepTimeoutError):
+            await timed.run_async({"name": "timed", "timeout_seconds": 0.2}, slow)
+        return out
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert await options_workflow() == [2]
+    steps = await DBOS.list_workflow_steps_async(wfid)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == [
+        (1, "timed"),
+        (2, "preemptible"),
+    ]
+
+    # Cancelling mid-step leaves the reserved step unrecorded; resuming runs it again at the same ID.
+    started, release = asyncio.Event(), asyncio.Event()
+    blocked_calls = 0
+
+    async def blocked() -> Optional[int]:
+        nonlocal blocked_calls
+        blocked_calls += 1
+        started.set()
+        await release.wait()
+        return DBOS.step_id
+
+    @DBOS.workflow()
+    async def cancelled_workflow() -> Optional[int]:
+        DBOS.reserve_step()  # Never run, so the blocked step is not step 1.
+        return await DBOS.reserve_step().run_async({"name": "blocked"}, blocked)
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        handle = await DBOS.start_workflow_async(cancelled_workflow)
+    await asyncio.wait_for(started.wait(), 10)
+    await DBOS.cancel_workflow_async(wfid)
+    release.set()
+    with pytest.raises(DBOSAwaitedWorkflowCancelledError):
+        await handle.get_result()
+    assert await DBOS.list_workflow_steps_async(wfid) == []
+    # The resumed run uses these test-loop events from another loop; that is safe only because both are already set.
+    resumed = await DBOS.resume_workflow_async(wfid)
+    assert await resumed.get_result() == 2
+    assert blocked_calls == 2
+    steps = await DBOS.list_workflow_steps_async(wfid)
+    assert [(s["function_id"], s["function_name"]) for s in steps] == [(2, "blocked")]
+
+
+def test_reserve_step_sync(dbos: DBOS) -> None:
+    calls = 0
+
+    def numbered(name: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"{name}-{DBOS.step_id}"
+
+    async def numbered_async(name: str) -> str:
+        return numbered(name)
+
+    @DBOS.workflow()
+    def sync_workflow() -> str:
+        first = DBOS.reserve_step()
+        second = DBOS.reserve_step()
+        b = second.run({"name": "second"}, numbered_async, "b")
+        a = first.run({"name": "first"}, numbered, "a")
+        return a + b
+
+    wfid = str(uuid.uuid4())
+    with SetWorkflowID(wfid):
+        assert sync_workflow() == "a-1b-2"
+    assert [
+        (s["function_id"], s["function_name"]) for s in DBOS.list_workflow_steps(wfid)
+    ] == [(1, "first"), (2, "second")]
+
+    assert reexecute_workflow_by_id(dbos, wfid).get_result() == "a-1b-2"
+    assert DBOS.fork_workflow(wfid, 1000).get_result() == "a-1b-2"
+    assert calls == 2
+
+
+def test_wait_first(dbos: DBOS, client: DBOSClient) -> None:
+    @DBOS.workflow()
+    def fast_workflow() -> str:
+        return "fast"
+
+    @DBOS.workflow()
+    def slow_workflow() -> str:
+        time.sleep(2)
+        return "slow"
+
+    handle_fast = DBOS.start_workflow(fast_workflow)
+    handle_slow = DBOS.start_workflow(slow_workflow)
+
+    # Test DBOS.wait_first
+    result_handle = DBOS.wait_first([handle_fast, handle_slow])
+    assert result_handle.workflow_id == handle_fast.workflow_id
+    assert result_handle.get_result() == "fast"
+
+    # Test client.wait_first with retrieved handles
+    client_fast: WorkflowHandle[str] = client.retrieve_workflow(handle_fast.workflow_id)
+    client_slow: WorkflowHandle[str] = client.retrieve_workflow(handle_slow.workflow_id)
+    client_result = client.wait_first([client_fast, client_slow])
+    # fast_workflow already completed, so it should be returned
+    assert client_result.workflow_id == handle_fast.workflow_id
+    assert client_result.get_result() == "fast"
+
+    # Wait for slow workflow to finish so it doesn't hang
+    handle_slow.get_result()
+
+
+def test_wait_first_empty(dbos: DBOS) -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        DBOS.wait_first([])
+
+
+@pytest.mark.asyncio
+async def test_wait_first_async(dbos: DBOS, client: DBOSClient) -> None:
+    @DBOS.workflow()
+    async def fast_async_wf() -> str:
+        return "fast"
+
+    @DBOS.workflow()
+    async def slow_async_wf() -> str:
+        await asyncio.sleep(2)
+        return "slow"
+
+    handle_fast = await DBOS.start_workflow_async(fast_async_wf)
+    handle_slow = await DBOS.start_workflow_async(slow_async_wf)
+
+    # Test DBOS.wait_first_async
+    result_handle = await DBOS.wait_first_async([handle_fast, handle_slow])
+    assert result_handle.workflow_id == handle_fast.workflow_id
+    assert await result_handle.get_result() == "fast"
+
+    # Test client.wait_first_async with retrieved handles
+    client_fast: WorkflowHandleAsync[str] = await client.retrieve_workflow_async(
+        handle_fast.workflow_id
+    )
+    client_slow: WorkflowHandleAsync[str] = await client.retrieve_workflow_async(
+        handle_slow.workflow_id
+    )
+    client_result = await client.wait_first_async([client_fast, client_slow])
+    assert client_result.workflow_id == handle_fast.workflow_id
+    assert await client_result.get_result() == "fast"
+
+    # Wait for slow workflow to finish so it doesn't hang
+    await handle_slow.get_result()
+
+    # Test wait_first_async called from within a workflow and verify checkpointing
+    @DBOS.workflow()
+    async def caller_wf() -> str:
+        h_fast = await DBOS.start_workflow_async(fast_async_wf)
+        h_slow = await DBOS.start_workflow_async(slow_async_wf)
+        winner = await DBOS.wait_first_async([h_fast, h_slow])
+        result: str = await winner.get_result()
+        await h_slow.get_result()
+        return result
+
+    caller_wfid = str(uuid.uuid4())
+    with SetWorkflowID(caller_wfid):
+        assert await caller_wf() == "fast"
+
+    steps = await DBOS.list_workflow_steps_async(caller_wfid)
+    assert len(steps) == 5
+    # Step 1: start fast workflow
+    assert steps[0]["function_name"] == fast_async_wf.__qualname__
+    # Step 2: start slow workflow
+    assert steps[1]["function_name"] == slow_async_wf.__qualname__
+    # Step 3: wait_first returns the fast workflow's ID
+    assert steps[2]["function_name"] == "DBOS.waitFirst"
+    assert steps[2]["output"] == steps[0]["child_workflow_id"]
+    # Step 4: get_result on the fast workflow
+    assert steps[3]["function_name"] == "DBOS.getResult"
+    # Step 5: get_result on the slow workflow
+    assert steps[4]["function_name"] == "DBOS.getResult"
+
+
+def test_get_event_timeout(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def workflow() -> Any:
+        workflow_id = DBOS.workflow_id
+        assert workflow_id
+        return DBOS.get_event(workflow_id, "key", timeout_seconds=0)
+
+    handle = DBOS.start_workflow(workflow)
+    assert handle.get_result() is None
+    forked_handle = DBOS.fork_workflow(handle.workflow_id, 5)
+    assert forked_handle.get_result() is None
+
+
+def test_recv_timeout(dbos: DBOS) -> None:
+    @DBOS.workflow()
+    def workflow() -> Any:
+        return DBOS.recv(timeout_seconds=0)
+
+    handle = DBOS.start_workflow(workflow)
+    assert handle.get_result() is None
+    forked_handle = DBOS.fork_workflow(handle.workflow_id, 5)
+    assert forked_handle.get_result() is None
+
+
+def test_notification_fallback_polling(dbos: DBOS) -> None:
+    """Test that recv and get_event still work when the notification listener thread is dead."""
+    sys_db = dbos._sys_db
+
+    # Set a fast poll interval so the test doesn't take 60s
+    sys_db._notification_fallback_polling_interval = 0.1
+
+    # Kill the notification listener thread
+    sys_db._run_background_processes = False
+    sys_db._cleanup_connections()
+
+    # Test recv fallback
+    @DBOS.workflow()
+    def recv_workflow() -> str:
+        msg = DBOS.recv(timeout_seconds=10)
+        return str(msg)
+
+    dest_uuid = str(uuid.uuid4())
+    with SetWorkflowID(dest_uuid):
+        handle = DBOS.start_workflow(recv_workflow)
+
+    @DBOS.workflow()
+    def send_workflow(dest: str) -> None:
+        DBOS.send(dest, "hello_fallback")
+
+    send_workflow(dest_uuid)
+    begin_time = time.time()
+    result = handle.get_result()
+    duration = time.time() - begin_time
+    assert result == "hello_fallback"
+    assert duration < 5.0
+
+    # Test get_event fallback
+    @DBOS.workflow()
+    def set_event_workflow() -> None:
+        DBOS.set_event("fallback_key", "fallback_value")
+
+    @DBOS.workflow()
+    def get_event_workflow(target: str) -> Optional[str]:
+        val = DBOS.get_event(target, "fallback_key", timeout_seconds=10)
+        return str(val) if val is not None else None
+
+    event_wf_uuid = str(uuid.uuid4())
+    with SetWorkflowID(event_wf_uuid):
+        set_event_workflow()
+
+    begin_time = time.time()
+    event_result = get_event_workflow(event_wf_uuid)
+    duration = time.time() - begin_time
+    assert event_result == "fallback_value"
+    assert duration < 5.0
+
+
+def test_recv_wakeup_trigger_is_kept(
+    dbos: DBOS, skip_with_sqlite: None, skip_with_sharding: None
+) -> None:
+    """The notifications trigger must wake a blocked recv: assert it exists and that, with the fallback recheck forced far out, a send still delivers promptly via the trigger's NOTIFY."""
+    sys_db = dbos._sys_db
+
+    # The trigger on the notifications table must exist.
+    with sys_db.engine.begin() as c:
+        trigger = c.execute(
+            sa.text(
+                "SELECT 1 FROM pg_trigger t "
+                "JOIN pg_class cl ON t.tgrelid = cl.oid "
+                "JOIN pg_namespace n ON cl.relnamespace = n.oid "
+                "WHERE n.nspname = :schema AND cl.relname = 'notifications' "
+                "AND t.tgname = 'dbos_notifications_trigger'"
+            ),
+            {"schema": sys_db.schema},
+        ).fetchone()
+    assert trigger is not None, "dbos_notifications_trigger must be kept"
+
+    dest_uuid = str(uuid.uuid4())
+
+    @DBOS.workflow()
+    def recv_workflow() -> str:
+        return str(DBOS.recv(timeout_seconds=30))
+
+    # Force the fallback recheck far out so a timely wakeup must come from the trigger's NOTIFY.
+    original = sys_db._notification_fallback_polling_interval
+    sys_db._notification_fallback_polling_interval = 30.0
+    try:
+        with SetWorkflowID(dest_uuid):
+            handle = DBOS.start_workflow(recv_workflow)
+
+        # Wait until the recv is blocked (listener registered) so delivery exercises the wakeup path.
+        payload = f"{dest_uuid}::{_dbos_null_topic}"
+
+        def recv_blocked() -> None:
+            assert sys_db.notifications_map.get(payload) is not None
+
+        retry_until_success(recv_blocked, interval=0.05, max_attempts=200)
+
+        begin_time = time.time()
+        DBOS.send(dest_uuid, "hello_trigger")
+        result = handle.get_result()
+        duration = time.time() - begin_time
+    finally:
+        sys_db._notification_fallback_polling_interval = original
+
+    assert result == "hello_trigger"
+    # Well under the 30s fallback: delivery came from the trigger's NOTIFY, not the recheck.
+    assert duration < 10.0, f"recv took {duration:.3f}s, trigger did not wake it"
+
+
+def test_get_event_delivered_by_notifier_without_trigger(
+    dbos: DBOS, skip_with_sqlite: None
+) -> None:
+    """get_event is woken by the app-side notifier: assert no workflow_events trigger exists and that, with the fallback recheck forced far out, a set_event still wakes a blocked get_event promptly."""
+    sys_db = dbos._sys_db
+
+    # No trigger may exist on the workflow_events table.
+    with sys_db.engine.begin() as c:
+        trigger = c.execute(
+            sa.text(
+                "SELECT 1 FROM pg_trigger t "
+                "JOIN pg_class cl ON t.tgrelid = cl.oid "
+                "JOIN pg_namespace n ON cl.relnamespace = n.oid "
+                "WHERE n.nspname = :schema AND cl.relname = 'workflow_events' "
+                "AND t.tgname = 'dbos_workflow_events_trigger'"
+            ),
+            {"schema": sys_db.schema},
+        ).fetchone()
+    assert trigger is None, "dbos_workflow_events_trigger should have been dropped"
+
+    target_uuid = str(uuid.uuid4())
+    key = "notifier_key"
+
+    @DBOS.workflow()
+    def setter_workflow() -> None:
+        DBOS.sleep(2.0)
+        DBOS.set_event(key, "notifier_value")
+
+    original = sys_db._notification_fallback_polling_interval
+    sys_db._notification_fallback_polling_interval = 30.0
+    try:
+        with SetWorkflowID(target_uuid):
+            handle = DBOS.start_workflow(setter_workflow)
+
+        # get_event blocks (the value is set ~2s in); prompt delivery must come from the notifier.
+        begin_time = time.time()
+        value = DBOS.get_event(target_uuid, key, timeout_seconds=30)
+        duration = time.time() - begin_time
+        handle.get_result()
+    finally:
+        sys_db._notification_fallback_polling_interval = original
+
+    assert value == "notifier_value"
+    # Well under the 30s fallback: delivery came from the notifier, not the recheck.
+    assert duration < 10.0, f"get_event took {duration:.3f}s, notifier did not wake it"
+
+
+@pytest.mark.asyncio
+async def test_workflow_wrapped_by_custom_decorator(
+    dbos: DBOS, client: DBOSClient
+) -> None:
+    F = TypeVar("F", bound=Callable[..., Any])
+
+    before_count = 0
+    after_count = 0
+    error_count = 0
+
+    def task_meta(description: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
+            @wraps(func)
+            async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                nonlocal before_count, after_count, error_count
+                before_count += 1
+                try:
+                    result = await func(*args, **kwargs)
+                    after_count += 1
+                    return result
+                except Exception:
+                    error_count += 1
+                    raise
+
+            return cast(F, wrapper)
+
+        return decorator
+
+    queue = await DBOS.register_queue_async("wrapped_workflow_queue")
+
+    # @DBOS.workflow() on top: DBOS registers the task_meta wrapper, so the hooks
+    # run both on direct invocation and on recovery.
+    @DBOS.workflow(name="wrapped_workflow")
+    @task_meta(description="wrapped_workflow")
+    async def wrapped_workflow(var: str) -> str:
+        return await helper_step(var)
+
+    @DBOS.step()
+    async def helper_step(var: str) -> str:
+        return var + "!"
+
+    # Direct invocation runs the hooks.
+    wfuuid = str(uuid.uuid4())
+    with SetWorkflowID(wfuuid):
+        assert await wrapped_workflow("hello") == "hello!"
+    assert before_count == 1
+    assert after_count == 1
+    assert error_count == 0
+
+    # Enqueuing the workflow runs the hooks
+    enqueue_handle = await queue.enqueue_async(wrapped_workflow, "enqueued")
+    assert await enqueue_handle.get_result() == "enqueued!"
+    assert before_count == 2
+    assert after_count == 2
+    assert error_count == 0
+
+    # Client enqueue runs the hooks
+    options: EnqueueOptions = {
+        "queue_name": queue.name,
+        "workflow_name": "wrapped_workflow",
+    }
+    client_handle: WorkflowHandleAsync[str] = await client.enqueue_async(
+        options, "client"
+    )
+    assert await client_handle.get_result() == "client!"
+    assert before_count == 3
+    assert after_count == 3
+    assert error_count == 0
+
+    # When the workflow is recovered, the hooks run. Recovery is sync, so run it in
+    # a thread.
+    with dbos._sys_db.engine.begin() as c:
+        c.execute(
+            sa.update(SystemSchema.workflow_status)
+            .values({"status": "PENDING", "name": "wrapped_workflow"})
+            .where(SystemSchema.workflow_status.c.workflow_uuid == wfuuid)
+        )
+
+    def recover_in_thread() -> Any:
+        handles = DBOS._recover_pending_workflows()
+        assert len(handles) == 1
+        return handles[0].get_result()
+
+    assert await asyncio.to_thread(recover_in_thread) == "hello!"
+    assert before_count == 4
+    assert after_count == 4
+    assert error_count == 0
+
+
+def test_set_enqueue_options_exits_in_another_context() -> None:
+    """Entry and exit may run in different contextvars Contexts, as threadpool-run
+    generator dependencies do; the options must still restore cleanly."""
+    options = SetEnqueueOptions(priority=1)
+    entered = contextvars.copy_context()
+    entered.run(options.__enter__)
+    assert entered.run(get_workflow_start_options).priority == 1
+    # Options are per Context, so the caller's are untouched.
+    assert get_workflow_start_options().priority is None
+    exited = contextvars.copy_context()
+    exited.run(options.__exit__, None, None, None)
+    assert exited.run(get_workflow_start_options).priority is None
+    assert get_workflow_start_options().priority is None
+
+
+def test_set_shard_key_exits_in_another_context() -> None:
+    with SetShardKey("tenant-a"):
+        shard_key = SetShardKey("tenant-b")
+        entered = contextvars.copy_context()
+        entered.run(shard_key.__enter__)
+        assert entered.run(get_workflow_start_options).shard_key == "tenant-b"
+        assert get_workflow_start_options().shard_key == "tenant-a"
+        # Independent of the enqueue options: setting those keeps the key.
+        with SetEnqueueOptions(priority=1):
+            assert get_workflow_start_options().shard_key == "tenant-a"
+        exited = contextvars.copy_context()
+        exited.run(shard_key.__exit__, None, None, None)
+        assert exited.run(get_workflow_start_options).shard_key == "tenant-a"
+        assert get_workflow_start_options().shard_key == "tenant-a"
+    assert get_workflow_start_options().shard_key is None
+    with pytest.raises(ValueError):
+        SetShardKey("")
+
+
+def test_setter_instance_rejects_overlapping_use() -> None:
+    timeout = SetWorkflowTimeout(5)
+    with timeout:
+        with pytest.raises(DBOSException, match="already in use"):
+            with timeout:
+                pass
+        assert get_workflow_start_options().workflow_timeout_ms == 5000
+    assert get_workflow_start_options().workflow_timeout_ms is None
+    # Sequential reuse is fine.
+    with timeout:
+        assert get_workflow_start_options().workflow_timeout_ms == 5000
+    assert get_local_dbos_context() is None
+
+    auth = DBOSContextSetAuth("alice", ["admin"])
+    with auth:
+        with pytest.raises(DBOSException, match="already in use"):
+            with auth:
+                pass
+        assert DBOS.authenticated_user == "alice"
+    assert get_local_dbos_context() is None
+
+
+def test_set_authentication_reaches_the_enclosing_context() -> None:
+    """A sync FastAPI dependency runs in a copied contextvars Context; the identity it
+    sets must still reach the endpoint, which shares its DBOSContext."""
+    with DBOSContextEnsure():
+        contextvars.copy_context().run(DBOS.set_authentication, "alice", ["admin"])
+        assert DBOS.authenticated_user == "alice"
+        assert DBOS.authenticated_roles == ["admin"]
+
+
+def test_set_authentication_inside_set_auth_block_is_undone_at_exit() -> None:
+    with DBOSContextEnsure():
+        DBOS.set_authentication("bob", ["reader"])
+        with DBOSContextSetAuth("carol", ["writer"]):
+            DBOS.set_authentication("dave", ["admin"])
+            assert DBOS.authenticated_user == "dave"
+            assert DBOS.authenticated_roles == ["admin"]
+        assert DBOS.authenticated_user == "bob"
+        assert DBOS.authenticated_roles == ["reader"]
+
+
+def test_set_authentication_changes_the_enclosing_set_auth_block() -> None:
+    """Middleware opens a DBOSContextSetAuth block; a sync FastAPI dependency, which runs in
+    a copied contextvars Context, then sets the identity the endpoint must see."""
+    with DBOSContextSetAuth(None, None):
+        contextvars.copy_context().run(DBOS.set_authentication, "alice", ["admin"])
+        assert DBOS.authenticated_user == "alice"
+        assert DBOS.authenticated_roles == ["admin"]
+
+    async def sibling_tasks() -> List[Optional[str]]:
+        with DBOSContextSetAuth("bob", ["reader"]):
+            reader_started = asyncio.Event()
+            identity_set = asyncio.Event()
+
+            async def setter() -> None:
+                await reader_started.wait()
+                DBOS.set_authentication("carol", ["writer"])
+                identity_set.set()
+
+            async def reader() -> Optional[str]:
+                reader_started.set()
+                await identity_set.wait()
+                return DBOS.authenticated_user
+
+            _, seen = await asyncio.gather(setter(), reader())
+            return [seen, DBOS.authenticated_user]
+
+    # A task already running inside the block sees its sibling's change.
+    assert asyncio.run(sibling_tasks()) == ["carol", "carol"]
+    assert get_local_dbos_context() is None
+
+
+def test_context_accessors_inside_setter_block() -> None:
+    with SetWorkflowID("accessor-test"):
+        DBOS.set_authentication("bob", ["reader"])
+        assert DBOS.authenticated_user == "bob"
+        assert DBOS.authenticated_roles == ["reader"]
+    assert get_local_dbos_context() is None
+
+
+def test_shard_keys_must_be_non_empty_strings() -> None:
+    """Every way a shard key enters refuses an empty or non-string one; SetShardKey alone
+    used to, and an empty key written anywhere else could never run."""
+    for bad in ("", 1):
+        with pytest.raises(DBOSException, match="non-empty string"):
+            with bind_shard_keys({"w": bad}):  # type: ignore[dict-item]
+                pass
+        with pytest.raises(DBOSException, match="non-empty string"):
+            with shard_key_scope(bad):  # type: ignore[arg-type]
+                pass
+        options: EnqueueOptions = {"queue_name": "q", "workflow_name": "w"}
+        options["shard_key"] = bad  # type: ignore[typeddict-item]
+        with pytest.raises(DBOSException, match="non-empty string"):
+            validate_enqueue_options(options)
+    # None leaves the key unset rather than invalid.
+    with bind_shard_keys({"w": None}), shard_key_scope(None):
+        pass
+
+
+def test_shard_keys_are_rejected_without_sharding(
+    dbos: DBOS, client: DBOSClient, skip_with_sharding: None
+) -> None:
+    """Without sharding, a shard key passed to any API is an error, never silently ignored."""
+
+    @DBOS.workflow()
+    def keyless() -> int:
+        return 1
+
+    @DBOS.workflow()
+    def nightly(at: datetime.datetime, ctx: Any) -> None:
+        pass
+
+    handle = DBOS.start_workflow(keyless)
+    assert handle.get_result() == 1
+    wfid = handle.workflow_id
+    key = "tenant-a"
+
+    def start_keyed() -> Any:
+        with SetShardKey(key):
+            return DBOS.start_workflow(keyless)
+
+    calls: List[Callable[[], Any]] = [
+        lambda: DBOS.get_workflow_status(wfid, shard_key=key),
+        lambda: DBOS.retrieve_workflow(wfid, shard_key=key),
+        lambda: DBOS.get_result(wfid, shard_key=key),
+        lambda: DBOS.get_event(wfid, "k", 0, shard_key=key),
+        lambda: DBOS.list_workflow_steps(wfid, shard_key=key),
+        lambda: DBOS.cancel_workflow(wfid, shard_key=key),
+        lambda: DBOS.resume_workflow(wfid, shard_key=key),
+        lambda: DBOS.fork_workflow(wfid, 1, shard_key=key),
+        lambda: DBOS.send(wfid, "m", shard_key=key),
+        lambda: DBOS.send_bulk([SendMessage(wfid, "m", shard_key=key)]),
+        start_keyed,
+        lambda: client.retrieve_workflow(wfid, shard_key=key).get_status(),
+        lambda: client.send(wfid, "m", shard_key=key),
+    ]
+    for call in calls:
+        with pytest.raises(DBOSException, match="not sharded"):
+            call()
+    listings: List[Callable[[], Any]] = [
+        lambda: DBOS.list_workflows(shard_key=key),
+        lambda: client.list_workflows(shard_key=key),
+        lambda: DBOS.list_workflows(parent_shard_key=key),
+        lambda: client.list_queued_workflows(parent_shard_key=key),
+        lambda: DBOS.list_workflows(shard_key=[]),
+    ]
+    for listing in listings:
+        with pytest.raises(DBOSException, match="requires a sharded system database"):
+            listing()
+    with pytest.raises(DBOSException, match="requires a sharded system database"):
+        DBOS.create_schedule(
+            schedule_name="keyed",
+            workflow_fn=nightly,
+            schedule="0 0 * * *",
+            shard_key=key,
+        )
+    # Nothing ran, moved or arrived under the key.
+    status = DBOS.get_workflow_status(wfid)
+    assert status is not None and status.status == "SUCCESS"
+    assert DBOS.get_schedule("keyed") is None

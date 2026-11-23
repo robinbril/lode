@@ -1,0 +1,47 @@
+# Stage 1: Build the frontend app
+FROM node:24-alpine AS build
+
+WORKDIR /app
+
+COPY ./frontend/app/package.json ./frontend/app/pnpm-lock.yaml ./
+RUN corepack pnpm@10.16.1 --version
+RUN corepack pnpm@10.16.1 install --frozen-lockfile && corepack pnpm@10.16.1 store prune
+
+COPY ./frontend/app ./
+RUN npm run build
+
+# Stage 2: Build the static fileserver
+FROM golang:1.26-alpine AS staticfileserver
+
+WORKDIR /app
+
+ENV CGO_ENABLED=0
+
+ARG FIPS=false
+
+COPY go.mod go.sum ./
+COPY ./cmd/hatchet-staticfileserver/ ./cmd/hatchet-staticfileserver/
+
+RUN if [ "$FIPS" = "true" ]; then export GOFIPS140=v1.0.0; fi && \
+    go build -ldflags="-w -s" -a -o hatchet-staticfileserver ./cmd/hatchet-staticfileserver && \
+    if [ "$FIPS" = "true" ]; then \
+      go version -m ./hatchet-staticfileserver | grep -q 'GOFIPS140=v1.0.0-c2097c7c$' && go version -m ./hatchet-staticfileserver | grep -Eq 'DefaultGODEBUG=.*fips140=on(,|$)' || { echo "hatchet-staticfileserver is not linked against the validated FIPS module"; exit 1; }; \
+    fi
+RUN chmod +x ./hatchet-staticfileserver
+
+# Stage 3: Run the static fileserver
+FROM alpine:3.24
+
+ARG FIPS=false
+LABEL run.hatchet.fips=${FIPS}
+
+ENV BASE_PATH="/"
+
+WORKDIR /app
+
+COPY --from=build /app/dist ./dist
+COPY --from=staticfileserver /app/hatchet-staticfileserver ./hatchet-staticfileserver
+
+EXPOSE 80
+
+CMD ["/app/hatchet-staticfileserver", "-static-asset-dir", "/app/dist"]

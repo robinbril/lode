@@ -1,0 +1,173 @@
+package v1
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/hatchet-dev/hatchet/internal/msgqueue"
+	"github.com/hatchet-dev/hatchet/internal/services/dispatcher/contracts"
+	"github.com/hatchet-dev/hatchet/pkg/enums"
+	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
+)
+
+type CELEvaluationFailures struct {
+	Failures []v1.CELEvaluationFailure
+}
+
+func CELEvaluationFailureMessage(tenantId uuid.UUID, failures []v1.CELEvaluationFailure) (*msgqueue.Message, error) {
+	return msgqueue.NewTenantMessage(
+		tenantId,
+		msgqueue.MsgIDCELEvaluationFailure,
+		false,
+		true,
+		CELEvaluationFailures{
+			Failures: failures,
+		},
+	)
+}
+
+type CreatedTaskPayload struct {
+	*v1.V1TaskWithPayload
+	RequeueCount int `json:"requeue_count"`
+}
+
+func CreatedTaskMessage(tenantId uuid.UUID, payload CreatedTaskPayload) (*msgqueue.Message, error) {
+	return msgqueue.NewTenantMessage(
+		tenantId,
+		msgqueue.MsgIDCreatedTask,
+		false,
+		true,
+		payload,
+	)
+}
+
+type CreatedDAGPayload struct {
+	*v1.DAGWithData
+	RequeueCount int `json:"requeue_count"`
+}
+
+func CreatedDAGMessage(tenantId uuid.UUID, payload CreatedDAGPayload) (*msgqueue.Message, error) {
+	return msgqueue.NewTenantMessage(
+		tenantId,
+		msgqueue.MsgIDCreatedDAG,
+		false,
+		true,
+		payload,
+	)
+}
+
+type CreatedEventTriggerPayloadSingleton struct {
+	MaybeRunId              *int64     `json:"run_id"`
+	MaybeRunInsertedAt      *time.Time `json:"run_inserted_at"`
+	MaybeRunExternalId      *uuid.UUID `json:"run_external_id,omitempty"`
+	EventSeenAt             time.Time  `json:"event_seen_at"`
+	EventKey                string     `json:"event_key"`
+	EventExternalId         uuid.UUID  `json:"event_id"`
+	EventPayload            []byte     `json:"event_payload,omitempty"`
+	EventAdditionalMetadata []byte     `json:"event_additional_metadata,omitempty"`
+	EventScope              *string    `json:"event_scope,omitempty"`
+	FilterId                *uuid.UUID `json:"filter_id,omitempty"`
+	TriggeringWebhookName   *string    `json:"triggering_webhook_name,omitempty"`
+	PayloadReferenceId      *uuid.UUID `json:"payload_reference_id,omitempty"`
+}
+
+type CreatedEventTriggerPayload struct {
+	Payloads []CreatedEventTriggerPayloadSingleton `json:"payloads"`
+}
+
+func CreatedEventTriggerMessage(tenantId uuid.UUID, eventTriggers CreatedEventTriggerPayload) (*msgqueue.Message, error) {
+	return msgqueue.NewTenantMessage(
+		tenantId,
+		msgqueue.MsgIDCreatedEventTrigger,
+		false,
+		true,
+		eventTriggers,
+	)
+}
+
+type CreateMonitoringEventPayload struct {
+	TaskId int64 `json:"task_id"`
+
+	RequeueCount int `json:"requeue_count"`
+
+	RetryCount             int32 `json:"retry_count"`
+	DurableInvocationCount int32 `json:"durable_invocation_count"`
+
+	WorkerId *uuid.UUID `json:"worker_id,omitempty"`
+
+	EventType enums.V1EventTypeOlap `json:"event_type"`
+
+	EventTimestamp time.Time `json:"event_timestamp" validate:"required"`
+	EventPayload   string    `json:"event_payload" validate:"required"`
+	EventMessage   string    `json:"event_message,omitempty"`
+
+	// StatusOnly applies a DAG orchestrator event to its run's DAG status without writing a task
+	// event, for publishes that duplicate an event already sent by the regular reporting path.
+	// Ignored for other tasks.
+	StatusOnly bool `json:"status_only,omitempty"`
+
+	// WillRetry records the failure or timeout event but leaves the task and its run non-terminal.
+	WillRetry bool `json:"will_retry,omitempty"`
+
+	// PayloadReferenceId is set on FINISHED events whose output the task controller stores in the
+	// core payload store under this id, so OLAP keeps the reference instead of its own copy.
+	PayloadReferenceId *uuid.UUID `json:"payload_reference_id,omitempty"`
+}
+
+func MonitoringEventMessageFromActionEvent(tenantId uuid.UUID, taskId int64, retryCount int32, durableInvocationCount int32, request *contracts.StepActionEvent, payloadReferenceId *uuid.UUID) (*msgqueue.Message, error) {
+	var workerId *uuid.UUID
+	parsedId, err := uuid.Parse(request.WorkerId)
+
+	if err == nil {
+		workerId = &parsedId
+	}
+
+	payload := CreateMonitoringEventPayload{
+		TaskId:                 taskId,
+		RetryCount:             retryCount,
+		DurableInvocationCount: durableInvocationCount,
+		WorkerId:               workerId,
+		EventTimestamp:         request.EventTimestamp.AsTime(),
+		EventPayload:           request.EventPayload,
+		PayloadReferenceId:     payloadReferenceId,
+	}
+
+	switch request.EventType {
+	case contracts.StepActionEventType_STEP_EVENT_TYPE_COMPLETED:
+		payload.EventType = enums.V1EventTypeOlapFINISHED
+
+		if payloadReferenceId != nil {
+			payload.EventPayload = ""
+		}
+	case contracts.StepActionEventType_STEP_EVENT_TYPE_FAILED:
+		payload.EventType = enums.V1EventTypeOlapFAILED
+	case contracts.StepActionEventType_STEP_EVENT_TYPE_STARTED:
+		payload.EventType = enums.V1EventTypeOlapSTARTED
+	case contracts.StepActionEventType_STEP_EVENT_TYPE_UNKNOWN,
+		contracts.StepActionEventType_STEP_EVENT_TYPE_ACKNOWLEDGED,
+		contracts.StepActionEventType_STEP_EVENT_TYPE_CANCELLED:
+		return nil, fmt.Errorf("unknown event type: %s", request.EventType.String())
+	default:
+		return nil, fmt.Errorf("unknown event type: %s", request.EventType.String())
+	}
+
+	return msgqueue.NewTenantMessage(
+		tenantId,
+		msgqueue.MsgIDCreateMonitoringEvent,
+		false,
+		true,
+		payload,
+	)
+}
+
+func MonitoringEventMessageFromInternal(tenantId uuid.UUID, payload CreateMonitoringEventPayload) (*msgqueue.Message, error) {
+	return msgqueue.NewTenantMessage(
+		tenantId,
+		msgqueue.MsgIDCreateMonitoringEvent,
+		false,
+		true,
+		payload,
+	)
+}

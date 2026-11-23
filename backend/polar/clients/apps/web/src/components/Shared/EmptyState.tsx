@@ -1,0 +1,56 @@
+import { Button, Text } from '@polar-sh/orbit'
+import { Box } from '@polar-sh/orbit/Box'
+import { ButtonProps } from '@polar-sh/orbit/ui/button'
+import { ReactNode } from 'react'
+
+interface EmptyStateProps {
+  icon: ReactNode
+  title: string
+  description: string
+  actions?: (ButtonProps & { text: string })[]
+  /** Grow to fill the parent's remaining space, e.g. to match sibling list heights. */
+  fill?: boolean
+  /** Drop the border when the parent is already a bordered surface. */
+  bordered?: boolean
+}
+
+export const EmptyState = ({
+  icon,
+  title,
+  description,
+  actions,
+  fill = false,
+  bordered = true,
+}: EmptyStateProps) => {
+  return (
+    <Box
+      flexDirection="column"
+      alignItems="center"
+      justifyContent="center"
+      gap="m"
+      borderRadius="m"
+      borderWidth={bordered ? 1 : 0}
+      borderStyle="solid"
+      borderColor="border-primary"
+      padding="3xl"
+      flexGrow={fill ? 1 : undefined}
+    >
+      <Box alignItems="center" justifyContent="center" color="text-secondary">
+        {icon}
+      </Box>
+      <Box flexDirection="column" alignItems="center" textAlign="center">
+        <Text variant="body" as="h3">
+          {title}
+        </Text>
+        <Text color="muted">{description}</Text>
+      </Box>
+      {(actions?.length ?? 0) > 0 ? (
+        <Box marginTop="l" columnGap="l">
+          {actions?.map((action) => (
+            <Button key={action.text} {...action} />
+          ))}
+        </Box>
+      ) : null}
+    </Box>
+  )
+}

@@ -1,0 +1,154 @@
+import { createChatSurface } from "./chat";
+import { createComposerSurface, type ComposerOptions } from "./composer";
+import { densityTierFor, type DensityTier } from "./density";
+import { subscribeDeliveries } from "./core-bridge";
+import { applySessionState } from "./session-list";
+import { refreshOpenTrees, refreshSessions, refreshTreesFor, renderList, sessionsState } from "./sessions";
+import { appState } from "./shell-state";
+import { clearTranscriptCache, refreshCachedTranscript } from "./transcript-cache";
+import { handleUiSignal, releaseUiCanvas, resyncUiCanvas } from "./ui-canvas";
+import type { Conversation, ConvCtx, ConvHost } from "./conv-types";
+
+const live = new Set<Conversation>();
+let main: Conversation | null = null;
+
+export function createConversation(host: ConvHost, composerOptions?: ComposerOptions): Conversation {
+  const ctx = { ...host } as ConvCtx;
+  ctx.chat = createChatSurface(ctx);
+  ctx.composer = createComposerSurface(ctx, composerOptions);
+  const conv = ctx.chat as Conversation;
+  conv.composer = ctx.composer;
+  live.add(conv);
+  return conv;
+}
+
+export function disposeConversation(conv: Conversation): void {
+  live.delete(conv);
+  releaseUiCanvas(conv);
+  if (main === conv) main = null;
+  conv.composer.dispose();
+  conv.dispose();
+}
+
+export function allConversations(): Conversation[] {
+  return [...live];
+}
+
+export function conversationsBusy(): boolean {
+  for (const { state, composer } of live) {
+    if (state.agent?.state.isStreaming || state.pendingSend !== null) return true;
+    if (composer.state.draft.trim() || composer.state.attachments.length > 0) return true;
+  }
+  return false;
+}
+
+export function isLiveConversation(conv: Conversation): boolean {
+  return live.has(conv);
+}
+
+export function mainConversation(): Conversation {
+  main ??= createConversation({
+    pane: false,
+    ownsUrl: true,
+    container: () => appState.mainEl,
+    claimContainer: () => {
+      exitCanvas();
+      return appState.mainEl;
+    },
+    visible: () => appState.currentView === "chats",
+    density: () => "full" as DensityTier,
+    onDensityChange: () => {},
+    ensureDeliveryStream,
+  });
+  return main;
+}
+
+export function paneDensity(el: HTMLElement): DensityTier | null {
+  const r = el.getBoundingClientRect();
+  const width = r.width || el.clientWidth;
+  const height = r.height || el.clientHeight;
+  return width > 0 && height > 0 ? densityTierFor(width, height) : null;
+}
+
+let exitCanvas: () => void = () => {};
+
+export function onExitCanvas(fn: () => void): void {
+  exitCanvas = fn;
+}
+
+let inboxItemHandler: ((event: { loopId: string; itemId: string; op: string }) => void) | null = null;
+
+export function onInboxItemEvent(fn: (event: { loopId: string; itemId: string; op: string }) => void): void {
+  inboxItemHandler = fn;
+}
+
+let inboxResyncHandler: (() => void) | null = null;
+
+export function onInboxResync(fn: () => void): void {
+  inboxResyncHandler = fn;
+}
+
+let deliveryStreamOpen = false;
+
+function refreshCachedThread(threadRef: string): void {
+  const id = sessionsState.list.find((session) => session.threadRef === threadRef)?.id;
+  if (id && ![...live].some((conv) => conv.state.sessionId === id)) refreshCachedTranscript(id);
+}
+
+export function ensureDeliveryStream(): void {
+  if (deliveryStreamOpen) return;
+  deliveryStreamOpen = true;
+  subscribeDeliveries(
+    (threadRef) => {
+      refreshCachedThread(threadRef);
+      void refreshSessions({ silent: true });
+      refreshTreesFor(threadRef);
+      for (const conv of live) conv.onDelivery(threadRef);
+    },
+    (event) => {
+      if (event.state === "ui") {
+        handleUiSignal(event as Parameters<typeof handleUiSignal>[0], [...live], sessionsState.list);
+        return;
+      }
+      if (event.state === "metadata") {
+        void refreshSessions({ silent: true });
+        refreshTreesFor(event.threadRef);
+        return;
+      }
+      refreshCachedThread(event.threadRef);
+      const { list, matched } = applySessionState(sessionsState.list, { ...event, state: event.state });
+      if (matched) {
+        sessionsState.list = list;
+        renderList();
+        const parentId = list.find((session) => session.threadRef === event.threadRef)?.parentSessionId;
+        if (event.state === "idle" || parentId) void refreshSessions({ silent: true });
+        if (parentId) for (const conv of live) if (conv.state.sessionId === parentId) conv.redraw();
+        refreshTreesFor(event.threadRef);
+      } else {
+        void refreshSessions({ silent: true });
+        refreshTreesFor(event.threadRef);
+      }
+      if (event.state === "working") for (const conv of live) conv.resumeIfIdle();
+      else for (const conv of live) conv.onDelivery(event.threadRef);
+    },
+    () => {
+      const openIds = [...live].flatMap((conv) => (conv.state.sessionId ? [conv.state.sessionId] : []));
+      clearTranscriptCache();
+      void refreshSessions({ silent: true });
+      refreshOpenTrees();
+      resyncUiCanvas(openIds);
+      catchUpAll();
+    },
+    (event) => inboxItemHandler?.(event),
+    () => inboxResyncHandler?.(),
+  );
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") catchUpAll();
+  });
+  window.addEventListener("focus", catchUpAll);
+  window.addEventListener("online", catchUpAll);
+}
+
+function catchUpAll(): void {
+  for (const conv of live) conv.catchUp();
+}

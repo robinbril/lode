@@ -1,0 +1,127 @@
+import { actsAsScope, type Destination } from "../types.ts";
+import type { Cron, CronSchedule } from "./types.ts";
+import { principalDestination } from "../reach/reach.ts";
+import { personKeys } from "../directory/person.ts";
+import { errMessage, reportFailure, reportFailureAs } from "../util/errors.ts";
+import { randomUUID } from "node:crypto";
+
+export interface CronEditDetail {
+  schedule?: CronSchedule;
+  destinationLabel?: string;
+}
+
+function scheduleClause(s: CronSchedule | undefined): string {
+  if (s?.everyMs) {
+    const mins = Math.round(s.everyMs / 60_000);
+    if (mins < 1) return "to run more often";
+    if (mins < 60) return `to run every ${mins === 1 ? "minute" : `${mins} minutes`}`;
+    if (mins % 60 === 0) {
+      const h = mins / 60;
+      if (h % 24 === 0) return `to run every ${h === 24 ? "day" : `${h / 24} days`}`;
+      return `to run every ${h === 1 ? "hour" : `${h} hours`}`;
+    }
+    return `to run every ${mins} minutes`;
+  }
+  if (s?.cron) return `to run on a new schedule (\`${s.cron}\`)`;
+  return "to run on a new schedule";
+}
+
+const LIFECYCLE_VERB: Record<string, string> = {
+  deleted: "deleted",
+  "enabled=false": "paused",
+  "enabled=true": "re-enabled",
+  "archived=true": "archived",
+  "archived=false": "restored",
+};
+
+function joinAnd(parts: string[]): string {
+  if (parts.length <= 1) return parts[0] ?? "";
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+export function composeCronEditNotice(args: {
+  editorName: string;
+  ref: string;
+  place?: string;
+  changes: string[];
+  detail?: CronEditDetail;
+}): string {
+  const cron = `your ${args.ref} cron${args.place ? ` in ${args.place}` : ""}`;
+  const verbs: string[] = [];
+  const toClauses: string[] = [];
+  for (const token of args.changes) {
+    const key = token.split("=")[0]!;
+    if (LIFECYCLE_VERB[token]) verbs.push(LIFECYCLE_VERB[token]!);
+    else if (key === "title") verbs.push("renamed");
+    else if (key === "note") verbs.push("left a shift-change note on");
+    else if (key === "task") toClauses.push("to do something different");
+    else if (key === "schedule") toClauses.push(scheduleClause(args.detail?.schedule));
+    else if (key === "destination")
+      toClauses.push(
+        args.detail?.destinationLabel ? `to post to ${args.detail.destinationLabel}` : "to post somewhere new",
+      );
+    else if (key === "unfurlLinks") toClauses.push("to change its link previews");
+    else if (key === "mode") toClauses.push("to run in a different mode");
+  }
+  const clauses = [
+    ...verbs.map((v) => `${v} ${cron}`),
+    ...(toClauses.length ? [`changed ${cron} ${joinAnd(toClauses)}`] : []),
+  ];
+  const body = clauses.length
+    ? joinAnd(clauses.map((c, i) => (i === 0 ? c : c.replace(` ${cron}`, " it"))))
+    : `edited ${cron}`;
+  const takeover = args.changes.includes("owner")
+    ? " It now runs as them, with their access, since the task is theirs."
+    : "";
+  return `Heads up: ${args.editorName} ${body}.${takeover}`;
+}
+
+export interface CronEditNoticeSink {
+  enqueueDelivery(input: { destination: Destination; text: string; idempotencyKey: string }): Promise<unknown>;
+  directoryMember(
+    principalId: string,
+  ): Promise<{ displayName?: string; principalId?: string; slackId?: string } | null>;
+  cronAdminUrl(cron: Cron): string | undefined;
+  channelName?(channelId: string): Promise<string | undefined>;
+}
+
+export async function notifyOwnerOfCronEdit(
+  sink: CronEditNoticeSink,
+  args: { cron: Cron; editorId: string; changeSummary: string[]; detail?: CronEditDetail },
+  onError?: (message: string) => void,
+): Promise<void> {
+  const { cron } = args;
+  if (actsAsScope(cron.owner, cron.ownerScopeId)) return;
+  try {
+    const [editor, owner] = await Promise.all([
+      sink.directoryMember(args.editorId).catch(reportFailureAs("cron edit notice: editor lookup", null)),
+      sink.directoryMember(cron.owner).catch(reportFailureAs("cron edit notice: owner lookup", null)),
+    ]);
+    const ownerKeys = personKeys(owner, cron.owner);
+    if ([...personKeys(editor, args.editorId)].some((k) => ownerKeys.has(k))) return;
+    const url = sink.cronAdminUrl(cron);
+    const label = cron.title ?? "shared";
+    let ref = "shared";
+    if (url) ref = `<${url}|${label}>`;
+    else if (cron.title) ref = `"${cron.title}"`;
+    const [kind, scopeRef] = String(cron.ownerScopeId).split(":", 2) as [string, string | undefined];
+    const place =
+      kind === "channel" && scopeRef && sink.channelName
+        ? await sink.channelName(scopeRef).catch(reportFailureAs("cron edit notice: channel name lookup", undefined))
+        : undefined;
+    await sink.enqueueDelivery({
+      destination: principalDestination(cron.owner, args.editorId),
+      text: composeCronEditNotice({
+        editorName: editor?.displayName ?? args.editorId,
+        ref,
+        ...(place ? { place } : {}),
+        changes: args.changeSummary,
+        ...(args.detail ? { detail: args.detail } : {}),
+      }),
+      idempotencyKey: `cron-edit-notice:${cron.id}:${randomUUID()}`,
+    });
+  } catch (e) {
+    if (onError) onError(errMessage(e));
+    else reportFailure("cron edit notice", e);
+  }
+}

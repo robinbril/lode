@@ -1,0 +1,48 @@
+import pytest
+
+from examples.fanout.worker import ParentInput, parent_wf
+from examples.test_utils import wait_for_child_runs
+from hatchet_sdk import Hatchet
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_run(hatchet: Hatchet) -> None:
+    ref = await parent_wf.aio_run(
+        ParentInput(n=2),
+        wait_for_result=False,
+    )
+
+    result = await ref.aio_result()
+
+    assert len(result["spawn"]["results"]) == 2
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_additional_metadata_propagation(
+    hatchet: Hatchet, test_run_id: str
+) -> None:
+    ref = await parent_wf.aio_run(
+        ParentInput(n=2),
+        additional_metadata={"test_run_id": test_run_id},
+        wait_for_result=False,
+    )
+
+    await ref.aio_result()
+
+    runs = await wait_for_child_runs(
+        hatchet,
+        ref.workflow_run_id,
+        additional_metadata={"test_run_id": test_run_id},
+    )
+
+    assert runs
+
+    """Assert that the additional metadata is propagated to the child runs."""
+    for run in runs:
+        assert run.additional_metadata
+        assert run.additional_metadata["test_run_id"] == test_run_id
+
+        assert run.children
+        for child in run.children:
+            assert child.additional_metadata
+            assert child.additional_metadata["test_run_id"] == test_run_id

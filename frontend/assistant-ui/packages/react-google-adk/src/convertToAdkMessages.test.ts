@@ -1,0 +1,738 @@
+import { describe, it, expect } from "vitest";
+import {
+  getMessageContent,
+  getPendingCancellations,
+  getPendingToolCalls,
+} from "./convertToAdkMessages";
+import { convertAdkMessage } from "./convertAdkMessages";
+import type { AppendMessage } from "@assistant-ui/core";
+import type { AdkMessage, AdkMessageContentPart, AdkEventPart } from "./types";
+import { contentToParts } from "./contentToParts";
+
+const makeAppendMessage = (content: AppendMessage["content"]): AppendMessage =>
+  ({
+    role: "user",
+    content,
+    attachments: [],
+    parentId: null,
+    sourceId: null,
+    runConfig: undefined,
+    metadata: { custom: {} },
+  }) as unknown as AppendMessage;
+
+const aiWithToolCalls = (
+  id: string,
+  toolCalls: Array<{ id: string; name: string }>,
+): AdkMessage => ({
+  id,
+  type: "ai",
+  content: [],
+  tool_calls: toolCalls.map((tc) => ({
+    id: tc.id,
+    name: tc.name,
+    args: {},
+    argsText: "{}",
+  })),
+});
+
+const toolResponse = (
+  id: string,
+  toolCallId: string,
+  name: string,
+): AdkMessage => ({
+  id,
+  type: "tool",
+  tool_call_id: toolCallId,
+  name,
+  content: JSON.stringify({ ok: true }),
+  status: "success",
+});
+
+describe("getPendingToolCalls", () => {
+  it("returns tool calls without matching tool responses", () => {
+    const messages: AdkMessage[] = [
+      aiWithToolCalls("ai-1", [
+        { id: "tc-1", name: "tool_a" },
+        { id: "tc-2", name: "tool_b" },
+      ]),
+    ];
+    expect(getPendingToolCalls(messages)).toEqual([
+      { id: "tc-1", name: "tool_a", args: {}, argsText: "{}" },
+      { id: "tc-2", name: "tool_b", args: {}, argsText: "{}" },
+    ]);
+  });
+
+  it("excludes tool calls that have a matching tool response", () => {
+    const messages: AdkMessage[] = [
+      aiWithToolCalls("ai-1", [
+        { id: "tc-1", name: "tool_a" },
+        { id: "tc-2", name: "tool_b" },
+      ]),
+      toolResponse("t-1", "tc-1", "tool_a"),
+    ];
+    expect(getPendingToolCalls(messages)).toEqual([
+      { id: "tc-2", name: "tool_b", args: {}, argsText: "{}" },
+    ]);
+  });
+
+  it("returns empty for threads with no ai messages", () => {
+    expect(getPendingToolCalls([])).toEqual([]);
+  });
+});
+
+describe("getPendingCancellations", () => {
+  it("skips a null tool_calls entry and cancels the rest", () => {
+    const messages = [
+      {
+        id: "ai-1",
+        type: "ai",
+        content: [],
+        tool_calls: [null, { id: "tc-1", name: "tool_a", args: {} }],
+      },
+    ] as unknown as AdkMessage[];
+    expect(getPendingCancellations(messages, [])).toMatchObject([
+      { type: "tool", name: "tool_a", tool_call_id: "tc-1", status: "error" },
+    ]);
+  });
+
+  it("emits a {cancelled:true} tool message for every pending tool call", () => {
+    const messages: AdkMessage[] = [
+      aiWithToolCalls("ai-1", [{ id: "tc-1", name: "tool_a" }]),
+    ];
+    const result = getPendingCancellations(messages, []);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: "tool",
+      name: "tool_a",
+      tool_call_id: "tc-1",
+      content: JSON.stringify({ cancelled: true }),
+      status: "error",
+    });
+  });
+
+  it("skips tool calls whose id is in longRunningToolIds", () => {
+    const messages: AdkMessage[] = [
+      aiWithToolCalls("ai-1", [
+        { id: "lrt-1", name: "adk_request_input" },
+        { id: "tc-2", name: "regular_tool" },
+      ]),
+    ];
+    const result = getPendingCancellations(messages, ["lrt-1"]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: "tool",
+      name: "regular_tool",
+      tool_call_id: "tc-2",
+    });
+  });
+
+  it("skips all three HITL interrupt types", () => {
+    const messages: AdkMessage[] = [
+      aiWithToolCalls("ai-1", [
+        { id: "lrt-1", name: "adk_request_input" },
+        { id: "lrt-2", name: "adk_request_confirmation" },
+        { id: "lrt-3", name: "adk_request_credential" },
+      ]),
+    ];
+    const result = getPendingCancellations(messages, [
+      "lrt-1",
+      "lrt-2",
+      "lrt-3",
+    ]);
+    expect(result).toEqual([]);
+  });
+
+  it("returns empty when no tool calls are pending", () => {
+    const messages: AdkMessage[] = [
+      aiWithToolCalls("ai-1", [{ id: "tc-1", name: "tool_a" }]),
+      toolResponse("t-1", "tc-1", "tool_a"),
+    ];
+    expect(getPendingCancellations(messages, [])).toEqual([]);
+  });
+
+  it("cancels regular tool calls even when HITL interrupts are resolved", () => {
+    const messages: AdkMessage[] = [
+      aiWithToolCalls("ai-1", [
+        { id: "lrt-1", name: "adk_request_input" },
+        { id: "tc-2", name: "regular_tool" },
+      ]),
+      toolResponse("t-1", "lrt-1", "adk_request_input"),
+    ];
+    // lrt-1 lingering in longRunningToolIds is harmless because
+    // getPendingToolCalls already excluded it via the tool response.
+    const result = getPendingCancellations(messages, ["lrt-1"]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      tool_call_id: "tc-2",
+      name: "regular_tool",
+    });
+  });
+});
+
+describe("getMessageContent", () => {
+  it.each([
+    [
+      "image/png",
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+    ],
+    ["image/jpeg", "/9j/4AAQSkZJRg=="],
+    ["image/jpeg", "/9j/4AAQ\r\nSkZJRg==", "/9j/4AAQSkZJRg=="],
+    ["image/png", "PHN2Zy8+"],
+  ])(
+    "sends bare base64 %s images as Gemini inline data",
+    (mimeType, image, data = image) => {
+      const content = getMessageContent(
+        makeAppendMessage([{ type: "image", image, filename: "pixel.png" }]),
+      );
+
+      expect(contentToParts(content)).toEqual([
+        {
+          inlineData: {
+            mimeType,
+            data,
+            displayName: "pixel.png",
+          },
+        },
+      ]);
+    },
+  );
+
+  it.each(["/uploads/cat.png", "/9j/uploads/cat.png"])(
+    "preserves relative image reference %s",
+    (image) => {
+      const content = getMessageContent(
+        makeAppendMessage([{ type: "image", image, filename: "cat.png" }]),
+      );
+
+      expect(contentToParts(content)).toEqual([
+        { fileData: { fileUri: image, displayName: "cat.png" } },
+      ]);
+    },
+  );
+
+  it.each(["file", "image"] as const)(
+    "sends percent-encoded %s data URL bytes as bare Gemini inline data",
+    (type) => {
+      const value = "data:image/png;base64,aGk%3D";
+      const content = getMessageContent(
+        makeAppendMessage(
+          type === "file"
+            ? [{ type: "file", data: value, mimeType: "image/png" }]
+            : [{ type: "image", image: value }],
+        ),
+      );
+
+      expect(contentToParts(content)).toEqual([
+        { inlineData: { mimeType: "image/png", data: "aGk=" } },
+      ]);
+    },
+  );
+
+  it("sends activity messages as text parts", () => {
+    expect(
+      contentToParts([{ type: "activity", message: "Working on it" }]),
+    ).toEqual([{ text: "Working on it" }]);
+  });
+
+  it("serializes data URL images as inline data", () => {
+    const content = getMessageContent(
+      makeAppendMessage([
+        { type: "image", image: "data:image/png;base64,AAAA" },
+      ]),
+    );
+
+    expect(contentToParts(content)).toEqual([
+      { inlineData: { mimeType: "image/png", data: "AAAA" } },
+    ]);
+  });
+
+  it("infers an image MIME type when the data URL declares a generic type", () => {
+    const content = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "image",
+          image: "data:application/octet-stream;base64,iVBORw0KGgo=",
+        },
+      ]),
+    );
+
+    expect(contentToParts(content)).toEqual([
+      { inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } },
+    ]);
+  });
+
+  it("preserves image filenames for inline and URL media", () => {
+    const inline = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "image",
+          image: "data:image/png;base64,AAAA",
+          filename: "photo.png",
+        },
+      ]),
+    );
+    expect(inline).toEqual([
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: "AAAA",
+        filename: "photo.png",
+      },
+    ]);
+    expect(contentToParts(inline)).toEqual([
+      {
+        inlineData: {
+          mimeType: "image/png",
+          data: "AAAA",
+          displayName: "photo.png",
+        },
+      },
+    ]);
+
+    const url = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "image",
+          image: "https://example.com/photo.png",
+          filename: "photo.png",
+        },
+      ]),
+    );
+    expect(url).toEqual([
+      {
+        type: "image_url",
+        url: "https://example.com/photo.png",
+        filename: "photo.png",
+      },
+    ]);
+    expect(contentToParts(url)).toEqual([
+      {
+        fileData: {
+          fileUri: "https://example.com/photo.png",
+          displayName: "photo.png",
+        },
+      },
+    ]);
+  });
+
+  it("prefers an attachment's declared image MIME type", () => {
+    const message = makeAppendMessage([]);
+    const content = getMessageContent({
+      ...message,
+      attachments: [
+        {
+          id: "attachment-1",
+          type: "image",
+          name: "photo.webp",
+          contentType: "image/webp",
+          status: { type: "complete" },
+          content: [{ type: "image", image: "data:image/png;base64,AAAA" }],
+        },
+      ],
+    });
+
+    expect(contentToParts(content)).toEqual([
+      { inlineData: { mimeType: "image/webp", data: "AAAA" } },
+    ]);
+  });
+
+  it("resolves wildcard attachment MIME types to a concrete image type", () => {
+    const message = makeAppendMessage([]);
+    const content = getMessageContent({
+      ...message,
+      attachments: [
+        {
+          id: "attachment-1",
+          type: "image",
+          name: "photo.jpg",
+          contentType: "image/*",
+          status: { type: "complete" },
+          content: [{ type: "image", image: "data:image/jpeg;base64,AAAA" }],
+        },
+      ],
+    });
+
+    expect(contentToParts(content)).toEqual([
+      { inlineData: { mimeType: "image/jpeg", data: "AAAA" } },
+    ]);
+  });
+
+  it("preserves file part data and mimeType end-to-end", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        { type: "text", text: "see attached" },
+        {
+          type: "file",
+          mimeType: "application/pdf",
+          data: "JVBERi0xLjQK",
+          filename: "report.pdf",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      { type: "text", text: "see attached" },
+      {
+        type: "file",
+        mimeType: "application/pdf",
+        data: "JVBERi0xLjQK",
+        filename: "report.pdf",
+      },
+    ]);
+    expect(contentToParts(result)).toEqual([
+      { text: "see attached" },
+      {
+        inlineData: {
+          mimeType: "application/pdf",
+          data: "JVBERi0xLjQK",
+          displayName: "report.pdf",
+        },
+      },
+    ]);
+  });
+
+  it("keeps file-only content as an array (does not collapse to a text marker)", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          mimeType: "image/png",
+          data: "AAAA",
+          filename: "x.png",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      {
+        type: "file",
+        mimeType: "image/png",
+        data: "AAAA",
+        filename: "x.png",
+      },
+    ]);
+  });
+
+  it("omits filename when not provided", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        { type: "file", mimeType: "application/pdf", data: "AAAA" },
+      ]),
+    );
+    expect(result).toEqual([
+      { type: "file", mimeType: "application/pdf", data: "AAAA" },
+    ]);
+    expect(contentToParts(result)).toEqual([
+      { inlineData: { mimeType: "application/pdf", data: "AAAA" } },
+    ]);
+    expect(
+      contentToParts([
+        {
+          type: "file_url",
+          url: "gs://bucket/report.pdf",
+          mimeType: "application/pdf",
+        },
+      ]),
+    ).toEqual([
+      {
+        fileData: {
+          fileUri: "gs://bucket/report.pdf",
+          mimeType: "application/pdf",
+        },
+      },
+    ]);
+  });
+
+  it.each([
+    {
+      kind: "inline image",
+      part: {
+        type: "image",
+        mimeType: "image/png",
+        data: "AAAA",
+        filename: "",
+      },
+      expected: { inlineData: { mimeType: "image/png", data: "AAAA" } },
+    },
+    {
+      kind: "image URL",
+      part: {
+        type: "image_url",
+        url: "https://example.com/img.png",
+        filename: "",
+      },
+      expected: { fileData: { fileUri: "https://example.com/img.png" } },
+    },
+    {
+      kind: "inline file",
+      part: {
+        type: "file",
+        mimeType: "application/pdf",
+        data: "AAAA",
+        filename: "",
+      },
+      expected: { inlineData: { mimeType: "application/pdf", data: "AAAA" } },
+    },
+    {
+      kind: "file URL",
+      part: { type: "file_url", url: "gs://bucket/report.pdf", filename: "" },
+      expected: { fileData: { fileUri: "gs://bucket/report.pdf" } },
+    },
+  ] satisfies Array<{
+    kind: string;
+    part: AdkMessageContentPart;
+    expected: AdkEventPart;
+  }>)("omits an empty filename for $kind", ({ part, expected }) => {
+    expect(contentToParts([part])).toEqual([expected]);
+  });
+
+  it("uses the binary data URL default for a media-less file", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          mimeType: "",
+          data: "data:;base64,SGVsbG8=",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      {
+        type: "file",
+        mimeType: "application/octet-stream",
+        data: "SGVsbG8=",
+      },
+    ]);
+  });
+
+  it("emits a file_url part for file parts with sourceType url", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          mimeType: "application/pdf",
+          data: "gs://bucket/report.pdf",
+          filename: "report.pdf",
+          sourceType: "url",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      {
+        type: "file_url",
+        url: "gs://bucket/report.pdf",
+        mimeType: "application/pdf",
+        filename: "report.pdf",
+      },
+    ]);
+    expect(contentToParts(result)).toEqual([
+      {
+        fileData: {
+          fileUri: "gs://bucket/report.pdf",
+          mimeType: "application/pdf",
+          displayName: "report.pdf",
+        },
+      },
+    ]);
+  });
+
+  it("keeps file parts inline without sourceType", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          mimeType: "application/pdf",
+          data: "gs://bucket/report.pdf",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      {
+        type: "file",
+        mimeType: "application/pdf",
+        data: "gs://bucket/report.pdf",
+      },
+    ]);
+  });
+
+  it("round-trips a file_url part through convert and edit-resend", () => {
+    const converted = convertAdkMessage(
+      {
+        id: "m1",
+        type: "human",
+        content: [
+          {
+            type: "file_url",
+            url: "gs://bucket/report.pdf",
+            mimeType: "application/pdf",
+            filename: "report.pdf",
+          },
+        ],
+      },
+      {},
+    );
+    const content = (converted as { content: AppendMessage["content"] })
+      .content;
+    const result = getMessageContent(makeAppendMessage(content));
+    expect(result).toEqual([
+      {
+        type: "file_url",
+        url: "gs://bucket/report.pdf",
+        mimeType: "application/pdf",
+        filename: "report.pdf",
+      },
+    ]);
+  });
+
+  it("ignores sourceType id on file parts", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          mimeType: "application/pdf",
+          data: "file-abc123",
+          sourceType: "id",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      { type: "file", mimeType: "application/pdf", data: "file-abc123" },
+    ]);
+  });
+
+  it("forwards an audio part as a file block with the format-derived mime type", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        { type: "audio", audio: { data: "QUJD", format: "mp3" } },
+      ]),
+    );
+    expect(result).toEqual([
+      { type: "file", mimeType: "audio/mp3", data: "QUJD" },
+    ]);
+  });
+
+  it("forwards a wav audio part with the audio/wav mime type", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        { type: "audio", audio: { data: "QUJD", format: "wav" } },
+      ]),
+    );
+    expect(result).toEqual([
+      { type: "file", mimeType: "audio/wav", data: "QUJD" },
+    ]);
+  });
+
+  it("strips a data URL envelope from audio data", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "audio",
+          audio: { data: "data:audio/mp3;base64,QUJD", format: "mp3" },
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      { type: "file", mimeType: "audio/mp3", data: "QUJD" },
+    ]);
+  });
+
+  it("strips a data URL envelope from file data", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          data: "data:application/pdf;base64,QUJD",
+          mimeType: "application/pdf",
+          filename: "a.pdf",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      {
+        type: "file",
+        mimeType: "application/pdf",
+        data: "QUJD",
+        filename: "a.pdf",
+      },
+    ]);
+  });
+
+  it("emits a file_url part for an unmarked http source", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          data: "https://cdn.example.com/a.pdf",
+          mimeType: "application/pdf",
+        },
+      ]),
+    );
+    expect(result).toEqual([
+      {
+        type: "file_url",
+        url: "https://cdn.example.com/a.pdf",
+        mimeType: "application/pdf",
+      },
+    ]);
+  });
+
+  it("leaves bare base64 file data untouched", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        { type: "file", data: "QUJD", mimeType: "application/pdf" },
+      ]),
+    );
+    expect(result).toEqual([
+      { type: "file", mimeType: "application/pdf", data: "QUJD" },
+    ]);
+  });
+
+  it("round-trips an audio file part through both converters", () => {
+    const outbound = getMessageContent(
+      makeAppendMessage([
+        {
+          type: "file",
+          data: "data:audio/mp3;base64,QUJD",
+          mimeType: "audio/mp3",
+        },
+      ]),
+    );
+
+    expect(outbound).toEqual([
+      { type: "file", mimeType: "audio/mp3", data: "QUJD" },
+    ]);
+
+    const inbound = convertAdkMessage(
+      { id: "m1", type: "human", content: outbound } as never,
+      {},
+    );
+
+    expect(inbound).toMatchObject({
+      role: "user",
+      content: [{ type: "file", data: "QUJD", mimeType: "audio/mp3" }],
+    });
+  });
+
+  it("skips data parts while keeping surrounding text", () => {
+    const result = getMessageContent(
+      makeAppendMessage([
+        { type: "text", text: "hi" },
+        { type: "data", name: "chart", data: { x: 1 } },
+      ]),
+    );
+    expect(result).toBe("hi");
+  });
+
+  it("returns empty content for a data-only message", () => {
+    const result = getMessageContent(
+      makeAppendMessage([{ type: "data", name: "chart", data: { x: 1 } }]),
+    );
+    expect(result).toEqual([]);
+  });
+
+  it("still throws on assistant-only part types", () => {
+    expect(() =>
+      getMessageContent(
+        makeAppendMessage([{ type: "reasoning", text: "thinking" }]),
+      ),
+    ).toThrow("Unsupported append message part type: reasoning");
+  });
+});

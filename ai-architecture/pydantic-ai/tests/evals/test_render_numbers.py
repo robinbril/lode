@@ -1,0 +1,147 @@
+from __future__ import annotations as _annotations
+
+import pytest
+
+from .._inline_snapshot import snapshot
+from ..conftest import try_import
+
+with try_import() as imports_successful:
+    from pydantic_evals.reporting.render_numbers import (
+        default_render_duration,
+        default_render_duration_diff,
+        default_render_number,
+        default_render_number_diff,
+    )
+
+pytestmark = [pytest.mark.skipif(not imports_successful(), reason='pydantic-evals not installed')]
+
+
+@pytest.mark.parametrize(
+    'value,expected',
+    [
+        (0, snapshot('0')),
+        (0.0, snapshot('0.000')),
+        (17348, snapshot('17,348')),
+        (-17348, snapshot('-17,348')),
+        (17347.0, snapshot('17,347.0')),
+        (-17347.0, snapshot('-17,347.0')),
+        (0.1234, snapshot('0.123')),
+        (-0.1234, snapshot('-0.123')),
+        (0.1, snapshot('0.100')),
+        (-0.1, snapshot('-0.100')),
+        (2.0, snapshot('2.00')),
+        (12.0, snapshot('12.0')),
+        (2398723.123, snapshot('2,398,723.1')),
+        (0.00000000000001, snapshot('0.0000000000000100')),
+        (float('inf'), snapshot('inf')),
+        (float('-inf'), snapshot('-inf')),
+        (float('nan'), snapshot('nan')),
+    ],
+)
+def test_default_render_number(value: float | int, expected: str):
+    assert default_render_number(value) == expected
+
+
+@pytest.mark.parametrize(
+    'old,new,expected',
+    [
+        (3, 3, snapshot(None)),
+        (127.3, 127.3, snapshot(None)),
+        (3, 4, snapshot('+1')),
+        (4, 3, snapshot('-1')),
+        (1.5, float('inf'), snapshot(None)),
+        (float('inf'), 1.5, snapshot(None)),
+        (1.5, float('nan'), snapshot(None)),
+        (float('nan'), float('nan'), snapshot(None)),
+        (1.0, 1.7, snapshot('+0.7 / +70.0%')),
+        (2.5, 1.0, snapshot('-1.5 / -60.0%')),
+        (10.023, 10.024, snapshot('+0.001')),
+        (1.00024, 1.00023, snapshot('-1e-05')),
+        (2.0, 25.0, snapshot('+23.0 / 12.5x')),
+        (2.0, -25.0, snapshot('-27.0 / -12.5x')),
+        (0.02, 25.0, snapshot('+25.0 / 1,250x')),
+        (0.02, -25.0, snapshot('-25.0 / -1,250x')),
+        (0.001, 25.0, snapshot('+25.0')),
+        (0.0, 25.0, snapshot('+25.0')),
+        (0.0, -25.0, snapshot('-25.0')),
+        (1.0, -3.0, snapshot('-4.0 / -3.0x')),
+        # A negative base keeps the percentage form past 100%, where a multiplier would read backwards.
+        (-2.0, -1.0, snapshot('+1.0 / +50.0%')),
+        (-1.0, -2.0, snapshot('-1.0 / -100.0%')),
+        (-1.0, -3.0, snapshot('-2.0 / -200.0%')),
+        (-1.0, 0.0, snapshot('+1.0 / +100.0%')),
+        (-2.0, 1.0, snapshot('+3.0 / +150.0%')),
+        (-1.0, 3.0, snapshot('+4.0 / +400.0%')),
+        (-0.5, -0.25, snapshot('+0.25 / +50.0%')),
+        (-0.02, -25.0, snapshot('-25.0 / -124,900.0%')),
+        (-0.001, -25.0, snapshot('-25.0')),
+        (-10.023, -10.024, snapshot('-0.001')),
+    ],
+)
+def test_default_render_number_diff(old: int | float, new: int | float, expected: str | None):
+    assert default_render_number_diff(old, new) == expected
+
+
+@pytest.mark.parametrize('old', [-2.0, -0.5, 0.5, 2.0])
+@pytest.mark.parametrize('new', [-5.0, -1.0, -0.25, 0.0, 0.25, 1.0, 5.0])
+def test_default_render_number_diff_sign_matches_direction(old: float, new: float):
+    """The absolute and relative halves of a diff never point in opposite directions, whatever the signs."""
+    rendered = default_render_number_diff(old, new)
+    assert rendered is not None
+    abs_part, _, rel_part = rendered.partition(' / ')
+    assert rel_part
+    assert abs_part.startswith('-') == rel_part.startswith('-')
+
+
+@pytest.mark.parametrize(
+    'value,expected',
+    [
+        (-123.4567, snapshot('-123.5s')),
+        (-0.1234567, snapshot('-123.5ms')),
+        (-0.00001234567, snapshot('-12µs')),
+        (-0.0000001234567, snapshot('-0.1µs')),
+        (-0.00000001234567, snapshot('-0.0µs')),
+        (0, snapshot('0s')),
+        (0.00000001234567, snapshot('0.0µs')),
+        (0.0000001234567, snapshot('0.1µs')),
+        (0.000001234567, snapshot('1µs')),
+        (0.0001234567, snapshot('123µs')),
+        (0.001234567, snapshot('1.2ms')),
+        (0.1234567, snapshot('123.5ms')),
+        (1.234567, snapshot('1.2s')),
+        (12.34567, snapshot('12.3s')),
+        (123.4567, snapshot('123.5s')),
+        (1234.567, snapshot('1,234.6s')),
+        (12345.67, snapshot('12,345.7s')),
+        (123456.7, snapshot('123,456.7s')),
+    ],
+)
+def test_default_render_duration(value: float, expected: str):
+    assert default_render_duration(value) == expected
+
+
+@pytest.mark.parametrize(
+    'old,new,expected',
+    [
+        (3, 3, snapshot(None)),
+        (127.3, 127.3, snapshot(None)),
+        (3, 4, snapshot('+1.0s / +33.3%')),
+        (4, 3, snapshot('-1.0s / -25.0%')),
+        (1.0, 1.7, snapshot('+700.0ms / +70.0%')),
+        (2.5, 1.0, snapshot('-1.5s / -60.0%')),
+        (10.023, 10.024, snapshot('+1,000µs')),
+        (1.00024, 1.00023, snapshot('-10µs')),
+        (2.0, 25.0, snapshot('+23.0s / 12.5x')),
+        (2.0, -25.0, snapshot('-27.0s / -12.5x')),
+        (0.02, 25.0, snapshot('+25.0s / 1,250x')),
+        (0.02, -25.0, snapshot('-25.0s / -1,250x')),
+        (0.001, 25.0, snapshot('+25.0s')),
+    ],
+)
+def test_default_render_duration_diff(old: float, new: float, expected: str | None):
+    assert default_render_duration_diff(old, new) == expected
+
+
+def test_default_duration_formatters_retain_microsecond_units():
+    assert default_render_duration(0.0001) == '100µs'
+    assert default_render_duration_diff(0.0001, 0.0002) == '+100µs / +100.0%'

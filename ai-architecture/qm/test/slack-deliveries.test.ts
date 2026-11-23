@@ -1,0 +1,556 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { createSlackDeliverer } from "../src/slack/deliveries.ts";
+import { SLACK_POST_SPLIT_LIMIT } from "../src/slack/lib.ts";
+
+const mixedFiles = [
+  { name: "first.png", mimetype: "image/png", sizeBytes: 2, blobId: "B1" },
+  { name: "second.jpg", mimetype: "image/jpeg", sizeBytes: 2, blobId: "B2" },
+  { name: "notes.pdf", mimetype: "application/pdf", sizeBytes: 2, blobId: "B3" },
+];
+
+const uploadedNames = (uploads: Record<string, unknown>[]) =>
+  uploads.flatMap((u) => (u.file_uploads as Array<{ filename: string }>).map(({ filename }) => filename));
+
+async function deliver(
+  destination: Record<string, unknown> = {},
+  sourceThreadRef?: string,
+  webUiPublicUrl?: string,
+  text = "two screenshots and the notes",
+  row: {
+    createdAt?: number;
+    history?: Record<string, unknown>[];
+    loseAck?: boolean;
+    approval?: unknown;
+    updateError?: string;
+    provenance?: Record<string, unknown>;
+  } = {},
+) {
+  const delivery = {
+    id: "D1",
+    idempotencyKey: destination.commandApprovalId ? `command-approval:${destination.commandApprovalId}:0` : "D1",
+    text,
+    ...(sourceThreadRef
+      ? { provenance: { trigger: "cron", sourceThreadRef, sourceTitle: "Weekly <project> & check-in" } }
+      : {}),
+    ...(row.provenance ? { provenance: row.provenance } : {}),
+    destination: { type: "slack", target: "C1:100.200", ...destination },
+    attachments: mixedFiles,
+    createdAt: row.createdAt ?? Date.now(),
+  };
+  const acknowledgements: string[] = [];
+  const uploads: Record<string, unknown>[] = [];
+  const posts: Record<string, unknown>[] = [];
+  const updates: Record<string, unknown>[] = [];
+  const failures: Array<[string, string]> = [];
+  const marks: Array<{ channel: string; ts: string }> = [];
+  const probes: Record<string, unknown>[] = [];
+  const history = row.history ?? [];
+  const conversationsOpened: Record<string, unknown>[] = [];
+  const probe = async (args: Record<string, unknown>) => {
+    probes.push(args);
+    return {
+      messages: history,
+    };
+  };
+  const ackBodies: Array<Record<string, unknown>> = [];
+  const core = {
+    getApproval: async () => row.approval ?? null,
+    readBlob: async (id: string) => Buffer.from(id),
+    failDelivery: async (id: string, code: string) => void failures.push([id, code]),
+    ackDelivery: async (id: string, body?: Record<string, unknown>) => {
+      if (row.loseAck) throw new Error("acknowledgement lost");
+      acknowledgements.push(id);
+      ackBodies.push({ id, ...body });
+    },
+  };
+  const client = {
+    conversations: {
+      open: async (args: Record<string, unknown>) => {
+        conversationsOpened.push(args);
+        return { channel: { id: "C1" } };
+      },
+      replies: probe,
+      history: probe,
+    },
+    files: {
+      uploadV2: async (args: Record<string, unknown>) => {
+        uploads.push(args);
+        history.push({ ts: "101.300", text: args.initial_comment, files: mixedFiles });
+        return { files: [{ files: mixedFiles.map((_, index) => ({ id: `F${index + 1}` })) }] };
+      },
+      info: async () => ({ file: { shares: { private: { C1: [{ ts: "101.300" }] } } } }),
+    },
+    chat: {
+      update: async (args: Record<string, unknown>) => {
+        updates.push(args);
+        if (row.updateError) throw Object.assign(new Error(row.updateError), { data: { error: row.updateError } });
+        return { ok: true };
+      },
+      postMessage: async (args: Record<string, unknown>) => {
+        posts.push(args);
+        history.push({ ...args, ts: "separate-message" });
+        return { ts: "separate-message" };
+      },
+    },
+  };
+  const deliverer = createSlackDeliverer({
+    core: core as never,
+    webUiPublicUrl,
+    flow: {
+      inFlightRuns: new Set<string>(),
+      fetchBlobFromCore: async (id: string) => Buffer.from(id),
+      fetchFileArtifactFromCore: async () => Buffer.from("artifact"),
+    } as never,
+    threads: { mark: (channel: string, ts: string) => void marks.push({ channel, ts }) } as never,
+    clientForIdentity: () => client,
+  });
+
+  await deliverer.deliver(client, delivery as never);
+  return { acknowledgements, ackBodies, uploads, posts, updates, failures, marks, probes, conversationsOpened };
+}
+
+test("webhook deliveries link their title to the webhook's settings, defaulting to Webhook", async () => {
+  const footer = async (provenance: Record<string, unknown>) => {
+    const { posts } = await deliver({}, undefined, "https://agent.example", "done", { provenance });
+    const blocks = posts[0]!.blocks as Array<{ type: string; elements?: Array<{ text: string }> }>;
+    return blocks.at(-1)?.elements?.[0]?.text;
+  };
+  const base = { trigger: "webhook", sourceThreadRef: "webhook:wh-1:d1", sourceId: "wh-1" };
+  assert.equal(
+    await footer({ ...base, sourceTitle: "PR review" }),
+    "PR review · <https://agent.example/webhooks/wh-1|Settings>",
+  );
+  assert.equal(await footer(base), "Webhook · <https://agent.example/webhooks/wh-1|Settings>");
+});
+
+for (const type of ["slack", "group", "principal"]) {
+  test(`${type} cron deliveries include settings below the complete message and preserve attachments`, async () => {
+    const text = "Scheduled update. ".repeat(250);
+    const { posts, uploads, acknowledgements } = await deliver(
+      { type },
+      "cron:morning report:fire:123",
+      "https://agent.example/web-ui/",
+      text,
+    );
+    assert.equal(posts.length, 1);
+    const blocks = posts[0]!.blocks as Array<{ type: string; text?: { text: string }; elements?: unknown[] }>;
+    assert.equal(
+      blocks
+        .filter((b) => b.type === "section")
+        .map((b) => b.text!.text)
+        .join(""),
+      text,
+    );
+    assert.deepEqual(blocks.at(-1), {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "Weekly &lt;project&gt; &amp; check-in · <https://agent.example/web-ui/crons/morning%20report|Settings>",
+          verbatim: true,
+        },
+      ],
+    });
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0]!.initial_comment, undefined);
+    assert.deepEqual(
+      uploadedNames(uploads),
+      mixedFiles.map((f) => f.name),
+    );
+    assert.deepEqual(acknowledgements, ["D1"]);
+  });
+}
+
+test("cron deliveries omit settings when the web UI is unavailable", async () => {
+  const { posts, uploads } = await deliver({}, "cron:c1:fire:123");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0]!.blocks, undefined);
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0]!.initial_comment, undefined);
+  assert.deepEqual(
+    uploadedNames(uploads),
+    mixedFiles.map((f) => f.name),
+  );
+});
+
+for (const type of ["slack", "group", "principal"]) {
+  test(`${type} deliveries mark text for recovery and batch mixed attachments`, async () => {
+    const { acknowledgements, uploads, posts, marks } = await deliver({ type });
+
+    assert.equal(uploads.length, 1);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0]!.metadata, {
+      event_type: "qm_delivery",
+      event_payload: { idempotency_key: "D1" },
+    });
+    assert.equal(uploads[0]!.channel_id, "C1");
+    assert.equal(uploads[0]!.thread_ts, type === "principal" ? undefined : "100.200");
+    assert.equal(uploads[0]!.initial_comment, undefined);
+    assert.deepEqual(uploadedNames(uploads), ["first.png", "second.jpg", "notes.pdf"]);
+    assert.deepEqual(acknowledgements, ["D1"]);
+    assert.deepEqual(marks, type === "principal" ? [] : [{ channel: "C1", ts: "100.200" }]);
+  });
+
+  test(`${type} restart after a lost acknowledgement reuses the actual posted message and files`, async () => {
+    const history: Record<string, unknown>[] = [];
+    const first = await deliver({ type }, undefined, undefined, undefined, { history, loseAck: true });
+    assert.equal(first.posts.length, 1);
+    assert.equal(first.uploads.length, 1);
+    assert.deepEqual(first.acknowledgements, []);
+    const { probes, posts, uploads, acknowledgements } = await deliver({ type }, undefined, undefined, undefined, {
+      createdAt: Date.now() - 60_000,
+      history,
+    });
+
+    assert.equal(probes.length, 1, "the recovered row probes Slack for the delivered marker");
+    assert.equal(posts.length, 0, "a marker hit means the text was already posted");
+    assert.equal(uploads.length, 0, "files behind a delivered marker are not replayed");
+    assert.deepEqual(acknowledgements, ["D1"]);
+  });
+
+  test(`${type} long replies with attachments take the splitting path instead of one upload comment`, async () => {
+    const text = "a long reply ".repeat(Math.ceil(SLACK_POST_SPLIT_LIMIT / 12) + 20);
+    const { posts, uploads } = await deliver({ type }, undefined, undefined, text);
+
+    assert.ok(posts.length > 1, `expected the text split across posts, got ${posts.length}`);
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0]!.initial_comment, undefined);
+    assert.deepEqual(uploadedNames(uploads), ["first.png", "second.jpg", "notes.pdf"]);
+  });
+
+  test(`${type} deliveries keep the separate-comment fallback when upload comments cannot carry post options`, async () => {
+    const { uploads, posts } = await deliver({ type, unfurlLinks: false });
+
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0]!.text, "two screenshots and the notes");
+    assert.equal(posts[0]!.unfurl_links, false);
+    assert.equal(uploads.length, 1, "the fallback still batches the files themselves");
+    assert.equal(uploads[0]!.initial_comment, undefined);
+    assert.deepEqual(uploadedNames(uploads), ["first.png", "second.jpg", "notes.pdf"]);
+  });
+}
+
+for (const [label, destination, sourceThreadRef, webUiPublicUrl, footer] of [
+  [
+    "a persona post",
+    { persona: { id: "p 1", name: "Ada <&>" } },
+    undefined,
+    "https://agent.example/web-ui/",
+    "From <https://agent.example/web-ui/personas/p%201|Ada &lt;&amp;&gt;>",
+  ],
+  [
+    "a persona post without a web UI",
+    { persona: { id: "p 1", name: "Ada <&>" } },
+    undefined,
+    undefined,
+    "From Ada &lt;&amp;&gt;",
+  ],
+  [
+    "a persona's project cron post",
+    { persona: { id: "p 1", name: "Ada <&>" }, project: { id: "j1", name: "Launch" } },
+    "cron:c1:fire:123",
+    "https://agent.example",
+    "From <https://agent.example/personas/p%201|Ada &lt;&amp;&gt;> in <https://agent.example/contexts?scope=group%3Aweb-project-j1|Launch> · Weekly &lt;project&gt; &amp; check-in · <https://agent.example/crons/c1|Settings>",
+  ],
+] as const) {
+  test(`${label} names where it came from in the footer`, async () => {
+    const { posts } = await deliver(destination, sourceThreadRef, webUiPublicUrl, "Hello");
+    assert.deepEqual((posts[0]!.blocks as unknown[]).at(-1), {
+      type: "context",
+      elements: [{ type: "mrkdwn", text: footer, verbatim: true }],
+    });
+  });
+}
+
+test("ordinary deliveries omit cron settings even with a configured web UI", async () => {
+  const { posts } = await deliver({ unfurlLinks: false }, "dm:D1", "https://agent.example/web-ui");
+  assert.equal(posts[0]!.blocks, undefined);
+});
+
+for (const type of ["slack", "group", "principal"]) {
+  test(`${type} attachment-only cron deliveries use a valid footer without an empty message section`, async () => {
+    const { posts, uploads, acknowledgements } = await deliver(
+      { type },
+      "cron:c1:fire:123",
+      "https://agent.example",
+      "",
+    );
+    assert.equal(posts.length, 1);
+    assert.deepEqual(
+      (posts[0]!.blocks as Array<{ type: string }>).map((block) => block.type),
+      ["context"],
+    );
+    assert.equal(uploads.length, 1);
+    assert.deepEqual(
+      uploadedNames(uploads),
+      mixedFiles.map((f) => f.name),
+    );
+    assert.deepEqual(acknowledgements, ["D1"]);
+  });
+}
+
+for (const type of ["group", "principal"]) {
+  for (const sender of ["josh", "@josh", "<@U123> & <!channel>"]) {
+    test(`${type} relay attribution is a plain-text footer for ${sender}`, async () => {
+      const { posts } = await deliver({ type, relaySender: sender }, undefined, undefined, "Ship it");
+      assert.equal(posts.length, 1);
+      assert.equal(posts[0]!.text, "Ship it");
+      assert.deepEqual(posts[0]!.blocks, [
+        { type: "section", text: { type: "mrkdwn", text: "Ship it" } },
+        {
+          type: "context",
+          elements: [{ type: "plain_text", text: `Sent for @${sender.replace(/^@+/, "")}`, emoji: false }],
+        },
+      ]);
+    });
+  }
+
+  test(`${type} attachment-only relay retains its attribution alongside cron settings`, async () => {
+    const { posts, uploads } = await deliver(
+      { type, relaySender: "josh" },
+      "cron:c1:fire:123",
+      "https://agent.example/web-ui",
+      "",
+    );
+    assert.equal(posts.length, 1);
+    const blocks = posts[0]!.blocks as Array<{ type: string; elements: Array<{ type: string; text: string }> }>;
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0]!.type, "context");
+    assert.deepEqual(blocks[0]!.elements[0], { type: "plain_text", text: "Sent for @josh", emoji: false });
+    assert.equal(blocks[0]!.elements[1]!.type, "mrkdwn");
+    assert.ok(uploads.length);
+  });
+}
+
+for (const type of ["group", "principal"]) {
+  test(`${type} long relays split within Slack's block limit and keep the footer last`, async () => {
+    const text = "x".repeat(145_000);
+    const { posts } = await deliver({ type, relaySender: "josh" }, undefined, undefined, text);
+    assert.equal(posts.length, 2);
+    const blocks = posts.flatMap((post) => {
+      const batch = post.blocks as Array<{ type: string; text?: { text: string }; elements?: unknown[] }>;
+      assert.ok(batch.length <= 50);
+      return batch;
+    });
+    assert.equal(
+      blocks
+        .filter((block) => block.type === "section")
+        .map((block) => block.text!.text)
+        .join(""),
+      text,
+    );
+    assert.deepEqual(blocks.at(-1), {
+      type: "context",
+      elements: [{ type: "plain_text", text: "Sent for @josh", emoji: false }],
+    });
+    assert.equal(blocks.filter((block) => block.type === "context").length, 1);
+  });
+}
+
+test("principal delivery metadata renders an actionable deployment card", async () => {
+  const request = { deploymentId: "00000000-0000-4000-8000-000000000001", requesterId: "bob@example.com" };
+  const { posts } = await deliver(
+    JSON.parse(JSON.stringify({ type: "principal", target: "U1", deploymentAccess: request })),
+  );
+  const blocks = posts[0]!.blocks as Array<{ type: string; elements?: Array<{ value: string }> }>;
+  const actions = blocks.find((b) => b.type === "actions")!;
+  assert.equal(actions.elements!.length, 2);
+  assert.deepEqual(JSON.parse(actions.elements![0]!.value), request);
+});
+test("delegated approvals recover native buttons from durable records", async () => {
+  const approval = {
+    requestId: "A1",
+    command: "publish",
+    reason: "approval",
+    grantModes: { session: false, always: false },
+    request: { actor: { externalId: "U1" } },
+  };
+  const history: Record<string, unknown>[] = [];
+  const destination = { type: "principal", target: "U1", commandApprovalId: "A1" };
+  const first = await deliver(destination, undefined, undefined, "Approval needed", {
+    approval,
+    history,
+    loseAck: true,
+  });
+  assert.equal(first.posts.length, 1);
+  const rendered = JSON.stringify(first.posts[0]!.blocks);
+  assert.match(rendered, /hilo_allow_once/);
+  assert.doesNotMatch(rendered, /hilo_allow_always/);
+  const second = await deliver(destination, undefined, undefined, "Approval needed", {
+    approval,
+    history,
+    createdAt: Date.now() - 60_000,
+  });
+  assert.equal(second.posts.length, 0);
+  assert.deepEqual(second.acknowledgements, ["D1"]);
+});
+
+test("an approval from a linked principal is posted to the Slack user who asked", async () => {
+  const approval = {
+    requestId: "A1",
+    command: "publish",
+    reason: "approval",
+    request: {
+      actor: { externalId: "oidc:linked-principal" },
+      surfaceOrigin: { author: { surface: "slack", account: "default", id: "U9" }, workspace: "T1" },
+    },
+  };
+  const { posts, conversationsOpened } = await deliver(
+    { type: "principal", target: "U9", commandApprovalId: "A1" },
+    undefined,
+    undefined,
+    "Approval needed",
+    { approval },
+  );
+  assert.deepEqual(conversationsOpened, [{ users: "U9" }]);
+  assert.match(JSON.stringify(posts[0]!.blocks), /hilo_allow_once/);
+});
+
+test("an approval too long for Slack links its Deny-only card to the conversation on the web", async () => {
+  const approval = {
+    requestId: "A1",
+    sessionId: "S 1",
+    command: `example_send {"a":"${"&".repeat(15_000)}","to":"attacker@example.com"}`,
+    reason: "this tool asks for approval before each call",
+    request: { actor: { externalId: "U1" } },
+  };
+  const out = await deliver(
+    { type: "principal", target: "U1", commandApprovalId: "A1" },
+    undefined,
+    "https://qm.example.com/",
+    "Approval needed",
+    { approval },
+  );
+  const rendered = JSON.stringify(out.posts[0]!.blocks);
+  assert.match(rendered, /<https:\/\/qm\.example\.com\/s\/S%201\|this conversation in QM>/);
+  assert.doesNotMatch(rendered, /hilo_allow_once|attacker@example\.com/);
+});
+
+for (const approval of [null, { requestId: "A1", command: "publish", request: { actor: { externalId: "U2" } } }]) {
+  test(`delegated approvals discard ${approval ? "mismatched" : "expired"} records`, async () => {
+    const out = await deliver(
+      { type: "principal", target: "U1", commandApprovalId: "A1" },
+      undefined,
+      undefined,
+      "Approval needed",
+      { approval },
+    );
+    assert.equal(out.posts.length, 0);
+    assert.deepEqual(out.acknowledgements, ["D1"]);
+  });
+}
+
+test("a stale queued approval cannot render a newer request for the same command", async () => {
+  const approval = { requestId: "A1", createdAt: 99, command: "publish", request: { actor: { externalId: "U1" } } };
+  const out = await deliver(
+    { type: "principal", target: "U1", commandApprovalId: "A1" },
+    undefined,
+    undefined,
+    "approval",
+    { approval },
+  );
+  assert.equal(out.posts.length, 0);
+  assert.deepEqual(out.acknowledgements, ["D1"]);
+});
+
+test("a queued system approval notification is retired without opening a Slack DM", async () => {
+  const actorId = "system:ambient:acme";
+  const approval = { requestId: "A1", command: "publish", request: { actor: { externalId: actorId } } };
+  const out = await deliver(
+    { type: "principal", target: actorId, commandApprovalId: "A1" },
+    undefined,
+    undefined,
+    "Approval needed",
+    { approval },
+  );
+  assert.deepEqual(out.conversationsOpened, []);
+  assert.deepEqual(out.posts, []);
+  assert.deepEqual(out.uploads, []);
+  assert.deepEqual(out.acknowledgements, ["D1"]);
+});
+
+for (const type of ["slack", "group", "principal"]) {
+  test(`${type} file-only deliveries survive a restart after a lost acknowledgement`, async () => {
+    const history: Record<string, unknown>[] = [];
+    const first = await deliver({ type }, undefined, undefined, "", { history, loseAck: true });
+    assert.equal(first.posts.length, 1);
+    assert.equal(first.posts[0]!.text, "Files attached.");
+    assert.equal(first.uploads.length, 1);
+    assert.deepEqual(first.acknowledgements, []);
+    const recovered = await deliver({ type }, undefined, undefined, "", {
+      history,
+      createdAt: Date.now() - 60_000,
+    });
+    assert.equal(recovered.posts.length, 0);
+    assert.equal(recovered.uploads.length, 0);
+    assert.deepEqual(recovered.acknowledgements, ["D1"]);
+  });
+}
+
+test("an explicit edit rewrites the target message in place and posts nothing new", async () => {
+  const { updates, posts, uploads, acknowledgements } = await deliver(
+    { target: "C1", edit: { messageTs: "99.100" } },
+    undefined,
+    undefined,
+    "corrected numbers",
+  );
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0]!.channel, "C1");
+  assert.equal(updates[0]!.ts, "99.100");
+  assert.equal(updates[0]!.text, "corrected numbers");
+  assert.deepEqual(posts, []);
+  assert.deepEqual(uploads, []);
+  assert.deepEqual(acknowledgements, ["D1"]);
+});
+
+test("an edit Slack refuses fails the delivery instead of posting the text as a new message", async () => {
+  const { updates, posts, failures } = await deliver(
+    { target: "C1", edit: { messageTs: "99.100" } },
+    undefined,
+    undefined,
+    "corrected numbers",
+    { updateError: "cant_update_message" },
+  );
+  assert.equal(updates.length, 1);
+  assert.deepEqual(posts, []);
+  assert.deepEqual(failures, [["D1", "cant_update_message"]]);
+});
+
+test("an edit of a message that no longer exists fails the delivery instead of retrying", async () => {
+  const { posts, failures } = await deliver(
+    { target: "C1", edit: { messageTs: "99.100" } },
+    undefined,
+    undefined,
+    "corrected numbers",
+    { updateError: "message_not_found" },
+  );
+  assert.deepEqual(posts, []);
+  assert.deepEqual(failures, [["D1", "edit_target_not_found"]]);
+});
+
+test("a reply revised by the reply check carries a plain-text edit note footer", async () => {
+  const { posts } = await deliver(
+    { type: "slack", editNote: "Edited after a reply check: em dash" },
+    undefined,
+    undefined,
+    "Clean reply",
+  );
+  const blocks = posts.at(-1)!.blocks as Array<{ type: string; elements?: unknown[] }>;
+  assert.deepEqual(blocks.at(-1), {
+    type: "context",
+    elements: [{ type: "plain_text", text: "Edited after a reply check: em dash", emoji: false }],
+  });
+});
+
+test("a posted delivery acks with the Slack ts of the message it created", async () => {
+  const { ackBodies } = await deliver();
+  assert.equal(ackBodies.length, 1);
+  assert.equal(ackBodies[0]!.messageTs, "separate-message", "the ack carries the new message's ts");
+});
+
+test("an edited delivery acks with the ts it rewrote", async () => {
+  const { ackBodies, updates } = await deliver({ edit: { messageTs: "77.88" } }, undefined, undefined, "revised");
+  assert.equal(updates.length, 1);
+  assert.equal(ackBodies[0]!.messageTs, "77.88", "the ack echoes the edited message's ts");
+});

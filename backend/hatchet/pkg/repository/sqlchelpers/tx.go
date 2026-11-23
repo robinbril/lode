@@ -1,0 +1,208 @@
+package sqlchelpers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime/debug"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
+)
+
+// Pool is the subset of a pgx pool used to start a transaction. *pgxpool.Pool
+// and a fairpool.Handle (ForTenant or ForShared) both satisfy it.
+type Pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	Stat() *pgxpool.Stat
+}
+
+func PrepareTx(ctx context.Context, pool Pool, l *zerolog.Logger) (pgx.Tx, func(context.Context) error, func(), error) {
+	start := time.Now()
+
+	tx, err := pool.Begin(ctx)
+
+	if err != nil {
+		if sinceStart := time.Since(start); sinceStart > 100*time.Millisecond {
+			l.Error().Dur(
+				"duration", sinceStart,
+			).Int(
+				"acquired_connections", int(pool.Stat().AcquiredConns()),
+			).Caller(1).Msgf("long transaction start with error: %v", err)
+		}
+
+		return nil, nil, nil, err
+	}
+
+	if sinceStart := time.Since(start); sinceStart > 100*time.Millisecond {
+		l.Warn().Dur(
+			"duration", sinceStart,
+		).Int(
+			"acquired_connections", int(pool.Stat().AcquiredConns()),
+		).Caller(1).Msg("long transaction start")
+	}
+
+	rollback := func() {
+		DeferRollback(ctx, l, tx.Rollback)
+	}
+
+	return tx, tx.Commit, rollback, nil
+}
+
+func PrepareTxWithStatementTimeout(ctx context.Context, pool Pool, l *zerolog.Logger, timeoutMs int, opts ...pgx.TxOptions) (pgx.Tx, func(context.Context) error, func(), error) {
+	start := time.Now()
+
+	txOpts := pgx.TxOptions{}
+	if len(opts) > 0 {
+		txOpts = opts[0]
+	}
+
+	tx, err := pool.BeginTx(ctx, txOpts)
+
+	if err != nil {
+		if sinceStart := time.Since(start); sinceStart > 100*time.Millisecond {
+			l.Error().Dur(
+				"duration", sinceStart,
+			).Int(
+				"acquired_connections", int(pool.Stat().AcquiredConns()),
+			).Caller(1).Msgf("long transaction start with error: %v", err)
+		}
+
+		return nil, nil, nil, err
+	}
+
+	if sinceStart := time.Since(start); sinceStart > 100*time.Millisecond {
+		l.Warn().Dur(
+			"duration", sinceStart,
+		).Int(
+			"acquired_connections", int(pool.Stat().AcquiredConns()),
+		).Caller(1).Msg("long transaction start")
+	}
+
+	rollback := func() {
+		DeferRollback(ctx, l, tx.Rollback)
+	}
+
+	_, err = tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout=%d", timeoutMs))
+
+	if err != nil {
+		rollback()
+		return nil, nil, nil, err
+	}
+
+	_, err = tx.Exec(ctx, fmt.Sprintf("SET LOCAL idle_in_transaction_session_timeout=%d", timeoutMs))
+
+	if err != nil {
+		rollback()
+		return nil, nil, nil, err
+	}
+
+	return tx, tx.Commit, rollback, nil
+}
+
+// rawAcquirer is implemented by *pgxpool.Pool. The DDL pool stays on that concrete
+// pool, so statement-timeout acquires are not counted against a tenant.
+type rawAcquirer interface {
+	Acquire(context.Context) (*pgxpool.Conn, error)
+	Stat() *pgxpool.Stat
+}
+
+// AcquireConnectionWithStatementTimeout acquires a connection from the pool and overwrites the default statement timeout on it.
+// It does not support timeout values lower than the default timeout (if called with such a value, it will just use the default timeout).
+func AcquireConnectionWithStatementTimeout(ctx context.Context, pool rawAcquirer, l *zerolog.Logger, timeoutMs int) (*pgx.Conn, func(), error) {
+	start := time.Now()
+
+	conn, err := pool.Acquire(ctx)
+
+	if err != nil {
+		if sinceStart := time.Since(start); sinceStart > 100*time.Millisecond {
+			l.Error().Dur(
+				"duration", sinceStart,
+			).Int(
+				"acquired_connections", int(pool.Stat().AcquiredConns()),
+			).Caller(1).Msgf("long connection acquire with error: %v", err)
+		}
+
+		return nil, nil, err
+	}
+
+	if sinceStart := time.Since(start); sinceStart > 100*time.Millisecond {
+		l.Warn().Dur(
+			"duration", sinceStart,
+		).Int(
+			"acquired_connections", int(pool.Stat().AcquiredConns()),
+		).Caller(1).Msg("long connection acquire")
+	}
+
+	release := func() {
+		// reset timeouts with a separate ctx; we don't want to use the original ctx here in case it has been cancelled
+		resetCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = conn.Exec(resetCtx, "SET statement_timeout=30000")
+
+		if err != nil {
+			l.Error().Err(err).Msg("failed to reset statement timeout on released connection")
+		}
+
+		_, err = conn.Exec(resetCtx, "SET idle_in_transaction_session_timeout=30000")
+
+		if err != nil {
+			l.Error().Err(err).Msg("failed to reset idle in transaction timeout on released connection")
+		}
+
+		conn.Release()
+	}
+
+	_, err = conn.Exec(ctx, fmt.Sprintf("SET statement_timeout=%d", timeoutMs))
+
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+
+	_, err = conn.Exec(ctx, fmt.Sprintf("SET idle_in_transaction_session_timeout=%d", timeoutMs))
+
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+
+	return conn.Conn(), release, nil
+}
+
+func DeferRollback(ctx context.Context, l *zerolog.Logger, rollback func(context.Context) error) {
+	// NOTE: rollback must always run, even if the caller's context has been cancelled, because
+	// pgxpool only releases the connection back to the pool via Rollback/Commit. Skipping the
+	// rollback on a cancelled context permanently leaks the connection from the pool.
+	if err := rollback(ctx); err != nil {
+		// a cancelled context makes the rollback fail, but pgxpool still destroys and releases
+		// the connection, so there's nothing actionable to log
+		if ctx.Err() != nil {
+			return
+		}
+
+		if !errors.Is(err, pgx.ErrTxClosed) {
+			l.Error().Err(err).Msg("failed to rollback transaction")
+
+			// TRACE
+			trace := debug.Stack()
+			l.Error().Str("stack_trace", string(trace)).Msg("Stack trace for rollback failure")
+		}
+	}
+}
+
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func DisableJITForTransaction(ctx context.Context, tx execer) error {
+	if _, err := tx.Exec(ctx, "SET LOCAL jit = off"); err != nil {
+		return fmt.Errorf("failed to disable jit for transaction: %w", err)
+	}
+
+	return nil
+}

@@ -1,0 +1,167 @@
+import type { ScopedConfigStore, TurnRuntimePurpose } from "../resolution/config-store.ts";
+import {
+  defaultModel,
+  fastModeModelIds,
+  modelSupported,
+  resolveModel,
+  safeModelMetadata,
+  thinkingLevelsFor,
+  modelUnavailableReason,
+} from "../model/pi-models.ts";
+import type { ScopeId } from "../types.ts";
+import type { Agent, AgentTurnInput, RuntimeChoice, SessionRoute } from "./agent.ts";
+import { NonRetryableTurnError } from "../core/turn-error.ts";
+import { governGoal, type GoalGovernorInput } from "./goal.ts";
+import { infrequentCronTurn, turnRuntimePurpose } from "../core/turn-options.ts";
+
+export const NON_INTERACTIVE_THINKING_LEVEL = "xhigh";
+export const NON_INTERACTIVE_FAST_MODE = false;
+
+export function turnModelOptions(input: {
+  triggered: boolean;
+  surface?: string;
+  infrequentCron?: boolean;
+  thinkingLevel?: string;
+  fastMode?: boolean;
+}): {
+  thinkingLevel?: string;
+  fastMode?: boolean;
+} {
+  const chatDefaults = infrequentCronTurn(input);
+  const nonInteractiveDefaults = input.triggered && !chatDefaults && turnRuntimePurpose(input) !== "cron";
+  let thinkingLevel = input.thinkingLevel;
+  if (!thinkingLevel && nonInteractiveDefaults) thinkingLevel = NON_INTERACTIVE_THINKING_LEVEL;
+  let fastMode = input.fastMode;
+  if (typeof fastMode !== "boolean" && (nonInteractiveDefaults || chatDefaults)) fastMode = NON_INTERACTIVE_FAST_MODE;
+  return {
+    ...(thinkingLevel ? { thinkingLevel } : {}),
+    ...(typeof fastMode === "boolean" ? { fastMode } : {}),
+  };
+}
+
+function normalizeRuntimeChoice(choice: RuntimeChoice): RuntimeChoice {
+  if (
+    (choice.effortLevel === "adaptive" || choice.effortLevel === "default") &&
+    !thinkingLevelsFor(choice.modelId).includes(choice.effortLevel)
+  )
+    throw new NonRetryableTurnError(`${choice.effortLevel} reasoning is not supported by ${choice.modelId}`);
+  return {
+    modelId: choice.modelId,
+    ...(choice.effortLevel && thinkingLevelsFor(choice.modelId).includes(choice.effortLevel)
+      ? { effortLevel: choice.effortLevel }
+      : {}),
+    ...(typeof choice.fastMode === "boolean"
+      ? { fastMode: choice.fastMode && fastModeModelIds().includes(choice.modelId) }
+      : {}),
+  };
+}
+
+function storedChoice(stored: RuntimeChoice): RuntimeChoice {
+  return {
+    modelId: stored.modelId,
+    ...(stored.effortLevel ? { effortLevel: stored.effortLevel } : {}),
+    ...(typeof stored.fastMode === "boolean" ? { fastMode: stored.fastMode } : {}),
+  };
+}
+
+export async function resolveRuntimeChoice(
+  config: ScopedConfigStore,
+  orgScopeId: ScopeId,
+  scope: ScopeId,
+  fallback: RuntimeChoice,
+  requested?: Partial<RuntimeChoice>,
+  hydrateModelCatalog?: () => Promise<unknown>,
+  purpose?: TurnRuntimePurpose,
+  sessionModelId?: string,
+): Promise<RuntimeChoice> {
+  if (purpose === "infrequentCron") scope = orgScopeId;
+  const [orgStored, scopedStored, orgLegacy, scopedLegacy, purposeRuntime] = await Promise.all([
+    config.getRuntimeSelectionDurable(orgScopeId),
+    scope === orgScopeId ? null : config.getRuntimeSelectionDurable(scope),
+    config.getBaseModelOwnDurable(orgScopeId),
+    scope === orgScopeId ? null : config.getBaseModelOwnDurable(scope),
+    purpose ? config.getPurposeRuntimeDurable(purpose) : undefined,
+  ]);
+  if (hydrateModelCatalog) {
+    const candidates = [
+      requested?.modelId,
+      purposeRuntime?.modelId,
+      sessionModelId,
+      scopedStored?.modelId,
+      orgStored?.modelId,
+    ];
+    if (candidates.some((modelId) => modelId && !resolveModel(modelId))) await hydrateModelCatalog();
+  }
+  if (purposeRuntime) {
+    const explicit = Object.fromEntries(Object.entries(requested ?? {}).filter(([, value]) => value !== undefined));
+    const choice: RuntimeChoice = { ...purposeRuntime, ...explicit };
+    if (!modelSupported(choice.modelId)) throw new NonRetryableTurnError(`runtime ${choice.modelId} is not approved`);
+    const unavailable = modelUnavailableReason(choice.modelId);
+    if (unavailable) throw new NonRetryableTurnError(`${choice.modelId}: ${unavailable}`);
+    if (choice.effortLevel !== undefined && !thinkingLevelsFor(choice.modelId).includes(choice.effortLevel))
+      throw new NonRetryableTurnError(`${choice.effortLevel} reasoning is not supported by ${choice.modelId}`);
+    if (choice.fastMode && !fastModeModelIds().includes(choice.modelId))
+      throw new NonRetryableTurnError(`fast mode is not supported by ${choice.modelId}`);
+    return choice;
+  }
+  if (purpose === "cron")
+    requested = { effortLevel: NON_INTERACTIVE_THINKING_LEVEL, fastMode: NON_INTERACTIVE_FAST_MODE, ...requested };
+  const configuredOrg: RuntimeChoice = orgStored ? storedChoice(orgStored) : { modelId: orgLegacy ?? fallback.modelId };
+  const sessionStored =
+    sessionModelId && modelSupported(sessionModelId) && !modelUnavailableReason(sessionModelId)
+      ? { modelId: sessionModelId }
+      : undefined;
+  const configuredId =
+    requested?.modelId ?? sessionStored?.modelId ?? scopedStored?.modelId ?? scopedLegacy ?? configuredOrg.modelId;
+  const unavailableReason = modelUnavailableReason(configuredId);
+  if (unavailableReason) throw new NonRetryableTurnError(`${configuredId}: ${unavailableReason}`);
+  const safeFallback = modelSupported(fallback.modelId) ? fallback : { modelId: defaultModel(fallback.modelId) };
+  const org = modelSupported(configuredOrg.modelId) ? configuredOrg : safeFallback;
+  let inherited: RuntimeChoice = org;
+  if (scopedStored) inherited = storedChoice(scopedStored);
+  else if (scopedLegacy) inherited = { modelId: scopedLegacy };
+  if (sessionStored && requested?.modelId === undefined) inherited = sessionStored;
+  const choice = { ...inherited, ...requested };
+  if (!modelSupported(choice.modelId)) {
+    if (requested?.modelId) throw new NonRetryableTurnError(`runtime ${choice.modelId} is not approved`);
+    return normalizeRuntimeChoice({ ...org, ...requested });
+  }
+  return normalizeRuntimeChoice(choice);
+}
+
+export function withResolvedRuntime(
+  agent: Agent,
+  resolve: (input: AgentTurnInput, routedBy: (ruleId: string) => void) => RuntimeChoice | Promise<RuntimeChoice>,
+  resolveSession: (route: SessionRoute) => Promise<RuntimeChoice>,
+): Agent {
+  const resolved = <I extends SessionRoute, R>(call: ((input: I) => Promise<R>) | undefined) =>
+    call && (async (input: I) => call({ ...input, runtime: await resolveSession(input) }));
+  const compactHistory = resolved(agent.compactHistory?.bind(agent));
+  const shouldRespond = resolved(agent.shouldRespond?.bind(agent));
+  return {
+    ...agent,
+    ...(compactHistory ? { compactHistory } : {}),
+    ...(shouldRespond ? { shouldRespond } : {}),
+    async runTurn(input) {
+      let routedBy: string | undefined;
+      const choice = await resolve(input, (ruleId) => {
+        routedBy = ruleId;
+      });
+      const label = safeModelMetadata(choice.modelId)?.label;
+      input.onRuntime?.({
+        modelId: choice.modelId,
+        ...(label ? { label } : {}),
+        ...(routedBy ? { change: { rule: routedBy } } : {}),
+      });
+      const judge = agent.judge;
+      return agent.runTurn({
+        ...input,
+        runtime: choice,
+        tools: input.runtimeControl
+          ? { ...input.tools, runtime: (request, signal) => input.runtimeControl!(choice, request, signal) }
+          : input.tools,
+        ...(judge ? { governGoal: (goalInput: GoalGovernorInput) => governGoal(judge, goalInput, input.cancel) } : {}),
+      });
+    },
+  };
+}

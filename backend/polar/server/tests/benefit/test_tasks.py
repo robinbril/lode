@@ -1,0 +1,654 @@
+import uuid
+
+import pytest
+from dramatiq import Message, Retry, get_broker
+from pytest_mock import MockerFixture
+from sqlalchemy import select
+
+from polar.benefit.grant.repository import BenefitGrantRepository
+from polar.benefit.grant.service import BenefitGrantService
+from polar.benefit.strategies import BenefitRetriableError
+from polar.benefit.tasks import (  # type: ignore[attr-defined]
+    BenefitDoesNotExist,
+    BenefitGrantDoesNotExist,
+    CustomerDoesNotExist,
+    benefit_delete,
+    benefit_delete_grant,
+    benefit_enqueue_grants,
+    benefit_grant,
+    benefit_grant_service,
+    benefit_revoke,
+    benefit_update,
+)
+from polar.kit.utils import utc_now
+from polar.models import (
+    Benefit,
+    BenefitGrant,
+    Customer,
+    Member,
+    Organization,
+    Product,
+    Subscription,
+)
+from polar.models.order import OrderStatus
+from polar.models.subscription import SubscriptionStatus
+from polar.postgres import AsyncSession
+from polar.subscription.service import SubscriptionService
+from polar.subscription.service import subscription as subscription_service
+from tests.fixtures.database import SaveFixture
+from tests.fixtures.random_objects import (
+    create_active_subscription,
+    create_benefit_grant,
+    create_order,
+    create_payment,
+    create_product_fixed_and_seat,
+    create_refund,
+    create_subscription,
+    set_product_benefits,
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("revoke", [False, True], ids=["grant", "revoke"])
+async def test_manual_benefit_task_accepts_serialized_ids(
+    session: AsyncSession,
+    save_fixture: SaveFixture,
+    customer: Customer,
+    benefit_organization: Benefit,
+    member_owner: Member,
+    revoke: bool,
+) -> None:
+    grant = await create_benefit_grant(
+        save_fixture,
+        customer,
+        benefit_organization,
+        granted=True if revoke else None,
+        member=member_owner,
+    )
+    grant.manually_granted_at = utc_now()
+    if revoke:
+        grant.manually_revoked_at = utc_now()
+    await save_fixture(grant)
+    grant_id = grant.id
+
+    actor = get_broker().get_actor("benefit.revoke" if revoke else "benefit.grant")
+    message = Message.decode(
+        actor.message(
+            customer_id=customer.id,
+            benefit_id=benefit_organization.id,
+            benefit_grant_id=grant_id,
+        ).encode()
+    )
+
+    task = benefit_revoke if revoke else benefit_grant
+    await task(**message.kwargs)
+
+    updated = await BenefitGrantRepository.from_session(session).get_by_id(grant_id)
+    assert updated is not None
+    assert updated.is_granted is not revoke
+    assert updated.is_revoked is revoke
+
+
+@pytest.mark.anyio
+class TestBenefitGrant:
+    @pytest.mark.parametrize(
+        ("status", "revoke_benefits", "eligible"),
+        [
+            (OrderStatus.paid, False, True),
+            (OrderStatus.pending, False, False),
+            (OrderStatus.refunded, False, True),
+            (OrderStatus.refunded, True, False),
+        ],
+    )
+    async def test_grant_and_revoke_for_order_without_purchased_seats(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        organization: Organization,
+        customer: Customer,
+        member_owner: Member,
+        benefit_organization: Benefit,
+        status: OrderStatus,
+        revoke_benefits: bool,
+        eligible: bool,
+    ) -> None:
+        product = await create_product_fixed_and_seat(
+            save_fixture, organization=organization, recurring_interval=None
+        )
+        await set_product_benefits(
+            save_fixture, product=product, benefits=[benefit_organization]
+        )
+        order = await create_order(
+            save_fixture, customer=customer, product=product, status=status
+        )
+        if status == OrderStatus.refunded:
+            payment = await create_payment(save_fixture, organization, order=order)
+            refund = await create_refund(save_fixture, order, payment)
+            refund.revoke_benefits = revoke_benefits
+            await save_fixture(refund)
+
+        await benefit_grant(customer.id, benefit_organization.id, order_id=order.id)
+
+        grant = await session.scalar(
+            select(BenefitGrant).where(BenefitGrant.order_id == order.id)
+        )
+        if not eligible:
+            assert grant is None
+            return
+
+        assert grant is not None
+        assert grant.is_granted
+        assert grant.member_id == member_owner.id
+        grant_id = grant.id
+
+        await benefit_revoke(customer.id, benefit_organization.id, order_id=order.id)
+
+        revoked_grant = await session.get(BenefitGrant, grant_id)
+        assert revoked_grant is not None
+        assert revoked_grant.is_revoked
+
+    async def test_not_existing_customer(
+        self,
+        subscription: Subscription,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        # then
+        session.expunge_all()
+
+        with pytest.raises(CustomerDoesNotExist):
+            await benefit_grant(
+                uuid.uuid4(),
+                benefit_organization.id,
+                subscription_id=subscription.id,
+            )
+
+    async def test_not_existing_benefit(
+        self,
+        subscription: Subscription,
+        customer: Customer,
+        session: AsyncSession,
+    ) -> None:
+        # then
+        session.expunge_all()
+
+        with pytest.raises(BenefitDoesNotExist):
+            await benefit_grant(
+                customer.id, uuid.uuid4(), subscription_id=subscription.id
+            )
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            SubscriptionStatus.active,
+            SubscriptionStatus.trialing,
+            SubscriptionStatus.paused,
+            SubscriptionStatus.canceled,
+            SubscriptionStatus.past_due,
+        ],
+    )
+    async def test_subscription_benefit_eligibility(
+        self,
+        mocker: MockerFixture,
+        customer: Customer,
+        benefit_organization: Benefit,
+        product: Product,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        status: SubscriptionStatus,
+    ) -> None:
+        grant_benefit_mock = mocker.patch.object(
+            benefit_grant_service,
+            "grant_benefit",
+            spec=BenefitGrantService.grant_benefit,
+        )
+
+        subscription = await create_subscription(
+            save_fixture, product=product, customer=customer, status=status
+        )
+        await set_product_benefits(
+            save_fixture, product=product, benefits=[benefit_organization]
+        )
+        session.expunge_all()
+
+        await benefit_grant(
+            customer.id,
+            benefit_organization.id,
+            subscription_id=subscription.id,
+        )
+
+        assert grant_benefit_mock.call_count == int(
+            SubscriptionStatus.is_active(status)
+        )
+
+    async def test_retry(
+        self,
+        mocker: MockerFixture,
+        customer: Customer,
+        benefit_organization: Benefit,
+        product: Product,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+    ) -> None:
+        grant_benefit_mock = mocker.patch.object(
+            benefit_grant_service,
+            "grant_benefit",
+            spec=BenefitGrantService.grant_benefit,
+        )
+        grant_benefit_mock.side_effect = BenefitRetriableError(10)
+
+        subscription = await create_active_subscription(
+            save_fixture, product=product, customer=customer
+        )
+        await set_product_benefits(
+            save_fixture, product=product, benefits=[benefit_organization]
+        )
+        session.expunge_all()
+
+        with pytest.raises(Retry):
+            await benefit_grant(
+                customer.id,
+                benefit_organization.id,
+                subscription_id=subscription.id,
+            )
+
+
+@pytest.mark.anyio
+class TestBenefitRevoke:
+    async def test_soft_deleted_member(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        customer: Customer,
+        subscription: Subscription,
+        benefit_organization: Benefit,
+        member_owner: Member,
+        member_second: Member,
+    ) -> None:
+        target = await create_benefit_grant(
+            save_fixture,
+            customer,
+            benefit_organization,
+            granted=True,
+            member=member_second,
+            subscription=subscription,
+        )
+        other = await create_benefit_grant(
+            save_fixture,
+            customer,
+            benefit_organization,
+            granted=True,
+            member=member_owner,
+            subscription=subscription,
+        )
+        member_second.set_deleted_at()
+        await save_fixture(member_second)
+
+        await benefit_revoke(
+            customer.id,
+            benefit_organization.id,
+            member_id=member_second.id,
+            subscription_id=subscription.id,
+        )
+
+        revoked = await session.get(BenefitGrant, target.id)
+        assert revoked is not None
+        assert revoked.is_revoked
+        surviving = await session.get(BenefitGrant, other.id)
+        assert surviving is not None
+        assert surviving.is_granted
+
+    async def test_not_existing_customer(
+        self,
+        subscription: Subscription,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        # then
+        session.expunge_all()
+
+        with pytest.raises(CustomerDoesNotExist):
+            await benefit_revoke(
+                uuid.uuid4(),
+                benefit_organization.id,
+                subscription_id=subscription.id,
+            )
+
+    async def test_not_existing_benefit(
+        self,
+        subscription: Subscription,
+        customer: Customer,
+        session: AsyncSession,
+    ) -> None:
+        # then
+        session.expunge_all()
+
+        with pytest.raises(BenefitDoesNotExist):
+            await benefit_revoke(
+                customer.id, uuid.uuid4(), subscription_id=subscription.id
+            )
+
+    async def test_existing_benefit(
+        self,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        revoke_benefit_mock = mocker.patch.object(
+            benefit_grant_service,
+            "revoke_benefit",
+            spec=BenefitGrantService.revoke_benefit,
+        )
+
+        # then
+        session.expunge_all()
+
+        await benefit_revoke(
+            customer.id,
+            benefit_organization.id,
+            subscription_id=subscription.id,
+        )
+
+        revoke_benefit_mock.assert_called_once()
+
+    async def test_soft_deleted_benefit(
+        self,
+        mocker: MockerFixture,
+        save_fixture: SaveFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        revoke_benefit_mock = mocker.patch.object(
+            benefit_grant_service,
+            "revoke_benefit",
+            spec=BenefitGrantService.revoke_benefit,
+        )
+
+        benefit_organization.set_deleted_at()
+        await save_fixture(benefit_organization)
+
+        await benefit_revoke(
+            customer.id,
+            benefit_organization.id,
+            subscription_id=subscription.id,
+        )
+
+        revoke_benefit_mock.assert_called_once()
+
+    async def test_retry(
+        self,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        revoke_benefit_mock = mocker.patch.object(
+            benefit_grant_service,
+            "revoke_benefit",
+            spec=BenefitGrantService.revoke_benefit,
+        )
+        revoke_benefit_mock.side_effect = BenefitRetriableError(10)
+
+        # then
+        session.expunge_all()
+
+        with pytest.raises(Retry):
+            await benefit_revoke(
+                customer.id,
+                benefit_organization.id,
+                subscription_id=subscription.id,
+            )
+
+
+@pytest.mark.anyio
+class TestBenefitUpdate:
+    async def test_not_existing_grant(
+        self,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        # then
+        session.expunge_all()
+
+        with pytest.raises(BenefitGrantDoesNotExist):
+            await benefit_update(uuid.uuid4())
+
+    async def test_existing_grant(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+    ) -> None:
+        grant = BenefitGrant(
+            subscription=subscription, customer=customer, benefit=benefit_organization
+        )
+        grant.set_granted()
+        await save_fixture(grant)
+
+        update_benefit_grant_mock = mocker.patch.object(
+            benefit_grant_service,
+            "update_benefit_grant",
+            spec=BenefitGrantService.update_benefit_grant,
+        )
+
+        # then
+        session.expunge_all()
+
+        await benefit_update(grant.id)
+
+        update_benefit_grant_mock.assert_called_once()
+
+    async def test_retry(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+    ) -> None:
+        grant = BenefitGrant(
+            subscription=subscription, customer=customer, benefit=benefit_organization
+        )
+        grant.set_granted()
+        await save_fixture(grant)
+
+        update_benefit_grant_mock = mocker.patch.object(
+            benefit_grant_service,
+            "update_benefit_grant",
+            spec=BenefitGrantService.update_benefit_grant,
+        )
+        update_benefit_grant_mock.side_effect = BenefitRetriableError(10)
+
+        # then
+        session.expunge_all()
+
+        with pytest.raises(Retry):
+            await benefit_update(grant.id)
+
+
+@pytest.mark.anyio
+class TestBenefitDelete:
+    async def test_soft_deleted_benefit(
+        self,
+        save_fixture: SaveFixture,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        enqueue_job_mock = mocker.patch("polar.benefit.grant.service.enqueue_job")
+
+        grant = BenefitGrant(
+            subscription=subscription, customer=customer, benefit=benefit_organization
+        )
+        grant.set_granted()
+        await save_fixture(grant)
+
+        benefit_organization.set_deleted_at()
+        await save_fixture(benefit_organization)
+
+        await benefit_delete(benefit_organization.id)
+
+        enqueue_job_mock.assert_called_once()
+
+
+@pytest.mark.anyio
+class TestBenefitDeleteGrant:
+    async def test_not_existing_grant(
+        self,
+        benefit_organization: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        # then
+        session.expunge_all()
+
+        with pytest.raises(BenefitGrantDoesNotExist):
+            await benefit_delete_grant(uuid.uuid4())
+
+    async def test_existing_grant(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+    ) -> None:
+        grant = BenefitGrant(
+            subscription=subscription, customer=customer, benefit=benefit_organization
+        )
+        grant.set_granted()
+        await save_fixture(grant)
+
+        delete_benefit_grant_mock = mocker.patch.object(
+            benefit_grant_service,
+            "delete_benefit_grant",
+            spec=BenefitGrantService.delete_benefit_grant,
+        )
+
+        # then
+        session.expunge_all()
+
+        await benefit_delete_grant(grant.id)
+
+        delete_benefit_grant_mock.assert_called_once()
+
+    async def test_retry(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        customer: Customer,
+        benefit_organization: Benefit,
+    ) -> None:
+        grant = BenefitGrant(
+            subscription=subscription, customer=customer, benefit=benefit_organization
+        )
+        grant.set_granted()
+        await save_fixture(grant)
+
+        delete_benefit_grant_mock = mocker.patch.object(
+            benefit_grant_service,
+            "delete_benefit_grant",
+            spec=BenefitGrantService.delete_benefit_grant,
+        )
+        delete_benefit_grant_mock.side_effect = BenefitRetriableError(10)
+
+        # then
+        session.expunge_all()
+
+        with pytest.raises(Retry):
+            await benefit_delete_grant(grant.id)
+
+
+@pytest.mark.anyio
+class TestBenefitEnqueueGrants:
+    async def test_does_not_reset_meters(
+        self,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        session: AsyncSession,
+    ) -> None:
+        """
+        The benefit grant pipeline must NOT reset meters. Resets are handled
+        by order.service.create_subscription_order for cycle/cancel orders
+        and by meter_credit.cycle() for per-grant renewal. See issue #11427.
+        """
+        reset_meters_mock = mocker.patch.object(
+            subscription_service,
+            "reset_meters",
+            spec=SubscriptionService.reset_meters,
+        )
+
+        session.expunge_all()
+
+        await benefit_enqueue_grants(
+            subscription.customer_id, [], subscription_id=subscription.id
+        )
+
+        reset_meters_mock.assert_not_called()
+
+    async def test_enqueues_grants(
+        self,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        benefit_organization: Benefit,
+        benefit_organization_second: Benefit,
+        session: AsyncSession,
+    ) -> None:
+        enqueue_job_mock = mocker.patch("polar.benefit.tasks.enqueue_job")
+
+        benefit_ids = [benefit_organization.id, benefit_organization_second.id]
+
+        session.expunge_all()
+
+        await benefit_enqueue_grants(
+            subscription.customer_id,
+            benefit_ids,
+            subscription_id=subscription.id,
+        )
+
+        assert enqueue_job_mock.call_count == 2
+        enqueue_job_mock.assert_any_call(
+            "benefit.grant",
+            customer_id=subscription.customer_id,
+            benefit_id=benefit_organization.id,
+            member_id=None,
+            subscription_id=subscription.id,
+        )
+        enqueue_job_mock.assert_any_call(
+            "benefit.grant",
+            customer_id=subscription.customer_id,
+            benefit_id=benefit_organization_second.id,
+            member_id=None,
+            subscription_id=subscription.id,
+        )
+
+    async def test_no_grants_skips_enqueue(
+        self,
+        mocker: MockerFixture,
+        subscription: Subscription,
+        session: AsyncSession,
+    ) -> None:
+        enqueue_job_mock = mocker.patch("polar.benefit.tasks.enqueue_job")
+
+        session.expunge_all()
+
+        await benefit_enqueue_grants(
+            subscription.customer_id,
+            [],
+            subscription_id=subscription.id,
+        )
+
+        enqueue_job_mock.assert_not_called()

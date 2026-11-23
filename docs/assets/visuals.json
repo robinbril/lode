@@ -1,0 +1,87 @@
+{
+  "colors": {
+    "accent": "#1D5FD1",
+    "accent_dark": "#4C8DFF",
+    "gradient_end": "#0B1F4B",
+    "card": "#F5F8FF",
+    "card_stroke": "#CFDEFA",
+    "line": "#8FB4F2",
+    "line_dark": "#2F5AA8"
+  },
+  "banner": {
+    "file": "banner.svg",
+    "alt": "lode: complete codebases, ontwerpkaarten en skills voor Claude Code en Codex",
+    "title": "lode",
+    "tagline": "Je model kent veel code. Lode laat het bouwen naar goede code.",
+    "pillars": [
+      {
+        "icon": "blokken",
+        "title": "Codebases",
+        "text": "compleet en vast"
+      },
+      {
+        "icon": "boek",
+        "title": "Kaarten",
+        "text": "één idee per kaart"
+      },
+      {
+        "icon": "schild",
+        "title": "Toets",
+        "text": "twee skills"
+      },
+      {
+        "icon": "check",
+        "title": "Akkoord",
+        "text": "eerst het plan"
+      }
+    ]
+  },
+  "flows": [
+    {
+      "file": "zo-werkt-het.svg",
+      "alt": "Van opdracht naar bron, toets, akkoord en eerste werkende plak",
+      "steps": [
+        {
+          "icon": "vraag",
+          "title": "Opdracht",
+          "lines": [
+            "/lode met je doel",
+            "en je project"
+          ]
+        },
+        {
+          "icon": "zoek",
+          "title": "Bron",
+          "lines": [
+            "Eén codebase en",
+            "hooguit zes kaarten"
+          ]
+        },
+        {
+          "icon": "schild",
+          "title": "Toets",
+          "lines": [
+            "airesearch, council",
+            "of allebei"
+          ]
+        },
+        {
+          "icon": "plan",
+          "title": "Akkoord",
+          "lines": [
+            "Jij keurt het plan",
+            "voor er iets wijzigt"
+          ]
+        },
+        {
+          "icon": "bouw",
+          "title": "Eerste plak",
+          "lines": [
+            "Van database tot",
+            "scherm, met test"
+          ]
+        }
+      ]
+    }
+  ]
+}

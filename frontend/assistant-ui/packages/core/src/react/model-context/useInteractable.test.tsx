@@ -1,0 +1,294 @@
+// @vitest-environment jsdom
+
+import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Unstable_InteractableStateSchema } from "../types/scopes/interactables";
+
+type JsonSchema = Exclude<
+  Unstable_InteractableStateSchema,
+  { "~standard": unknown }
+>;
+type StandardSchemaWithJsonSchema = Extract<
+  Unstable_InteractableStateSchema,
+  { "~standard": unknown }
+> & {
+  "~standard": {
+    jsonSchema: { input: () => JsonSchema; output: () => JsonSchema };
+  };
+};
+
+const mocks = vi.hoisted(() => {
+  const unregister = vi.fn();
+  const register = vi.fn(() => unregister);
+  return {
+    register,
+    unregister,
+    aui: { unstable_interactables: { register } },
+    state: {
+      optional: { part: undefined as unknown },
+      thread: { messages: [] as unknown[] },
+    },
+    methods: {
+      setState: vi.fn(),
+      isPending: false,
+      error: undefined,
+      flush: vi.fn(async () => undefined),
+    },
+  };
+});
+
+vi.mock("@assistant-ui/store", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@assistant-ui/store")>()),
+  useAui: () => mocks.aui,
+  useAuiState: (selector: (state: typeof mocks.state) => unknown) =>
+    selector(mocks.state),
+}));
+
+vi.mock("./useInteractableState", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useInteractableState")>()),
+  unstable_useInteractableState: () => [undefined, mocks.methods],
+}));
+
+import { unstable_useInteractable } from "./useInteractable";
+
+afterEach(cleanup);
+
+describe("unstable_useInteractable", () => {
+  it("refreshes the registration when its JSON schema changes", async () => {
+    const schemaA = {
+      type: "object",
+      properties: { first: { type: "string" } },
+    } satisfies Unstable_InteractableStateSchema;
+    const schemaB = {
+      type: "object",
+      properties: { second: { type: "number" } },
+    } satisfies Unstable_InteractableStateSchema;
+    const initialA = { first: "one" };
+    const initialB = { second: 2 };
+
+    const hook = renderHook<
+      unknown,
+      { stateSchema: Unstable_InteractableStateSchema; initialState: unknown }
+    >(
+      ({ stateSchema, initialState }) =>
+        unstable_useInteractable("panel", {
+          id: "panel-1",
+          description: "A panel",
+          stateSchema,
+          initialState,
+        }),
+      { initialProps: { stateSchema: schemaA, initialState: initialA } },
+    );
+    await waitFor(() => expect(mocks.register).toHaveBeenCalledTimes(1));
+
+    hook.rerender({ stateSchema: schemaB, initialState: initialB });
+
+    await waitFor(() => expect(mocks.register).toHaveBeenCalledTimes(2));
+    expect(mocks.unregister).toHaveBeenCalledTimes(1);
+    expect(mocks.register).toHaveBeenLastCalledWith(
+      expect.objectContaining({ stateSchema: schemaB, initialState: initialB }),
+    );
+
+    hook.rerender({
+      stateSchema: {
+        type: "object",
+        properties: { second: { type: "number" } },
+      },
+      initialState: { second: 3 },
+    });
+    expect(mocks.register).toHaveBeenCalledTimes(2);
+  });
+
+  it("stabilizes equivalent rebuilt standard schemas", async () => {
+    const createSchema = (property: string): StandardSchemaWithJsonSchema => ({
+      "~standard": {
+        version: 1,
+        vendor: "test",
+        validate: () => ({ value: {} }),
+        jsonSchema: {
+          input: () => ({
+            type: "object",
+            properties: { [property]: { type: "string" } },
+          }),
+          output: () => ({ type: "object" }),
+        },
+      },
+    });
+    const firstSchema = createSchema("value");
+
+    const hook = renderHook<
+      unknown,
+      { stateSchema: Unstable_InteractableStateSchema }
+    >(
+      ({ stateSchema }) =>
+        unstable_useInteractable("panel", {
+          id: "panel-1",
+          description: "A panel",
+          stateSchema,
+          initialState: {},
+        }),
+      { initialProps: { stateSchema: firstSchema } },
+    );
+    await waitFor(() => expect(mocks.register).toHaveBeenCalledTimes(1));
+
+    hook.rerender({ stateSchema: createSchema("value") });
+    expect(mocks.register).toHaveBeenCalledTimes(1);
+
+    const changedSchema = createSchema("other");
+    hook.rerender({ stateSchema: changedSchema });
+    await waitFor(() => expect(mocks.register).toHaveBeenCalledTimes(2));
+    expect(mocks.register).toHaveBeenLastCalledWith(
+      expect.objectContaining({ stateSchema: changedSchema }),
+    );
+  });
+
+  it("keeps unsupported standard schemas from failing during render", async () => {
+    const createSchema = () =>
+      ({
+        "~standard": {
+          version: 1 as const,
+          vendor: "test",
+          validate: () => ({ value: {} }),
+        },
+      }) satisfies Unstable_InteractableStateSchema;
+
+    const hook = renderHook<
+      unknown,
+      { stateSchema: Unstable_InteractableStateSchema }
+    >(
+      ({ stateSchema }) =>
+        unstable_useInteractable("panel", {
+          id: "panel-1",
+          description: "A panel",
+          stateSchema,
+          initialState: {},
+        }),
+      { initialProps: { stateSchema: createSchema() } },
+    );
+    await waitFor(() => expect(mocks.register).toHaveBeenCalledTimes(1));
+
+    hook.rerender({ stateSchema: createSchema() });
+    expect(mocks.register).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an interactable app-scoped inside another tool's call that shares its id", async () => {
+    mocks.state.optional.part = {
+      type: "tool-call",
+      toolCallId: "call-1",
+      toolName: "generate_report",
+      args: { topic: "sales" },
+      result: { report: "Q3" },
+    };
+    try {
+      renderHook(() =>
+        unstable_useInteractable("report", {
+          id: "call-1",
+          description: "A report",
+          stateSchema: { type: "object", properties: {} },
+          initialState: { report: "Q3" },
+        }),
+      );
+      await waitFor(() =>
+        expect(mocks.register).toHaveBeenLastCalledWith(
+          expect.objectContaining({ id: "call-1", name: "report" }),
+        ),
+      );
+      expect(mocks.register).toHaveBeenLastCalledWith(
+        expect.not.objectContaining({ scope: "thread" }),
+      );
+    } finally {
+      mocks.state.optional.part = undefined;
+    }
+  });
+
+  it("keeps an interactable app-scoped inside another instance's creating call", async () => {
+    mocks.state.optional.part = {
+      type: "tool-call",
+      toolCallId: "call-9",
+      toolName: "create_report",
+      args: {},
+      result: { success: true, interactable: "report" },
+    };
+    try {
+      renderHook(() =>
+        unstable_useInteractable("report", {
+          id: "call-1",
+          description: "A report",
+          stateSchema: { type: "object", properties: {} },
+          initialState: {},
+        }),
+      );
+      await waitFor(() =>
+        expect(mocks.register).toHaveBeenLastCalledWith(
+          expect.objectContaining({ id: "call-1", name: "report" }),
+        ),
+      );
+      expect(mocks.register).toHaveBeenLastCalledWith(
+        expect.not.objectContaining({ scope: "thread" }),
+      );
+    } finally {
+      mocks.state.optional.part = undefined;
+    }
+  });
+
+  it("converts a referentially stable schema only once", async () => {
+    const convert = vi.fn(() => ({
+      type: "object" as const,
+      properties: { value: { type: "string" as const } },
+    }));
+    const stateSchema: StandardSchemaWithJsonSchema = {
+      "~standard": {
+        version: 1,
+        vendor: "test",
+        validate: () => ({ value: {} }),
+        jsonSchema: { input: convert, output: convert },
+      },
+    };
+
+    const hook = renderHook<unknown, { initialState: Record<string, unknown> }>(
+      ({ initialState }) =>
+        unstable_useInteractable("panel", {
+          id: "panel-1",
+          description: "A panel",
+          stateSchema,
+          initialState,
+        }),
+      { initialProps: { initialState: { value: "first" } } },
+    );
+    await waitFor(() => expect(mocks.register).toHaveBeenCalledTimes(1));
+
+    hook.rerender({ initialState: { value: "second" } });
+    expect(convert).toHaveBeenCalledTimes(1);
+    expect(mocks.register).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["an object", { success: true, id: "panel-1" }],
+    ["JSON text", JSON.stringify({ success: true, id: "panel-1" })],
+  ])(
+    "registers an id-less update call under the instance its result resolved, given as %s",
+    async (_, result) => {
+      mocks.state.optional.part = {
+        type: "tool-call",
+        toolName: "update_panel",
+        args: { value: "edited" },
+        result,
+      } as never;
+      try {
+        renderHook(() =>
+          unstable_useInteractable("panel", {
+            description: "A panel",
+            stateSchema: { type: "object" },
+            initialState: { value: "edited" },
+          }),
+        );
+        await waitFor(() => expect(mocks.register).toHaveBeenCalled());
+        expect(mocks.register).toHaveBeenLastCalledWith(
+          expect.objectContaining({ id: "panel-1", scope: "thread" }),
+        );
+      } finally {
+        mocks.state.optional.part = undefined;
+      }
+    },
+  );
+});

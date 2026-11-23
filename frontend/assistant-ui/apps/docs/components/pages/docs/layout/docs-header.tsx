@@ -1,0 +1,332 @@
+"use client";
+
+import { useMemo } from "react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import type * as PageTree from "fumadocs-core/page-tree";
+import { ArrowUpRight, Search } from "lucide-react";
+import { useSearchContext } from "@/components/shared/search-provider";
+import { preloadSearchDialog } from "@/components/shared/lazy-search-dialog";
+import {
+  NAV_ITEMS,
+  CLOUD_URL,
+  megaGroups,
+  type NavItem,
+} from "@/lib/constants";
+import { Button } from "@/components/ui/button";
+import { Kbd, KbdGroup } from "@/components/ui/kbd";
+import { MoreDropdown } from "@/components/shared/more-dropdown";
+import { NavItems, NavItemsRoot } from "@/components/shared/nav-items";
+import { DocsSiteHeader } from "@assistant-ui/docs-theme/ui";
+import { useAssistantPanel } from "@/components/pages/docs/assistant/context";
+import { ThemeToggle } from "@/components/shared/theme-toggle";
+import { HeaderBrandLink } from "@/components/shared/header-brand-link";
+import { headerSlashClassName } from "@/components/shared/header-chrome";
+import { useScrolled } from "@/hooks/use-scrolled";
+import { analytics } from "@/lib/analytics";
+import { cn } from "@/lib/utils";
+import { usePlatform } from "@/components/pages/docs/platform/context";
+import { PlatformSwitcher } from "@/components/pages/docs/platform/switcher";
+import {
+  buildPlatformSections,
+  findPathToNode,
+  getPlatformHomeUrl,
+} from "@/components/pages/docs/platform/tree";
+
+interface DocsHeaderProps {
+  section: string;
+  sectionHref: string;
+  tree: PageTree.Root;
+}
+
+function AskAIButton() {
+  const { toggle } = useAssistantPanel();
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={toggle}
+      className="shrink-0"
+      aria-keyshortcuts="Meta+I Control+I"
+    >
+      Ask AI
+      <KbdGroup className="hidden xl:inline-flex">
+        <Kbd>⌘</Kbd>
+        <Kbd>I</Kbd>
+      </KbdGroup>
+    </Button>
+  );
+}
+
+function HeaderSearch() {
+  const { setOpenSearch, hotKey } = useSearchContext();
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={() => {
+        analytics.search.opened("header");
+        setOpenSearch(true);
+      }}
+      onPointerEnter={preloadSearchDialog}
+      onFocus={preloadSearchDialog}
+      className="text-muted-foreground hover:text-foreground w-full max-w-96 shrink justify-start gap-2 font-normal max-xl:hidden"
+    >
+      <Search className="size-3.5 shrink-0" />
+      <span className="flex-1 text-left">Search...</span>
+      <KbdGroup>
+        {hotKey.map((k, i) => (
+          <Kbd key={i}>{k.display}</Kbd>
+        ))}
+      </KbdGroup>
+    </Button>
+  );
+}
+
+function SearchIconButton({ className }: { className?: string }) {
+  const { setOpenSearch } = useSearchContext();
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        analytics.search.opened("header");
+        setOpenSearch(true);
+      }}
+      onPointerEnter={preloadSearchDialog}
+      onFocus={preloadSearchDialog}
+      className={cn(
+        "text-muted-foreground hover:text-foreground flex cursor-pointer items-center justify-center transition-colors",
+        className,
+      )}
+      aria-label="Search"
+    >
+      <Search className="size-4" />
+    </button>
+  );
+}
+
+const CONDENSED_HIDDEN = new Set(["Showcase", "Pricing"]);
+
+function MobileSectionBreadcrumb({
+  tree,
+  section,
+}: {
+  tree: PageTree.Root;
+  section: string;
+}) {
+  const pathname = usePathname();
+  const { platform } = usePlatform();
+
+  const activeSection = useMemo(() => {
+    const folders = tree.children.filter(
+      (node): node is PageTree.Folder => node.type === "folder",
+    );
+
+    const sections = buildPlatformSections(folders, platform);
+    const active = sections.find((folder) => findPathToNode(folder, pathname));
+    if (!active || typeof active.name !== "string" || active.name === section) {
+      return null;
+    }
+
+    return {
+      label: active.name,
+      href: active.index?.url,
+    };
+  }, [tree, pathname, platform, section]);
+
+  if (!activeSection) return null;
+
+  return (
+    <span className="flex min-w-0 items-center md:hidden">
+      <span className="text-muted-foreground/40 mx-3 shrink-0">/</span>
+      {activeSection.href ? (
+        <Link
+          href={activeSection.href}
+          className="text-foreground hover:text-foreground/80 min-w-0 truncate text-sm font-medium transition-colors"
+        >
+          {activeSection.label}
+        </Link>
+      ) : (
+        <span className="text-foreground min-w-0 truncate text-sm font-medium">
+          {activeSection.label}
+        </span>
+      )}
+    </span>
+  );
+}
+
+export function DocsHeader({ section, sectionHref, tree }: DocsHeaderProps) {
+  const scrolled = useScrolled();
+  const { platform } = usePlatform();
+  const homeHref = useMemo(
+    () => getPlatformHomeUrl(tree, platform) ?? sectionHref,
+    [tree, platform, sectionHref],
+  );
+
+  const sectionFilter = (item: (typeof NAV_ITEMS)[number]) =>
+    item.type !== "link" || item.href !== sectionHref;
+  const filteredItems = NAV_ITEMS.filter(sectionFilter);
+  const condensedItems = filteredItems.filter(
+    (item) => !CONDENSED_HIDDEN.has(item.label),
+  );
+  const moreItems = filteredItems.filter(
+    (item): item is Extract<NavItem, { type: "link" }> =>
+      item.type === "link" && CONDENSED_HIDDEN.has(item.label),
+  );
+
+  return (
+    <DocsSiteHeader
+      scrolled={scrolled}
+      navigationRoot={NavItemsRoot}
+      brand={
+        <>
+          <HeaderBrandLink showLabel={false} />
+          <span className={cn(headerSlashClassName, "max-md:hidden")}>/</span>
+          <Link
+            href={homeHref}
+            className="text-foreground hover:text-foreground/80 text-sm font-medium transition-colors max-md:hidden"
+          >
+            {section}
+          </Link>
+          <span className="flex items-center max-lg:hidden">
+            <span className="text-muted-foreground mx-1.5 text-sm">for</span>
+            <PlatformSwitcher tree={tree} />
+          </span>
+          <MobileSectionBreadcrumb tree={tree} section={section} />
+        </>
+      }
+      mobileControls={
+        <>
+          <SearchIconButton className="size-8" />
+          <AskAIButton />
+        </>
+      }
+      condensedNavigation={
+        <>
+          <div className="flex items-center gap-2">
+            <SearchIconButton className="size-7" />
+            <AskAIButton />
+          </div>
+          <div className="flex shrink-0 items-center">
+            <NavItems
+              items={condensedItems}
+              contentClassName="mx-auto max-w-7xl"
+            />
+            {moreItems.length > 0 && <MoreDropdown items={moreItems} />}
+          </div>
+          <ThemeToggle />
+        </>
+      }
+      desktopNavigation={
+        <>
+          <div className="flex min-w-0 items-center gap-2">
+            <SearchIconButton className="size-7 xl:hidden" />
+            <HeaderSearch />
+            <AskAIButton />
+          </div>
+          <NavItems
+            items={filteredItems}
+            contentClassName="mx-auto max-w-7xl"
+          />
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              size="sm"
+              nativeButton={false}
+              render={
+                <a href={CLOUD_URL} target="_blank" rel="noopener noreferrer" />
+              }
+            >
+              Cloud
+            </Button>
+            <ThemeToggle />
+          </div>
+        </>
+      }
+      mobileNavigation={(close) => (
+        <>
+          {filteredItems.map((item) => {
+            if (item.type === "link") {
+              return item.href.startsWith("http") ? (
+                <a
+                  key={item.href}
+                  href={item.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => close()}
+                  className="text-foreground py-3 text-lg transition-colors"
+                >
+                  {item.label}
+                </a>
+              ) : (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  onClick={() => close()}
+                  className="text-foreground py-3 text-lg transition-colors"
+                >
+                  {item.label}
+                </Link>
+              );
+            }
+
+            return (
+              <div key={item.label} className="flex flex-col">
+                <span className="text-foreground py-3 text-lg">
+                  {item.label}
+                </span>
+                {megaGroups(item).map((group) => (
+                  <div key={group.label} className="flex flex-col">
+                    <span className="text-muted-foreground py-3 text-sm">
+                      {group.label}
+                    </span>
+                    {group.items.map((link) =>
+                      link.external ? (
+                        <a
+                          key={link.href}
+                          href={link.href}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={() => close()}
+                          className="text-foreground flex items-center gap-1.5 py-2 pl-4 text-lg transition-colors"
+                        >
+                          {link.label}
+                          <ArrowUpRight className="size-3.5 opacity-40" />
+                        </a>
+                      ) : (
+                        <Link
+                          key={link.href}
+                          href={link.href}
+                          onClick={() => close()}
+                          className="text-foreground py-2 pl-4 text-lg transition-colors"
+                        >
+                          {link.label}
+                        </Link>
+                      ),
+                    )}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          <div className="mt-auto flex items-center justify-between border-t py-6">
+            <Button
+              size="sm"
+              nativeButton={false}
+              className="w-fit"
+              onClick={() => close()}
+              render={
+                <a href={CLOUD_URL} target="_blank" rel="noopener noreferrer" />
+              }
+            >
+              Cloud
+            </Button>
+            <ThemeToggle />
+          </div>
+        </>
+      )}
+    />
+  );
+}

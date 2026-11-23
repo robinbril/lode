@@ -1,0 +1,170 @@
+import {
+  Virtualizer,
+  elementScroll,
+  observeElementOffset,
+  observeElementRect,
+  observeWindowOffset,
+  observeWindowRect,
+  windowScroll,
+} from '@tanstack/virtual-core'
+import type { ReactiveController, ReactiveControllerHost } from 'lit'
+import type { PartialKeys, VirtualizerOptions } from '@tanstack/virtual-core'
+
+export * from '@tanstack/virtual-core'
+
+class VirtualizerControllerBase<
+  TScrollElement extends Element | Window,
+  TItemElement extends Element,
+> implements ReactiveController {
+  host: ReactiveControllerHost
+
+  private readonly virtualizer: Virtualizer<TScrollElement, TItemElement>
+
+  private options: VirtualizerOptions<TScrollElement, TItemElement>
+
+  private cleanup: () => void = () => {}
+
+  constructor(
+    host: ReactiveControllerHost,
+    options: VirtualizerOptions<TScrollElement, TItemElement>,
+  ) {
+    this.host = host
+    this.options = { ...options }
+    this.virtualizer = new Virtualizer(this.resolveOptions(this.options))
+    this.host.addController(this)
+  }
+
+  public getVirtualizer() {
+    return this.virtualizer
+  }
+
+  /**
+   * Merge a partial options update into the options this controller already
+   * holds, push them to the virtualizer, and request a host update. Lit folds
+   * a request made from `willUpdate` into the update already in progress.
+   *
+   * Keys set to `undefined` are ignored, matching core `setOptions`, so a
+   * partial update cannot wipe an option stored earlier. Defaults supplied by
+   * `VirtualizerController` / `WindowVirtualizerController` stay in place
+   * unless a later call replaces them.
+   */
+  public setOptions(
+    options: Partial<VirtualizerOptions<TScrollElement, TItemElement>>,
+  ) {
+    if (!this.applyOptions(options)) return
+
+    this.virtualizer.setOptions(this.resolveOptions(this.options))
+    this.virtualizer._willUpdate()
+    this.host.requestUpdate()
+  }
+
+  hostConnected() {
+    this.cleanup = this.virtualizer._didMount()
+    // `hostDisconnected` runs the cleanup returned by `_didMount`, which
+    // drops `scrollElement` and its observers. Lit calls `hostUpdated` only
+    // when an update runs, and reconnecting a host with no pending update
+    // does not schedule one, so scrolling would stop changing the rendered
+    // range until a reactive property changed.
+    //
+    // Scroll elements that are already readable (the window, or a
+    // `getScrollElement` that does not use Lit's `ref`) can be observed
+    // immediately. `ref` clears its value on disconnect and restores it only
+    // after this callback returns, so also request an update: the following
+    // `hostUpdated` runs `_willUpdate` once that ref is populated again.
+    this.virtualizer._willUpdate()
+    this.host.requestUpdate()
+  }
+
+  hostUpdated() {
+    this.virtualizer._willUpdate()
+  }
+
+  hostDisconnected() {
+    this.cleanup()
+  }
+
+  private applyOptions(
+    partial: Partial<VirtualizerOptions<TScrollElement, TItemElement>>,
+  ): boolean {
+    const next: VirtualizerOptions<TScrollElement, TItemElement> = {
+      ...this.options,
+    }
+    let changed = false
+
+    for (const key in partial) {
+      if (!Object.prototype.hasOwnProperty.call(partial, key)) continue
+
+      const value = partial[key as keyof typeof partial]
+      if (value === undefined) continue
+
+      if (!Object.is(next[key as keyof typeof next], value)) {
+        changed = true
+        Object.assign(next, { [key]: value })
+      }
+    }
+
+    if (changed) this.options = next
+    return changed
+  }
+
+  private resolveOptions(
+    options: VirtualizerOptions<TScrollElement, TItemElement>,
+  ): VirtualizerOptions<TScrollElement, TItemElement> {
+    return {
+      ...options,
+      onChange: (instance, sync) => {
+        this.host.updateComplete.then(() => this.host.requestUpdate())
+        options.onChange?.(instance, sync)
+      },
+    }
+  }
+}
+
+export class VirtualizerController<
+  TScrollElement extends Element,
+  TItemElement extends Element,
+> extends VirtualizerControllerBase<TScrollElement, TItemElement> {
+  constructor(
+    host: ReactiveControllerHost,
+    options: PartialKeys<
+      VirtualizerOptions<TScrollElement, TItemElement>,
+      'observeElementRect' | 'observeElementOffset' | 'scrollToFn'
+    >,
+  ) {
+    super(host, {
+      observeElementRect: observeElementRect,
+      observeElementOffset: observeElementOffset,
+      scrollToFn: elementScroll,
+      ...options,
+    })
+  }
+}
+
+export class WindowVirtualizerController<
+  TItemElement extends Element,
+> extends VirtualizerControllerBase<Window, TItemElement> {
+  constructor(
+    host: ReactiveControllerHost,
+    options: PartialKeys<
+      VirtualizerOptions<Window, TItemElement>,
+      | 'getScrollElement'
+      | 'observeElementRect'
+      | 'observeElementOffset'
+      | 'scrollToFn'
+    >,
+  ) {
+    super(host, {
+      getScrollElement: () => (typeof document !== 'undefined' ? window : null),
+      observeElementRect: observeWindowRect,
+      observeElementOffset: observeWindowOffset,
+      scrollToFn: windowScroll,
+      initialOffset: () =>
+        typeof document !== 'undefined'
+          ? options.horizontal
+            ? window.scrollX
+            : window.scrollY
+          : 0,
+      ...options,
+    })
+  }
+}

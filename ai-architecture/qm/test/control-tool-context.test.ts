@@ -1,0 +1,233 @@
+import "./support/auto-fake-sprites.ts";
+import { testTenant } from "./support/test-tenant.ts";
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildApp } from "./support/build-app.ts";
+import { createControlService } from "../src/api/control-service.ts";
+import { createToolContext, type ToolContextDeps, CONTROL_UNAVAILABLE } from "../src/tools/primitives.ts";
+import { scopeId } from "../src/types.ts";
+import { CAPABILITY_TTL_MS, type CapabilityClaims } from "../src/auth/capability-token.ts";
+import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
+import { testConfig } from "./support/test-config.ts";
+import { createAgentTools } from "../src/agent/agent-tools.ts";
+import { createSurfaceToolDeps, type SurfaceToolsContext } from "../src/surfaces/surface-tools.ts";
+import { createPostgresChannelPolicyStore } from "../src/surface-cache/channel-policy-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { testSurfaces } from "./support/single-process.ts";
+
+const SECRET = "control-tool-ctx";
+const handle: SandboxHandle = { id: "h", rootDir: "/workspace" };
+
+function build() {
+  const built = buildApp(
+    testConfig({ dataDir: mkdtempSync(join(tmpdir(), "control-tool-ctx-")), signingSecret: SECRET }),
+  );
+  const control = createControlService(built.app, built.scheduler);
+  return { built, control };
+}
+
+const claims = (actorId: string): CapabilityClaims => ({
+  actorId,
+  scopeId: scopeId("personal", actorId),
+  destination: { type: "slack", target: "D1", audienceScopeId: scopeId("personal", actorId) },
+  destinations: [
+    { key: "k-dm", type: "slack", target: "D1", audienceScopeId: scopeId("personal", actorId), label: "this DM" },
+  ],
+  defaultDestinationKey: "k-dm",
+  exp: Date.now() + CAPABILITY_TTL_MS,
+});
+
+function ctxFor(extra: Partial<ToolContextDeps>) {
+  const scope = scopeId("personal", "U1");
+  return createToolContext({
+    tenant: testTenant,
+    sandbox: {} as unknown as Sandbox,
+    provision: async () => handle,
+    writableScopeId: scope,
+    readOnlyScopeIds: [],
+    commandPolicy: () => ({ mode: "denylist", rules: [] }),
+    authorizeCommand: () => false,
+    grantedHandles: [],
+    deploy: {} as never,
+    acl: {} as never,
+    createdBy: "U1",
+    ...extra,
+  });
+}
+
+test("createToolContext.cronCreate creates a real cron through the shared service", async () => {
+  const { built, control } = build();
+  const ctx = ctxFor({ control, controlClaims: claims("U1") });
+  const r = await ctx.cronCreate({ title: "digest", schedule: { everyMs: 3_600_000 }, action: "check gmail" });
+  assert.ok(r.ok, JSON.stringify(r));
+  const stored = await built.app.getCron(r.cron.id);
+  assert.ok(stored);
+  assert.equal(stored.owner, "U1");
+  assert.equal(stored.title, "digest");
+});
+
+test("webhook registration through the tool requires a live person and leaves refused calls without effects", async () => {
+  const { built, control } = build();
+  const request = { action: "handle the event", verification: { scheme: "hmac-sha256" as const, secret: "secret" } };
+  const auditBefore = await built.auditLog.events(testTenant);
+  for (const scope of ["personal:U1", "channel:C1"] as const) {
+    for (const extra of [
+      {},
+      { liveActor: false, liveAuthor: false },
+      { triggered: true },
+      { triggered: true, liveActor: true },
+      { triggered: true, liveAuthor: true },
+    ]) {
+      const ctx = ctxFor({ control, controlClaims: { ...claims("U1"), scopeId: scope, ...extra } });
+      const result = await ctx.webhookCreate(request);
+      assert.equal(result.ok, false, JSON.stringify({ scope, extra }));
+      assert.equal(result.ok ? undefined : result.code, "forbidden");
+      assert.deepEqual(await built.app.listWebhooks(), []);
+      assert.deepEqual(await built.auditLog.events(testTenant), auditBefore);
+    }
+  }
+  for (const extra of [{ liveActor: true }, { liveAuthor: true }]) {
+    const ctx = ctxFor({ control, controlClaims: { ...claims("U1"), ...extra } });
+    const result = await ctx.webhookCreate(request);
+    assert.ok(result.ok, JSON.stringify(result));
+    assert.equal(result.webhook.owner, "U1");
+    assert.equal(result.secret, "secret");
+  }
+  const [webhook] = await built.app.listWebhooks();
+  await built.app.setWebhookEnabled(webhook!.id, false);
+  const disabled = await built.app.listWebhooks();
+  const auditAfter = await built.auditLog.events(testTenant);
+  const ctx = ctxFor({ control, controlClaims: { ...claims("U1"), triggered: true } });
+  const result = await ctx.webhookCreate(request);
+  assert.equal(result.ok ? undefined : result.code, "forbidden");
+  assert.deepEqual(await built.app.listWebhooks(), disabled);
+  assert.deepEqual(await built.auditLog.events(testTenant), auditAfter);
+});
+
+test("createToolContext.soulWrite then soulRead reflect the new SOUL", async () => {
+  const { control } = build();
+  const ctx = ctxFor({ control, controlClaims: claims("U1") });
+  const w = await ctx.soulWrite("Be brief.");
+  assert.ok("ok" in w && w.ok);
+  const r = ctx.soulRead();
+  assert.ok(!("code" in r) || r.code !== "control_unavailable");
+  assert.equal((r as { soul: string | null }).soul, "Be brief.");
+});
+
+for (const scope of ["conversation", "channel"] as const) {
+  test(`concurrent guidance edits at ${scope} scope reject a stale replacement without losing the winner`, async () => {
+    const { control } = build();
+    const channelPolicy = createPostgresChannelPolicyStore(testDatabaseUrl());
+    let reads = 0;
+    let releaseReads!: () => void;
+    const bothRead = new Promise<void>((resolve) => (releaseReads = resolve));
+    const racingPolicy = {
+      ...channelPolicy,
+      async get(container: string) {
+        const policy = await channelPolicy.get(container);
+        if (++reads === 2) releaseReads();
+        await bothRead;
+        return policy;
+      },
+    };
+    const surface = createSurfaceToolDeps({
+      deps: {
+        surfaces: testSurfaces(),
+        deliveries: {},
+        channelPolicy: scope === "channel" ? racingPolicy : channelPolicy,
+        auditLog: { record() {} },
+      },
+      input: { surfaceTools: true },
+      actor: { id: "U1" },
+      conversation: { kind: "channel", channelRef: "C1" },
+      session: { id: "S1" },
+      scopeId: "channel:C1",
+      defaultDestination: {},
+    } as unknown as SurfaceToolsContext)!;
+    const ctx = ctxFor({ control, controlClaims: claims("U1"), surface });
+    await ctx.soulWrite("First rule. Second rule.");
+    await ctx.setStandingOrder("First rule. Second rule.");
+    const entries: string[] = [];
+    const tool = createAgentTools(
+      {
+        current: ctx,
+        scopeLabel: scopeId("personal", "U1"),
+        emit: async (item) => {
+          entries.push(item.kind);
+          return undefined;
+        },
+      },
+      { controlTools: true },
+    ).find((t) => t.name === "guidance")!;
+    const edit = (old: string, next: string) =>
+      tool
+        .execute(old, { action: "edit", scope, old, new: next }, undefined, undefined, {} as never)
+        .then((result) => JSON.stringify(result));
+    const results = await Promise.all([edit("First rule.", "First updated."), edit("Second rule.", "Second updated.")]);
+    assert.equal(results.filter((result) => !result.includes("[error]")).length, 1);
+    assert.equal(entries.filter((kind) => kind === "ToolResult").length, 2);
+    assert.match(
+      results.find((result) => result.includes("[error]"))!,
+      /changed/,
+    );
+    const current =
+      scope === "conversation" ? control.readSoul(claims("U1")).soul : (await channelPolicy.get("C1"))!.orders;
+    assert.ok(current === "First updated. Second rule." || current === "First rule. Second updated.");
+    const retry = current.includes("First updated.")
+      ? await edit("Second rule.", "Second updated.")
+      : await edit("First rule.", "First updated.");
+    assert.doesNotMatch(retry, /\[error\]/);
+    const final =
+      scope === "conversation" ? control.readSoul(claims("U1")).soul : (await channelPolicy.get("C1"))!.orders;
+    assert.equal(final, "First updated. Second updated.");
+  });
+}
+
+test("channel guidance metadata updates preserve intervening edits and initialize missing policies", async () => {
+  const channelPolicy = createPostgresChannelPolicyStore(testDatabaseUrl());
+  const surface = createSurfaceToolDeps({
+    deps: { surfaces: testSurfaces(), deliveries: {}, channelPolicy, auditLog: { record() {} } },
+    input: { surfaceTools: true },
+    actor: { id: "U1" },
+    conversation: { kind: "channel", channelRef: "C1" },
+    session: { id: "S1" },
+    scopeId: "channel:C1",
+    defaultDestination: {},
+  } as unknown as SurfaceToolsContext)!;
+  const ctx = ctxFor({ surface });
+  const tool = createAgentTools({ current: ctx }, { controlTools: true }).find((t) => t.name === "guidance")!;
+  const replace = (params: Record<string, unknown>) =>
+    tool.execute("metadata", { action: "replace", scope: "channel", ...params }, undefined, undefined, {} as never);
+  await replace({ ambientEnabled: true });
+  assert.equal((await channelPolicy.get("C1"))!.orders, "");
+  assert.equal((await channelPolicy.get("C1"))!.ambientEnabled, true);
+  const read = ctx.getStandingOrder;
+  ctx.getStandingOrder = async () => {
+    const snapshot = await read();
+    await surface.setStandingOrder("Concurrent edit.");
+    return snapshot;
+  };
+  await replace({ ambientEnabled: false, bots: { news: { mode: "ignore" } } });
+  const stored = (await channelPolicy.get("C1"))!;
+  assert.equal(stored.orders, "Concurrent edit.");
+  assert.equal(stored.ambientEnabled, false);
+  assert.deepEqual(stored.bots, { news: { mode: "ignore" } });
+  assert.equal((await channelPolicy.history("C1"))[0]!.orders, stored.orders);
+  await replace({ content: "Explicit replacement." });
+  assert.equal((await channelPolicy.get("C1"))!.orders, "Explicit replacement.");
+  await replace({ content: 42, ambientEnabled: true });
+  assert.equal((await channelPolicy.get("C1"))!.orders, "Concurrent edit.");
+});
+
+test("without control/controlClaims wired, every control method returns CONTROL_UNAVAILABLE", async () => {
+  const ctx = ctxFor({});
+  assert.deepEqual(await ctx.cronCreate({ schedule: { everyMs: 1000 }, action: "x" }), CONTROL_UNAVAILABLE);
+  assert.deepEqual(await ctx.cronList(), CONTROL_UNAVAILABLE);
+  assert.deepEqual(await ctx.cronRuns("cron-1"), CONTROL_UNAVAILABLE);
+  assert.deepEqual(await ctx.webhookList(), CONTROL_UNAVAILABLE);
+  assert.deepEqual(ctx.soulRead(), CONTROL_UNAVAILABLE);
+});

@@ -1,0 +1,550 @@
+"""Unit tests for GoogleDriveConnector slim retrieval routing.
+
+Verifies that:
+- GoogleDriveConnector implements SlimConnector so pruning takes the ID-only path
+- retrieve_all_slim_docs() calls _extract_slim_docs_from_google_drive with include_permissions=False
+- retrieve_all_slim_docs_perm_sync() calls _extract_slim_docs_from_google_drive with include_permissions=True
+- celery_utils routing picks retrieve_all_slim_docs() for GoogleDriveConnector
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from onyx.access.models import ExternalAccess
+from onyx.background.celery.celery_utils import extract_ids_from_runnable_connector
+from onyx.connectors.google_drive.connector import (
+    DRIVE_FETCH_WORKERS,
+    GoogleDriveConnector,
+)
+from onyx.connectors.google_drive.doc_conversion import (
+    PermissionSyncContext,
+    build_slim_document,
+)
+from onyx.connectors.google_drive.file_retrieval import DriveFileFieldType
+from onyx.connectors.google_drive.models import (
+    DriveListingState,
+    GDriveMimeType,
+    GoogleDriveCheckpoint,
+    ImpersonationError,
+    RetrievedDriveFile,
+)
+from onyx.connectors.google_drive.source_operations import (
+    GoogleDriveRefreshError,
+    GoogleDriveSourceOperations,
+)
+from onyx.connectors.interfaces import SlimConnector, SlimConnectorWithPermSync
+from onyx.connectors.models import SlimDocument
+from onyx.utils.threadpool_concurrency import ThreadSafeDict, ThreadSafeSet
+
+_ADMIN_EMAIL = "admin@example.com"
+_EXTERNAL_OWNER_EMAIL = "owner@external.example"
+_RETRIEVER_EMAIL = "retriever@example.com"
+_DOC_CONVERSION_MODULE = "onyx.connectors.google_drive.doc_conversion"
+_CONN_MODULE = "onyx.connectors.google_drive.connector"
+
+
+def _done_listing() -> DriveListingState:
+    """A listing with no partition left to list."""
+    return DriveListingState(window_t0=0, window_t1=0)
+
+
+def _make_done_checkpoint() -> GoogleDriveCheckpoint:
+    return GoogleDriveCheckpoint(
+        listing=_done_listing(),
+        retrieved_drive_file_ids=set(),
+        has_more=False,
+    )
+
+
+def _make_connector() -> GoogleDriveConnector:
+    connector = GoogleDriveConnector(include_my_drives=True)
+    connector._ops = MagicMock(spec=GoogleDriveSourceOperations)
+    connector._primary_admin_email = _ADMIN_EMAIL
+    return connector
+
+
+class TestBuildSlimDocumentPermissions:
+    def test_routes_owner_then_retriever_fallback(self) -> None:
+        ops = MagicMock(spec=GoogleDriveSourceOperations)
+        external_access = ExternalAccess.empty()
+        file = {
+            "id": "file-id",
+            "mimeType": "text/plain",
+            "webViewLink": "https://drive.google.com/file/d/file-id/view",
+            "owners": [{"emailAddress": _EXTERNAL_OWNER_EMAIL}],
+        }
+        permission_sync_context = PermissionSyncContext(
+            primary_admin_email=_ADMIN_EMAIL,
+            google_domain="example.com",
+        )
+
+        with patch(
+            f"{_DOC_CONVERSION_MODULE}._get_external_access_for_raw_gdrive_file",
+            return_value=external_access,
+        ) as mock_get_external_access:
+            slim_document = build_slim_document(
+                ops,
+                file,
+                permission_sync_context,
+                _RETRIEVER_EMAIL,
+            )
+
+        assert slim_document is not None
+        assert slim_document.external_access == external_access
+        mock_get_external_access.assert_called_once()
+        access_kwargs = mock_get_external_access.call_args.kwargs
+        assert access_kwargs["file"] == file
+        assert access_kwargs["company_domain"] == "example.com"
+        assert access_kwargs["ops"] is ops
+        # Read as the owner, then as the retriever, then as the admin.
+        assert access_kwargs["retriever_email"] == _EXTERNAL_OWNER_EMAIL
+        assert access_kwargs["fallback_retriever_email"] == _RETRIEVER_EMAIL
+        assert access_kwargs["admin_email"] == _ADMIN_EMAIL
+        assert access_kwargs["fallback_user_email"] == _RETRIEVER_EMAIL
+
+    def test_skips_retriever_fallback_when_retriever_owns_file(self) -> None:
+        ops = MagicMock(spec=GoogleDriveSourceOperations)
+        file = {
+            "id": "file-id",
+            "mimeType": "text/plain",
+            "webViewLink": "https://drive.google.com/file/d/file-id/view",
+            "owners": [{"emailAddress": _RETRIEVER_EMAIL}],
+        }
+        permission_sync_context = PermissionSyncContext(
+            primary_admin_email=_ADMIN_EMAIL,
+            google_domain="example.com",
+        )
+
+        with patch(
+            f"{_DOC_CONVERSION_MODULE}._get_external_access_for_raw_gdrive_file",
+            return_value=ExternalAccess.empty(),
+        ) as mock_get_external_access:
+            build_slim_document(
+                ops,
+                file,
+                permission_sync_context,
+                _RETRIEVER_EMAIL,
+            )
+
+        access_kwargs = mock_get_external_access.call_args.kwargs
+        assert access_kwargs["retriever_email"] == _RETRIEVER_EMAIL
+        assert access_kwargs["fallback_retriever_email"] is None
+        assert access_kwargs["admin_email"] == _ADMIN_EMAIL
+
+
+class TestGoogleDriveSlimConnectorInterface:
+    def test_implements_slim_connector(self) -> None:
+        connector = _make_connector()
+        assert isinstance(connector, SlimConnector)
+
+    def test_implements_slim_connector_with_perm_sync(self) -> None:
+        connector = _make_connector()
+        assert isinstance(connector, SlimConnectorWithPermSync)
+
+    def test_slim_connector_checked_before_perm_sync(self) -> None:
+        """SlimConnector must appear before SlimConnectorWithPermSync in MRO
+        so celery_utils isinstance check routes to retrieve_all_slim_docs()."""
+        mro = GoogleDriveConnector.__mro__
+        slim_idx = mro.index(SlimConnector)
+        perm_sync_idx = mro.index(SlimConnectorWithPermSync)
+        assert slim_idx < perm_sync_idx
+
+
+class TestRetrieveAllSlimDocs:
+    def test_does_not_call_extract_when_checkpoint_is_done(self) -> None:
+        connector = _make_connector()
+        slim_doc = MagicMock(
+            spec=SlimDocument,
+            id="doc1",
+            parent_hierarchy_raw_node_id=None,
+            doc_created_at=None,
+        )
+
+        with patch.object(
+            connector, "build_dummy_checkpoint", return_value=_make_done_checkpoint()
+        ):
+            with patch.object(
+                connector,
+                "_extract_slim_docs_from_google_drive",
+                return_value=iter([[slim_doc]]),
+            ) as mock_extract:
+                list(connector.retrieve_all_slim_docs())
+
+        mock_extract.assert_not_called()  # loop exits immediately since the listing is done
+
+    def test_calls_extract_with_include_permissions_false_non_done_checkpoint(
+        self,
+    ) -> None:
+        connector = _make_connector()
+        slim_doc = MagicMock(
+            spec=SlimDocument,
+            id="doc1",
+            parent_hierarchy_raw_node_id=None,
+            doc_created_at=None,
+        )
+        # The checkpoint starts with no listing, and _extract finishes one
+        with patch.object(connector, "build_dummy_checkpoint") as mock_build:
+            start_checkpoint = GoogleDriveCheckpoint(
+                retrieved_drive_file_ids=set(),
+                has_more=False,
+            )
+            mock_build.return_value = start_checkpoint
+
+            def _advance_checkpoint(**_kwargs: object) -> object:
+                start_checkpoint.listing = _done_listing()
+                yield [slim_doc]
+
+            with patch.object(
+                connector,
+                "_extract_slim_docs_from_google_drive",
+                side_effect=_advance_checkpoint,
+            ) as mock_extract:
+                list(connector.retrieve_all_slim_docs())
+
+        mock_extract.assert_called_once()
+        _, kwargs = mock_extract.call_args
+        assert kwargs.get("include_permissions") is False
+
+    def test_yields_slim_documents(self) -> None:
+        connector = _make_connector()
+        slim_doc = MagicMock(
+            spec=SlimDocument,
+            id="doc1",
+            parent_hierarchy_raw_node_id=None,
+            doc_created_at=None,
+        )
+        start_checkpoint = GoogleDriveCheckpoint(
+            retrieved_drive_file_ids=set(),
+            has_more=False,
+        )
+
+        with patch.object(
+            connector, "build_dummy_checkpoint", return_value=start_checkpoint
+        ):
+
+            def _advance_and_yield(**_kwargs: object) -> object:
+                start_checkpoint.listing = _done_listing()
+                yield [slim_doc]
+
+            with patch.object(
+                connector,
+                "_extract_slim_docs_from_google_drive",
+                side_effect=_advance_and_yield,
+            ):
+                batches = list(connector.retrieve_all_slim_docs())
+
+        assert len(batches) == 1
+        assert batches[0][0] is slim_doc
+
+
+class TestRetrieveAllSlimDocsPermSync:
+    def test_calls_extract_with_include_permissions_true(self) -> None:
+        connector = _make_connector()
+        slim_doc = MagicMock(
+            spec=SlimDocument,
+            id="doc1",
+            parent_hierarchy_raw_node_id=None,
+            doc_created_at=None,
+        )
+        start_checkpoint = GoogleDriveCheckpoint(
+            retrieved_drive_file_ids=set(),
+            has_more=False,
+        )
+
+        with patch.object(
+            connector, "build_dummy_checkpoint", return_value=start_checkpoint
+        ):
+
+            def _advance_and_yield(**_kwargs: object) -> object:
+                start_checkpoint.listing = _done_listing()
+                yield [slim_doc]
+
+            with patch.object(
+                connector,
+                "_extract_slim_docs_from_google_drive",
+                side_effect=_advance_and_yield,
+            ) as mock_extract:
+                list(connector.retrieve_all_slim_docs_perm_sync())
+
+        mock_extract.assert_called_once()
+        _, kwargs = mock_extract.call_args
+        assert (
+            kwargs.get("include_permissions") is None
+            or kwargs.get("include_permissions") is True
+        )
+
+
+class TestSlimPoolWidth:
+    def test_slim_build_uses_fetch_pool_not_conversion_pool(self) -> None:
+        """The conversion setting must not widen the slim (permission sync) pool."""
+        connector = _make_connector()
+        retrieved = RetrievedDriveFile(
+            drive_file={
+                "id": "f1",
+                "name": "f1",
+                "mimeType": GDriveMimeType.DOC.value,
+            },
+            user_email=_ADMIN_EMAIL,
+        )
+        with (
+            patch(f"{_CONN_MODULE}.DRIVE_CONVERSION_WORKERS", 64),
+            patch.object(
+                connector, "_fetch_drive_items", return_value=(f for f in [retrieved])
+            ),
+            patch.object(connector, "_listed_folder_nodes", return_value=[]),
+            patch(
+                f"{_CONN_MODULE}.run_functions_tuples_in_parallel", return_value=[]
+            ) as mock_parallel,
+        ):
+            list(
+                connector._extract_slim_docs_from_google_drive(
+                    checkpoint=_make_done_checkpoint(), include_permissions=False
+                )
+            )
+
+        mock_parallel.assert_called_once()
+        assert mock_parallel.call_args.kwargs["max_workers"] == DRIVE_FETCH_WORKERS
+
+
+class TestCeleryUtilsRouting:
+    def test_pruning_uses_retrieve_all_slim_docs(self) -> None:
+        """extract_ids_from_runnable_connector must call retrieve_all_slim_docs,
+        not retrieve_all_slim_docs_perm_sync, for GoogleDriveConnector."""
+        connector = _make_connector()
+        slim_doc = MagicMock(
+            spec=SlimDocument,
+            id="doc1",
+            parent_hierarchy_raw_node_id=None,
+            doc_created_at=None,
+        )
+        with (
+            patch.object(
+                connector, "retrieve_all_slim_docs", return_value=iter([[slim_doc]])
+            ) as mock_slim,
+            patch.object(
+                connector, "retrieve_all_slim_docs_perm_sync"
+            ) as mock_perm_sync,
+        ):
+            extract_ids_from_runnable_connector(
+                connector, connector_type="google_drive"
+            )
+
+        mock_slim.assert_called_once()
+        mock_perm_sync.assert_not_called()
+
+
+class TestFailedFolderIdsByEmail:
+    def _make_failed_map(
+        self, entries: dict[str, set[str]]
+    ) -> ThreadSafeDict[str, ThreadSafeSet[str]]:
+        return ThreadSafeDict({k: ThreadSafeSet(v) for k, v in entries.items()})
+
+    def test_skips_api_call_for_known_failed_pair(self) -> None:
+        """_get_folder_metadata must skip the API call for a (folder, email) pair
+        that previously confirmed no accessible parent."""
+        connector = _make_connector()
+        failed_map = self._make_failed_map(
+            {
+                "retriever@example.com": {"folder1"},
+                "admin@example.com": {"folder1"},
+            }
+        )
+
+        with patch(
+            "onyx.connectors.google_drive.connector.get_folder_metadata"
+        ) as mock_api:
+            result = connector._get_folder_metadata(
+                folder_id="folder1",
+                retriever_email="retriever@example.com",
+                field_type=DriveFileFieldType.SLIM,
+                failed_folder_ids_by_email=failed_map,
+            )
+
+        mock_api.assert_not_called()
+        assert result is None
+
+    def test_records_failed_pair_when_no_parents(self) -> None:
+        """_get_folder_metadata must record (email → folder_id) in the map
+        when the API returns a folder with no parents."""
+        connector = _make_connector()
+        failed_map: ThreadSafeDict[str, ThreadSafeSet[str]] = ThreadSafeDict()
+        folder_no_parents: dict = {"id": "folder1", "name": "Orphaned"}
+
+        with (
+            patch(
+                "onyx.connectors.google_drive.connector.get_folder_metadata",
+                return_value=folder_no_parents,
+            ),
+        ):
+            connector._get_folder_metadata(
+                folder_id="folder1",
+                retriever_email="retriever@example.com",
+                field_type=DriveFileFieldType.SLIM,
+                failed_folder_ids_by_email=failed_map,
+            )
+
+        assert "folder1" in failed_map.get("retriever@example.com", ThreadSafeSet())
+        assert "folder1" in failed_map.get("admin@example.com", ThreadSafeSet())
+
+    def test_does_not_record_when_parents_found(self) -> None:
+        """_get_folder_metadata must NOT record a pair when parents are found."""
+        connector = _make_connector()
+        failed_map: ThreadSafeDict[str, ThreadSafeSet[str]] = ThreadSafeDict()
+        folder_with_parents: dict = {
+            "id": "folder1",
+            "name": "Normal",
+            "parents": ["root"],
+        }
+
+        with (
+            patch(
+                "onyx.connectors.google_drive.connector.get_folder_metadata",
+                return_value=folder_with_parents,
+            ),
+        ):
+            connector._get_folder_metadata(
+                folder_id="folder1",
+                retriever_email="retriever@example.com",
+                field_type=DriveFileFieldType.SLIM,
+                failed_folder_ids_by_email=failed_map,
+            )
+
+        assert len(failed_map) == 0
+
+
+def _make_checkpoint_with_user(user_email: str) -> GoogleDriveCheckpoint:
+    return GoogleDriveCheckpoint(
+        retrieved_drive_file_ids=set(),
+        has_more=False,
+        user_emails=[user_email, _ADMIN_EMAIL],
+    )
+
+
+def _run_gate(
+    connector: GoogleDriveConnector,
+    user_email: str,
+    checkpoint: GoogleDriveCheckpoint,
+    fresh_emails: list[str],
+) -> tuple[list[RetrievedDriveFile], bool]:
+    yielded: list[RetrievedDriveFile] = []
+    ops = MagicMock(spec=GoogleDriveSourceOperations)
+    ops.get_root_folder_id.side_effect = GoogleDriveRefreshError(
+        "invalid_grant: Invalid email or User ID"
+    )
+    connector._ops = ops
+    with (
+        patch(
+            "onyx.connectors.google_drive.connector.retry_builder",
+            return_value=lambda f: f,
+        ),
+        patch.object(connector, "_get_all_user_emails", return_value=fresh_emails),
+    ):
+        gate = connector._impersonation_gate(user_email, checkpoint)
+        try:
+            while True:
+                yielded.append(next(gate))
+        except StopIteration as stop:
+            return yielded, stop.value
+
+
+class TestImpersonationGateRefreshError:
+    def test_user_removed_error_skips_silently(self) -> None:
+        """RefreshError + user absent from workspace: silent skip, user failed."""
+        user_email = "wilbur.suero@savvywealth.com"
+        connector = _make_connector()
+        checkpoint = _make_checkpoint_with_user(user_email)
+
+        results, usable = _run_gate(
+            connector, user_email, checkpoint, fresh_emails=[_ADMIN_EMAIL]
+        )
+
+        assert results == []
+        assert usable is False
+        assert user_email in checkpoint.failed_impersonation_emails
+
+    def test_impersonation_error_yields_error(self) -> None:
+        """RefreshError + user still present: error record yielded, user failed."""
+        user_email = "wilbur.suero@savvywealth.com"
+        connector = _make_connector()
+        checkpoint = _make_checkpoint_with_user(user_email)
+
+        results, usable = _run_gate(
+            connector, user_email, checkpoint, fresh_emails=[user_email, _ADMIN_EMAIL]
+        )
+
+        assert usable is False
+        assert len(results) == 1
+        assert isinstance(results[0].error, ImpersonationError)
+        assert results[0].error.user_email == user_email
+        assert user_email in checkpoint.failed_impersonation_emails
+
+    def test_removal_check_does_not_rewrite_the_user_list(self) -> None:
+        """Later phases derive their partitions from checkpoint.user_emails, so
+        the removal lookup must not replace it mid-run."""
+        user_email = "wilbur.suero@savvywealth.com"
+        connector = _make_connector()
+        checkpoint = _make_checkpoint_with_user(user_email)
+
+        _run_gate(connector, user_email, checkpoint, fresh_emails=[_ADMIN_EMAIL])
+
+        assert checkpoint.user_emails == [user_email, _ADMIN_EMAIL]
+
+
+def _passes_with_no_files(checkpoint: GoogleDriveCheckpoint, num_passes: int) -> object:
+    """Stands in for _extract_slim_docs_from_google_drive: each pass yields
+    nothing, as when every listed file is filtered out or none changed."""
+    calls = 0
+
+    def _pass(**_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls >= num_passes:
+            checkpoint.listing = _done_listing()
+        yield from ()
+
+    return _pass
+
+
+class TestSlimWalkProgress:
+    def test_every_pass_reports_progress_even_without_files(self) -> None:
+        connector = _make_connector()
+        checkpoint = _make_done_checkpoint()
+        checkpoint.listing = None
+        callback = MagicMock()
+        callback.should_stop.return_value = False
+
+        with patch.object(
+            connector,
+            "_extract_slim_docs_from_google_drive",
+            side_effect=_passes_with_no_files(checkpoint, num_passes=3),
+        ):
+            batches = list(
+                connector.retrieve_all_slim_docs_perm_sync(
+                    callback=callback, checkpoint=checkpoint
+                )
+            )
+
+        assert batches == []
+        assert callback.progress.call_count == 3
+
+    def test_stop_signal_between_passes_raises(self) -> None:
+        connector = _make_connector()
+        checkpoint = _make_done_checkpoint()
+        checkpoint.listing = None
+        callback = MagicMock()
+        callback.should_stop.return_value = True
+
+        with patch.object(
+            connector,
+            "_extract_slim_docs_from_google_drive",
+            side_effect=_passes_with_no_files(checkpoint, num_passes=3),
+        ):
+            with pytest.raises(RuntimeError, match="Stop signal detected"):
+                list(
+                    connector.retrieve_all_slim_docs_perm_sync(
+                        callback=callback, checkpoint=checkpoint
+                    )
+                )
+
+        callback.progress.assert_not_called()

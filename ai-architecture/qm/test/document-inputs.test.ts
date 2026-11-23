@@ -1,0 +1,552 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
+import { documentBlocks, nativeDocumentFormat, withDocumentInputs } from "../src/agent/document-inputs.ts";
+import {
+  isDocumentAttachment,
+  documentFallbackText,
+  documentText,
+  loadDocumentInputs,
+  turnDocumentMetas,
+  type DocumentInput,
+} from "../src/core/documents.ts";
+import { mimeFromName } from "../src/core/attachments.ts";
+import type { AttachmentMeta } from "../src/types.ts";
+import { storedItem } from "../src/sessions/items.ts";
+import type { FileArtifact, FileArtifactStore } from "../src/files/file-artifact-store.ts";
+import { guardOutputBudget, sanitizeLlmPayload, trimPayloadToByteBudget } from "../src/agent/provider-payload.ts";
+
+const openai = { api: "openai-responses", provider: "openai", input: ["text", "image"] };
+const anthropic = { api: "anthropic-messages", provider: "anthropic", input: ["text", "image"] };
+async function fixture(ext: string): Promise<DocumentInput> {
+  return {
+    name: `sample.${ext}`,
+    mimeType: mimeFromName(`sample.${ext}`),
+    dataBase64: (await readFile(new URL(`./fixtures/documents/sample.${ext}`, import.meta.url))).toString("base64"),
+  };
+}
+
+for (const ext of [
+  "pdf",
+  "docx",
+  "xlsx",
+  "pptx",
+  "doc",
+  "xls",
+  "ppt",
+  "odt",
+  "txt",
+  "md",
+  "csv",
+  "tsv",
+  "json",
+  "xml",
+  "html",
+  "yaml",
+  "py",
+  "js",
+  "ts",
+  "css",
+  "sql",
+  "eml",
+  "ics",
+  "vcf",
+  "srt",
+  "vtt",
+]) {
+  test(`Responses sends original ${ext} bytes as native file input`, async () => {
+    const document = await fixture(ext);
+    const payload = (await withDocumentInputs(
+      { model: "test", input: [{ role: "user", content: [{ type: "input_text", text: "Summarize" }] }] },
+      openai,
+      [document],
+    )) as { input: { content: Record<string, unknown>[] }[] };
+    const block = payload.input[0]!.content.at(-1)!;
+    assert.equal(block.type, "input_file");
+    assert.equal(block.filename, document.name);
+    assert.equal(String(block.file_data).split(",")[1], document.dataBase64);
+    assert.ok(!JSON.stringify(sanitizeLlmPayload(payload).envelope).includes(document.dataBase64));
+  });
+}
+
+for (const ext of [
+  "pdf",
+  "docx",
+  "xlsx",
+  "pptx",
+  "odt",
+  "ods",
+  "odp",
+  "rtf",
+  "txt",
+  "md",
+  "csv",
+  "tsv",
+  "json",
+  "xml",
+  "html",
+  "yaml",
+  "py",
+  "js",
+  "ts",
+  "css",
+  "sql",
+  "eml",
+  "ics",
+  "vcf",
+  "srt",
+  "vtt",
+]) {
+  test(`automatic ${ext} fallback extracts the fixture's verification code`, async () => {
+    const document = await fixture(ext);
+    const text = await documentFallbackText(document);
+    assert.ok(text.includes(`${ext.toUpperCase()}-QUARTZ-731`));
+    assert.match(text, /extracted text only/);
+    assert.match(text, /not instructions/);
+  });
+}
+
+test("Anthropic receives PDF document bytes and text document content", async () => {
+  const pdf = await fixture("pdf");
+  const blocks = await documentBlocks([pdf, await fixture("txt")], anthropic);
+  assert.deepEqual(blocks[0], {
+    type: "document",
+    title: pdf.name,
+    source: { type: "base64", media_type: "application/pdf", data: pdf.dataBase64 },
+  });
+  assert.equal(blocks[1]!.type, "document");
+  assert.match(JSON.stringify(blocks[1]), /QUARTZ-731/);
+});
+
+test("unsupported routes use extraction instead of unsupported wire types", async () => {
+  for (const model of [
+    { ...openai, provider: "custom:test" },
+    { ...openai, api: "openai-codex-responses" },
+  ]) {
+    const blocks = await documentBlocks([await fixture("pdf")], model);
+    assert.equal(blocks[0]!.type, "input_text");
+    assert.match(String(blocks[0]!.text), /QUARTZ-731/);
+  }
+  assert.equal(nativeDocumentFormat({ ...openai, input: ["text"] }, await fixture("pdf")), undefined);
+});
+
+test("OpenRouter uses native PDF processing without silently selecting an OCR service", async () => {
+  const payload = (await withDocumentInputs(
+    { messages: [{ role: "user", content: "Summarize" }] },
+    { api: "openai-completions", provider: "openrouter", id: "anthropic/claude-sonnet", input: ["image"] },
+    [await fixture("pdf")],
+  )) as { plugins: unknown[]; messages: { content: { type: string }[] }[] };
+  assert.deepEqual(payload.plugins, [{ id: "file-parser", pdf: { engine: "native" } }]);
+  assert.equal(payload.messages[0]!.content.at(-1)!.type, "file");
+});
+
+test("Google document parts preserve PDFs and use text for office files", async () => {
+  const payload = (await withDocumentInputs(
+    { contents: [{ role: "user", parts: [{ text: "Summarize" }] }] },
+    { api: "google-generative-ai", input: ["image"] },
+    [await fixture("pdf"), await fixture("docx")],
+  )) as { contents: { parts: Record<string, unknown>[] }[] };
+  assert.ok(payload.contents[0]!.parts.some((part) => part.inlineData));
+  assert.match(String(payload.contents[0]!.parts.at(-1)!.text), /QUARTZ-731/);
+});
+
+test("invalid binary documents and empty scans never masquerade as read documents", async () => {
+  const document = await fixture("pdf");
+  document.dataBase64 = Buffer.from("not a PDF").toString("base64");
+  assert.match(await documentFallbackText(document), /could not be included/);
+  assert.match(await documentFallbackText(await fixture("doc")), /Do not summarize it from another file/);
+});
+
+test("request byte budgets replace all native document wire formats with explicit notices", async () => {
+  for (const [model, payload] of [
+    [openai, { input: [{ role: "user", content: [] }] }],
+    [anthropic, { messages: [{ role: "user", content: [] }] }],
+    [
+      { api: "openai-completions", provider: "openai", input: ["image"] },
+      { messages: [{ role: "user", content: [] }] },
+    ],
+    [{ api: "google-generative-ai", input: ["image"] }, { contents: [{ role: "user", parts: [] }] }],
+  ] as const) {
+    const encoded = await withDocumentInputs(payload, model, [await fixture("pdf")]);
+    const trimmed = trimPayloadToByteBudget(encoded, 1000);
+    assert.match(JSON.stringify(trimmed), /Document omitted/);
+    assert.doesNotMatch(JSON.stringify(trimmed), /JVBER/);
+  }
+});
+
+test("requests clearly under the byte budget are sent without serializing them", (t) => {
+  const payload = {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(2_000_000) } },
+          { type: "input_file", file_data: `data:application/pdf;base64,${"B".repeat(500_000)}` },
+          { type: "text", text: "notes ".repeat(20_000) },
+        ],
+      },
+    ],
+  };
+  const stringify = t.mock.method(JSON, "stringify");
+  assert.equal(trimPayloadToByteBudget(payload, 3_400_000), payload);
+  assert.equal(stringify.mock.callCount(), 0);
+});
+
+test("chat-completions image URLs over the byte budget are shed like other inline images", () => {
+  const payload = {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe" },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${"A".repeat(400_000)}` } },
+        ],
+      },
+    ],
+  };
+  const trimmed = JSON.stringify(trimPayloadToByteBudget(payload, 100_000));
+  assert.doesNotMatch(trimmed, /AAAA/);
+  assert.match(trimmed, /image removed/);
+  assert.match(trimmed, /describe/);
+});
+
+test("escape-heavy text near the byte budget still sheds inline images", () => {
+  const payload = {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "\u0001".repeat(10_000) },
+          { type: "toolCall", id: "call", name: "upload", arguments: { file_data: "\u0001".repeat(500_000) } },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(200_000) } },
+        ],
+      },
+    ],
+  };
+  const trimmed = JSON.stringify(trimPayloadToByteBudget(payload, 1_000_000));
+  assert.doesNotMatch(trimmed, /AAAA/);
+  assert.match(trimmed, /image removed/);
+  assert.match(trimmed, /"upload"/);
+});
+
+test("empty documents restore as empty content on every turn", async () => {
+  const { store, meta } = storeFor(Buffer.alloc(0));
+  for (let turn = 0; turn < 2; turn++) {
+    const result = await loadDocumentInputs(store, [meta], () => true);
+    assert.deepEqual(
+      result.documents.map((document) => document.dataBase64),
+      [""],
+    );
+    assert.deepEqual(result.notices, []);
+  }
+});
+
+let stores = 0;
+function storeFor(data = Buffer.from("QUARTZ-731")) {
+  const artifact = {
+    id: `doc${++stores}`,
+    name: "sample.txt",
+    mimetype: "text/plain",
+    sizeBytes: data.length,
+    sha256: createHash("sha256").update(data).digest("hex"),
+    ownerScopeId: "user:owner",
+    enabled: true,
+  } as FileArtifact;
+  let opens = 0;
+  const store = {
+    get: async () => artifact,
+    open: async () => {
+      opens++;
+      return { artifact, sizeBytes: data.length, stream: Readable.from(data) };
+    },
+  } as unknown as FileArtifactStore;
+  const meta = {
+    name: artifact.name,
+    mimetype: artifact.mimetype,
+    artifactId: artifact.id,
+    sizeBytes: artifact.sizeBytes,
+    direction: "in",
+  } as AttachmentMeta;
+  return { artifact, store, meta, opens: () => opens };
+}
+
+test("restores stopped/restarted turns from durable document metadata and deduplicates retries", async () => {
+  const { store, meta, opens } = storeFor();
+  const history = [
+    storedItem({ kind: "UserMessage", body: { attachments: [meta] } }, { sessionId: "s", seq: 0, createdAt: 0 }),
+    storedItem({ kind: "AgentMessage", text: "stopped" }, { sessionId: "s", seq: 1, createdAt: 0 }),
+  ];
+  const inputs = await loadDocumentInputs(store, [...turnDocumentMetas(history, 0), meta], () => true);
+  assert.equal(inputs.documents.length, 1);
+  assert.equal(opens(), 1);
+  assert.match(await documentFallbackText(inputs.documents[0]!), /QUARTZ-731/);
+});
+
+test("reuploaded identical documents consume the input budget once and retain the newest artifact", async () => {
+  const { store, meta, artifact, opens } = storeFor();
+  store.get = async (id) => ({ ...artifact, id });
+  const open = store.open.bind(store);
+  store.open = async (id) => {
+    const loaded = await open(id);
+    return loaded && { ...loaded, artifact: { ...loaded.artifact, id } };
+  };
+  const checked: string[] = [];
+  const inputs = await loadDocumentInputs(
+    store,
+    [meta, { ...meta, artifactId: "new-upload" }],
+    (file) => {
+      checked.push(file.id);
+      return true;
+    },
+    { maxBytes: artifact.sizeBytes },
+  );
+  assert.equal(inputs.documents.length, 1);
+  assert.equal(inputs.documents[0]!.artifactId, "new-upload");
+  assert.deepEqual(inputs.notices, []);
+  assert.equal(opens(), 1);
+  assert.ok(checked.includes(artifact.id));
+  assert.ok(checked.includes("new-upload"));
+});
+
+test("steered reuploads already in the turn do not consume another document slot or emit budget notices", async () => {
+  const { store, meta, artifact, opens } = storeFor();
+  const initial = await loadDocumentInputs(store, [meta], () => true);
+  store.get = async (id) => ({ ...artifact, id });
+  const checked: string[] = [];
+  const steered = await loadDocumentInputs(
+    store,
+    [{ ...meta, artifactId: "steered-upload" }],
+    (file) => {
+      checked.push(file.id);
+      return true;
+    },
+    { maxBytes: 0, maxDocuments: 0, existingDocuments: initial.documents },
+  );
+  assert.deepEqual(steered, { documents: [], notices: [], tokens: 0 });
+  assert.deepEqual(checked, ["steered-upload"]);
+  assert.equal(opens(), 1);
+});
+
+test("later turns reuse verified document bytes but still check current access", async () => {
+  const { store, meta, artifact, opens } = storeFor(Buffer.from("SAPPHIRE-204"));
+  const first = await loadDocumentInputs(store, [meta], () => true);
+  const second = await loadDocumentInputs(store, [meta], () => true);
+  assert.equal(opens(), 1);
+  assert.deepEqual(second, first);
+  assert.equal(Buffer.from(second.documents[0]!.dataBase64, "base64").toString(), "SAPPHIRE-204");
+  assert.deepEqual((await loadDocumentInputs(store, [meta], () => false)).documents, []);
+  store.get = async () => null;
+  assert.deepEqual((await loadDocumentInputs(store, [meta], () => true)).documents, []);
+  store.get = async () => ({ ...artifact, name: "renamed.txt" });
+  const renamed = await loadDocumentInputs(store, [meta], () => true);
+  assert.equal(renamed.documents[0]!.name, "renamed.txt");
+  assert.equal(opens(), 1);
+  store.get = async () => ({ ...artifact, sha256: "replaced" });
+  assert.deepEqual((await loadDocumentInputs(store, [meta], () => true)).documents, []);
+  assert.equal(opens(), 2);
+});
+
+test("only the current turn's own user messages contribute documents", () => {
+  const { meta } = storeFor();
+  const doc = (artifactId: string) => ({ ...meta, artifactId });
+  const turn = "00000000-0000-4000-8000-00000000000a";
+  const other = "00000000-0000-4000-8000-00000000000b";
+  const at = (seq: number, turnId = turn) => ({ sessionId: "s", seq, createdAt: 0, turnId });
+  const history = [
+    storedItem({ kind: "UserMessage", body: { attachments: [doc("earlier")] } }, at(0, other)),
+    storedItem({ kind: "AgentMessage", text: "read it" }, at(1, other)),
+    storedItem({ kind: "UserMessage", body: { attachments: [doc("current")] } }, at(2)),
+    storedItem({ kind: "SteeringMessage", body: { attachments: [doc("steered")] } }, at(3)),
+    storedItem({ kind: "UserMessage", body: { overheard: true, attachments: [doc("overheard")] } }, at(4)),
+    storedItem({ kind: "UserMessage", body: { attachments: [doc("next-turn")] } }, at(5, other)),
+    storedItem({ kind: "UserMessage", body: { attachments: [doc("outside-a-run")] } }, { ...at(6), turnId: undefined }),
+  ];
+  assert.deepEqual(turnDocumentMetas(history, undefined), []);
+  assert.deepEqual(
+    turnDocumentMetas(history, 2).map((file) => file.artifactId),
+    ["current", "steered"],
+  );
+});
+
+test("document restoration checks current access and budgets before opening bytes", async () => {
+  const { store, meta, opens } = storeFor();
+  assert.equal((await loadDocumentInputs(store, [meta], () => false)).documents.length, 0);
+  assert.equal(opens(), 0);
+  const result = await loadDocumentInputs(store, [meta], () => true, { maxBytes: 1 });
+  assert.equal(result.documents.length, 0);
+  assert.match(result.notices[0]!, /not included inline/);
+  assert.equal(opens(), 0);
+});
+
+test("document restoration rejects tampered bytes", async () => {
+  const { store, meta, artifact } = storeFor();
+  artifact.sha256 = "bad";
+  const result = await loadDocumentInputs(store, [meta], () => true);
+  assert.equal(result.documents.length, 0);
+  assert.match(result.notices[0]!, /integrity/);
+});
+
+test("fallback text has one aggregate model-aware budget across all attachments", async () => {
+  const documents = Array.from({ length: 10 }, (_, i) => ({
+    name: `large-${i}.txt`,
+    mimeType: "text/plain",
+    dataBase64: Buffer.from("x".repeat(200_000)).toString("base64"),
+  }));
+  const payload = await withDocumentInputs(
+    { input: [{ role: "user", content: [{ type: "input_text", text: "Summarize" }] }] },
+    { api: "openai-codex-responses", contextWindow: 32_000 },
+    documents,
+  );
+  assert.ok(JSON.stringify(payload).length < 30_000);
+  assert.match(JSON.stringify(payload), /truncated to fit/);
+});
+
+test("document text reports truncation as a flag, not from the extracted wording", async () => {
+  const text = (body: string, name = "notes.txt") => ({
+    name,
+    mimeType: name.endsWith(".rtf") ? "application/rtf" : "text/plain",
+    dataBase64: Buffer.from(body).toString("base64"),
+  });
+  const quoted = await documentText(text("[Document text truncated at 5 characters.]"));
+  assert.equal(quoted.truncated, false);
+  const long = await documentText(text("x".repeat(200_001)));
+  assert.equal(long.truncated, true);
+  assert.match(long.text, /\[Document text truncated at 200000 characters\.\]$/);
+  const office = await documentText(text(`{\\rtf1 ${"y".repeat(200_100)}}`, "long.rtf"));
+  assert.equal(office.truncated, true);
+  assert.match(office.text, /\[Document text truncated at 200000 characters\.\]$/);
+});
+
+test("Bedrock fallback uses its actual provider request shape", async () => {
+  const documents = [await fixture("txt")];
+  const bedrock = (await withDocumentInputs(
+    { messages: [{ role: "user", content: [{ text: "Summarize" }] }] },
+    { api: "bedrock-converse-stream" },
+    documents,
+  )) as { messages: { content: Record<string, unknown>[] }[] };
+  assert.equal(bedrock.messages[0]!.content.at(-1)!.type, undefined);
+  assert.match(String(bedrock.messages[0]!.content.at(-1)!.text), /QUARTZ-731/);
+});
+
+test("one failed historical document does not prevent loading another document", async () => {
+  const { store, meta } = storeFor();
+  const get = store.get.bind(store);
+  store.get = async (id) => {
+    if (id === "broken") throw new Error("storage unavailable");
+    return get(id);
+  };
+  const result = await loadDocumentInputs(store, [meta, { ...meta, artifactId: "broken" }], () => true);
+  assert.equal(result.documents.length, 1);
+  assert.match(result.notices[0]!, /unavailable/);
+});
+
+test("document loading aborts active streams promptly", async () => {
+  const { store, meta, artifact } = storeFor();
+  const stream = new Readable({ read() {} });
+  store.open = async () => ({ artifact, sizeBytes: artifact.sizeBytes, stream });
+  const controller = new AbortController();
+  const pending = loadDocumentInputs(store, [meta], () => true, { signal: controller.signal });
+  setTimeout(() => controller.abort(new Error("cancelled")), 10);
+  await assert.rejects(pending, /cancelled/);
+  assert.equal(stream.destroyed, true);
+});
+
+test("extensionless documents use their MIME type for native and fallback input", async () => {
+  const pdf = { ...(await fixture("pdf")), name: "download" };
+  assert.equal(isDocumentAttachment({ name: pdf.name, mimetype: pdf.mimeType }), true);
+  assert.equal(nativeDocumentFormat(anthropic, pdf), "anthropic");
+  assert.match(await documentFallbackText(pdf), /PDF-QUARTZ-731/);
+  const blocks = await documentBlocks([pdf], openai);
+  assert.equal(blocks.at(-1)?.filename, "download.pdf");
+  const txt = {
+    name: "download",
+    mimeType: "text/plain; charset=utf-8",
+    dataBase64: Buffer.from("mime-only-text").toString("base64"),
+  };
+  assert.match(await documentFallbackText(txt), /mime-only-text/);
+});
+
+test("scanned PDFs explicitly report unavailable text on a text-only route", async () => {
+  const dataBase64 = (await readFile(new URL("./fixtures/documents/scanned.pdf", import.meta.url))).toString("base64");
+  assert.match(
+    await documentFallbackText({ name: "scan.pdf", mimeType: "application/pdf", dataBase64 }),
+    /No extractable text/,
+  );
+});
+
+test("native file inputs normalize text MIME types rejected by the provider", async () => {
+  for (const ext of ["xml", "ts", "yaml"]) {
+    const blocks = await documentBlocks([await fixture(ext)], openai);
+    assert.match(String(blocks.at(-1)?.file_data), /^data:text\/plain;base64,/);
+  }
+});
+
+test("unknown vision gateways do not assume native PDF support", async () => {
+  assert.equal(
+    nativeDocumentFormat({ api: "openai-completions", provider: "qm:gateway", input: ["image"] }, await fixture("pdf")),
+    undefined,
+  );
+});
+
+test("RTF uses reliable text extraction on Responses routes", async () => {
+  const blocks = await documentBlocks([await fixture("rtf")], openai);
+  assert.equal(blocks[0]?.type, "input_text");
+  assert.match(String(blocks[0]?.text), /RTF-QUARTZ-731/);
+});
+
+test("encrypted PDFs do not expose content through text fallback", async () => {
+  const dataBase64 = (await readFile(new URL("./fixtures/documents/encrypted.pdf", import.meta.url))).toString(
+    "base64",
+  );
+  const text = await documentFallbackText({ name: "encrypted.pdf", mimeType: "application/pdf", dataBase64 });
+  assert.match(text, /could not be included/);
+  assert.doesNotMatch(text, /QUARTZ-731/);
+});
+
+for (const model of [
+  openai,
+  anthropic,
+  { api: "google-generative-ai", provider: "google", input: ["text", "image"] },
+  { api: "openai-completions", provider: "openai", input: ["text", "image"] },
+]) {
+  test(`${model.api} isolates invalid documents while retaining scanned native PDFs`, async () => {
+    const documents = await Promise.all(
+      ["scanned", "malformed", "encrypted"].map(async (name) => ({
+        name: `${name}.pdf`,
+        mimeType: "application/pdf",
+        dataBase64: (await readFile(new URL(`./fixtures/documents/${name}.pdf`, import.meta.url))).toString("base64"),
+      })),
+    );
+    for (let turn = 0; turn < 2; turn++) {
+      const blocks = JSON.stringify(
+        await documentBlocks(
+          documents.map((document) => ({ ...document })),
+          model,
+        ),
+      );
+      assert.ok(blocks.includes(documents[0]!.dataBase64));
+      for (const document of documents.slice(1)) {
+        assert.ok(!blocks.includes(document.dataBase64));
+        assert.ok(blocks.includes(document.name));
+      }
+      assert.equal((blocks.match(/could not be included/g) ?? []).length, 2);
+    }
+  });
+}
+
+test("output budgeting does not count native document base64 as text tokens", () => {
+  const data = "a".repeat(1_200_000);
+  for (const content of [
+    { type: "input_file", file_data: `data:application/pdf;base64,${data}` },
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data } },
+    { type: "file", file: { file_data: `data:application/pdf;base64,${data}` } },
+    { inlineData: { mimeType: "application/pdf", data } },
+  ]) {
+    const payload = { max_tokens: 1, messages: [{ role: "user", content: [content] }] };
+    const result = guardOutputBudget(payload, { contextWindow: 200_000, maxTokens: 8192 });
+    assert.equal(result.kind, "raised");
+    if (result.kind === "raised") assert.ok(result.estimatedPromptTokens < 2000);
+  }
+});

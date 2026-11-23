@@ -1,0 +1,2315 @@
+import json
+import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+from logfire.testing import CaptureLogfire
+from pytest_mock import MockerFixture
+from sqlalchemy import Select
+
+from polar.billing_entry.service import ReducerUsageAlreadyBilled
+from polar.billing_entry.service import billing_entry as billing_entry_service
+from polar.billing_interval.repository import BillingIntervalRepository
+from polar.billing_interval.types import MeterCharge
+from polar.enums import SubscriptionProrationBehavior, SubscriptionRecurringInterval
+from polar.event.system import SystemEvent
+from polar.kit.utils import utc_now
+from polar.meter.aggregation import (
+    AggregationFunction,
+    CountAggregation,
+    PropertyAggregation,
+)
+from polar.meter.filter import Filter, FilterConjunction
+from polar.models import (
+    BillingEntry,
+    BillingInterval,
+    Customer,
+    Meter,
+    Order,
+    OrderItem,
+    Organization,
+    Product,
+    ProductPrice,
+    ProductPriceSeatUnit,
+    ReducerBucket,
+    Subscription,
+)
+from polar.models.billing_entry import BillingEntryDirection, BillingEntryType
+from polar.models.billing_interval import UsagePolicy
+from polar.models.event import EventSource
+from polar.models.reducer import ReducerKind
+from polar.models.subscription_product_price import SubscriptionProductPrice
+from polar.postgres import AsyncSession
+from polar.product.guard import (
+    StaticPrice,
+    is_custom_price,
+    is_fixed_price,
+    is_metered_price,
+    is_seat_price,
+)
+from polar.product.tiers import Tiers, TierType
+from polar.reducer.repository import ReducerRepository
+from polar.reducer.service import reducer as reducer_service
+from polar.reducer.types import UsageWindow
+from tests.fixtures.database import SaveFixture
+from tests.fixtures.random_objects import (
+    create_active_subscription,
+    create_event,
+    create_meter,
+    create_order,
+    create_product,
+    create_product_price_fixed,
+    create_product_price_metered_tiers,
+    create_product_price_metered_unit,
+    create_subscription_with_seats,
+)
+
+
+@pytest.fixture
+async def meter(save_fixture: SaveFixture, organization: Organization) -> Meter:
+    return await create_meter(
+        save_fixture,
+        filter=Filter(conjunction=FilterConjunction.and_, clauses=[]),
+        aggregation=PropertyAggregation(
+            func=AggregationFunction.sum, property="tokens"
+        ),
+        organization=organization,
+    )
+
+
+@pytest.fixture
+async def product_metered_unit(
+    save_fixture: SaveFixture, meter: Meter, organization: Organization
+) -> Product:
+    return await create_product(
+        save_fixture,
+        organization=organization,
+        recurring_interval=SubscriptionRecurringInterval.month,
+        prices=[(meter, Decimal(100), None, "usd")],
+    )
+
+
+async def create_graduated_metered_product(
+    save_fixture: SaveFixture,
+    *,
+    organization: Organization,
+    meter: Meter,
+    cap_amount: int | None = None,
+) -> Product:
+    """20 units at 100, then 50 each."""
+    product = await create_product(
+        save_fixture,
+        organization=organization,
+        recurring_interval=SubscriptionRecurringInterval.month,
+        prices=[],
+    )
+    price = await create_product_price_metered_tiers(
+        save_fixture,
+        product=product,
+        meter=meter,
+        cap_amount=cap_amount,
+        tiers=Tiers.model_validate(
+            {
+                "type": TierType.graduated,
+                "tiers": [
+                    {"bound": 20, "unit_amount": "100"},
+                    {"bound": None, "unit_amount": "50"},
+                ],
+            }
+        ),
+    )
+    product.prices.append(price)
+    product.all_prices.append(price)
+    return product
+
+
+@pytest.fixture
+async def product_metered_tiers(
+    save_fixture: SaveFixture, meter: Meter, organization: Organization
+) -> Product:
+    return await create_graduated_metered_product(
+        save_fixture, organization=organization, meter=meter
+    )
+
+
+@pytest.fixture
+async def metered_tiers_subscription(
+    save_fixture: SaveFixture, customer: Customer, product_metered_tiers: Product
+) -> Subscription:
+    return await create_active_subscription(
+        save_fixture, customer=customer, product=product_metered_tiers
+    )
+
+
+@pytest.fixture
+async def metered_subscription(
+    save_fixture: SaveFixture, customer: Customer, product_metered_unit: Product
+) -> Subscription:
+    return await create_active_subscription(
+        save_fixture, customer=customer, product=product_metered_unit
+    )
+
+
+@pytest.fixture
+async def order(
+    save_fixture: SaveFixture,
+    customer: Customer,
+    product_metered_unit: Product,
+    metered_subscription: Subscription,
+) -> Order:
+    return await create_order(
+        save_fixture,
+        product=product_metered_unit,
+        customer=customer,
+        subscription=metered_subscription,
+    )
+
+
+async def create_metered_event_billing_entry(
+    save_fixture: SaveFixture,
+    *,
+    customer: Customer,
+    price: ProductPrice,
+    subscription: Subscription,
+    tokens: int,
+    pending: bool = True,
+    order: Order | None = None,
+    metadata_key: str = "tokens",
+) -> BillingEntry:
+    event = await create_event(
+        save_fixture,
+        organization=customer.organization,
+        customer=customer,
+        metadata={metadata_key: tokens},
+    )
+    billing_entry = BillingEntry(
+        start_timestamp=event.timestamp,
+        end_timestamp=event.timestamp,
+        type=BillingEntryType.metered,
+        direction=BillingEntryDirection.debit,
+        customer=customer,
+        product_price=price,
+        subscription=subscription,
+        event=event,
+    )
+    if not pending:
+        assert order is not None, "Order must be provided if not pending"
+        order_item = OrderItem(
+            label="",
+            amount=100,
+            net_amount=100,
+            tax_amount=0,
+            product_price=price,
+        )
+        order.items.append(order_item)
+        await save_fixture(order)
+        billing_entry.order_item = order_item
+
+    await save_fixture(billing_entry)
+    return billing_entry
+
+
+async def create_credit_billing_entry(
+    save_fixture: SaveFixture,
+    *,
+    customer: Customer,
+    price: ProductPrice,
+    subscription: Subscription,
+    units: int,
+    meter: Meter,
+    pending: bool = True,
+    order: Order | None = None,
+) -> BillingEntry:
+    event = await create_event(
+        save_fixture,
+        organization=customer.organization,
+        source=EventSource.system,
+        name=SystemEvent.meter_credited,
+        customer=customer,
+        metadata={"meter_id": str(meter.id), "units": units},
+    )
+    billing_entry = BillingEntry(
+        start_timestamp=event.timestamp,
+        end_timestamp=event.timestamp,
+        type=BillingEntryType.metered,
+        direction=BillingEntryDirection.debit,
+        customer=customer,
+        product_price=price,
+        subscription=subscription,
+        event=event,
+    )
+    if not pending:
+        assert order is not None, "Order must be provided if not pending"
+        order_item = OrderItem(
+            label="",
+            amount=100,
+            net_amount=100,
+            tax_amount=0,
+            product_price=price,
+        )
+        order.items.append(order_item)
+        await save_fixture(order)
+        billing_entry.order_item = order_item
+
+    await save_fixture(billing_entry)
+    return billing_entry
+
+
+async def create_system_billing_entry(
+    save_fixture: SaveFixture,
+    *,
+    customer: Customer,
+    price: ProductPrice,
+    subscription: Subscription,
+    meter: Meter,
+    name: SystemEvent,
+) -> BillingEntry:
+    event = await create_event(
+        save_fixture,
+        organization=customer.organization,
+        source=EventSource.system,
+        name=name,
+        customer=customer,
+        metadata={"meter_id": str(meter.id)},
+    )
+    billing_entry = BillingEntry(
+        start_timestamp=event.timestamp,
+        end_timestamp=event.timestamp,
+        type=BillingEntryType.metered,
+        direction=BillingEntryDirection.debit,
+        customer=customer,
+        product_price=price,
+        subscription=subscription,
+        event=event,
+    )
+    await save_fixture(billing_entry)
+    return billing_entry
+
+
+async def create_static_price_billing_entry(
+    save_fixture: SaveFixture,
+    *,
+    type: BillingEntryType = BillingEntryType.cycle,
+    customer: Customer,
+    price: StaticPrice,
+    subscription: Subscription,
+    pending: bool = True,
+    order: Order | None = None,
+) -> BillingEntry:
+    amount = 0
+    if is_fixed_price(price):
+        amount = price.price_amount
+    elif is_seat_price(price):
+        assert subscription.seats is not None
+        amount = price.calculate_amount(subscription.seats)
+    elif is_custom_price(price):
+        raise NotImplementedError()
+
+    event = await create_event(
+        save_fixture,
+        source=EventSource.system,
+        name=SystemEvent.subscription_cycled,
+        organization=customer.organization,
+        customer=customer,
+        metadata={"subscription_id": str(subscription.id)},
+    )
+    billing_entry = BillingEntry(
+        start_timestamp=subscription.current_period_start,
+        end_timestamp=subscription.current_period_end,
+        type=type,
+        direction=BillingEntryDirection.debit,
+        customer=customer,
+        product_price=price,
+        subscription=subscription,
+        event=event,
+        amount=amount,
+        currency=subscription.currency,
+    )
+    if not pending:
+        assert order is not None, "Order must be provided if not pending"
+        order_item = OrderItem(
+            label="",
+            amount=amount,
+            net_amount=amount,
+            tax_amount=0,
+            product_price=price,
+        )
+        order.items.append(order_item)
+        await save_fixture(order)
+        billing_entry.order_item = order_item
+
+    await save_fixture(billing_entry)
+    return billing_entry
+
+
+async def create_seat_change_billing_entry(
+    save_fixture: SaveFixture,
+    *,
+    type: BillingEntryType = BillingEntryType.subscription_seats_increase,
+    customer: Customer,
+    price: ProductPriceSeatUnit,
+    subscription: Subscription,
+    amount: int,
+    new_seats: int = 11,
+    pending: bool = True,
+    order: Order | None = None,
+) -> BillingEntry:
+    event = await create_event(
+        save_fixture,
+        source=EventSource.system,
+        name=SystemEvent.subscription_seats_updated,
+        organization=customer.organization,
+        customer=customer,
+        metadata={
+            "subscription_id": str(subscription.id),
+            "old_seats": subscription.seats,
+            "new_seats": new_seats,
+            "proration_behavior": SubscriptionProrationBehavior.invoice,
+        },
+    )
+    billing_entry = BillingEntry(
+        start_timestamp=subscription.current_period_start,
+        end_timestamp=subscription.current_period_end,
+        type=type,
+        direction=BillingEntryDirection.debit,
+        customer=customer,
+        product_price=price,
+        subscription=subscription,
+        event=event,
+        amount=amount,
+        currency=subscription.currency,
+    )
+    if not pending:
+        assert order is not None, "Order must be provided if not pending"
+        order_item = OrderItem(
+            label="",
+            amount=amount,
+            net_amount=amount,
+            tax_amount=0,
+            product_price=price,
+        )
+        order.items.append(order_item)
+        await save_fixture(order)
+        billing_entry.order_item = order_item
+
+    await save_fixture(billing_entry)
+    return billing_entry
+
+
+@pytest.mark.anyio
+class TestCreateOrderItemsFromPending:
+    async def test_one_metered_price(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+        order: Order,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        assert is_metered_price(price)
+        entries = [
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                tokens=10,
+                pending=False,
+                order=order,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                tokens=20,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                tokens=30,
+            ),
+        ]
+        deleted_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            tokens=40,
+        )
+        deleted_entry.deleted_at = utc_now()
+        await save_fixture(deleted_entry)
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription
+        ) as order_items:
+            assert len(order_items) == 1
+
+            order_item = order_items[0]
+            assert meter.name in order_item.label
+            assert order_item.amount == 50_00
+            assert order_item.start_timestamp == entries[1].start_timestamp
+            assert order_item.end_timestamp == entries[2].end_timestamp
+
+            order = await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        for entry in entries[1:]:
+            await session.refresh(entry)
+            assert entry.order_item_id == order_item.id
+
+        await session.refresh(deleted_entry)
+        assert deleted_entry.order_item_id is None
+
+    async def test_one_tiered_metered_price(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_tiers: Product,
+        metered_tiers_subscription: Subscription,
+    ) -> None:
+        price = product_metered_tiers.prices[0]
+        for tokens in (20, 30):
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_tiers_subscription,
+                tokens=tokens,
+            )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_tiers_subscription
+        ) as order_items:
+            assert len(order_items) == 1
+            # Graduated: 20 units at 100, then 30 at 50.
+            assert order_items[0].amount == 20 * 100 + 30 * 50
+
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_tiered_metered_price_stops_at_its_cap(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        organization: Organization,
+    ) -> None:
+        product = await create_graduated_metered_product(
+            save_fixture, organization=organization, meter=meter, cap_amount=25_00
+        )
+        subscription = await create_active_subscription(
+            save_fixture, customer=customer, product=product
+        )
+        await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=product.prices[0],
+            subscription=subscription,
+            tokens=100,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            assert len(order_items) == 1
+            # Uncapped this is 20 * 100 + 80 * 50 = 6_000.
+            assert order_items[0].amount == 25_00
+            assert "Capped at $25.00" in order_items[0].label
+
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_credits_come_off_before_the_tiers_apply(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_tiers: Product,
+        metered_tiers_subscription: Subscription,
+    ) -> None:
+        price = product_metered_tiers.prices[0]
+        await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_tiers_subscription,
+            tokens=50,
+        )
+        await create_credit_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_tiers_subscription,
+            meter=meter,
+            units=20,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_tiers_subscription
+        ) as order_items:
+            assert len(order_items) == 1
+            # 30 billable units re-enter at the first tier: 20 * 100 + 10 * 50.
+            # Billing the 50 consumed units would give 3_500.
+            assert order_items[0].amount == 20 * 100 + 10 * 50
+
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_metered_entries_respect_cutoff(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        assert is_metered_price(price)
+        cutoff = datetime(2025, 7, 1, tzinfo=UTC)
+        current_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            tokens=20,
+        )
+        current_entry.start_timestamp = cutoff - timedelta(seconds=1)
+        current_entry.end_timestamp = cutoff - timedelta(seconds=1)
+        current_entry.created_at = cutoff - timedelta(seconds=1)
+        await save_fixture(current_entry)
+        future_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            tokens=100,
+        )
+        future_entry.start_timestamp = cutoff
+        future_entry.end_timestamp = cutoff
+        future_entry.created_at = cutoff - timedelta(seconds=1)
+        await save_fixture(future_entry)
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription, cutoff=cutoff
+        ) as order_items:
+            assert len(order_items) == 1
+            order_item = order_items[0]
+            assert order_item.amount == 20_00
+            await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        await session.refresh(current_entry)
+        await session.refresh(future_entry)
+        assert current_entry.order_item_id == order_item.id
+        assert future_entry.order_item_id is None
+
+    async def test_metered_entries_use_cutoff_for_amount_and_linking(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        assert is_metered_price(price)
+
+        included_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            tokens=20,
+        )
+        cutoff = included_entry.created_at + timedelta(seconds=1)
+        included_entry.start_timestamp = cutoff - timedelta(seconds=1)
+        included_entry.end_timestamp = cutoff - timedelta(seconds=1)
+        await save_fixture(included_entry)
+        future_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            tokens=100,
+        )
+        future_entry.start_timestamp = cutoff - timedelta(seconds=1)
+        future_entry.end_timestamp = cutoff - timedelta(seconds=1)
+        future_entry.created_at = cutoff + timedelta(seconds=1)
+        await save_fixture(future_entry)
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription, cutoff=cutoff
+        ) as order_items:
+            assert len(order_items) == 1
+            order_item = order_items[0]
+            assert order_item.amount == 20_00
+
+            late_entry = await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                tokens=200,
+            )
+            late_entry.start_timestamp = cutoff - timedelta(seconds=1)
+            late_entry.end_timestamp = cutoff - timedelta(seconds=1)
+            late_entry.created_at = cutoff + timedelta(seconds=2)
+            await save_fixture(late_entry)
+            await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        await session.refresh(included_entry)
+        await session.refresh(future_entry)
+        await session.refresh(late_entry)
+        assert included_entry.order_item_id == order_item.id
+        assert future_entry.order_item_id is None
+        assert late_entry.order_item_id is None
+
+    async def test_several_metered_prices(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        mocker: MockerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+        order: Order,
+    ) -> None:
+        """
+        Test that billing entries from multiple active prices are all billed.
+        Both prices must be in subscription_product_prices to be billed.
+        """
+        old_price = await create_product_price_metered_unit(
+            save_fixture,
+            product=product_metered_unit,
+            meter=meter,
+            unit_amount=Decimal(250),
+        )
+        current_price = product_metered_unit.prices[0]
+        assert is_metered_price(current_price)
+
+        # Add old_price to the subscription's active prices
+        # (simulating a subscription that has both prices active)
+        metered_subscription.subscription_product_prices.append(
+            SubscriptionProductPrice.from_price(old_price)
+        )
+        await save_fixture(metered_subscription)
+
+        entries = [
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=old_price,
+                subscription=metered_subscription,
+                tokens=10,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=old_price,
+                subscription=metered_subscription,
+                tokens=20,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=current_price,
+                subscription=metered_subscription,
+                tokens=30,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=current_price,
+                subscription=metered_subscription,
+                tokens=40,
+            ),
+        ]
+
+        monkeypatch.setattr(
+            "polar.billing_entry.repository._LINK_PENDING_BATCH_SIZE",
+            1,
+        )
+        execute_spy = mocker.spy(session, "execute")
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription
+        ) as order_items:
+            assert len(order_items) == 2
+
+            order_item_old_price = next(
+                item for item in order_items if item.product_price == old_price
+            )
+            assert meter.name in order_item_old_price.label
+            assert order_item_old_price.amount == 75_00
+
+            order_item_current_price = next(
+                item for item in order_items if item.product_price == current_price
+            )
+            assert meter.name in order_item_current_price.label
+            assert order_item_current_price.amount == 70_00
+
+            order = await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        for entry in entries[:2]:
+            await session.refresh(entry)
+            assert entry.order_item_id == order_item_old_price.id
+
+        for entry in entries[2:]:
+            await session.refresh(entry)
+            assert entry.order_item_id == order_item_current_price.id
+
+        billing_entry_updates = [
+            call.args[0]
+            for call in execute_spy.call_args_list
+            if isinstance(call.args[0], Select)
+            and f"UPDATE {BillingEntry.__tablename__}" in str(call.args[0])
+        ]
+        assert len(billing_entry_updates) > len(order_items)
+        # The batch LIMIT and the last-id subquery LIMIT.
+        assert all(
+            str(statement).count("LIMIT") == 2 for statement in billing_entry_updates
+        )
+        keyset_statements = [
+            statement
+            for statement in billing_entry_updates
+            if f"{BillingEntry.__tablename__}.id > " in str(statement)
+        ]
+        assert len(keyset_statements) >= len(order_items)
+
+    @pytest.mark.parametrize(
+        ("entry_type", "new_seats", "expected_transition"),
+        [
+            (BillingEntryType.subscription_seats_increase, 14, "10 → 14 seats"),
+            (BillingEntryType.subscription_seats_decrease, 6, "10 → 6 seats"),
+        ],
+    )
+    async def test_proration_seat_items(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        organization: Organization,
+        entry_type: BillingEntryType,
+        new_seats: int,
+        expected_transition: str,
+    ) -> None:
+        product = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[("seat", 10_00, "usd")],
+        )
+        subscription = await create_subscription_with_seats(
+            save_fixture, product=product, customer=customer, seats=10
+        )
+        price = product.prices[0]
+        assert is_seat_price(price)
+
+        entry = await create_seat_change_billing_entry(
+            save_fixture,
+            type=entry_type,
+            customer=customer,
+            price=price,
+            subscription=subscription,
+            amount=50_00,
+            new_seats=new_seats,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            assert len(order_items) == 1
+
+            order_item = order_items[0]
+            assert order_item.amount == 50_00
+            assert order_item.proration is True
+            assert order_item.start_timestamp == entry.start_timestamp
+            assert order_item.end_timestamp == entry.end_timestamp
+
+            # Seat-change prorations charge a delta, not the full seat amount.
+            # The label shows the seat transition (old → new), read from the
+            # event metadata, so the prorated amount is explained rather than a
+            # single total seat count that wouldn't reconcile with it.
+            assert product.name in order_item.label
+            assert expected_transition in order_item.label
+
+            await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        await session.refresh(entry)
+        assert entry.order_item_id == order_item.id
+
+    async def test_credit_events(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+        order: Order,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        assert is_metered_price(price)
+        entries = [
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                tokens=10,
+                pending=False,
+                order=order,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                tokens=20,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                tokens=30,
+            ),
+            await create_credit_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=metered_subscription,
+                meter=meter,
+                units=10,
+            ),
+        ]
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription
+        ) as order_items:
+            assert len(order_items) == 1
+
+            order_item = order_items[0]
+            assert meter.name in order_item.label
+            assert order_item.amount == 40_00
+
+            order = await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        for entry in entries[1:]:
+            await session.refresh(entry)
+            assert entry.order_item_id == order_item.id
+
+    async def test_count_meter_excludes_system_entries(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        organization: Organization,
+    ) -> None:
+        count_meter = await create_meter(
+            save_fixture,
+            filter=Filter(conjunction=FilterConjunction.and_, clauses=[]),
+            aggregation=CountAggregation(),
+            organization=organization,
+        )
+        product = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(count_meter, Decimal(100), None, "usd")],
+        )
+        subscription = await create_active_subscription(
+            save_fixture, customer=customer, product=product
+        )
+        price = product.prices[0]
+        assert is_metered_price(price)
+
+        # Three consumption events -> a count meter bills three units.
+        for _ in range(3):
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=subscription,
+                tokens=1,
+            )
+        # System events must not inflate the consumption count, though credited units
+        # are still subtracted separately.
+        await create_credit_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=subscription,
+            meter=count_meter,
+            units=1,
+        )
+        await create_system_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=subscription,
+            meter=count_meter,
+            name=SystemEvent.meter_reset,
+        )
+        await create_system_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=subscription,
+            meter=count_meter,
+            name=SystemEvent.subscription_created,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            assert len(order_items) == 1
+
+            order_item = order_items[0]
+            assert count_meter.name in order_item.label
+            # 3 consumed units - 1 credited unit = 2 billable units
+            assert order_item.amount == 2_00
+
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_static_price(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product: Product,
+        order: Order,
+    ) -> None:
+        subscription = await create_active_subscription(
+            save_fixture, product=product, customer=customer
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+
+        entries = [
+            await create_static_price_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=subscription,
+                pending=False,
+                order=order,
+            ),
+            await create_static_price_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=subscription,
+                pending=True,
+            ),
+            await create_static_price_billing_entry(
+                save_fixture,
+                type=BillingEntryType.proration,
+                customer=customer,
+                price=price,
+                subscription=subscription,
+                pending=True,
+            ),
+        ]
+
+        entries[1].start_timestamp -= timedelta(days=2)
+        entries[2].start_timestamp -= timedelta(days=1)
+        await save_fixture(entries[1])
+        await save_fixture(entries[2])
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            assert len(order_items) == 2
+
+            order_item_1 = order_items[0]
+            assert product.name in order_item_1.label
+            assert order_item_1.proration is False
+            assert order_item_1.start_timestamp == entries[1].start_timestamp
+            assert order_item_1.end_timestamp == entries[1].end_timestamp
+
+            order_item_2 = order_items[1]
+            assert product.name in order_item_2.label
+            assert order_item_2.proration is True
+            assert order_item_2.start_timestamp == entries[2].start_timestamp
+            assert order_item_2.end_timestamp == entries[2].end_timestamp
+
+            # Fixed-only product: no seats qualifier should appear.
+            assert "seat" not in order_item_1.label
+            assert "seat" not in order_item_2.label
+
+            order = await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        await session.refresh(entries[1])
+        assert entries[1].order_item_id == order_item_1.id
+
+        await session.refresh(entries[2])
+        assert entries[2].order_item_id == order_item_2.id
+
+    async def test_static_entry_created_after_cutoff_is_included(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        product: Product,
+    ) -> None:
+        subscription = await create_active_subscription(
+            save_fixture, product=product, customer=customer
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+        cutoff = subscription.current_period_start
+        entry = await create_static_price_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=subscription,
+        )
+        entry.created_at = cutoff + timedelta(seconds=1)
+        await save_fixture(entry)
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription, cutoff=cutoff
+        ) as order_items:
+            assert len(order_items) == 1
+            order_item = order_items[0]
+            await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        await session.refresh(entry)
+        assert entry.order_item_id == order_item.id
+
+    async def test_static_entry_alongside_metered_entries(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        organization: Organization,
+        meter: Meter,
+    ) -> None:
+        # The static line-item query must find the (few) pending static entries
+        # even when they are outnumbered by pending metered entries — the
+        # high-volume shape that was timing out in production.
+        product = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(1000, "usd"), (meter, Decimal(100), None, "usd")],
+        )
+        subscription = await create_active_subscription(
+            save_fixture, product=product, customer=customer
+        )
+        static_price = product.prices[0]
+        metered_price = product.prices[1]
+        assert is_fixed_price(static_price)
+        assert is_metered_price(metered_price)
+
+        for tokens in (20, 30):
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=metered_price,
+                subscription=subscription,
+                tokens=tokens,
+            )
+        static_entry = await create_static_price_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=static_price,
+            subscription=subscription,
+            pending=True,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            assert len(order_items) == 2
+
+            static_items = [
+                item
+                for item in order_items
+                if item.product_price is not None and is_fixed_price(item.product_price)
+            ]
+            metered_items = [
+                item
+                for item in order_items
+                if item.product_price is not None
+                and is_metered_price(item.product_price)
+            ]
+            assert len(static_items) == 1
+            assert len(metered_items) == 1
+
+            static_item = static_items[0]
+            assert static_item.amount == static_price.price_amount
+            assert static_item.proration is False
+            assert product.name in static_item.label
+
+            assert meter.name in metered_items[0].label
+
+            await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        await session.refresh(static_entry)
+        assert static_entry.order_item_id == static_item.id
+
+    async def test_max_aggregation_across_product_prices(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        organization: Organization,
+    ) -> None:
+        """
+        Test that MAX aggregation computes correctly across multiple product prices
+        for the same meter. The MAX should be computed across ALL events, not per-price.
+        """
+        # Create a meter with MAX aggregation
+        meter_max = await create_meter(
+            save_fixture,
+            filter=Filter(conjunction=FilterConjunction.and_, clauses=[]),
+            aggregation=PropertyAggregation(
+                func=AggregationFunction.max, property="servers"
+            ),
+            organization=organization,
+        )
+
+        # Create initial product with metered price
+        product_a = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter_max, Decimal(10_00), None, "usd")],  # $10 per server
+        )
+        price_a = product_a.prices[0]
+
+        subscription = await create_active_subscription(
+            save_fixture, customer=customer, product=product_a
+        )
+
+        # Create events on price A: max is 3 servers
+        entries = [
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price_a,
+                subscription=subscription,
+                tokens=1,
+                metadata_key="servers",
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price_a,
+                subscription=subscription,
+                tokens=3,  # MAX here
+                metadata_key="servers",
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price_a,
+                subscription=subscription,
+                tokens=2,
+                metadata_key="servers",
+            ),
+        ]
+        deleted_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price_a,
+            subscription=subscription,
+            tokens=100,
+            metadata_key="servers",
+        )
+        deleted_entry.deleted_at = utc_now()
+        await save_fixture(deleted_entry)
+
+        # Simulate product change: create new price for same meter but different product
+        product_b = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter_max, Decimal(15_00), None, "usd")],  # $15 per server
+        )
+        price_b = product_b.prices[0]
+
+        subscription.subscription_product_prices = [
+            SubscriptionProductPrice.from_price(price_b)
+        ]
+        await save_fixture(subscription)
+
+        # Create events on price B: values are lower but shouldn't matter for MAX
+        entries.extend(
+            [
+                await create_metered_event_billing_entry(
+                    save_fixture,
+                    customer=customer,
+                    price=price_b,
+                    subscription=subscription,
+                    tokens=1,
+                    metadata_key="servers",
+                ),
+                await create_metered_event_billing_entry(
+                    save_fixture,
+                    customer=customer,
+                    price=price_b,
+                    subscription=subscription,
+                    tokens=2,
+                    metadata_key="servers",
+                ),
+            ]
+        )
+        cutoff = entries[0].created_at + timedelta(seconds=1)
+        for entry in entries:
+            entry.start_timestamp = cutoff - timedelta(seconds=1)
+            entry.end_timestamp = cutoff - timedelta(seconds=1)
+            entry.created_at = cutoff - timedelta(seconds=1)
+        await session.flush()
+        future_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price_b,
+            subscription=subscription,
+            tokens=100,
+            metadata_key="servers",
+        )
+        future_entry.start_timestamp = cutoff - timedelta(seconds=1)
+        future_entry.end_timestamp = cutoff - timedelta(seconds=1)
+        future_entry.created_at = cutoff + timedelta(seconds=1)
+        await save_fixture(future_entry)
+
+        # When computing order items, MAX should be 3 (not 3 + 2 = 5)
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            subscription,
+            cutoff=cutoff,
+        ) as order_items:
+            # Should create ONE line item (grouped by meter, not by price)
+            assert len(order_items) == 1
+
+            order_item = order_items[0]
+            assert meter_max.name in order_item.label
+            # MAX of all events is 3, billed at the most recent price ($15)
+            assert order_item.amount == 45_00
+            assert order_item.product_price == price_b  # Uses most recent price
+
+            order = await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        # All billing entries should be linked to this single order item
+        for entry in entries:
+            await session.refresh(entry)
+            assert entry.order_item_id == order_item.id
+        await session.refresh(future_entry)
+        assert future_entry.order_item_id is None
+        await session.refresh(deleted_entry)
+        assert deleted_entry.order_item_id is None
+
+    async def test_inactive_price_kept_after_product_switch(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        organization: Organization,
+    ) -> None:
+        # Create initial product with metered price
+        product_old = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter, Decimal(100), None, "usd")],
+        )
+        old_price = product_old.prices[0]
+        assert is_metered_price(old_price)
+
+        # Create subscription on old product
+        subscription = await create_active_subscription(
+            save_fixture, customer=customer, product=product_old
+        )
+
+        # Create billing entries on old price (usage during first period)
+        old_entries = [
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=old_price,
+                subscription=subscription,
+                tokens=100,
+            ),
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=old_price,
+                subscription=subscription,
+                tokens=200,
+            ),
+        ]
+
+        # Customer switches to a new product with a different price
+        product_new = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter, Decimal(50), None, "usd")],  # Different rate
+        )
+        new_price = product_new.prices[0]
+        assert is_metered_price(new_price)
+
+        # Update subscription to use only the new price
+        # (simulating what happens when customer switches products)
+        subscription.subscription_product_prices = [
+            SubscriptionProductPrice.from_price(new_price)
+        ]
+        await save_fixture(subscription)
+
+        # Create new billing entries on new price (usage after switch)
+        new_entries = [
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=new_price,
+                subscription=subscription,
+                tokens=50,
+            ),
+        ]
+
+        # When computing order items, old price entries should be KEPT and billed
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            # Should create two line items: one for the old price, one for the new price
+            assert len(order_items) == 2
+
+            # Sort by price creation date to ensure consistent order for assertions
+            order_items = sorted(
+                order_items,
+                key=lambda item: (
+                    0 if not item.product_price else item.product_price.created_at
+                ),
+            )
+
+            old_price_order_item = order_items[0]
+            assert old_price_order_item.product_price == old_price
+            # 100 + 200 tokens at $1.00 each
+            assert old_price_order_item.amount == 300_00
+
+            new_price_order_item = order_items[1]
+            assert new_price_order_item.product_price == new_price
+            # 50 tokens at $0.50 each
+            assert new_price_order_item.amount == 25_00
+
+            await create_order(
+                save_fixture,
+                customer=customer,
+                order_items=list(order_items),
+            )
+
+        # Old entries should be linked to the old price order item
+        for entry in old_entries:
+            await session.refresh(entry)
+            assert entry.order_item_id == old_price_order_item.id
+
+        # New entries should be linked to the order item
+        for entry in new_entries:
+            await session.refresh(entry)
+            assert entry.order_item_id == new_price_order_item.id
+
+        # Trying to create order items again should not include already linked entries
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            # No new order items should be created since all entries are linked
+            assert len(order_items) == 0
+
+    async def test_price_snapshot_bills_switched_away_price(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        organization: Organization,
+    ) -> None:
+        product_old = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter, Decimal(100), None, "usd")],
+        )
+        old_price = product_old.prices[0]
+        subscription = await create_active_subscription(
+            save_fixture, customer=customer, product=product_old
+        )
+        old_entries = [
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=old_price,
+                subscription=subscription,
+                tokens=tokens,
+            )
+            for tokens in (100, 200)
+        ]
+        product_new = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter, Decimal(50), None, "usd")],
+        )
+        subscription.subscription_product_prices = [
+            SubscriptionProductPrice.from_price(product_new.prices[0])
+        ]
+        await save_fixture(subscription)
+
+        async with billing_entry_service.create_metered_order_items_from_pending(
+            session, subscription, price_ids=[old_price.id]
+        ) as order_items:
+            assert len(order_items) == 1
+            order_item = order_items[0]
+            assert order_item.product_price == old_price
+            assert order_item.amount == 300_00
+
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        for entry in old_entries:
+            await session.refresh(entry)
+            assert entry.order_item_id == order_item.id
+
+    @pytest.mark.parametrize(
+        ("include_metered", "billed"), [(True, True), (False, False)]
+    )
+    async def test_bills_reducer_buckets_with_metered_usage(
+        self,
+        include_metered: bool,
+        billed: bool,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        bill = mocker.patch(
+            "polar.billing_entry.service.billing_interval_service.bill_usage",
+            return_value={meter.id: (Decimal(10), Decimal(0))},
+        )
+        await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=product_metered_unit.prices[0],
+            subscription=metered_subscription,
+            tokens=10,
+        )
+        cutoff = utc_now()
+        reducer_cutoff = metered_subscription.current_period_start
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            metered_subscription,
+            include_metered=include_metered,
+            cutoff=cutoff,
+            reducer_cutoff=reducer_cutoff,
+        ) as order_items:
+            order = await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        if billed:
+            bill.assert_called_once_with(
+                session,
+                metered_subscription,
+                {meter.id},
+                order_id=order.id,
+                cutoff=reducer_cutoff,
+            )
+        else:
+            bill.assert_not_called()
+
+    async def test_compares_net_usage_with_the_reducer(
+        self,
+        capfire: CaptureLogfire,
+        mocker: MockerFixture,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        organization: Organization,
+    ) -> None:
+        mocker.patch(
+            "polar.billing_entry.service.billing_interval_service.bill_usage",
+            return_value={meter.id: (Decimal(15), Decimal(16))},
+        )
+        product_old = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter, Decimal(100), None, "usd")],
+        )
+        subscription = await create_active_subscription(
+            save_fixture, customer=customer, product=product_old
+        )
+        product_new = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[(meter, Decimal(50), None, "usd")],
+        )
+        # Legacy nets each price on its own: max(0, 10 - 8) + max(0, 5 - 8) = 2.
+        for price, tokens in ((product_old.prices[0], 10), (product_new.prices[0], 5)):
+            await create_metered_event_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=subscription,
+                tokens=tokens,
+            )
+            await create_credit_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=price,
+                subscription=subscription,
+                meter=meter,
+                units=8,
+            )
+        subscription.subscription_product_prices = [
+            SubscriptionProductPrice.from_price(product_new.prices[0])
+        ]
+        await save_fixture(subscription)
+        mocker.patch(
+            "polar.billing_entry.comparison.billing_interval_service.get_usage_windows",
+            return_value=(
+                UsageWindow(
+                    interval_id=uuid.uuid4(),
+                    source_subscription_id=subscription.id,
+                    meter_id=meter.id,
+                    start=datetime(2020, 1, 1, tzinfo=UTC),
+                    end=utc_now() + timedelta(days=1),
+                ),
+            ),
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, subscription
+        ) as order_items:
+            assert len(order_items) == 2
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        [span] = [
+            span
+            for span in capfire.exporter.exported_spans
+            if span.name == "Bill and compare reducer usage"
+            and span.attributes is not None
+            and span.attributes.get("logfire.span_type") == "span"
+        ]
+        assert span.attributes is not None
+        assert json.loads(str(span.attributes["quantities"])) == {
+            str(meter.id): {
+                "legacy": {"usage": "15.0", "credits": "16", "net": "2.0"},
+                "reducer": {"usage": "15", "credits": "16", "net": "0"},
+                "adjustments": {"unpooled_net": {"net": "2.0"}},
+                "explained": {"usage": "15", "credits": "16", "net": "2.0"},
+            }
+        }
+        assert span.attributes["raw_match"] is False
+        assert span.attributes["match"] is True
+
+
+REDUCER_CUTOFF = datetime(2026, 10, 7, 12, tzinfo=UTC)
+
+
+async def enable_reducer_billing(
+    save_fixture: SaveFixture,
+    session: AsyncSession,
+    subscription: Subscription,
+    price: ProductPrice,
+    meter: Meter,
+    *,
+    tokens: int | Decimal,
+) -> ReducerBucket:
+    """Puts the organization on reducer billing, with `tokens` of usage the
+    subscription owns in a bucket before REDUCER_CUTOFF."""
+    organization = subscription.customer.organization
+    organization.feature_settings = {"reducer_billing_enabled": True}
+    await save_fixture(organization)
+    reducer = await reducer_service.sync_meter(session, meter)
+    start = REDUCER_CUTOFF - timedelta(hours=1)
+    await save_fixture(
+        BillingInterval(
+            organization=organization,
+            subscription=subscription,
+            customer=subscription.customer,
+            meter=meter,
+            product_price=price,
+            period_start=start,
+            usage_policy=UsagePolicy.charge,
+        )
+    )
+    bucket = ReducerBucket(
+        organization=organization,
+        reducer=reducer,
+        customer=subscription.customer,
+        bucket_start=start,
+        bucket_end=start + timedelta(minutes=5),
+        count=1,
+        sum=Decimal(tokens),
+        min=Decimal(tokens),
+        max=Decimal(tokens),
+    )
+    await save_fixture(bucket)
+    return bucket
+
+
+async def create_legacy_usage_billing_entry(
+    save_fixture: SaveFixture,
+    *,
+    customer: Customer,
+    price: ProductPrice,
+    subscription: Subscription,
+    timestamp: datetime,
+    tokens: int,
+) -> BillingEntry:
+    event = await create_event(
+        save_fixture,
+        organization=customer.organization,
+        customer=customer,
+        timestamp=timestamp,
+        metadata={"tokens": tokens},
+    )
+    entry = BillingEntry(
+        start_timestamp=timestamp,
+        end_timestamp=timestamp,
+        type=BillingEntryType.metered,
+        direction=BillingEntryDirection.debit,
+        customer=customer,
+        product_price=price,
+        subscription=subscription,
+        event=event,
+    )
+    await save_fixture(entry)
+    return entry
+
+
+@pytest.mark.anyio
+class TestCreateOrderItemsFromReducers:
+    async def test_bills_reducer_usage_and_static_entries(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        bucket = await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=20
+        )
+        pending_metered_entry = await create_metered_event_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            tokens=99,
+        )
+        static_price = await create_product_price_fixed(
+            save_fixture, product=product_metered_unit, amount=10_00
+        )
+        static_entry = await create_static_price_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=static_price,
+            subscription=metered_subscription,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription, reducer_cutoff=REDUCER_CUTOFF
+        ) as order_items:
+            static_item, metered_item = order_items
+            assert static_item.amount == 10_00
+            assert meter.name in metered_item.label
+            assert metered_item.amount == 20_00
+            assert metered_item.product_price == price
+
+            order = await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        await session.refresh(bucket)
+        assert bucket.order_id == order.id
+        assert bucket.billed_at is not None
+        await session.refresh(static_entry)
+        assert static_entry.order_item_id == static_item.id
+        await session.refresh(pending_metered_entry)
+        assert pending_metered_entry.order_item_id == metered_item.id
+
+    async def test_bills_legacy_usage_pending_before_the_period_once(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=20
+        )
+        period_start = REDUCER_CUTOFF - timedelta(hours=1)
+        legacy_entry = await create_legacy_usage_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            timestamp=period_start - timedelta(minutes=5),
+            tokens=3,
+        )
+        period_entry = await create_legacy_usage_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            timestamp=period_start + timedelta(minutes=10),
+            tokens=99,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            metered_subscription,
+            reducer_cutoff=REDUCER_CUTOFF,
+            period_start=period_start,
+        ) as order_items:
+            metered_item, legacy_item = order_items
+            assert metered_item.amount == 20_00
+            assert legacy_item.amount == 3_00
+            assert legacy_item.product_price == price
+            assert "3 consumed units from the previous period" in legacy_item.label
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        await session.refresh(legacy_entry)
+        assert legacy_entry.order_item_id == legacy_item.id
+        await session.refresh(period_entry)
+        assert period_entry.order_item_id == metered_item.id
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            metered_subscription,
+            reducer_cutoff=REDUCER_CUTOFF + timedelta(hours=1),
+            period_start=REDUCER_CUTOFF,
+        ) as order_items:
+            assert order_items == []
+
+    async def test_charges_legacy_usage_what_it_adds_to_the_charge(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        bucket = await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=20
+        )
+        credit_reducer = await ReducerRepository.from_session(
+            session
+        ).get_by_meter_and_kind(meter.id, ReducerKind.credit)
+        await save_fixture(
+            ReducerBucket(
+                organization=customer.organization,
+                reducer=credit_reducer,
+                customer=customer,
+                bucket_start=bucket.bucket_start,
+                bucket_end=bucket.bucket_end,
+                count=1,
+                sum=Decimal(22),
+                min=Decimal(22),
+                max=Decimal(22),
+            )
+        )
+        period_start = REDUCER_CUTOFF - timedelta(hours=1)
+        await create_legacy_usage_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            timestamp=period_start - timedelta(minutes=5),
+            tokens=3,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            metered_subscription,
+            reducer_cutoff=REDUCER_CUTOFF,
+            period_start=period_start,
+        ) as order_items:
+            assert [item.amount for item in order_items] == [0, 1_00]
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_legacy_usage_reaching_a_cheaper_volume_tier_is_negative(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = await create_product_price_metered_tiers(
+            save_fixture,
+            product=product_metered_unit,
+            meter=meter,
+            tiers=Tiers.model_validate(
+                {
+                    "type": TierType.volume,
+                    "tiers": [
+                        {"bound": 20, "unit_amount": "100"},
+                        {"bound": None, "unit_amount": "50"},
+                    ],
+                }
+            ),
+        )
+        await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=19
+        )
+        period_start = REDUCER_CUTOFF - timedelta(hours=1)
+        await create_legacy_usage_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            timestamp=period_start - timedelta(minutes=5),
+            tokens=3,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            metered_subscription,
+            reducer_cutoff=REDUCER_CUTOFF,
+            period_start=period_start,
+        ) as order_items:
+            # 19 units at 1.00 alone, 22 units at 0.50 together.
+            assert [item.amount for item in order_items] == [19_00, -8_00]
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_legacy_usage_without_reducer_usage_is_the_only_item(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=0
+        )
+        period_start = REDUCER_CUTOFF - timedelta(hours=1)
+        legacy_entry = await create_legacy_usage_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            timestamp=period_start - timedelta(minutes=5),
+            tokens=3,
+        )
+        period_entry = await create_legacy_usage_billing_entry(
+            save_fixture,
+            customer=customer,
+            price=price,
+            subscription=metered_subscription,
+            timestamp=period_start + timedelta(minutes=10),
+            tokens=0,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            metered_subscription,
+            reducer_cutoff=REDUCER_CUTOFF,
+            period_start=period_start,
+        ) as order_items:
+            (legacy_item,) = order_items
+            assert legacy_item.amount == 3_00
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        await session.refresh(legacy_entry)
+        assert legacy_entry.order_item_id == legacy_item.id
+        await session.refresh(period_entry)
+        assert period_entry.order_item_id is None
+
+    async def test_charges_legacy_usage_oldest_price_first(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=20
+        )
+        period_start = REDUCER_CUTOFF - timedelta(hours=1)
+        legacy_prices = []
+        for minutes, unit_amount in ((10, 200), (5, 300)):
+            legacy_price = await create_product_price_metered_unit(
+                save_fixture,
+                product=product_metered_unit,
+                meter=meter,
+                unit_amount=Decimal(unit_amount),
+            )
+            await create_legacy_usage_billing_entry(
+                save_fixture,
+                customer=customer,
+                price=legacy_price,
+                subscription=metered_subscription,
+                timestamp=period_start - timedelta(minutes=minutes),
+                tokens=1,
+            )
+            legacy_prices.append(legacy_price)
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session,
+            metered_subscription,
+            reducer_cutoff=REDUCER_CUTOFF,
+            period_start=period_start,
+        ) as order_items:
+            assert [(item.product_price, item.amount) for item in order_items] == [
+                (price, 20_00),
+                (legacy_prices[0], 2_00),
+                (legacy_prices[1], 3_00),
+            ]
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_charges_usage_at_the_price_of_its_interval(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        old_price = product_metered_unit.prices[0]
+        first_bucket = await enable_reducer_billing(
+            save_fixture,
+            session,
+            metered_subscription,
+            old_price,
+            meter,
+            tokens=Decimal("19.5"),
+        )
+        changed_at = REDUCER_CUTOFF - timedelta(minutes=30)
+        (old_interval,) = await BillingIntervalRepository.from_session(
+            session
+        ).get_by_subscription(metered_subscription.id)
+        old_interval.period_end = changed_at
+        await save_fixture(old_interval)
+        new_price = await create_product_price_metered_unit(
+            save_fixture,
+            product=product_metered_unit,
+            meter=meter,
+            unit_amount=Decimal(300),
+        )
+        await save_fixture(
+            BillingInterval(
+                organization=customer.organization,
+                subscription=metered_subscription,
+                customer=customer,
+                meter=meter,
+                product_price=new_price,
+                period_start=changed_at,
+                usage_policy=UsagePolicy.charge,
+            )
+        )
+        credit_reducer = await ReducerRepository.from_session(
+            session
+        ).get_by_meter_and_kind(meter.id, ReducerKind.credit)
+        for reducer, bucket_start, units in (
+            (first_bucket.reducer, changed_at, 5),
+            (credit_reducer, first_bucket.bucket_start, 22),
+        ):
+            await save_fixture(
+                ReducerBucket(
+                    organization=customer.organization,
+                    reducer=reducer,
+                    customer=customer,
+                    bucket_start=bucket_start,
+                    bucket_end=bucket_start + timedelta(minutes=5),
+                    count=1,
+                    sum=Decimal(units),
+                    min=Decimal(units),
+                    max=Decimal(units),
+                )
+            )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription, reducer_cutoff=REDUCER_CUTOFF
+        ) as order_items:
+            assert [(item.product_price, item.amount) for item in order_items] == [
+                (old_price, 0),
+                (new_price, 7_50),
+            ]
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_bills_a_meter_the_subscription_no_longer_has_a_price_for(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=20
+        )
+        metered_subscription.subscription_product_prices = []
+        await save_fixture(metered_subscription)
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription, reducer_cutoff=REDUCER_CUTOFF
+        ) as order_items:
+            assert [(item.product_price, item.amount) for item in order_items] == [
+                (price, 20_00)
+            ]
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    async def test_metered_settles_every_meter_with_intervals(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        price = product_metered_unit.prices[0]
+        bucket = await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, meter, tokens=20
+        )
+        other_meter = await create_meter(
+            save_fixture,
+            id=uuid.uuid4(),
+            filter=meter.filter,
+            aggregation=meter.aggregation,
+            organization=customer.organization,
+        )
+        other_price = await create_product_price_metered_unit(
+            save_fixture, product=product_metered_unit, meter=other_meter
+        )
+        other_bucket = await enable_reducer_billing(
+            save_fixture,
+            session,
+            metered_subscription,
+            other_price,
+            other_meter,
+            tokens=7,
+        )
+
+        async with billing_entry_service.create_metered_order_items_from_pending(
+            session, metered_subscription, cutoff=REDUCER_CUTOFF, price_ids=[price.id]
+        ) as order_items:
+            assert {(item.product_price, item.amount) for item in order_items} == {
+                (price, 20_00),
+                (other_price, 7_00),
+            }
+            order = await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+        await session.refresh(bucket)
+        assert bucket.order_id == order.id
+        await session.refresh(other_bucket)
+        assert other_bucket.order_id == order.id
+
+    async def test_no_usage_creates_no_item(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        await enable_reducer_billing(
+            save_fixture,
+            session,
+            metered_subscription,
+            product_metered_unit.prices[0],
+            meter,
+            tokens=0,
+        )
+
+        async with billing_entry_service.create_order_items_from_pending(
+            session, metered_subscription, reducer_cutoff=REDUCER_CUTOFF
+        ) as order_items:
+            assert order_items == []
+
+    async def test_bills_a_peak_from_before_a_period_start_that_was_never_settled(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        organization: Organization,
+        metered_subscription: Subscription,
+        product_metered_unit: Product,
+    ) -> None:
+        peak_meter = await create_meter(
+            save_fixture,
+            id=uuid.uuid4(),
+            filter=Filter(conjunction=FilterConjunction.and_, clauses=[]),
+            aggregation=PropertyAggregation(
+                func=AggregationFunction.max, property="tokens"
+            ),
+            organization=organization,
+        )
+        price = await create_product_price_metered_unit(
+            save_fixture, product=product_metered_unit, meter=peak_meter
+        )
+        await enable_reducer_billing(
+            save_fixture, session, metered_subscription, price, peak_meter, tokens=20
+        )
+
+        async with billing_entry_service.create_metered_order_items_from_pending(
+            session,
+            metered_subscription,
+            cutoff=REDUCER_CUTOFF,
+            price_ids=[price.id],
+            period_start=REDUCER_CUTOFF - timedelta(minutes=10),
+        ) as order_items:
+            assert [(item.product_price, item.amount) for item in order_items] == [
+                (price, 20_00)
+            ]
+            await create_order(
+                save_fixture, customer=customer, order_items=list(order_items)
+            )
+
+    @pytest.mark.parametrize("paid_on_creation", [False, True])
+    async def test_usage_billed_by_another_order_raises_unless_paid(
+        self,
+        paid_on_creation: bool,
+        mocker: MockerFixture,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        customer: Customer,
+        meter: Meter,
+        product_metered_unit: Product,
+        metered_subscription: Subscription,
+    ) -> None:
+        organization = customer.organization
+        organization.feature_settings = {"reducer_billing_enabled": True}
+        await save_fixture(organization)
+        price_id = product_metered_unit.prices[0].id
+        mocker.patch(
+            "polar.billing_entry.service.billing_interval_service.get_meter_ids",
+            return_value={meter.id},
+        )
+        mocker.patch(
+            "polar.billing_entry.service.billing_interval_service.seal_usage",
+            return_value=(
+                {
+                    meter.id: MeterCharge(
+                        Decimal(20),
+                        {price_id: Decimal(20)},
+                        {price_id: Decimal(1)},
+                        Decimal(0),
+                    )
+                },
+                [uuid.uuid4(), uuid.uuid4()],
+            ),
+        )
+        mocker.patch(
+            "polar.billing_entry.service.reducer_service.mark_as_billed",
+            return_value=1,
+        )
+
+        async def create() -> None:
+            async with billing_entry_service.create_order_items_from_pending(
+                session, metered_subscription, paid_on_creation=paid_on_creation
+            ) as order_items:
+                await create_order(
+                    save_fixture, customer=customer, order_items=list(order_items)
+                )
+
+        if paid_on_creation:
+            await create()
+        else:
+            with pytest.raises(ReducerUsageAlreadyBilled):
+                await create()

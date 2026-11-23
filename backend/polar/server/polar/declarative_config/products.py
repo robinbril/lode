@@ -1,0 +1,171 @@
+from collections.abc import Collection
+from typing import Any
+from uuid import UUID
+
+from polar.custom_field.schemas import AttachedCustomFieldCreate
+from polar.exceptions import PolarRequestValidationError
+from polar.exceptions import ValidationError as RequestValidationError
+from polar.product.schemas import (
+    ProductCreateOneTime,
+    ProductCreateRecurring,
+    ProductPriceCreate,
+    ProductPriceFixedCreate,
+    ProductPriceMeteredTiersCreate,
+    ProductPriceMeteredUnitCreate,
+    ProductPriceSeatBasedCreate,
+    ProductPriceUnitBasedCreate,
+    ProductUpdate,
+)
+
+from .schemas import (
+    ConfigProduct,
+    ConfigProductPrice,
+    ConfigProductPriceMeteredTiers,
+    ConfigProductPriceMeteredUnit,
+    ConfigProductPriceSeatBased,
+    ConfigProductPriceUnitBased,
+)
+
+_PRICE_INPUT_FIELDS = {
+    "amount_type",
+    "price_currency",
+    "tax_behavior",
+    "price_amount",
+    "unit_amount",
+    "cap_amount",
+    "tiers",
+    "minimum_units",
+    "unit_label",
+}
+
+
+def product_error(
+    error: PolarRequestValidationError,
+    index: int,
+    external_ids: dict[str, str],
+) -> PolarRequestValidationError:
+    errors: list[RequestValidationError] = []
+    for detail in error.errors():
+        path = list(detail["loc"][1:])
+        if path and path[-1] == "meter_id":
+            path[-1] = "meter"
+        errors.append(
+            RequestValidationError(
+                type=detail["type"],
+                loc=("body", "products", index, *path),
+                msg=detail["msg"],
+                input=detail["input"]
+                if path and path[-1] in _PRICE_INPUT_FIELDS
+                else external_ids.get(str(detail["input"])),
+            )
+        )
+    return PolarRequestValidationError(errors)
+
+
+def price_create(
+    price: ConfigProductPrice,
+    meter_ids: dict[str, UUID],
+) -> (
+    ProductPriceFixedCreate
+    | ProductPriceMeteredUnitCreate
+    | ProductPriceSeatBasedCreate
+    | ProductPriceMeteredTiersCreate
+    | ProductPriceUnitBasedCreate
+):
+    if isinstance(price, ConfigProductPriceMeteredUnit):
+        return ProductPriceMeteredUnitCreate(
+            **price.model_dump(exclude={"meter"}),
+            meter_id=meter_ids[price.meter],
+        )
+
+    if isinstance(price, ConfigProductPriceMeteredTiers):
+        return ProductPriceMeteredTiersCreate(
+            **price.model_dump(exclude={"meter"}), meter_id=meter_ids[price.meter]
+        )
+
+    if isinstance(price, ConfigProductPriceSeatBased):
+        return ProductPriceSeatBasedCreate(**price.model_dump())
+
+    if isinstance(price, ConfigProductPriceUnitBased):
+        return ProductPriceUnitBasedCreate(**price.model_dump())
+
+    return ProductPriceFixedCreate(**price.model_dump())
+
+
+def _attached_custom_fields(
+    config: ConfigProduct, custom_field_ids: dict[str, UUID]
+) -> list[AttachedCustomFieldCreate]:
+    return [
+        AttachedCustomFieldCreate(
+            custom_field_id=custom_field_ids[attached.field],
+            required=attached.required,
+        )
+        for attached in config.custom_fields
+    ]
+
+
+def product_create(
+    config: ConfigProduct,
+    organization_id: UUID | None,
+    meter_ids: dict[str, UUID],
+    custom_field_ids: dict[str, UUID] | None,
+) -> ProductCreateRecurring | ProductCreateOneTime:
+    fields = config.model_dump(
+        include={"name", "description", "visibility", "metadata"}
+    )
+    prices: list[ProductPriceCreate] = [
+        price_create(price, meter_ids) for price in config.prices
+    ]
+    attached_custom_fields = (
+        []
+        if custom_field_ids is None
+        else _attached_custom_fields(config, custom_field_ids)
+    )
+    if config.recurring_interval is None:
+        return ProductCreateOneTime(
+            **fields,
+            prices=prices,
+            attached_custom_fields=attached_custom_fields,
+            organization_id=organization_id,
+        )
+    return ProductCreateRecurring(
+        **fields,
+        recurring_interval=config.recurring_interval,
+        recurring_interval_count=config.recurring_interval_count or 1,
+        trial_interval=config.trial_interval,
+        trial_interval_count=config.trial_interval_count,
+        trial_payment_setup_required=config.trial_payment_setup_required,
+        meter_interval=config.meter_interval,
+        meter_interval_count=config.meter_interval_count,
+        prices=prices,
+        attached_custom_fields=attached_custom_fields,
+        organization_id=organization_id,
+    )
+
+
+def product_update(
+    config: ConfigProduct,
+    meter_ids: dict[str, UUID],
+    custom_field_ids: dict[str, UUID],
+    fields: Collection[str],
+) -> ProductUpdate:
+    values: dict[str, Any] = {
+        name: getattr(config, name)
+        for name in ("name", "description", "visibility")
+        if name in fields
+    }
+    # The trial interval and its count are only valid together.
+    if {"trial_interval", "trial_interval_count"} & set(fields):
+        values["trial_interval"] = config.trial_interval
+        values["trial_interval_count"] = config.trial_interval_count
+    if "trial_payment_setup_required" in fields:
+        values["trial_payment_setup_required"] = config.trial_payment_setup_required
+    if "user_metadata" in fields:
+        values["metadata"] = config.metadata
+    if "prices" in fields:
+        values["prices"] = [price_create(price, meter_ids) for price in config.prices]
+    if "custom_fields" in fields:
+        values["attached_custom_fields"] = _attached_custom_fields(
+            config, custom_field_ids
+        )
+    return ProductUpdate(**values)

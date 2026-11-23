@@ -1,0 +1,1068 @@
+import { agUiWireMessageId } from "./adapter/conversions";
+import { describe, it, expect, vi } from "vitest";
+import { HttpAgent, type AbstractAgent } from "@ag-ui/client";
+import type {
+  AppendMessage,
+  ThreadAssistantMessage,
+  ThreadHistoryAdapter,
+  ThreadMessage,
+} from "@assistant-ui/core";
+import { AgUiThreadController } from "./AgUiThreadController";
+import type { AgUiSubscriber } from "./adapter/subscriber";
+import { makeLogger } from "./logger";
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function createCore(
+  history?: ThreadHistoryAdapter,
+  agent = {} as AbstractAgent,
+) {
+  const core = new AgUiThreadController({
+    agent,
+    logger: makeLogger(),
+    showThinking: true,
+    ...(history && { history }),
+  });
+  const update = (nextHistory?: ThreadHistoryAdapter) =>
+    core.updateOptions({
+      agent,
+      logger: makeLogger(),
+      showThinking: true,
+      ...(nextHistory && { history: nextHistory }),
+    });
+  return { core, update };
+}
+
+function createHistory() {
+  return {
+    load: vi.fn().mockResolvedValue({
+      headId: "restored",
+      messages: [
+        {
+          parentId: null,
+          message: {
+            id: "restored",
+            role: "user" as const,
+            content: [{ type: "text" as const, text: "hello" }],
+            createdAt: new Date(0),
+            metadata: { custom: {} },
+          },
+        },
+      ],
+    }),
+    append: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+const userMessage = (text: string) =>
+  ({
+    parentId: null,
+    role: "user",
+    content: [{ type: "text", text }],
+    startRun: false,
+  }) as unknown as AppendMessage;
+
+const storedUser: ThreadMessage = {
+  id: "restored",
+  role: "user",
+  content: [{ type: "text", text: "earlier" }],
+  attachments: [],
+  createdAt: new Date(0),
+  metadata: { custom: {} },
+};
+
+const storedToolCall: ThreadAssistantMessage = {
+  id: "assistant",
+  role: "assistant",
+  content: [
+    {
+      type: "tool-call",
+      toolCallId: "call",
+      toolName: "lookup",
+      args: {},
+      argsText: "{}",
+    },
+  ],
+  status: { type: "requires-action", reason: "tool-calls" },
+  createdAt: new Date(0),
+  metadata: {
+    custom: {},
+    unstable_state: null,
+    unstable_annotations: [],
+    unstable_data: [],
+    steps: [],
+  },
+};
+
+const storedInterrupt: ThreadAssistantMessage = {
+  ...storedToolCall,
+  status: { type: "requires-action", reason: "interrupt" },
+  content: [
+    {
+      ...storedToolCall.content[0]!,
+      approval: { id: "gate", prompt: "Continue?" },
+    },
+  ] as ThreadAssistantMessage["content"],
+  metadata: {
+    ...storedToolCall.metadata,
+    custom: {
+      agui: {
+        interrupts: [{ id: "gate", reason: "tool_call", toolCallId: "call" }],
+      },
+    },
+  },
+};
+
+function deferredHistory(messages: ThreadMessage[] = [storedUser]) {
+  let finishLoad!: (
+    repo: Awaited<ReturnType<ThreadHistoryAdapter["load"]>>,
+  ) => void;
+  const load = vi.fn(
+    () =>
+      new Promise<Awaited<ReturnType<ThreadHistoryAdapter["load"]>>>(
+        (resolve) => {
+          finishLoad = resolve;
+        },
+      ),
+  );
+  const history: ThreadHistoryAdapter = {
+    load,
+    append: vi.fn().mockResolvedValue(undefined),
+  };
+  return {
+    history,
+    finish: (unstableResume = false) =>
+      finishLoad({
+        headId: messages.at(-1)?.id ?? null,
+        ...(unstableResume && { unstable_resume: true }),
+        messages: messages.map((message, index) => ({
+          parentId: messages[index - 1]?.id ?? null,
+          message,
+        })),
+      }),
+  };
+}
+
+describe("AgUiThreadController optimistic assistant identity", () => {
+  it("keeps the assistant id when a run settles without a server id", async () => {
+    let runningAssistant!: ThreadAssistantMessage;
+    const runAgent = vi.fn(
+      async (input: { runId: string }, subscriber: AgUiSubscriber) => {
+        subscriber.onRunStartedEvent?.();
+        subscriber.onTextMessageContentEvent?.({
+          event: { type: "TEXT_MESSAGE_CONTENT", delta: "partial" },
+        });
+        runningAssistant = core.getMessages().at(-1) as ThreadAssistantMessage;
+        expect(core.isRunning()).toBe(true);
+        expect(runningAssistant.status).toEqual({ type: "running" });
+        expect(runningAssistant.metadata.isOptimistic).toBe(true);
+        subscriber.onTextMessageContentEvent?.({
+          event: { type: "TEXT_MESSAGE_CONTENT", delta: " answer" },
+        });
+        expect(core.getMessages().at(-1)).toMatchObject({
+          id: runningAssistant.id,
+          metadata: { isOptimistic: true },
+        });
+        subscriber.onRunFinishedEvent?.({
+          event: { type: "RUN_FINISHED", runId: input.runId },
+        });
+        subscriber.onRunFinalized?.();
+      },
+    );
+    const { core } = createCore(undefined, {
+      runAgent,
+    } as unknown as AbstractAgent);
+
+    await core.append({ ...userMessage("question"), startRun: true });
+
+    const settled = core.getMessages().at(-1) as ThreadAssistantMessage;
+    expect(settled.id).toBe(runningAssistant.id);
+    expect(settled.id.startsWith("__optimistic__")).toBe(false);
+    expect(settled.status).toEqual({ type: "complete", reason: "unknown" });
+    expect(settled.metadata.isOptimistic).toBe(false);
+    expect(settled.content).toEqual([{ type: "text", text: "partial answer" }]);
+    expect(core.getMessageRepository().headId).toBe(runningAssistant.id);
+    expect(
+      core.getMessageRepository().messages.map(({ message }) => message.id),
+    ).toEqual([core.getMessages()[0]!.id, runningAssistant.id]);
+  });
+
+  it.each(["text", "tool-call"] as const)(
+    "keeps the local id when adopting the first server id from a %s event",
+    async (eventType) => {
+      let optimisticId!: string;
+      const runAgent = vi.fn(
+        async (_input: unknown, subscriber: AgUiSubscriber) => {
+          subscriber.onTextMessageContentEvent?.({
+            event: { type: "TEXT_MESSAGE_CONTENT", delta: "partial" },
+          });
+          const placeholder = core.getMessages().at(-1)!;
+          optimisticId = placeholder.id;
+          expect(placeholder.metadata.isOptimistic).toBe(true);
+          if (eventType === "text") {
+            subscriber.onTextMessageStartEvent?.({
+              event: { type: "TEXT_MESSAGE_START", messageId: "server-answer" },
+            });
+          } else {
+            subscriber.onToolCallStartEvent?.({
+              event: {
+                type: "TOOL_CALL_START",
+                toolCallId: "call",
+                toolCallName: "lookup",
+                parentMessageId: "server-answer",
+              },
+            });
+          }
+          expect(core.getMessages().at(-1)).toMatchObject({
+            id: optimisticId,
+            metadata: { custom: { agui: { messageId: "server-answer" } } },
+          });
+          expect(
+            core.getMessages().at(-1)!.metadata.isOptimistic,
+          ).toBeUndefined();
+          subscriber.onRunFinalized?.();
+        },
+      );
+      const { core } = createCore(undefined, {
+        runAgent,
+      } as unknown as AbstractAgent);
+
+      await core.append({ ...userMessage("question"), startRun: true });
+
+      expect(core.getMessages().at(-1)!.id).toBe(optimisticId);
+      expect(
+        core
+          .getMessageRepository()
+          .messages.some(({ message }) => message.id === optimisticId),
+      ).toBe(true);
+    },
+  );
+
+  it("recreates an adopted local id without marking it optimistic", async () => {
+    let recreated!: ThreadAssistantMessage;
+    let optimisticId!: string;
+    const runAgent = vi.fn(
+      async (input: { runId: string }, subscriber: AgUiSubscriber) => {
+        const optimistic = core.getMessages().at(-1)!;
+        expect(optimistic.metadata.isOptimistic).toBe(true);
+        optimisticId = optimistic.id;
+        subscriber.onTextMessageStartEvent?.({
+          event: { type: "TEXT_MESSAGE_START", messageId: "server-answer" },
+        });
+        expect(core.getMessages().at(-1)!.id).toBe(optimisticId);
+
+        core.applyExternalMessages([]);
+        expect(core.getMessageRepository().messages).toEqual([]);
+        subscriber.onTextMessageContentEvent?.({
+          event: {
+            type: "TEXT_MESSAGE_CONTENT",
+            messageId: "server-answer",
+            delta: "answer",
+          },
+        });
+        recreated = core.getMessages().at(-1) as ThreadAssistantMessage;
+        subscriber.onRunFinishedEvent?.({
+          event: { type: "RUN_FINISHED", runId: input.runId },
+        });
+        subscriber.onRunFinalized?.();
+      },
+    );
+    const { core } = createCore(undefined, {
+      runAgent,
+    } as unknown as AbstractAgent);
+
+    await core.append({ ...userMessage("question"), startRun: true });
+
+    expect(recreated).toMatchObject({
+      id: optimisticId,
+      status: { type: "running" },
+      content: [{ type: "text", text: "answer" }],
+      metadata: { isOptimistic: false },
+    });
+    expect(core.getMessages().at(-1)).toMatchObject({
+      id: optimisticId,
+      status: { type: "complete" },
+      metadata: {
+        isOptimistic: false,
+        custom: { agui: { messageId: "server-answer" } },
+      },
+    });
+  });
+
+  it("persists and sends the same settled assistant id on the next run", async () => {
+    const append = vi
+      .fn<ThreadHistoryAdapter["append"]>()
+      .mockResolvedValue(undefined);
+    const history: ThreadHistoryAdapter = {
+      load: vi.fn().mockResolvedValue({ messages: [] }),
+      append,
+    };
+    const runningIds: string[] = [];
+    const runAgent = vi.fn(
+      async (
+        _input: { messages: { id: string; role: string }[] },
+        subscriber: AgUiSubscriber,
+      ) => {
+        subscriber.onTextMessageContentEvent?.({
+          event: { type: "TEXT_MESSAGE_CONTENT", delta: "answer" },
+        });
+        runningIds.push(core.getMessages().at(-1)!.id);
+        subscriber.onRunFinalized?.();
+      },
+    );
+    const { core } = createCore(history, {
+      runAgent,
+    } as unknown as AbstractAgent);
+    await core.__internal_load();
+
+    await core.append({ ...userMessage("question"), startRun: true });
+    const settledId = core.getMessages().at(-1)!.id;
+    await vi.waitFor(() =>
+      expect(append).toHaveBeenCalledWith({
+        parentId: core.getMessages()[0]!.id,
+        message: expect.objectContaining({
+          id: runningIds[0],
+          role: "assistant",
+          metadata: expect.objectContaining({ isOptimistic: false }),
+        }),
+      }),
+    );
+    expect(settledId).toBe(runningIds[0]);
+
+    await core.append({
+      ...userMessage("follow-up"),
+      parentId: settledId,
+      startRun: true,
+    });
+
+    const outbound = runAgent.mock.calls[1]![0].messages;
+    expect(outbound).toContainEqual(
+      expect.objectContaining({
+        id: settledId,
+        role: "assistant",
+        content: "answer",
+      }),
+    );
+    expect(outbound.every(({ id }) => !id.startsWith("__optimistic__"))).toBe(
+      true,
+    );
+    expect(
+      append.mock.calls.every(
+        ([{ message, parentId }]) =>
+          !message.id.startsWith("__optimistic__") &&
+          !parentId?.startsWith("__optimistic__"),
+      ),
+    ).toBe(true);
+  });
+
+  it("preserves the optimistic flag through custom metadata merges before and after settle", async () => {
+    const history: ThreadHistoryAdapter = {
+      load: vi.fn().mockResolvedValue({ messages: [] }),
+      append: vi.fn().mockResolvedValue(undefined),
+      resume: async function* () {
+        yield {
+          content: [{ type: "text", text: "answer" }],
+          metadata: {
+            custom: { source: "stream", agui: { opaqueReasoning: [] } },
+          },
+        };
+        expect(core.getMessages().at(-1)!.metadata.isOptimistic).toBe(true);
+        yield {
+          status: { type: "complete", reason: "unknown" },
+          metadata: { custom: { agui: { interrupts: [] } } },
+        };
+        expect(core.getMessages().at(-1)!.metadata.isOptimistic).toBe(false);
+        yield { metadata: { custom: { source: "finished" } } };
+      },
+    };
+    const { core } = createCore(history);
+
+    await core.resumeInFlightRun([]);
+
+    expect(core.getMessages().at(-1)!.metadata).toMatchObject({
+      isOptimistic: false,
+      custom: {
+        source: "finished",
+        agui: { opaqueReasoning: [], interrupts: [] },
+      },
+    });
+  });
+});
+
+describe("AgUiThreadController late history loading", () => {
+  it("drops a queued send when loading is cancelled", async () => {
+    const { history, finish } = deferredHistory();
+    const runAgent = vi.fn(async () => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const sending = core.append(userMessage("cancelled"));
+
+    await core.cancel();
+    finish();
+    await Promise.all([loading, sending]);
+
+    expect(core.getMessages().map((message) => message.id)).toEqual([
+      "restored",
+    ]);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("sends while the restored stream is still open after cancelling a queued send", async () => {
+    const { history, finish } = deferredHistory();
+    history.resume = async function* ({ abortSignal }) {
+      yield {
+        content: [{ type: "text", text: "partial" }],
+        status: { type: "running" },
+      };
+      await new Promise<void>((resolve) => {
+        abortSignal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    };
+    const runAgent = vi.fn(async (_input: unknown) => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const cancelled = core.append({
+      ...userMessage("cancelled"),
+      startRun: true,
+    });
+    await core.cancel();
+    finish(true);
+    await vi.waitFor(() => expect(core.isRunning()).toBe(true));
+    expect(core.isLoading).toBe(true);
+
+    const sending = core.append({
+      ...userMessage("sent during resume"),
+      parentId: core.getMessages().at(-1)?.id ?? null,
+      startRun: true,
+    });
+    await Promise.all([loading, cancelled, sending]);
+
+    expect(
+      core
+        .getMessages()
+        .filter((message) => message.role === "user")
+        .map((message) => message.content[0]),
+    ).toEqual([
+      { type: "text", text: "earlier" },
+      { type: "text", text: "sent during resume" },
+    ]);
+    expect(runAgent).toHaveBeenCalledOnce();
+  });
+
+  it("waits for history before reloading", async () => {
+    const { history, finish } = deferredHistory();
+    const runAgent = vi.fn(async () => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const reloading = core.reload("restored");
+
+    expect(runAgent).not.toHaveBeenCalled();
+    finish();
+    await Promise.all([loading, reloading]);
+    expect(runAgent).toHaveBeenCalledOnce();
+  });
+
+  it("waits for history before resuming a run", async () => {
+    const { history, finish } = deferredHistory();
+    const runAgent = vi.fn(async () => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const resuming = core.resume({
+      parentId: "restored",
+      sourceId: null,
+      runConfig: {},
+    });
+
+    expect(runAgent).not.toHaveBeenCalled();
+    finish();
+    await Promise.all([loading, resuming]);
+    expect(runAgent).toHaveBeenCalledOnce();
+  });
+
+  it("waits for history before resuming an in-flight run", async () => {
+    const { history, finish } = deferredHistory();
+    const resume = vi.fn(async function* () {
+      yield {
+        content: [{ type: "text" as const, text: "continued" }],
+        status: { type: "complete" as const, reason: "unknown" as const },
+      };
+    });
+    history.resume = resume;
+    const { core } = createCore(history);
+    const loading = core.__internal_load();
+    const resuming = core.resumeInFlightRun([storedUser]);
+
+    expect(resume).not.toHaveBeenCalled();
+    finish();
+    await Promise.all([loading, resuming]);
+    expect(resume).toHaveBeenCalledOnce();
+  });
+
+  it("waits for history before applying a tool result", async () => {
+    const { history, finish } = deferredHistory([storedUser, storedToolCall]);
+    const { core } = createCore(history);
+    const loading = core.__internal_load();
+    core.addToolResult({
+      messageId: "assistant",
+      toolCallId: "call",
+      toolName: "lookup",
+      result: "found",
+      isError: false,
+    });
+
+    finish();
+    await loading;
+    expect(
+      (core.getMessages()[1] as ThreadAssistantMessage).content[0],
+    ).toMatchObject({
+      result: "found",
+    });
+  });
+
+  it("waits for history before recording a tool interaction", async () => {
+    const { history, finish } = deferredHistory([storedUser, storedToolCall]);
+    const { core } = createCore(history);
+    const loading = core.__internal_load();
+    const recording = core.recordToolInteraction({
+      messageId: "assistant",
+      toolCallId: "call",
+      interaction: {
+        type: "action",
+        occurredAt: 1,
+        payload: { name: "confirm" },
+      },
+    });
+
+    finish();
+    await Promise.all([loading, recording]);
+    expect(
+      (core.getMessages()[1] as ThreadAssistantMessage).content[0],
+    ).toMatchObject({
+      unstable_interactions: { entries: [{ payload: { name: "confirm" } }] },
+    });
+  });
+
+  it("waits for history before submitting interrupt responses", async () => {
+    const { history, finish } = deferredHistory([storedUser, storedInterrupt]);
+    const runAgent = vi.fn(async () => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const responding = core.submitInterruptResponses([
+      { interruptId: "gate", status: "resolved" },
+    ]);
+
+    finish();
+    await Promise.all([loading, responding]);
+    expect(runAgent).toHaveBeenCalledOnce();
+    expect(core.getPendingInterrupts()).toBeNull();
+  });
+
+  it("waits for history before responding to a tool approval", async () => {
+    const { history, finish } = deferredHistory([storedUser, storedInterrupt]);
+    const runAgent = vi.fn(async () => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const responding = core.respondToToolApproval({
+      approvalId: "gate",
+      approved: true,
+    });
+
+    finish();
+    await Promise.all([loading, responding]);
+    expect(runAgent).toHaveBeenCalledOnce();
+    expect(
+      (core.getMessages()[1] as ThreadAssistantMessage).content[0],
+    ).toMatchObject({
+      approval: { id: "gate", approved: true },
+    });
+  });
+
+  it("waits for history before steering away from an interrupt", async () => {
+    const { history, finish } = deferredHistory([storedUser, storedInterrupt]);
+    const runAgent = vi.fn(async () => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const steering = core.steerAway("changed my mind");
+
+    finish();
+    await Promise.all([loading, steering]);
+    expect(core.getPendingInterrupts()).toBeNull();
+    expect(
+      core
+        .getMessages()
+        .some((message) =>
+          message.content.some(
+            (part) => part.type === "text" && part.text === "changed my mind",
+          ),
+        ),
+    ).toBe(true);
+    expect(runAgent).toHaveBeenCalledOnce();
+  });
+
+  it("waits for history before sending an A2UI action", async () => {
+    const { history, finish } = deferredHistory();
+    const runAgent = vi.fn(async (_input: unknown) => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    core.sendA2uiAction({ type: "a2ui:action", name: "submit" });
+
+    finish();
+    await loading;
+    expect(runAgent).toHaveBeenCalledOnce();
+    expect(runAgent.mock.calls[0]?.[0]).toMatchObject({
+      forwardedProps: { a2uiAction: { userAction: { name: "submit" } } },
+    });
+  });
+
+  it("links a new tail append after initial history imports", async () => {
+    const history = createHistory();
+    let finishLoad!: (
+      repo: Awaited<ReturnType<ThreadHistoryAdapter["load"]>>,
+    ) => void;
+    history.load.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishLoad = resolve;
+      }),
+    );
+    const { core } = createCore(history);
+    const loading = core.__internal_load();
+    const sending = core.append(userMessage("during load"));
+
+    finishLoad({
+      headId: "restored",
+      messages: [
+        {
+          parentId: null,
+          message: {
+            id: "restored",
+            role: "user",
+            content: [{ type: "text", text: "earlier" }],
+            attachments: [],
+            createdAt: new Date(0),
+            metadata: { custom: {} },
+          },
+        },
+      ],
+    });
+    await Promise.all([loading, sending]);
+
+    expect(core.getMessages().map((message) => message.content)).toEqual([
+      [{ type: "text", text: "earlier" }],
+      [{ type: "text", text: "during load" }],
+    ]);
+    expect(core.getMessageRepository().messages.at(-1)?.parentId).toBe(
+      "restored",
+    );
+  });
+
+  it("loads history when the adapter arrives after the first load", async () => {
+    const { core, update } = createCore();
+    const history = createHistory();
+
+    await core.__internal_load();
+    expect(history.load).not.toHaveBeenCalled();
+    expect(core.getMessages()).toEqual([]);
+
+    update(history);
+    await flush();
+
+    expect(history.load).toHaveBeenCalledOnce();
+    expect(core.getMessages().map((message) => message.id)).toEqual([
+      "restored",
+    ]);
+    expect(core.isLoading).toBe(false);
+  });
+
+  it("does not load late history over a thread that already has messages", async () => {
+    const { core, update } = createCore();
+    const history = createHistory();
+
+    await core.__internal_load();
+    await core.append(userMessage("typed"));
+    expect(core.getMessages()).toHaveLength(1);
+
+    update(history);
+    await flush();
+
+    expect(history.load).not.toHaveBeenCalled();
+    expect(core.getMessages()).toHaveLength(1);
+  });
+
+  it("does not reload when the adapter is replaced after a completed load", async () => {
+    const history = createHistory();
+    const { core, update } = createCore(history);
+    const replacement = createHistory();
+
+    await core.__internal_load();
+    expect(history.load).toHaveBeenCalledOnce();
+
+    update(replacement);
+    await flush();
+
+    expect(replacement.load).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgUiThreadController steerAway parent selection", () => {
+  it("starts a root branch for an explicit null parent", async () => {
+    const { core } = createCore();
+    await core.append(userMessage("old"));
+
+    await core.steerAway({
+      parentId: null,
+      content: [{ type: "text", text: "new root" }],
+      startRun: false,
+    });
+
+    expect(core.getMessages().map((message) => message.content)).toEqual([
+      [{ type: "text", text: "new root" }],
+    ]);
+    expect(core.getMessageRepository().messages.at(-1)?.parentId).toBeNull();
+  });
+});
+
+describe("AgUiThreadController activity deltas", () => {
+  it("applies a delta to the snapshot the run streamed", async () => {
+    type Subscriber = Record<string, ((payload?: unknown) => void) | undefined>;
+    const runAgent = vi.fn(async (_input: unknown, subscriber: Subscriber) => {
+      subscriber.onActivitySnapshotEvent?.({
+        event: {
+          type: "ACTIVITY_SNAPSHOT",
+          messageId: "act-1",
+          activityType: "progress",
+          content: { step: 1, label: "loading" },
+          replace: true,
+        },
+      });
+      subscriber.onActivityDeltaEvent?.({
+        event: {
+          type: "ACTIVITY_DELTA",
+          messageId: "act-1",
+          activityType: "progress",
+          patch: [{ op: "replace", path: "/step", value: 2 }],
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent, abortRun: vi.fn() } as unknown as AbstractAgent;
+    const core = new AgUiThreadController({
+      agent,
+      logger: makeLogger(),
+      showThinking: true,
+    });
+
+    await core.append({ ...userMessage("go"), startRun: true });
+    await flush();
+
+    const assistant = core.getMessages().at(-1)!;
+    expect(assistant.content.find((part) => part.type === "data")).toEqual({
+      type: "data",
+      name: "agui-activity/progress",
+      data: { step: 2, label: "loading" },
+    });
+  });
+});
+
+describe("AgUiThreadController run state", () => {
+  const createStateAgent = (sentStates: unknown[]) =>
+    new HttpAgent({
+      url: "http://agent.test/agent",
+      initialState: { fromInitialState: true },
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        sentStates.push(body.state);
+        const events = [
+          { type: "RUN_STARTED", threadId: body.threadId, runId: body.runId },
+          { type: "STATE_SNAPSHOT", snapshot: { a: 1 } },
+          { type: "RUN_FINISHED", threadId: body.threadId, runId: body.runId },
+        ];
+        return new Response(
+          events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+
+  type Subscriber = {
+    onStateSnapshotEvent?: (payload: {
+      event: { type: "STATE_SNAPSHOT"; snapshot: { count: number } };
+    }) => void;
+  };
+
+  it("sends an empty state when no snapshot exists and preserves null", async () => {
+    const runAgent = vi.fn(
+      async (_input: { state: unknown }, subscriber: Subscriber) => {
+        if (runAgent.mock.calls.length === 1) {
+          subscriber.onStateSnapshotEvent?.({
+            event: { type: "STATE_SNAPSHOT", snapshot: { count: 1 } },
+          });
+        }
+      },
+    );
+    const agent = {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent;
+    const { core } = createCore(undefined, agent);
+
+    await core.append({ ...userMessage("initial"), startRun: true });
+    expect(runAgent.mock.calls[0]?.[0].state).toEqual({});
+    expect(agent.state).toEqual({});
+
+    core.resetState();
+    expect(core.getState()).toBeUndefined();
+    await core.append({ ...userMessage("after reset"), startRun: true });
+    expect(runAgent.mock.calls[1]?.[0].state).toEqual({});
+    expect(agent.state).toEqual({});
+
+    core.setState(null);
+    await core.append({ ...userMessage("explicit null"), startRun: true });
+    expect(runAgent.mock.calls[2]?.[0].state).toBeNull();
+    expect(agent.state).toBeNull();
+  });
+
+  it("isolates mounted threads sharing one agent through runs and setState", async () => {
+    const sentStates: unknown[] = [];
+    const agent = createStateAgent(sentStates);
+    const { core: threadA } = createCore(undefined, agent);
+    const { core: threadB } = createCore(undefined, agent);
+
+    await threadA.append({ ...userMessage("A"), startRun: true });
+    expect(threadA.getState()).toEqual({ a: 1 });
+    expect.soft(threadB.getState()).toEqual({ fromInitialState: true });
+
+    threadA.setState({ x: 1 });
+    await flush();
+    expect(threadA.getState()).toEqual({ x: 1 });
+    expect.soft(threadB.getState()).toEqual({ fromInitialState: true });
+
+    await threadB.append({ ...userMessage("B"), startRun: true });
+    expect
+      .soft(sentStates)
+      .toEqual([{ fromInitialState: true }, { fromInitialState: true }]);
+    expect.soft(threadA.getState()).toEqual({ x: 1 });
+  });
+
+  it("starts a later thread from the shared agent's initial state after a run", async () => {
+    const sentStates: unknown[] = [];
+    const agent = createStateAgent(sentStates);
+    const { core: threadA } = createCore(undefined, agent);
+
+    await threadA.append({ ...userMessage("A"), startRun: true });
+    expect(agent.state).toEqual({ a: 1 });
+
+    const { core: threadB } = createCore(undefined, agent);
+    expect.soft(threadB.getState()).toEqual({ fromInitialState: true });
+    await threadB.append({ ...userMessage("B"), startRun: true });
+    expect(sentStates).toEqual([
+      { fromInitialState: true },
+      { fromInitialState: true },
+    ]);
+  });
+
+  it("copies the initial state before the agent state is mutated", () => {
+    const agent = new HttpAgent({
+      url: "http://agent.test/agent",
+      initialState: { nested: { count: 0 } },
+    });
+    const { core } = createCore(undefined, agent);
+
+    agent.state.nested.count = 1;
+    expect(core.getState()).toEqual({ nested: { count: 0 } });
+
+    const { core: laterThread } = createCore(undefined, agent);
+    expect(laterThread.getState()).toEqual({ nested: { count: 0 } });
+  });
+
+  it("records an undefined initial state without adopting later agent state", () => {
+    const agent = {} as AbstractAgent;
+    createCore(undefined, agent);
+    agent.state = { fromPreviousThread: true };
+
+    const { core } = createCore(undefined, agent);
+    expect(core.getState()).toBeUndefined();
+  });
+
+  it("leaves the state undefined for an agent without initialState", () => {
+    const agent = new HttpAgent({ url: "http://agent.test/agent" });
+    const { core } = createCore(undefined, agent);
+
+    expect(agent.state).toEqual({});
+    expect(core.getState()).toBeUndefined();
+
+    const swapped = new HttpAgent({ url: "http://agent.test/other" });
+    core.updateOptions({
+      agent: swapped,
+      logger: makeLogger(),
+      showThinking: true,
+    });
+    expect(core.getState()).toBeUndefined();
+  });
+
+  it("seeds a new agent's initial state on swap when the thread has no snapshot", () => {
+    const { core } = createCore();
+    const agent = new HttpAgent({
+      url: "http://agent.test/agent",
+      initialState: { a: 1 },
+    });
+    const listener = vi.fn();
+    core.getSnapshot();
+    core.subscribe(listener);
+
+    core.updateOptions({ agent, logger: makeLogger(), showThinking: true });
+
+    expect(agent.state).toEqual({ a: 1 });
+    expect(core.getState()).toEqual({ a: 1 });
+    expect(core.getSnapshot().state).toEqual({ a: 1 });
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the thread snapshot on swap and records the new agent's initial state", async () => {
+    const { core } = createCore();
+    core.setState({ fromThread: true });
+    const sentStates: unknown[] = [];
+    const agent = createStateAgent(sentStates);
+
+    core.updateOptions({ agent, logger: makeLogger(), showThinking: true });
+
+    expect(agent.state).toEqual({ fromInitialState: true });
+    expect(core.getState()).toEqual({ fromThread: true });
+    await core.append({ ...userMessage("after swap"), startRun: true });
+    expect(sentStates).toEqual([{ fromThread: true }]);
+
+    const { core: laterThread } = createCore(undefined, agent);
+    expect(laterThread.getState()).toEqual({ fromInitialState: true });
+  });
+});
+
+describe("AgUiThreadController setState", () => {
+  it("keeps a cancel the updater makes while a send waits for history", async () => {
+    const { history, finish } = deferredHistory();
+    const runAgent = vi.fn(async () => {});
+    const { core } = createCore(history, {
+      runAgent,
+      abortRun: vi.fn(),
+    } as unknown as AbstractAgent);
+    const loading = core.__internal_load();
+    const sending = core.append({
+      ...userMessage("cancelled"),
+      startRun: true,
+    });
+
+    core.setState(() => {
+      void core.cancel();
+      return { count: 1 };
+    });
+    finish();
+    await Promise.all([loading, sending]);
+
+    expect(core.getState()).toEqual({ count: 1 });
+    expect(core.getMessages().map((message) => message.id)).toEqual([
+      "restored",
+    ]);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgUiThreadController resuming a disconnected run", () => {
+  type Subscriber = {
+    onTextMessageStartEvent?: (payload: { event: unknown }) => void;
+    onTextMessageContentEvent?: (payload: { event: unknown }) => void;
+    onTextMessageEndEvent?: (payload: { event: unknown }) => void;
+    onRunFinishedEvent?: (payload: { event: unknown }) => void;
+  };
+  const sendText = (
+    subscriber: Subscriber,
+    messageId: string,
+    text: string,
+    end = true,
+  ) => {
+    subscriber.onTextMessageStartEvent?.({
+      event: { type: "TEXT_MESSAGE_START", messageId },
+    });
+    subscriber.onTextMessageContentEvent?.({
+      event: { type: "TEXT_MESSAGE_CONTENT", messageId, delta: text },
+    });
+    if (end) {
+      subscriber.onTextMessageEndEvent?.({
+        event: { type: "TEXT_MESSAGE_END", messageId },
+      });
+    }
+  };
+
+  it.each(["user", "assistant"] as const)(
+    "preserves replayed IDs and content when resume uses the %s parent",
+    async (parent) => {
+      const runAgent = vi.fn(
+        async (input: { runId: string }, subscriber: Subscriber) => {
+          if (runAgent.mock.calls.length === 1) {
+            sendText(subscriber, "assistant-a", "first", false);
+            throw new Error("stream disconnected");
+          }
+          sendText(subscriber, "assistant-a", "first and more");
+          sendText(subscriber, "assistant-b", "second answer");
+          subscriber.onRunFinishedEvent?.({
+            event: { type: "RUN_FINISHED", runId: input.runId },
+          });
+        },
+      );
+      const { core } = createCore(undefined, {
+        runAgent,
+        abortRun: vi.fn(),
+      } as unknown as AbstractAgent);
+
+      await expect(
+        core.append({ ...userMessage("question"), startRun: true }),
+      ).rejects.toThrow("stream disconnected");
+      const userId = core.getMessages()[0]!.id;
+      const firstAssistantId = core.getMessages()[1]!.id;
+      expect(core.getMessages()[1]).toMatchObject({
+        id: firstAssistantId,
+        metadata: { custom: { agui: { messageId: "assistant-a" } } },
+        content: [{ type: "text", text: "first" }],
+      });
+
+      await core.resume({
+        parentId: parent === "user" ? userId : firstAssistantId,
+        sourceId: null,
+        runConfig: {},
+      });
+
+      expect(runAgent).toHaveBeenCalledTimes(2);
+      expect(
+        core.getMessages().map((message) => agUiWireMessageId(message)),
+      ).toEqual([userId, "assistant-a", "assistant-b"]);
+      expect(core.getMessages().slice(1)).toMatchObject([
+        { content: [{ type: "text", text: "first and more" }] },
+        { content: [{ type: "text", text: "second answer" }] },
+      ]);
+      expect(
+        core.getMessageRepository().messages.map(({ parentId }) => parentId),
+      ).toEqual([null, userId, firstAssistantId]);
+    },
+  );
+});

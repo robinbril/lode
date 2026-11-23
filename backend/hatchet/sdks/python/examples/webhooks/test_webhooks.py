@@ -1,0 +1,554 @@
+import base64
+import hashlib
+import hmac
+import json
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
+
+import aiohttp
+import pytest
+
+from examples.test_utils import wait_for_event, wait_for_workflow_run
+from examples.webhooks.worker import WebhookInput
+from hatchet_sdk import (
+    Hatchet,
+    WebhookAPIKeyAuth,
+    WebhookBasicAuth,
+    WebhookHMACAlgorithm,
+    WebhookHMACAuth,
+    WebhookHMACEncoding,
+    WebhookSourceName,
+)
+from hatchet_sdk.clients.rest.models.v1_webhook import V1Webhook
+
+TEST_BASIC_USERNAME = "test_user"
+TEST_BASIC_PASSWORD = "test_password"
+TEST_API_KEY_HEADER = "X-API-Key"
+TEST_API_KEY_VALUE = "test_api_key_123"
+TEST_HMAC_SIGNATURE_HEADER = "X-Signature"
+TEST_HMAC_SECRET = "test_hmac_secret"
+
+
+hatchet = Hatchet()
+
+
+@pytest.fixture
+def webhook_body() -> WebhookInput:
+    return WebhookInput(type="test", message="Hello, world!")
+
+
+@pytest.fixture
+def test_run_id() -> str:
+    return str(uuid4())
+
+
+@pytest.fixture
+def test_start() -> datetime:
+    return datetime.now(UTC)
+
+
+def create_hmac_signature(
+    payload: bytes,
+    secret: str,
+    algorithm: WebhookHMACAlgorithm = "SHA256",
+    encoding: WebhookHMACEncoding = "HEX",
+) -> str:
+    algorithm_map = {
+        "SHA1": hashlib.sha1,
+        "SHA256": hashlib.sha256,
+        "SHA512": hashlib.sha512,
+        "MD5": hashlib.md5,
+    }
+
+    hash_func = algorithm_map[algorithm]
+    signature = hmac.new(secret.encode(), payload, hash_func).digest()
+
+    if encoding == "HEX":
+        return signature.hex()
+    if encoding == "BASE64":
+        return base64.b64encode(signature).decode()
+    if encoding == "BASE64URL":
+        return base64.urlsafe_b64encode(signature).decode()
+
+    raise ValueError(f"Unsupported encoding: {encoding}")
+
+
+@asynccontextmanager
+async def send_webhook_request(
+    url: str,
+    body: WebhookInput,
+    auth_type: str,
+    auth_data: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> AsyncGenerator[aiohttp.ClientResponse, None]:
+    request_headers = headers or {}
+
+    if auth_type == "BASIC" and auth_data:
+        request_headers["Authorization"] = aiohttp.encode_basic_auth(
+            auth_data["username"], auth_data["password"]
+        )
+    elif auth_type == "API_KEY" and auth_data:
+        request_headers[auth_data["header_name"]] = auth_data["api_key"]
+    elif auth_type == "HMAC" and auth_data:
+        payload = json.dumps(body.model_dump()).encode()
+        signature = create_hmac_signature(
+            payload,
+            auth_data["secret"],
+            auth_data.get("algorithm", "SHA256"),
+            auth_data.get("encoding", "HEX"),
+        )
+        request_headers[auth_data["header_name"]] = signature
+
+    async with (
+        aiohttp.ClientSession() as session,
+        session.post(url, json=body.model_dump(), headers=request_headers) as response,
+    ):
+        yield response
+
+
+@asynccontextmanager
+async def basic_auth_webhook(
+    hatchet: Hatchet,
+    test_run_id: str,
+    username: str = TEST_BASIC_USERNAME,
+    password: str = TEST_BASIC_PASSWORD,
+    source_name: WebhookSourceName = "GENERIC",
+) -> AsyncGenerator[V1Webhook, None]:
+
+    incoming_webhook = hatchet.webhooks.create(
+        source_name=source_name,
+        name=f"test-webhook-basic-{test_run_id}",
+        event_key_expression=f"'{hatchet.config.apply_namespace('webhook')}:' + input.type",
+        auth=WebhookBasicAuth(username=username, password=password),
+    )
+
+    try:
+        yield incoming_webhook
+    finally:
+        hatchet.webhooks.delete(incoming_webhook.name)
+
+
+@asynccontextmanager
+async def api_key_webhook(
+    hatchet: Hatchet,
+    test_run_id: str,
+    header_name: str = TEST_API_KEY_HEADER,
+    api_key: str = TEST_API_KEY_VALUE,
+    source_name: WebhookSourceName = "GENERIC",
+) -> AsyncGenerator[V1Webhook, None]:
+
+    incoming_webhook = hatchet.webhooks.create(
+        source_name=source_name,
+        name=f"test-webhook-apikey-{test_run_id}",
+        event_key_expression=f"'{hatchet.config.apply_namespace('webhook')}:' + input.type",
+        auth=WebhookAPIKeyAuth(
+            header_name=header_name,
+            api_key=api_key,
+        ),
+    )
+
+    try:
+        yield incoming_webhook
+    finally:
+        hatchet.webhooks.delete(incoming_webhook.name)
+
+
+@asynccontextmanager
+async def hmac_webhook(
+    hatchet: Hatchet,
+    test_run_id: str,
+    signature_header_name: str = TEST_HMAC_SIGNATURE_HEADER,
+    signing_secret: str = TEST_HMAC_SECRET,
+    algorithm: WebhookHMACAlgorithm = "SHA256",
+    encoding: WebhookHMACEncoding = "HEX",
+    source_name: WebhookSourceName = "GENERIC",
+) -> AsyncGenerator[V1Webhook, None]:
+
+    incoming_webhook = hatchet.webhooks.create(
+        source_name=source_name,
+        name=f"test-webhook-hmac-{test_run_id}",
+        event_key_expression=f"'{hatchet.config.apply_namespace('webhook')}:' + input.type",
+        auth=WebhookHMACAuth(
+            algorithm=algorithm,
+            encoding=encoding,
+            signature_header_name=signature_header_name,
+            signing_secret=signing_secret,
+        ),
+    )
+
+    try:
+        yield incoming_webhook
+    finally:
+        hatchet.webhooks.delete(incoming_webhook.name)
+
+
+def url(hatchet: Hatchet, webhook_name: str) -> str:
+    return f"{hatchet.config.server_url}/api/v1/stable/tenants/{hatchet.tenant_id}/webhooks/{webhook_name}"
+
+
+async def assert_has_runs(
+    hatchet: Hatchet,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+    incoming_webhook: V1Webhook,
+) -> None:
+    triggered_event = await wait_for_event(hatchet, incoming_webhook.name, test_start)
+    assert triggered_event is not None
+    assert (
+        triggered_event.key
+        == f"{hatchet.config.apply_namespace('webhook')}:{webhook_body.type}"
+    )
+    assert triggered_event.payload == webhook_body.model_dump()
+
+    workflow_run = await wait_for_workflow_run(hatchet, triggered_event.id, test_start)
+    assert workflow_run is not None
+    assert workflow_run.status == "COMPLETED"
+    assert workflow_run.additional_metadata is not None
+
+    assert workflow_run.additional_metadata["hatchet__event_id"] == triggered_event.id
+    assert workflow_run.additional_metadata["hatchet__event_key"] == triggered_event.key
+    assert workflow_run.status == "COMPLETED"
+
+
+async def assert_event_not_created(
+    hatchet: Hatchet,
+    test_start: datetime,
+    incoming_webhook: V1Webhook,
+) -> None:
+    triggered_event = await wait_for_event(hatchet, incoming_webhook.name, test_start)
+    assert triggered_event is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_basic_auth_success(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+) -> None:
+    async with basic_auth_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "BASIC",
+            {"username": TEST_BASIC_USERNAME, "password": TEST_BASIC_PASSWORD},
+        ) as response:
+            assert response.status == 200
+            data = await response.json()
+            assert data["message"] == "ok"
+            assert data["event"]["metadata"]["id"]
+
+        await assert_has_runs(
+            hatchet,
+            test_start,
+            webhook_body,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.parametrize(
+    ("username", "password"),
+    [
+        ("test_user", "incorrect_password"),
+        ("incorrect_user", "test_password"),
+        ("incorrect_user", "incorrect_password"),
+        ("", ""),
+    ],
+)
+@pytest.mark.asyncio(loop_scope="session")
+async def test_basic_auth_failure(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+    username: str,
+    password: str,
+) -> None:
+    """Test basic authentication failures."""
+    async with basic_auth_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "BASIC",
+            {"username": username, "password": password},
+        ) as response:
+            assert response.status == 403
+
+        await assert_event_not_created(
+            hatchet,
+            test_start,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_basic_auth_missing_credentials(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+) -> None:
+    async with basic_auth_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name), webhook_body, "NONE"
+        ) as response:
+            assert response.status == 403
+
+        await assert_event_not_created(
+            hatchet,
+            test_start,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_api_key_success(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+) -> None:
+    async with api_key_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "API_KEY",
+            {"header_name": TEST_API_KEY_HEADER, "api_key": TEST_API_KEY_VALUE},
+        ) as response:
+            assert response.status == 200
+            data = await response.json()
+            assert data["message"] == "ok"
+            assert data["event"]["metadata"]["id"]
+
+        await assert_has_runs(
+            hatchet,
+            test_start,
+            webhook_body,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    [
+        "incorrect_api_key",
+        "",
+        "partial_key",
+    ],
+)
+@pytest.mark.asyncio(loop_scope="session")
+async def test_api_key_failure(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+    api_key: str,
+) -> None:
+    async with api_key_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "API_KEY",
+            {"header_name": TEST_API_KEY_HEADER, "api_key": api_key},
+        ) as response:
+            assert response.status == 403
+
+        await assert_event_not_created(
+            hatchet,
+            test_start,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_api_key_missing_header(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+) -> None:
+    async with api_key_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name), webhook_body, "NONE"
+        ) as response:
+            assert response.status == 403
+
+        await assert_event_not_created(
+            hatchet,
+            test_start,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hmac_success(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+) -> None:
+    async with hmac_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "HMAC",
+            {
+                "header_name": TEST_HMAC_SIGNATURE_HEADER,
+                "secret": TEST_HMAC_SECRET,
+                "algorithm": "SHA256",
+                "encoding": "HEX",
+            },
+        ) as response:
+            assert response.status == 200
+            data = await response.json()
+            assert data["message"] == "ok"
+            assert data["event"]["metadata"]["id"]
+
+        await assert_has_runs(
+            hatchet,
+            test_start,
+            webhook_body,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "encoding"),
+    [
+        ("SHA1", "HEX"),
+        ("SHA256", "BASE64"),
+        ("SHA512", "BASE64URL"),
+        ("MD5", "HEX"),
+    ],
+)
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hmac_different_algorithms_and_encodings(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+    algorithm: WebhookHMACAlgorithm,
+    encoding: WebhookHMACEncoding,
+) -> None:
+    async with hmac_webhook(
+        hatchet, test_run_id, algorithm=algorithm, encoding=encoding
+    ) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "HMAC",
+            {
+                "header_name": TEST_HMAC_SIGNATURE_HEADER,
+                "secret": TEST_HMAC_SECRET,
+                "algorithm": algorithm,
+                "encoding": encoding,
+            },
+        ) as response:
+            assert response.status == 200
+            data = await response.json()
+            assert data["message"] == "ok"
+            assert data["event"]["metadata"]["id"]
+
+        await assert_has_runs(
+            hatchet,
+            test_start,
+            webhook_body,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "incorrect_secret",
+        "",
+        "partial_secret",
+    ],
+)
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hmac_signature_failure(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+    secret: str,
+) -> None:
+    async with hmac_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "HMAC",
+            {
+                "header_name": TEST_HMAC_SIGNATURE_HEADER,
+                "secret": secret,
+                "algorithm": "SHA256",
+                "encoding": "HEX",
+            },
+        ) as response:
+            assert response.status == 403
+
+        await assert_event_not_created(
+            hatchet,
+            test_start,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hmac_missing_signature_header(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+) -> None:
+    async with hmac_webhook(hatchet, test_run_id) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name), webhook_body, "NONE"
+        ) as response:
+            assert response.status == 403
+
+        await assert_event_not_created(
+            hatchet,
+            test_start,
+            incoming_webhook,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_name",
+    [
+        "GENERIC",
+        "GITHUB",
+    ],
+)
+@pytest.mark.asyncio(loop_scope="session")
+async def test_different_source_types(
+    hatchet: Hatchet,
+    test_run_id: str,
+    test_start: datetime,
+    webhook_body: WebhookInput,
+    source_name: WebhookSourceName,
+) -> None:
+    async with basic_auth_webhook(
+        hatchet, test_run_id, source_name=source_name
+    ) as incoming_webhook:
+        async with send_webhook_request(
+            url(hatchet, incoming_webhook.name),
+            webhook_body,
+            "BASIC",
+            {"username": TEST_BASIC_USERNAME, "password": TEST_BASIC_PASSWORD},
+        ) as response:
+            assert response.status == 200
+            data = await response.json()
+            assert data["message"] == "ok"
+            assert data["event"]["metadata"]["id"]
+
+        await assert_has_runs(
+            hatchet,
+            test_start,
+            webhook_body,
+            incoming_webhook,
+        )

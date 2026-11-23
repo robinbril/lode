@@ -1,0 +1,2388 @@
+"use client";
+
+import type {
+  ContentPart,
+  PartSource,
+  RunAgentParameters,
+} from "@ag-ui/client";
+import { fromThreadMessageLike, generateId } from "@assistant-ui/core";
+import type {
+  MessageStatus,
+  ThreadMessage,
+  ThreadMessageLike as CoreThreadMessageLike,
+  PartProviderMetadata,
+  ReasoningMessagePart,
+} from "@assistant-ui/core";
+import {
+  getAutoStatus,
+  parseDataUrl,
+  resolveFilePartSource,
+  resolveImageMediaType,
+  walkToolCallTree,
+} from "@assistant-ui/core/internal";
+import { type Tool, toToolsJSONSchema } from "assistant-stream";
+import type { ReadonlyJSONObject } from "assistant-stream/utils";
+import {
+  AG_UI_METADATA_NAMESPACE,
+  A2UI_SURFACE_ACTIVITY_TYPE,
+  MCP_APPS_ACTIVITY_TYPE,
+  type AgUiCustomMetadata,
+  type AgUiOpaqueReasoning,
+  MAX_SUBAGENT_DEPTH,
+} from "../types";
+import {
+  applyA2uiOperations,
+  surfaceToPresentToolCall,
+  type A2uiState,
+  type A2uiSurfaceState,
+} from "@assistant-ui/generative-ui/a2ui";
+import type { AgUiInterrupt } from "../types";
+import { projectAgUiToolApprovals } from "./tool-approval";
+import {
+  parseMcpToolCallResult,
+  readMcpAppResourceUri,
+  toolContentText,
+} from "../mcp-tool-result";
+
+type AttachmentLike = {
+  name?: string | undefined;
+  contentType?: string | undefined;
+  content?: readonly unknown[] | undefined;
+};
+
+type ThreadMessageLike = {
+  id?: string | undefined;
+  role: string;
+  content: unknown;
+  metadata?: unknown;
+  name?: string | undefined;
+  toolCallId?: string | undefined;
+  error?: string | undefined;
+  attachments?: readonly AttachmentLike[] | undefined;
+};
+
+type NormalizedThreadMessageLike = ThreadMessageLike & { id: string };
+
+type AgUiToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+export type AgUiMessage =
+  | {
+      id: string;
+      role: "user";
+      content: string | ContentPart[];
+      name?: string;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      id: string;
+      role: "assistant";
+      content: string;
+      name?: string;
+      toolCalls?: AgUiToolCall[];
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      id: string;
+      role: "system" | "developer";
+      content: string;
+      name?: string;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      id: string;
+      role: "reasoning";
+      content: string;
+      encryptedValue?: string;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      id: string;
+      role: "tool";
+      content: string | ContentPart[];
+      toolCallId: string;
+      error?: string;
+      metadata?: Record<string, unknown>;
+    };
+
+type CoreToolCallPart = Extract<
+  Exclude<CoreThreadMessageLike["content"], string>[number],
+  { type: "tool-call" }
+>;
+
+type ToolCallPart = Omit<CoreToolCallPart, "result" | "isError"> & {
+  result?: unknown;
+  isError?: boolean | undefined;
+  /** @deprecated Experimental since 2026-03-08. Not scheduled for removal; the API may change in any release. */
+  unstable_toolMessageId?: string;
+};
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const getString = (record: Record<string, unknown>, key: string) => {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
+};
+
+function toAgUiWireMetadata(
+  metadata: unknown,
+): Record<string, unknown> | undefined {
+  return isObject(metadata) ? { ...metadata } : undefined;
+}
+
+export function agUiWireMessageId(message: {
+  readonly id: string;
+  readonly metadata?: unknown;
+}): string {
+  const { metadata } = message;
+  if (!isObject(metadata) || !isObject(metadata.custom)) return message.id;
+  const namespaced = metadata.custom[AG_UI_METADATA_NAMESPACE];
+  return isObject(namespaced) &&
+    typeof namespaced.messageId === "string" &&
+    namespaced.messageId.trim()
+    ? namespaced.messageId
+    : message.id;
+}
+
+function readLegacyAgUiNamespace(metadata: unknown): Record<string, unknown> {
+  if (!isObject(metadata) || !isObject(metadata.custom)) return {};
+  const namespaced = metadata.custom[AG_UI_METADATA_NAMESPACE];
+  if (!isObject(namespaced)) return {};
+  return {
+    ...("interrupts" in namespaced
+      ? { interrupts: namespaced.interrupts }
+      : {}),
+    ...(typeof namespaced.messageId === "string"
+      ? { messageId: namespaced.messageId }
+      : {}),
+  };
+}
+
+function withoutPersistedStatusMetadata(
+  wire: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!isObject(wire.custom)) return wire;
+  const namespaced = wire.custom[AG_UI_METADATA_NAMESPACE];
+  if (
+    !isObject(namespaced) ||
+    (!("interrupts" in namespaced) && !("pendingToolCallIds" in namespaced))
+  )
+    return wire;
+
+  const {
+    interrupts: _interrupts,
+    pendingToolCallIds: _pendingToolCallIds,
+    ...remainingNamespace
+  } = namespaced;
+  const { [AG_UI_METADATA_NAMESPACE]: _namespace, ...remainingCustom } =
+    wire.custom;
+  if (Object.keys(remainingNamespace).length > 0) {
+    remainingCustom[AG_UI_METADATA_NAMESPACE] = remainingNamespace;
+  }
+  const { custom: _custom, ...remainingWire } = wire;
+  return Object.keys(remainingCustom).length > 0
+    ? { ...remainingWire, custom: remainingCustom }
+    : remainingWire;
+}
+
+function toSnapshotCustom(
+  metadata: unknown,
+  state: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const wire = withoutPersistedStatusMetadata(
+    toAgUiWireMetadata(metadata) ?? {},
+  );
+  const needsWireSlot =
+    isObject(metadata) &&
+    (Object.keys(metadata).length === 0 || AG_UI_METADATA_NAMESPACE in wire);
+  const namespaced = {
+    ...readLegacyAgUiNamespace(metadata),
+    ...(readPersistedPendingToolCallIds(metadata) !== undefined
+      ? { pendingToolCallIds: readPersistedPendingToolCallIds(metadata) }
+      : {}),
+    ...state,
+    ...(needsWireSlot ? { messageMetadata: wire } : {}),
+  };
+  return {
+    ...wire,
+    ...(Object.keys(namespaced).length > 0
+      ? { [AG_UI_METADATA_NAMESPACE]: namespaced }
+      : {}),
+  };
+}
+
+function toAgUiMessageMetadata(
+  metadata: unknown,
+): Record<string, unknown> | undefined {
+  const custom = readCustomMetadata(metadata);
+  const namespaced = readNamespacedMetadata(metadata);
+  if (isObject(namespaced.messageMetadata)) {
+    return { ...namespaced.messageMetadata };
+  }
+  const { [AG_UI_METADATA_NAMESPACE]: _state, ...wire } = custom;
+  return Object.keys(wire).length > 0 ? wire : undefined;
+}
+
+function withAgUiMessageMetadata(metadata: unknown): {
+  metadata?: Record<string, unknown>;
+} {
+  const messageMetadata = toAgUiMessageMetadata(metadata);
+  return messageMetadata !== undefined ? { metadata: messageMetadata } : {};
+}
+
+export function withAgUiPartMessageMetadata(
+  providerMetadata: PartProviderMetadata | undefined,
+  messageMetadata: Record<string, unknown> | undefined,
+): PartProviderMetadata {
+  if (!messageMetadata) return providerMetadata ?? {};
+
+  const existing = providerMetadata ?? {};
+  const namespaced = isObject(existing[AG_UI_METADATA_NAMESPACE])
+    ? existing[AG_UI_METADATA_NAMESPACE]
+    : {};
+  const previousMessageMetadata = isObject(namespaced.messageMetadata)
+    ? namespaced.messageMetadata
+    : {};
+  return {
+    ...existing,
+    [AG_UI_METADATA_NAMESPACE]: {
+      ...namespaced,
+      messageMetadata: {
+        ...previousMessageMetadata,
+        ...messageMetadata,
+      } as ReadonlyJSONObject,
+    },
+  };
+}
+
+function readAgUiPartMessageMetadata(
+  providerMetadata: unknown,
+): Record<string, unknown> | undefined {
+  const namespaced = readAgUiNamespace(providerMetadata);
+  return namespaced && isObject(namespaced.messageMetadata)
+    ? toAgUiWireMetadata(namespaced.messageMetadata)
+    : undefined;
+}
+
+const getToolCallId = (record: Record<string, unknown>) =>
+  getString(record, "toolCallId") ?? getString(record, "tool_call_id");
+
+const readAgUiNamespace = (providerMetadata: unknown) => {
+  if (!isObject(providerMetadata)) return undefined;
+  const namespaced = providerMetadata[AG_UI_METADATA_NAMESPACE];
+  return isObject(namespaced) ? namespaced : undefined;
+};
+
+const readAgUiReasoningMeta = (providerMetadata: unknown) => {
+  const namespaced = readAgUiNamespace(providerMetadata);
+  if (!namespaced) return {};
+  return {
+    encryptedValue: getString(namespaced, "encryptedValue"),
+    reasoningId: getString(namespaced, "reasoningId"),
+    messageMetadata: toAgUiWireMetadata(namespaced.messageMetadata),
+  };
+};
+
+// AG-UI carries per-item extras in `metadata`; anything else on the item is
+// stripped by its schema. The part's own `filename` wins over a key of the
+// same name in the bag.
+const buildPartMetadata = (
+  part: Record<string, unknown>,
+  filename?: string | undefined,
+) => {
+  const metadata = {
+    ...readAgUiNamespace(part.providerMetadata),
+    ...(filename !== undefined && { filename }),
+  };
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+};
+
+// The inverse: `filename` lands on the part's own field, everything else the
+// item carried goes back into the namespace it came from, so a snapshot echo
+// resends what the host attached.
+const readPartMetadata = (
+  metadata: unknown,
+): {
+  filename?: string | undefined;
+  providerMetadata?: PartProviderMetadata | undefined;
+} => {
+  if (!isObject(metadata)) return {};
+  const { filename: _filename, ...rest } = metadata;
+  return {
+    filename: getString(metadata, "filename"),
+    ...(Object.keys(rest).length > 0 && {
+      providerMetadata: {
+        [AG_UI_METADATA_NAMESPACE]: rest as PartProviderMetadata[string],
+      },
+    }),
+  };
+};
+
+function parseJSONText(value: string): unknown {
+  if (!value) return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeToolCall(part: ToolCallPart): {
+  id: string;
+  call: AgUiToolCall;
+} {
+  const id = part.toolCallId ?? generateId();
+  const argsText =
+    typeof part.argsText === "string"
+      ? part.argsText
+      : JSON.stringify(part.args ?? {});
+
+  return {
+    id,
+    call: {
+      id,
+      type: "function",
+      function: {
+        name: part.toolName ?? "tool",
+        arguments: argsText,
+      },
+    },
+  };
+}
+
+const isExportableNestedToolCall = (part: { readonly toolCallId?: unknown }) =>
+  typeof part.toolCallId === "string" && !part.toolCallId.startsWith("a2ui:");
+
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        part?.type === "text" && typeof part?.text === "string",
+    )
+    .map((part) => part.text)
+    .join("\n");
+}
+
+type MediaInputType = "image" | "audio" | "video" | "document";
+
+function mediaTypeForMime(mimeType: string | undefined): MediaInputType {
+  if (mimeType?.startsWith("image/")) return "image";
+  if (mimeType?.startsWith("audio/")) return "audio";
+  if (mimeType?.startsWith("video/")) return "video";
+  return "document";
+}
+
+// Build an AG-UI multimodal source from a data URL, raw base64 payload, or an
+// http(s) URL. A `url` source may omit the mime type; a `data` source always
+// resolves one (falling back to application/octet-stream). An explicit
+// `sourceType: "url"` on the part forces the url leg for non-http references,
+// and a data URL that is not base64 takes it too, since a `data` source
+// carries base64 bytes.
+function buildPartSource(
+  value: string,
+  declaredMimeType: string | undefined,
+  sourceType?: string,
+): PartSource {
+  if (sourceType === "id") {
+    return {
+      type: "file",
+      value,
+      ...(declaredMimeType !== undefined && { mimeType: declaredMimeType }),
+    };
+  }
+  const source = resolveFilePartSource({
+    data: value,
+    mimeType: declaredMimeType ?? "application/octet-stream",
+    sourceType:
+      /^data:/i.test(value) && !parseDataUrl(value) ? "url" : sourceType,
+  });
+  if (source.kind === "url") {
+    return declaredMimeType !== undefined
+      ? { type: "url", value: source.url, mimeType: declaredMimeType }
+      : { type: "url", value: source.url };
+  }
+  return {
+    type: "data",
+    value: source.data,
+    mimeType: source.mimeType,
+  };
+}
+
+function toContentPart(
+  part: unknown,
+  fallbackMimeType: string | undefined,
+): ContentPart | null {
+  if (!isObject(part)) return null;
+  const type = getString(part, "type");
+
+  if (type === "text") {
+    const text = getString(part, "text");
+    if (text === undefined) return null;
+    return { type: "text", text };
+  }
+
+  if (type === "image") {
+    const image = getString(part, "image");
+    if (image === undefined) return null;
+    const metadata = buildPartMetadata(part, getString(part, "filename"));
+    const source = buildPartSource(image, fallbackMimeType);
+    return {
+      type: "image",
+      source:
+        source.type === "data"
+          ? {
+              ...source,
+              mimeType: resolveImageMediaType(image, fallbackMimeType),
+            }
+          : source,
+      ...(metadata && { metadata }),
+    };
+  }
+
+  if (type === "file") {
+    const data = getString(part, "data");
+    if (data === undefined) return null;
+    const declaredMimeType = getString(part, "mimeType") || fallbackMimeType;
+    const filename = getString(part, "filename");
+    const source = buildPartSource(
+      data,
+      declaredMimeType,
+      getString(part, "sourceType"),
+    );
+    const metadata = buildPartMetadata(part, filename);
+    switch (mediaTypeForMime(source.mimeType)) {
+      case "image":
+        return { type: "image", source, ...(metadata && { metadata }) };
+      case "audio":
+        return { type: "audio", source, ...(metadata && { metadata }) };
+      case "video":
+        return { type: "video", source, ...(metadata && { metadata }) };
+      default:
+        return { type: "document", source, ...(metadata && { metadata }) };
+    }
+  }
+
+  if (type === "audio") {
+    const audio = part.audio;
+    if (!isObject(audio)) return null;
+    const data = getString(audio, "data");
+    const format = getString(audio, "format");
+    if (data === undefined || format === undefined) return null;
+    return {
+      type: "audio",
+      source: buildPartSource(
+        parseDataUrl(data)?.data ?? data,
+        `audio/${format}`,
+      ),
+    };
+  }
+
+  return null;
+}
+
+type SnapshotAttachment = NonNullable<
+  CoreThreadMessageLike["attachments"]
+>[number];
+
+const mediaInputTypes = new Set(["image", "audio", "video", "document"]);
+
+function partSourceToString(value: unknown): {
+  value: string;
+  mimeType?: string;
+  isUrl?: boolean;
+  isId?: boolean;
+} | null {
+  if (!isObject(value)) return null;
+  const sourceValue = getString(value, "value");
+  if (sourceValue === undefined) return null;
+  const mimeType = getString(value, "mimeType");
+  const type = getString(value, "type");
+  if (type === "url") {
+    return {
+      value: sourceValue,
+      isUrl: true,
+      ...(mimeType !== undefined && { mimeType }),
+    };
+  }
+  if (type === "file") {
+    return {
+      value: sourceValue,
+      isId: true,
+      ...(mimeType !== undefined && { mimeType }),
+    };
+  }
+  if (type === "data") {
+    const resolvedMimeType = mimeType ?? "application/octet-stream";
+    return {
+      value: `data:${resolvedMimeType};base64,${sourceValue}`,
+      mimeType: resolvedMimeType,
+    };
+  }
+  return null;
+}
+
+// Mirrors @ag-ui/client's BackwardCompatibility_0_0_47 middleware.
+function upgradeBinaryInputPart(
+  part: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const mimeType = getString(part, "mimeType");
+  if (mimeType === undefined) return null;
+  const data = getString(part, "data");
+  const url = getString(part, "url");
+  const source = data
+    ? { type: "data", value: data, mimeType }
+    : url
+      ? { type: "url", value: url, mimeType }
+      : null;
+  if (!source) return null;
+  const filename = getString(part, "filename");
+  return {
+    type: mediaTypeForMime(mimeType),
+    source,
+    ...(filename && { metadata: { filename } }),
+  };
+}
+
+function normalizeInputPart(
+  rawPart: Record<string, unknown>,
+): Record<string, unknown> | null {
+  return getString(rawPart, "type") === "binary"
+    ? upgradeBinaryInputPart(rawPart)
+    : rawPart;
+}
+
+type ContentSlot<T> = { index: number } & T;
+
+// Text imports as one string and encoded media as attachments, so export
+// needs the wire layout to restore the original order: each file source part
+// keeps its rank among media, and each text part its position among all kept
+// parts unless the text is one non-empty leading part.
+function toUserContentLayout(content: unknown): {
+  fileSourceParts: ContentSlot<{ part: Record<string, unknown> }>[];
+  textParts: ContentSlot<{ text: string }>[];
+} {
+  const fileSourceParts: ContentSlot<{ part: Record<string, unknown> }>[] = [];
+  const textParts: ContentSlot<{ text: string }>[] = [];
+  if (!Array.isArray(content)) return { fileSourceParts, textParts };
+
+  let mediaIndex = 0;
+  for (const rawPart of content) {
+    if (!isObject(rawPart)) continue;
+    if (rawPart.type === "text" && typeof rawPart.text === "string") {
+      textParts.push({
+        index: textParts.length + mediaIndex,
+        text: rawPart.text,
+      });
+      continue;
+    }
+    const part = normalizeInputPart(rawPart);
+    if (!part || !mediaInputTypes.has(getString(part, "type") ?? "")) continue;
+    if (!partSourceToString(part.source)) continue;
+    if (isObject(part.source) && part.source.type === "file") {
+      fileSourceParts.push({ index: mediaIndex, part });
+    }
+    mediaIndex++;
+  }
+
+  const leadingText =
+    textParts.length === 0 ||
+    (textParts.length === 1 &&
+      textParts[0]!.index === 0 &&
+      textParts[0]!.text !== "");
+  return { fileSourceParts, textParts: leadingText ? [] : textParts };
+}
+
+function toSnapshotAttachments(content: unknown): SnapshotAttachment[] {
+  if (!Array.isArray(content)) return [];
+
+  const attachments: SnapshotAttachment[] = [];
+  for (const rawPart of content) {
+    if (!isObject(rawPart)) continue;
+    const part = normalizeInputPart(rawPart);
+    if (!part) continue;
+    const type = getString(part, "type");
+    if (type === undefined || !mediaInputTypes.has(type)) continue;
+    const source = partSourceToString(part.source);
+    if (!source) continue;
+
+    const { filename, providerMetadata } = readPartMetadata(part.metadata);
+    const id = attachments.length.toString();
+
+    if (type === "image" && !source.isId) {
+      attachments.push({
+        id,
+        type: "image",
+        name: filename ?? "image",
+        ...(source.mimeType !== undefined && { contentType: source.mimeType }),
+        status: { type: "complete" },
+        content: [
+          {
+            type: "image",
+            image: source.value,
+            ...(filename !== undefined && { filename }),
+            ...(providerMetadata && { providerMetadata }),
+          },
+        ],
+      });
+      continue;
+    }
+
+    const mimeType = source.mimeType ?? "application/octet-stream";
+    attachments.push({
+      id,
+      type: type === "document" ? "document" : "file",
+      name: filename ?? "file",
+      contentType: mimeType,
+      status: { type: "complete" },
+      content: [
+        {
+          type: "file",
+          data: source.value,
+          mimeType,
+          ...(source.isUrl && { sourceType: "url" as const }),
+          ...(source.isId && { sourceType: "id" as const }),
+          ...(filename !== undefined && { filename }),
+          ...(providerMetadata && { providerMetadata }),
+        },
+      ],
+    });
+  }
+  return attachments;
+}
+
+function readContentSlots(
+  value: unknown,
+): { index: number; entry: Record<string, unknown> }[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) =>
+    isObject(entry) &&
+    typeof entry.index === "number" &&
+    Number.isInteger(entry.index) &&
+    entry.index >= 0
+      ? [{ index: entry.index, entry }]
+      : [],
+  );
+}
+
+function buildUserContent(message: ThreadMessageLike): string | ContentPart[] {
+  const contentParts = Array.isArray(message.content) ? message.content : [];
+
+  const attachments = message.attachments ?? [];
+
+  const converted: ContentPart[] = [];
+
+  // Promote string-form content to a leading text part so it survives when
+  // non-text attachments are present (fromAgUiMessages emits string content).
+  if (typeof message.content === "string" && message.content.length > 0) {
+    converted.push({ type: "text", text: message.content });
+  }
+
+  for (const part of contentParts) {
+    const input = toContentPart(part, undefined);
+    if (input) converted.push(input);
+  }
+  for (const attachment of attachments) {
+    if (!isObject(attachment)) continue;
+    const attachmentContent = attachment.content;
+    if (!Array.isArray(attachmentContent)) continue;
+    const fallbackMime = getString(attachment, "contentType");
+    for (const part of attachmentContent) {
+      const input = toContentPart(part, fallbackMime);
+      if (input) converted.push(input);
+    }
+  }
+
+  const namespaced = readNamespacedMetadata(message.metadata);
+  const textSlots = readContentSlots(namespaced.textParts).flatMap(
+    ({ index, entry }) =>
+      typeof entry.text === "string"
+        ? [{ index, part: { type: "text" as const, text: entry.text } }]
+        : [],
+  );
+  const mergedText = converted
+    .flatMap((part) => (part.type === "text" ? [part.text] : []))
+    .join("\n");
+  const restoresText =
+    textSlots.length > 0 &&
+    textSlots.map(({ part }) => part.text).join("\n") === mergedText;
+  const fileSourceSlots = readContentSlots(namespaced.fileSourceParts).flatMap(
+    ({ index, entry: { part } }) =>
+      isObject(part) &&
+      mediaInputTypes.has(getString(part, "type") ?? "") &&
+      isObject(part.source) &&
+      part.source.type === "file" &&
+      typeof part.source.value === "string"
+        ? [{ index, part: part as ContentPart, value: part.source.value }]
+        : [],
+  );
+  const ordered = restoresText
+    ? converted.filter((part) => part.type !== "text")
+    : converted;
+  for (const { index, part, value } of fileSourceSlots.sort(
+    (a, b) => a.index - b.index,
+  )) {
+    // A snapshot also imports the handle as an attachment; the slot replaces
+    // it in place to restore fields the attachment cannot hold.
+    const attached = ordered.findIndex(
+      (contentPart) =>
+        contentPart.type !== "text" &&
+        contentPart.source.type === "file" &&
+        contentPart.source.value === value &&
+        !fileSourceSlots.some((slot) => slot.part === contentPart),
+    );
+    if (attached !== -1) {
+      ordered[attached] = part;
+      continue;
+    }
+    const mediaPositions = ordered.flatMap((contentPart, position) =>
+      contentPart.type !== "text" ? [position] : [],
+    );
+    ordered.splice(mediaPositions[index] ?? ordered.length, 0, part);
+  }
+  if (restoresText) {
+    for (const { index, part } of textSlots.sort((a, b) => a.index - b.index)) {
+      ordered.splice(Math.min(index, ordered.length), 0, part);
+    }
+  }
+
+  if (restoresText || ordered.some((part) => part.type !== "text"))
+    return ordered;
+
+  // All-text path: collapse to plain string. Join text parts collected from
+  // both content and attachments so attachment-sourced text is not dropped.
+  if (converted.length === 0) return extractText(message.content);
+  return converted
+    .filter(
+      (part): part is { type: "text"; text: string } => part.type === "text",
+    )
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function toToolCallPart(value: unknown): ToolCallPart | null {
+  if (!isObject(value)) return null;
+  const rawFunction = isObject(value.function) ? value.function : null;
+  const toolCallId = getString(value, "toolCallId") ?? getString(value, "id");
+  const toolName =
+    getString(value, "toolName") ??
+    getString(value, "name") ??
+    (rawFunction ? getString(rawFunction, "name") : undefined) ??
+    "tool";
+  const argsText =
+    getString(value, "argsText") ??
+    getString(value, "arguments") ??
+    (rawFunction ? getString(rawFunction, "arguments") : undefined);
+
+  const parsedArgs =
+    typeof argsText === "string" ? parseJSONText(argsText) : undefined;
+  const args =
+    isObject(parsedArgs) && !Array.isArray(parsedArgs)
+      ? (parsedArgs as ReadonlyJSONObject)
+      : isObject(value.args) && !Array.isArray(value.args)
+        ? (value.args as ReadonlyJSONObject)
+        : undefined;
+  const part: ToolCallPart = {
+    type: "tool-call",
+    ...(toolCallId !== undefined ? { toolCallId } : {}),
+    toolName,
+    argsText: argsText ?? JSON.stringify(args ?? {}),
+    ...(args !== undefined ? { args } : {}),
+  };
+
+  if (value.type === "tool-call") {
+    const result = value.result;
+    const isError = value.isError;
+    if (result !== undefined) part.result = result;
+    if (typeof isError === "boolean") part.isError = isError;
+  }
+
+  return part;
+}
+
+function extractAssistantToolCalls(
+  message: Record<string, unknown>,
+): ToolCallPart[] {
+  const parts: ToolCallPart[] = [];
+  const seenToolCallIds = new Set<string>();
+  const pushPart = (part: ToolCallPart | null) => {
+    if (!part) return;
+    const id = part.toolCallId ?? generateId();
+    if (seenToolCallIds.has(id)) return;
+    seenToolCallIds.add(id);
+    parts.push({
+      ...part,
+      toolCallId: id,
+    });
+  };
+
+  const content = message.content;
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (isObject(part) && part.type === "tool-call") {
+        pushPart(toToolCallPart(part));
+      }
+    }
+  }
+
+  const toolCalls = Array.isArray(message.toolCalls)
+    ? message.toolCalls
+    : Array.isArray(message.tool_calls)
+      ? message.tool_calls
+      : [];
+  for (const call of toolCalls) {
+    pushPart(toToolCallPart(call));
+  }
+
+  return parts;
+}
+
+function validateInterrupts(value: unknown): AgUiInterrupt[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const valid = value.filter(
+    (entry): entry is AgUiInterrupt =>
+      isObject(entry) &&
+      typeof entry.id === "string" &&
+      typeof entry.reason === "string",
+  );
+  return valid.length > 0 ? valid : undefined;
+}
+
+function readPersistedInterrupts(
+  metadata: unknown,
+): AgUiInterrupt[] | undefined {
+  if (!isObject(metadata)) return undefined;
+  const custom = metadata.custom;
+  if (!isObject(custom)) return undefined;
+  const namespaced = custom[AG_UI_METADATA_NAMESPACE];
+  if (!isObject(namespaced)) return undefined;
+  return validateInterrupts(namespaced.interrupts);
+}
+
+function readPersistedPendingToolCallIds(
+  metadata: unknown,
+): string[] | undefined {
+  const value = readNamespacedMetadata(metadata).pendingToolCallIds;
+  return Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((id): id is string => typeof id === "string")
+    ? value
+    : undefined;
+}
+
+function readOpaqueReasoning(metadata: unknown): AgUiOpaqueReasoning[] {
+  if (!isObject(metadata)) return [];
+  const custom = metadata.custom;
+  if (!isObject(custom)) return [];
+  const namespaced = custom[AG_UI_METADATA_NAMESPACE];
+  if (!isObject(namespaced)) return [];
+  const entries = namespaced.opaqueReasoning;
+  if (!Array.isArray(entries)) return [];
+  return entries.flatMap((entry) => {
+    if (!isObject(entry)) return [];
+    const id = getString(entry, "id");
+    const encryptedValue = getString(entry, "encryptedValue");
+    if (!id?.trim() || !encryptedValue?.trim()) return [];
+    const metadata = toAgUiWireMetadata(entry.metadata);
+    return [
+      {
+        id,
+        encryptedValue,
+        ...(metadata ? { metadata } : {}),
+        ...(entry.after === true
+          ? { after: true }
+          : typeof entry.index === "number" &&
+              Number.isInteger(entry.index) &&
+              entry.index >= 0
+            ? { index: entry.index }
+            : {}),
+        ...(entry.opensStep === true ? { opensStep: true } : {}),
+      },
+    ];
+  });
+}
+
+function withOpaqueReasoning(
+  message: CoreThreadMessageLike,
+  opaqueReasoning: AgUiOpaqueReasoning[],
+): CoreThreadMessageLike {
+  const metadata = isObject(message.metadata) ? message.metadata : {};
+  const custom = isObject(metadata.custom) ? metadata.custom : {};
+  const namespaced = isObject(custom[AG_UI_METADATA_NAMESPACE])
+    ? (custom[AG_UI_METADATA_NAMESPACE] as Record<string, unknown>)
+    : {};
+  return {
+    ...message,
+    metadata: {
+      ...metadata,
+      custom: {
+        ...custom,
+        [AG_UI_METADATA_NAMESPACE]: { ...namespaced, opaqueReasoning },
+      },
+    },
+  } as CoreThreadMessageLike;
+}
+
+function toAssistantSnapshotMessage(
+  rawMessage: Record<string, unknown>,
+): CoreThreadMessageLike {
+  const text = extractText(rawMessage.content);
+  const custom = toSnapshotCustom(rawMessage.metadata);
+  const interrupts = readPersistedInterrupts({ custom });
+  const restoredToolCalls = extractAssistantToolCalls(rawMessage);
+  const approvals = projectAgUiToolApprovals(
+    interrupts,
+    new Set(
+      restoredToolCalls
+        .map((part) => part.toolCallId)
+        .filter((id): id is string => !!id),
+    ),
+  );
+  const toolCallParts = restoredToolCalls.map((part) => {
+    const approval = part.toolCallId
+      ? approvals.get(part.toolCallId)
+      : undefined;
+    return approval ? { ...part, approval } : part;
+  });
+  const assistantContent = [
+    ...(text.length > 0 ? [{ type: "text" as const, text }] : []),
+    ...toolCallParts,
+  ];
+  const messageName = getString(rawMessage, "name");
+  const namespaced = isObject(custom[AG_UI_METADATA_NAMESPACE])
+    ? { ...custom[AG_UI_METADATA_NAMESPACE] }
+    : {};
+  if (interrupts) namespaced.interrupts = interrupts;
+  else delete namespaced.interrupts;
+  const messageCustom = { ...custom };
+  if (Object.keys(namespaced).length > 0) {
+    messageCustom[AG_UI_METADATA_NAMESPACE] = namespaced;
+  } else {
+    delete messageCustom[AG_UI_METADATA_NAMESPACE];
+  }
+  return {
+    id: getString(rawMessage, "id") ?? generateId(),
+    role: "assistant",
+    content: assistantContent.length > 0 ? assistantContent : "",
+    ...(messageName !== undefined ? { name: messageName } : {}),
+    ...(Object.keys(messageCustom).length > 0
+      ? { metadata: { custom: messageCustom } }
+      : {}),
+  };
+}
+
+function toUserOrSystemSnapshotMessage(
+  role: "user" | "system" | "developer",
+  rawMessage: Record<string, unknown>,
+): CoreThreadMessageLike {
+  const messageName = getString(rawMessage, "name");
+  const { fileSourceParts, textParts } =
+    role === "user"
+      ? toUserContentLayout(rawMessage.content)
+      : { fileSourceParts: [], textParts: [] };
+  const custom = toSnapshotCustom(rawMessage.metadata, {
+    ...(role === "developer" ? { role: "developer" } : {}),
+    ...(fileSourceParts.length > 0 ? { fileSourceParts } : {}),
+    ...(textParts.length > 0 ? { textParts } : {}),
+  });
+  const attachments =
+    role === "user" ? toSnapshotAttachments(rawMessage.content) : [];
+  return {
+    id: getString(rawMessage, "id") ?? generateId(),
+    // The internal message model has no developer role; it rides as a system
+    // message with its wire role kept in metadata so the export restores it.
+    role: role === "developer" ? "system" : role,
+    content: extractText(rawMessage.content),
+    ...(messageName !== undefined ? { name: messageName } : {}),
+    ...(attachments.length > 0 ? { attachments } : {}),
+    ...(Object.keys(custom).length > 0 ? { metadata: { custom } } : {}),
+  };
+}
+
+function attachA2uiSurfaces(
+  message: CoreThreadMessageLike,
+  state: A2uiState,
+): CoreThreadMessageLike {
+  const a2uiParts: ToolCallPart[] = [];
+  for (const [surfaceId, surface] of state) {
+    const { toolCall } = surfaceToPresentToolCall(surfaceId, surface);
+    if (!toolCall) continue;
+    a2uiParts.push({
+      type: "tool-call",
+      ...toolCall,
+    });
+  }
+
+  const content = Array.isArray(message.content) ? message.content : [];
+  const preserved = content.filter(
+    (part) =>
+      !(
+        isObject(part) &&
+        part.type === "tool-call" &&
+        typeof part.toolCallId === "string" &&
+        part.toolCallId.startsWith("a2ui:")
+      ),
+  );
+  return { ...message, content: [...preserved, ...a2uiParts] };
+}
+
+// A tool call that arrives without a `parentMessageId` has no record to join, so
+// the client opens one keyed by the call id. An assistant record whose own id is
+// a call it carries is that container: an id the client invented for the call
+// rather than a boundary an agent drew. The prose of the turn lands in records
+// of its own on either side of it, and nothing on the wire binds them to the
+// run that produced them.
+function isSyntheticToolCallContainer(message: CoreThreadMessageLike): boolean {
+  if (message.role !== "assistant" || !Array.isArray(message.content))
+    return false;
+  let carriesOwnId = false;
+  for (const part of message.content) {
+    if (!isObject(part)) continue;
+    // The container is opened empty, so text on the record means an agent
+    // addressed it and the id is one it chose.
+    if (part.type === "text") return false;
+    if (
+      part.type === "tool-call" &&
+      getString(part, "toolCallId") === message.id
+    ) {
+      carriesOwnId = true;
+    }
+  }
+  return carriesOwnId;
+}
+
+function carriesPart(message: CoreThreadMessageLike, type: string): boolean {
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((part) => isObject(part) && part.type === type)
+  );
+}
+
+function carriesText(message: CoreThreadMessageLike): boolean {
+  return carriesPart(message, "text");
+}
+
+// A container joins the assistant record ahead of it when that record holds
+// prose or calls of the turn. A released reasoning record holds neither: its
+// part leaves the export under the record's own id, so a message merged under
+// that id would put two records with one id on the wire.
+function opensTurn(message: CoreThreadMessageLike): boolean {
+  return (
+    message.role === "assistant" &&
+    (carriesText(message) || carriesPart(message, "tool-call"))
+  );
+}
+
+// The parts of the answer fold onto the container ahead of them. A record
+// carrying a tool call an agent addressed is a boundary of its own and keeps
+// its message.
+function answersToolCallContainer(message: CoreThreadMessageLike): boolean {
+  if (message.role !== "assistant" || !Array.isArray(message.content))
+    return false;
+  if (message.content.length === 0) return false;
+  return !message.content.some(
+    (part) => isObject(part) && part.type === "tool-call",
+  );
+}
+
+function readCustomMetadata(metadata: unknown): Record<string, unknown> {
+  if (!isObject(metadata) || !isObject(metadata.custom)) return {};
+  return metadata.custom;
+}
+
+function readNamespacedMetadata(metadata: unknown): Record<string, unknown> {
+  const namespaced = readCustomMetadata(metadata)[AG_UI_METADATA_NAMESPACE];
+  return isObject(namespaced) ? namespaced : {};
+}
+
+function foldTurnRecords(
+  previous: CoreThreadMessageLike,
+  message: CoreThreadMessageLike,
+  mergePendingToolCallIds: boolean,
+): CoreThreadMessageLike {
+  const interrupts = [
+    ...(readPersistedInterrupts(previous.metadata) ?? []),
+    ...(readPersistedInterrupts(message.metadata) ?? []),
+  ];
+  // An entry keeps the content slot it arrived ahead of, so the export puts
+  // it back in its own step: one that rode the record behind the turn's
+  // calls opens the step that answered them, and one that trailed the
+  // earlier record now sits ahead of the content joined after it.
+  const offset = Array.isArray(previous.content) ? previous.content.length : 0;
+  const opaqueReasoning = [
+    ...readOpaqueReasoning(previous.metadata).map(({ after, ...entry }) =>
+      after ? { ...entry, index: offset } : entry,
+    ),
+    ...readOpaqueReasoning(message.metadata).map((entry) =>
+      entry.after ? entry : { ...entry, index: offset + (entry.index ?? 0) },
+    ),
+  ];
+  const previousPending = readPersistedPendingToolCallIds(previous.metadata);
+  const messagePending = readPersistedPendingToolCallIds(message.metadata);
+  const pendingToolCallIds =
+    !mergePendingToolCallIds ||
+    (previousPending === undefined && messagePending === undefined)
+      ? []
+      : [
+          ...admittedUnresolvedToolCallIds(previous, false),
+          ...admittedUnresolvedToolCallIds(message, false),
+        ];
+  const namespaced = {
+    ...readNamespacedMetadata(previous.metadata),
+    ...readNamespacedMetadata(message.metadata),
+    ...(interrupts.length > 0 ? { interrupts } : {}),
+    ...(pendingToolCallIds.length > 0 ? { pendingToolCallIds } : {}),
+    ...(opaqueReasoning.length > 0 ? { opaqueReasoning } : {}),
+  } satisfies AgUiCustomMetadata & Record<string, unknown>;
+  const custom = {
+    ...readCustomMetadata(previous.metadata),
+    ...readCustomMetadata(message.metadata),
+    ...(Object.keys(namespaced).length > 0
+      ? { [AG_UI_METADATA_NAMESPACE]: namespaced }
+      : {}),
+  };
+  const metadata = {
+    ...(isObject(previous.metadata) ? previous.metadata : {}),
+    ...(isObject(message.metadata) ? message.metadata : {}),
+    ...(Object.keys(custom).length > 0 ? { custom } : {}),
+  };
+  return {
+    ...previous,
+    ...message,
+    // A container's id names a call rather than the turn, so the record the
+    // agent addressed its prose to wins: that is the id the next run has to
+    // carry for the agent to recognize the message it wrote.
+    id: carriesText(message) ? message.id : previous.id,
+    content: [
+      ...(Array.isArray(previous.content) ? previous.content : []),
+      ...(Array.isArray(message.content) ? message.content : []),
+    ],
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+  } as CoreThreadMessageLike;
+}
+
+export type FromAgUiMessagesOptions = {
+  /**
+   * Whether to convert `reasoning` messages into visible reasoning parts.
+   * Matches the `showThinking` option of `useAgUiRuntime`. Defaults to `true`.
+   */
+  showThinking?: boolean;
+  /**
+   * Whether to join every run of adjacent assistant records into one message,
+   * for a backend whose history splits one turn across records with ids of
+   * their own. The merged message keeps the id of the record carrying the
+   * answer, with the parts in wire order. Records that belong to separate runs
+   * are joined too when no user message separates them. Matches the
+   * `joinAdjacentAssistantMessages` option of `useAgUiRuntime`. Defaults to
+   * `false`.
+   */
+  joinAdjacentAssistantMessages?: boolean;
+};
+
+const readSubagentRunId = (record: Record<string, unknown>) => {
+  const runId = getString(record, "subagentRunId");
+  return runId?.trim() ? runId : undefined;
+};
+
+const readToolCallIds = (record: Record<string, unknown>) =>
+  extractAssistantToolCalls(record).flatMap((part) =>
+    part.toolCallId ? [part.toolCallId] : [],
+  );
+
+export function fromAgUiMessages(
+  messages: readonly unknown[],
+  options?: FromAgUiMessagesOptions,
+): CoreThreadMessageLike[] {
+  return fromAgUiSnapshotMessages(messages, options);
+}
+
+/**
+ * Converts AG-UI messages, nesting each subagent run's messages under the tool
+ * call `SUBAGENT_STARTED.parentToolCallId` announced for it. A message's
+ * `subagentRunId` names its run; a run with no announced spawning call in
+ * `messages` stays in the parent thread.
+ */
+export function fromAgUiSnapshotMessages(
+  messages: readonly unknown[],
+  options?: FromAgUiMessagesOptions,
+  subagentParentToolCallIds?: ReadonlyMap<string, string | undefined>,
+  preservedAssistantIds?: ReadonlySet<string>,
+): CoreThreadMessageLike[] {
+  const records = messages.filter(isObject);
+  const callOwners = new Map<string, string | undefined>();
+  for (const record of records) {
+    if (getString(record, "role") !== "assistant") continue;
+    for (const toolCallId of readToolCallIds(record)) {
+      callOwners.set(toolCallId, readSubagentRunId(record));
+    }
+  }
+
+  const spawningCalls = new Map<string, string>();
+  for (const record of records) {
+    const runId = readSubagentRunId(record);
+    if (runId === undefined || spawningCalls.has(runId)) continue;
+    const toolCallId = subagentParentToolCallIds?.get(runId);
+    if (toolCallId !== undefined && callOwners.has(toolCallId))
+      spawningCalls.set(runId, toolCallId);
+  }
+  if (spawningCalls.size === 0)
+    return convertAgUiMessages(messages, options, preservedAssistantIds);
+
+  const reachesRoot = (runId: string) => {
+    let current: string | undefined = runId;
+    for (let depth = 0; current !== undefined; depth++) {
+      const toolCallId = spawningCalls.get(current);
+      if (toolCallId === undefined || depth > MAX_SUBAGENT_DEPTH) return false;
+      current = callOwners.get(toolCallId);
+    }
+    return true;
+  };
+  const nestedRuns = new Set([...spawningCalls.keys()].filter(reachesRoot));
+
+  const groups = new Map<string | undefined, unknown[]>();
+  for (const record of records) {
+    const ownRunId = readSubagentRunId(record);
+    const answered =
+      getString(record, "role") === "tool" ? getToolCallId(record) : undefined;
+    const runId =
+      answered !== undefined && callOwners.has(answered)
+        ? callOwners.get(answered)
+        : ownRunId;
+    const role = getString(record, "role");
+    const group =
+      role !== "user" &&
+      role !== "system" &&
+      role !== "developer" &&
+      runId !== undefined &&
+      nestedRuns.has(runId)
+        ? runId
+        : undefined;
+    const members = groups.get(group) ?? [];
+    members.push(record);
+    groups.set(group, members);
+  }
+
+  const runsBySpawningCall = new Map<string, string[]>();
+  for (const runId of nestedRuns) {
+    const toolCallId = spawningCalls.get(runId)!;
+    runsBySpawningCall.set(toolCallId, [
+      ...(runsBySpawningCall.get(toolCallId) ?? []),
+      runId,
+    ]);
+  }
+
+  const convertGroup = (group: string | undefined): CoreThreadMessageLike[] =>
+    convertAgUiMessages(
+      groups.get(group) ?? [],
+      options,
+      preservedAssistantIds,
+    ).map((message) => {
+      if (message.role !== "assistant" || !Array.isArray(message.content))
+        return message;
+      const nested: ThreadMessage[] = [];
+      const content = message.content.map((part) => {
+        if (part.type !== "tool-call") return part;
+        const runIds = runsBySpawningCall.get(part.toolCallId);
+        if (!runIds) return part;
+        const subagents = runIds.map(toSubagentMessage);
+        nested.push(...subagents);
+        return { ...part, messages: [...(part.messages ?? []), ...subagents] };
+      });
+      return liftSubagentState({ ...message, content }, nested);
+    });
+
+  const toSubagentMessage = (runId: string): ThreadMessage => {
+    const messages = convertGroup(runId).filter(
+      (message) => message.role === "assistant",
+    );
+    const folded = messages
+      .map((message) =>
+        typeof message.content === "string"
+          ? {
+              ...message,
+              content: message.content
+                ? [{ type: "text" as const, text: message.content }]
+                : [],
+            }
+          : message,
+      )
+      .reduce<CoreThreadMessageLike | undefined>(
+        (merged, message) =>
+          // Pending-call admission is taken from the original records below.
+          // Merging lists in this fold would union ids that admission skips.
+          merged ? foldTurnRecords(merged, message, false) : message,
+        undefined,
+      );
+    const content = Array.isArray(folded?.content) ? folded.content : [];
+    const pendingToolCallIds = new Set(
+      messages
+        .filter(
+          (message) =>
+            message.status?.type === "requires-action" &&
+            message.status.reason === "tool-calls",
+        )
+        .flatMap((message) => admittedUnresolvedToolCallIds(message, true)),
+    );
+    const metadata = pendingToolCallIds.size
+      ? withPendingToolCallIds(folded?.metadata, pendingToolCallIds)
+      : folded?.metadata;
+    return fromThreadMessageLike(
+      {
+        id: runId,
+        role: "assistant",
+        content,
+        ...(metadata ? { metadata } : {}),
+      },
+      runId,
+      subagentStatus(folded?.metadata, messages),
+    );
+  };
+
+  return convertGroup(undefined);
+}
+
+const hasUnresolvedToolCall = (content: readonly unknown[]) =>
+  content.some(
+    (part) =>
+      isObject(part) && part.type === "tool-call" && part.result === undefined,
+  );
+
+function admittedUnresolvedToolCallIds(
+  message: CoreThreadMessageLike,
+  includeNested: boolean,
+): string[] {
+  if (message.role !== "assistant" || !Array.isArray(message.content))
+    return [];
+  const listed = readPersistedPendingToolCallIds(message.metadata);
+  if (listed) return listed;
+  return message.content.flatMap((part) => {
+    if (part.type !== "tool-call") return [];
+    const calls = includeNested
+      ? [
+          part,
+          ...Array.from(
+            walkToolCallTree(part.messages ?? []),
+            ({ part }) => part,
+          ),
+        ]
+      : [part];
+    return calls.flatMap((call) =>
+      call.result === undefined && call.toolCallId ? [call.toolCallId] : [],
+    );
+  });
+}
+
+function withPendingToolCallIds(
+  metadata: CoreThreadMessageLike["metadata"],
+  ids: ReadonlySet<string>,
+): CoreThreadMessageLike["metadata"] {
+  return {
+    ...(isObject(metadata) ? metadata : {}),
+    custom: {
+      ...readCustomMetadata(metadata),
+      [AG_UI_METADATA_NAMESPACE]: {
+        ...readNamespacedMetadata(metadata),
+        pendingToolCallIds: [...ids],
+      },
+    },
+  };
+}
+
+function subagentStatus(
+  metadata: unknown,
+  messages: readonly CoreThreadMessageLike[],
+): MessageStatus {
+  const hasInterrupt = readPersistedInterrupts(metadata) !== undefined;
+  const hasPendingToolCall = messages.some(
+    (message) =>
+      message.status?.type === "requires-action" &&
+      message.status.reason === "tool-calls",
+  );
+  return hasInterrupt || hasPendingToolCall
+    ? getAutoStatus(false, false, hasInterrupt, hasPendingToolCall, undefined)
+    : { type: "complete", reason: "unknown" };
+}
+
+/**
+ * A nested run's open interrupts and unanswered calls surface on the message
+ * that spawned it, as the live run does.
+ */
+function liftSubagentState(
+  message: CoreThreadMessageLike,
+  nested: readonly ThreadMessage[],
+): CoreThreadMessageLike {
+  const waiting = nested.filter(
+    (subagent) => subagent.status?.type === "requires-action",
+  );
+  if (waiting.length === 0) return message;
+  const interrupts = [
+    ...(readPersistedInterrupts(message.metadata) ?? []),
+    ...waiting.flatMap(
+      (subagent) => readPersistedInterrupts(subagent.metadata) ?? [],
+    ),
+  ];
+  const custom = readCustomMetadata(message.metadata);
+  const metadata = {
+    ...(isObject(message.metadata) ? message.metadata : {}),
+    custom: {
+      ...custom,
+      [AG_UI_METADATA_NAMESPACE]: {
+        ...readNamespacedMetadata(message.metadata),
+        ...(interrupts.length > 0 ? { interrupts } : {}),
+      },
+    },
+  };
+  const hasInterrupt = interrupts.length > 0;
+  const hasPendingToolCall =
+    waiting.some(
+      (subagent) =>
+        subagent.status?.type === "requires-action" &&
+        subagent.status.reason === "tool-calls",
+    ) ||
+    (Array.isArray(message.content) && hasUnresolvedToolCall(message.content));
+  const pendingToolCallIds = new Set([
+    ...admittedUnresolvedToolCallIds(message, false),
+    ...waiting.flatMap((subagent) =>
+      subagent.status?.type === "requires-action" &&
+      subagent.status.reason === "tool-calls"
+        ? admittedUnresolvedToolCallIds(subagent, true)
+        : [],
+    ),
+  ]);
+  return {
+    ...message,
+    metadata: pendingToolCallIds.size
+      ? withPendingToolCallIds(metadata, pendingToolCallIds)
+      : metadata,
+    status: getAutoStatus(
+      false,
+      false,
+      hasInterrupt,
+      hasPendingToolCall,
+      undefined,
+    ),
+  };
+}
+
+function convertAgUiMessages(
+  messages: readonly unknown[],
+  options?: FromAgUiMessagesOptions,
+  preservedAssistantIds?: ReadonlySet<string>,
+): CoreThreadMessageLike[] {
+  const showThinking = options?.showThinking ?? true;
+  const joinAdjacentAssistantMessages =
+    options?.joinAdjacentAssistantMessages ?? false;
+  const converted: CoreThreadMessageLike[] = [];
+  const a2uiBuckets = new Map<string, A2uiState>();
+  const a2uiBucketOwnerIndices = new Map<string, number>();
+  const activityParts = new Map<
+    string,
+    { ownerIndex: number; part: { type: "data"; name: string; data: unknown } }
+  >();
+  // A zero-data-retention run carries its payload in encryptedValue with no
+  // readable content, so the record has no part to become and rides on the
+  // neighbouring message instead of being dropped. The anchor is the index the
+  // next pushed message will occupy, which is where it sat on the wire.
+  const opaqueReasoning: (AgUiOpaqueReasoning & { anchor: number })[] = [];
+  // A reasoning record belongs to the assistant record that follows it, which is
+  // the binding the export writes and the one the reference integrations read
+  // back. Holding it until that assistant arrives rebuilds the pair as the
+  // single message the live run produced.
+  const pendingReasoning: {
+    id: string | undefined;
+    part: ReasoningMessagePart;
+  }[] = [];
+
+  const flushPendingReasoning = () => {
+    for (const { id, part } of pendingReasoning) {
+      converted.push({
+        id: id ?? generateId(),
+        role: "assistant",
+        content: [part],
+      });
+    }
+    pendingReasoning.length = 0;
+  };
+
+  const withPendingReasoning = (
+    message: CoreThreadMessageLike,
+  ): CoreThreadMessageLike => {
+    if (pendingReasoning.length === 0) return message;
+    const parts = pendingReasoning.map(({ part }) => part);
+    pendingReasoning.length = 0;
+    return {
+      ...message,
+      content: [
+        ...parts,
+        ...(Array.isArray(message.content) ? message.content : []),
+      ],
+    };
+  };
+
+  // Whether the last record that was not reasoning is a tool result: a
+  // redacted block after one opens the step that answered it.
+  let followsToolResult = false;
+  for (const rawMessage of messages) {
+    if (!isObject(rawMessage)) continue;
+    const role = getString(rawMessage, "role");
+    if (!role) continue;
+    const opensStep = followsToolResult;
+    if (role === "tool") followsToolResult = true;
+    else if (
+      role === "assistant" ||
+      role === "user" ||
+      role === "system" ||
+      role === "developer"
+    )
+      followsToolResult = false;
+
+    if (role === "tool") {
+      flushPendingReasoning();
+      const toolCallId = getToolCallId(rawMessage) ?? `tool-${generateId()}`;
+      const toolMessageId = getString(rawMessage, "id");
+      const modelContent = Array.isArray(rawMessage.content)
+        ? toolContentText(rawMessage.content as ContentPart[])
+        : extractText(rawMessage.content);
+      const mcpResult = parseMcpToolCallResult(
+        rawMessage,
+        Array.isArray(rawMessage.content)
+          ? (rawMessage.content as ContentPart[])
+          : modelContent,
+      );
+      const toolModelContent = mcpResult
+        ? [{ type: "text" as const, text: modelContent }]
+        : undefined;
+      const result =
+        mcpResult ??
+        (Array.isArray(rawMessage.content)
+          ? rawMessage.content
+          : rawMessage.result !== undefined
+            ? rawMessage.result
+            : typeof rawMessage.content === "string"
+              ? parseJSONText(rawMessage.content)
+              : rawMessage.content);
+      const isError =
+        typeof rawMessage.error === "string" ||
+        rawMessage.isError === true ||
+        rawMessage.status === "error"
+          ? true
+          : rawMessage.isError === false
+            ? false
+            : undefined;
+      const mcpAppUri = readMcpAppResourceUri(mcpResult?._meta);
+      const mcpApp =
+        mcpAppUri !== undefined ? { resourceUri: mcpAppUri } : undefined;
+      const messageMetadata = toAgUiWireMetadata(rawMessage.metadata);
+
+      let updated = false;
+      for (
+        let messageIndex = converted.length - 1;
+        messageIndex >= 0 && !updated;
+        messageIndex--
+      ) {
+        const message = converted[messageIndex];
+        if (
+          !message ||
+          message.role !== "assistant" ||
+          !Array.isArray(message.content)
+        )
+          continue;
+
+        for (
+          let partIndex = message.content.length - 1;
+          partIndex >= 0;
+          partIndex--
+        ) {
+          const part = message.content[partIndex];
+          if (!isObject(part) || part.type !== "tool-call") continue;
+          if (getString(part, "toolCallId") !== toolCallId) continue;
+
+          const { modelContent: _modelContent, ...partWithoutModelContent } =
+            part as ToolCallPart;
+          const updatedPart: ToolCallPart = {
+            ...(Array.isArray(rawMessage.content) && !mcpResult
+              ? partWithoutModelContent
+              : (part as ToolCallPart)),
+            result,
+            ...(toolModelContent ? { modelContent: toolModelContent } : {}),
+            ...(isError !== undefined ? { isError } : {}),
+            ...(toolMessageId !== undefined
+              ? { unstable_toolMessageId: toolMessageId }
+              : {}),
+            ...(mcpApp ? { mcp: { app: mcpApp } } : {}),
+            ...(messageMetadata
+              ? {
+                  providerMetadata: withAgUiPartMessageMetadata(
+                    (part as ToolCallPart).providerMetadata,
+                    messageMetadata,
+                  ),
+                }
+              : {}),
+          };
+          const updatedContent = message.content.map((contentPart, index) =>
+            index === partIndex ? updatedPart : contentPart,
+          );
+          converted[messageIndex] = { ...message, content: updatedContent };
+          updated = true;
+          break;
+        }
+      }
+
+      if (updated) {
+        continue;
+      }
+
+      const id = toolMessageId ?? toolCallId;
+      const toolName =
+        getString(rawMessage, "name") ??
+        getString(rawMessage, "toolName") ??
+        "tool";
+      converted.push({
+        id: `${id}:assistant`,
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId,
+            toolName,
+            args: {},
+            argsText: "{}",
+            result,
+            ...(toolModelContent ? { modelContent: toolModelContent } : {}),
+            ...(isError !== undefined ? { isError } : {}),
+            ...(toolMessageId !== undefined
+              ? { unstable_toolMessageId: toolMessageId }
+              : {}),
+            ...(mcpApp ? { mcp: { app: mcpApp } } : {}),
+            ...(messageMetadata
+              ? {
+                  providerMetadata: withAgUiPartMessageMetadata(
+                    undefined,
+                    messageMetadata,
+                  ),
+                }
+              : {}),
+          },
+        ],
+      });
+      continue;
+    }
+
+    if (role === "activity") {
+      const activityType = getString(rawMessage, "activityType");
+      if (activityType === undefined || activityType === MCP_APPS_ACTIVITY_TYPE)
+        continue;
+
+      // A surface belongs to the turn that painted it, and held reasoning is a
+      // nearer antecedent than the previous turn's assistant record, so it is
+      // released here rather than folded past this record.
+      flushPendingReasoning();
+
+      let ownerIndex = -1;
+      for (let i = converted.length - 1; i >= 0; i--) {
+        const candidate = converted[i];
+        if (candidate && candidate.role === "assistant") {
+          ownerIndex = i;
+          break;
+        }
+      }
+      if (ownerIndex === -1) continue;
+
+      const owner = converted[ownerIndex]!;
+      if (activityType !== A2UI_SURFACE_ACTIVITY_TYPE) {
+        const bucketKey =
+          getString(rawMessage, "id") ?? `agui-activity:${activityType}`;
+        const part = {
+          type: "data" as const,
+          name: `agui-activity/${activityType}`,
+          data: rawMessage.content,
+        };
+        const existing = activityParts.get(bucketKey);
+        const existingOwner = existing && converted[existing.ownerIndex];
+        const existingIndex =
+          existingOwner && Array.isArray(existingOwner.content)
+            ? existingOwner.content.indexOf(existing.part)
+            : -1;
+        if (existing && existingOwner && existingIndex !== -1) {
+          const content = [...(existingOwner.content as unknown[])];
+          content[existingIndex] = part;
+          converted[existing.ownerIndex] = {
+            ...existingOwner,
+            content: content as typeof existingOwner.content,
+          };
+          activityParts.set(bucketKey, {
+            ownerIndex: existing.ownerIndex,
+            part,
+          });
+          continue;
+        }
+
+        const content = Array.isArray(owner.content) ? owner.content : [];
+        activityParts.set(bucketKey, { ownerIndex, part });
+        converted[ownerIndex] = {
+          ...owner,
+          content: [...content, part],
+        };
+        continue;
+      }
+
+      const activityContent = isObject(rawMessage.content)
+        ? (rawMessage.content as Record<string, unknown>)
+        : null;
+      const operations = activityContent?.["a2ui_operations"];
+      if (!Array.isArray(operations)) continue;
+      const bucketKey = getString(rawMessage, "id") ?? "a2ui:anonymous";
+      const { state } = applyA2uiOperations(new Map(), operations);
+      a2uiBuckets.delete(bucketKey);
+      a2uiBucketOwnerIndices.delete(bucketKey);
+      a2uiBuckets.set(bucketKey, state);
+      a2uiBucketOwnerIndices.set(bucketKey, ownerIndex);
+
+      const ownerState = new Map<string, A2uiSurfaceState>();
+      for (const [candidateBucketKey, candidateState] of a2uiBuckets) {
+        if (a2uiBucketOwnerIndices.get(candidateBucketKey) !== ownerIndex)
+          continue;
+        for (const [surfaceId, surface] of candidateState) {
+          ownerState.set(surfaceId, surface);
+        }
+      }
+      converted[ownerIndex] = attachA2uiSurfaces(owner, ownerState);
+      continue;
+    }
+
+    if (role === "assistant") {
+      converted.push(
+        withPendingReasoning(toAssistantSnapshotMessage(rawMessage)),
+      );
+      continue;
+    }
+
+    if (role === "reasoning") {
+      const text = extractText(rawMessage.content);
+      const encryptedValue = getString(rawMessage, "encryptedValue");
+      const messageMetadata = toAgUiWireMetadata(rawMessage.metadata);
+      if (text.trim().length === 0) {
+        // showThinking hides reasoning; this record is never rendered anyway,
+        // and dropping it would deny the provider the payload it needs to
+        // accept the next run.
+        const opaqueId = getString(rawMessage, "id");
+        if (opaqueId?.trim() && encryptedValue?.trim()) {
+          // The anchor counts materialized messages, so anything still held
+          // takes its own slot rather than folding past this record.
+          flushPendingReasoning();
+          opaqueReasoning.push({
+            id: opaqueId,
+            encryptedValue,
+            ...(messageMetadata ? { metadata: messageMetadata } : {}),
+            ...(opensStep ? { opensStep: true } : {}),
+            anchor: converted.length,
+          });
+        }
+        continue;
+      }
+      // Gate visible reasoning on showThinking so a cold reload matches the
+      // live run: the aggregator never stores reasoning parts when it is off.
+      // A signature on a hidden record is still transport state, so it is kept
+      // opaque rather than discarded with the text.
+      if (!showThinking) {
+        const hiddenId = getString(rawMessage, "id");
+        if (hiddenId?.trim() && encryptedValue?.trim()) {
+          opaqueReasoning.push({
+            id: hiddenId,
+            encryptedValue,
+            ...(messageMetadata ? { metadata: messageMetadata } : {}),
+            ...(opensStep ? { opensStep: true } : {}),
+            anchor: converted.length,
+          });
+        }
+        continue;
+      }
+      const rawReasoningId = getString(rawMessage, "id");
+      // A blank id still wins over a synthesized one on export, which would put
+      // an unaddressable record on the wire.
+      const reasoningId = rawReasoningId?.trim() ? rawReasoningId : undefined;
+      // The fold costs the record its own message id, so it rides the part
+      // instead: the export re-emits each block under the id it arrived with.
+      const meta = {
+        ...(reasoningId !== undefined ? { reasoningId } : {}),
+        ...(encryptedValue !== undefined ? { encryptedValue } : {}),
+        ...(messageMetadata
+          ? { messageMetadata: messageMetadata as ReadonlyJSONObject }
+          : {}),
+      };
+      pendingReasoning.push({
+        id: reasoningId,
+        part: {
+          type: "reasoning",
+          text,
+          ...(Object.keys(meta).length > 0
+            ? { providerMetadata: { [AG_UI_METADATA_NAMESPACE]: meta } }
+            : {}),
+        },
+      });
+      continue;
+    }
+
+    if (role === "user" || role === "system" || role === "developer") {
+      flushPendingReasoning();
+      converted.push(toUserOrSystemSnapshotMessage(role, rawMessage));
+    }
+  }
+
+  flushPendingReasoning();
+
+  for (const { anchor, ...entry } of opaqueReasoning) {
+    // Nothing followed it on the wire, so it trails the last message instead.
+    const trailing = anchor >= converted.length;
+    const index = trailing ? converted.length - 1 : anchor;
+    const target = converted[index];
+    if (!target) continue;
+    converted[index] = withOpaqueReasoning(target, [
+      ...readOpaqueReasoning(target.metadata),
+      ...(trailing ? [{ ...entry, after: true }] : [entry]),
+    ]);
+  }
+
+  // A turn that called a tool without addressing a record sits on the wire as
+  // a container beside the records around it, which the live run renders as
+  // one message: the container joins the assistant record ahead of it, and
+  // what follows a container joins it until the turn carries text, where a
+  // further text record opens a message of its own as it does live. An app
+  // that knows its backend splits a turn across records it named itself opts
+  // into joining every assistant record that follows one opening a turn.
+  const folded: CoreThreadMessageLike[] = [];
+  for (const message of converted) {
+    const previous = folded[folded.length - 1];
+    const foldedId = carriesText(message) ? message.id : previous?.id;
+    const dropsPreservedAssistantId =
+      joinAdjacentAssistantMessages &&
+      [previous?.id, message.id].some(
+        (id) =>
+          id !== undefined && id !== foldedId && preservedAssistantIds?.has(id),
+      );
+    if (
+      previous !== undefined &&
+      !dropsPreservedAssistantId &&
+      (isSyntheticToolCallContainer(message)
+        ? opensTurn(previous)
+        : (isSyntheticToolCallContainer(previous) &&
+            answersToolCallContainer(message)) ||
+          (joinAdjacentAssistantMessages &&
+            message.role === "assistant" &&
+            opensTurn(previous)))
+    ) {
+      folded[folded.length - 1] = foldTurnRecords(
+        previous,
+        message,
+        joinAdjacentAssistantMessages,
+      );
+      continue;
+    }
+    folded.push(message);
+  }
+
+  for (let i = 0; i < folded.length; i++) {
+    const message = folded[i]!;
+    if (message.role !== "assistant") continue;
+
+    const hasInterrupt =
+      readPersistedInterrupts(message.metadata) !== undefined;
+    const pendingToolCallIds = readPersistedPendingToolCallIds(
+      message.metadata,
+    );
+    const hasPendingToolCall =
+      Array.isArray(message.content) &&
+      message.content.some(
+        (part) =>
+          isObject(part) &&
+          part.type === "tool-call" &&
+          part.result === undefined &&
+          (pendingToolCallIds === undefined ||
+            pendingToolCallIds.includes(getString(part, "toolCallId") ?? "")),
+      );
+
+    if (hasInterrupt || hasPendingToolCall) {
+      folded[i] = {
+        ...message,
+        status: getAutoStatus(
+          false,
+          false,
+          hasInterrupt,
+          hasPendingToolCall,
+          undefined,
+        ),
+      };
+    }
+  }
+
+  return folded;
+}
+
+type AssistantStep = {
+  // Content indices, so positioned opaque reasoning can find its step.
+  start: number;
+  parts: { index: number; part: unknown }[];
+};
+
+const isExportedToolCall = (part: unknown): part is ToolCallPart =>
+  isObject(part) &&
+  part.type === "tool-call" &&
+  !(typeof part.toolCallId === "string" && part.toolCallId.startsWith("a2ui:"));
+
+// A model step ends with its tool calls: reasoning or prose after a call
+// belongs to the next step, which answered the call's result, and so does a
+// call addressed to a different assistant record than the calls before it.
+// Joined content keeps parts in arrival order, so these boundaries are the
+// steps the backend streamed, and each one goes back out as its own records.
+// `stepSlots` are content indices a redacted block that followed a tool
+// result arrived ahead of: it rides the metadata, but opens a step all the
+// same.
+function splitAssistantSteps(
+  content: readonly unknown[],
+  stepSlots: ReadonlySet<number>,
+): AssistantStep[] {
+  const steps: AssistantStep[] = [{ start: 0, parts: [] }];
+  let stepParentIds: Set<string> | undefined;
+  for (const [index, part] of content.entries()) {
+    const type = isObject(part) ? part.type : undefined;
+    const parentId = isExportedToolCall(part)
+      ? getString(part, "parentId")
+      : undefined;
+    if (
+      stepParentIds !== undefined &&
+      (type === "reasoning" ||
+        type === "text" ||
+        stepSlots.has(index) ||
+        (parentId !== undefined &&
+          stepParentIds.size > 0 &&
+          !stepParentIds.has(parentId)))
+    ) {
+      steps.push({ start: index, parts: [] });
+      stepParentIds = undefined;
+    }
+    steps.at(-1)!.parts.push({ index, part });
+    if (isExportedToolCall(part)) {
+      stepParentIds ??= new Set();
+      if (parentId !== undefined) stepParentIds.add(parentId);
+    }
+  }
+  return steps;
+}
+
+// Some providers reject a blank reasoning block, but a blank one carrying a
+// signature or wire id is a redacted block the provider needs back verbatim.
+function isExportableReasoning(part: Record<string, unknown>): boolean {
+  const text = getString(part, "text") ?? "";
+  if (text.trim().length > 0) return true;
+  const { encryptedValue, reasoningId } = readAgUiReasoningMeta(
+    part.providerMetadata,
+  );
+  return !!encryptedValue?.trim() || !!reasoningId?.trim();
+}
+
+function convertAssistantMessage(
+  message: NormalizedThreadMessageLike,
+  converted: AgUiMessage[],
+  positionedReasoning: readonly (AgUiOpaqueReasoning & { index: number })[],
+  toOpaqueRecord: (entry: AgUiOpaqueReasoning) => AgUiMessage,
+): void {
+  const messageId = agUiWireMessageId(message);
+  const contentArray = Array.isArray(message.content) ? message.content : [];
+  const steps =
+    typeof message.content === "string"
+      ? [{ start: 0, parts: [] }]
+      : splitAssistantSteps(
+          contentArray,
+          new Set(
+            positionedReasoning
+              .filter((entry) => entry.opensStep === true)
+              .map((entry) => entry.index),
+          ),
+        );
+  const stepOf = (index: number) =>
+    Math.max(
+      0,
+      steps.findLastIndex((step) => step.start <= index),
+    );
+  const opaqueBySteps = steps.map(
+    () => [] as (AgUiOpaqueReasoning & { index: number })[],
+  );
+  for (const entry of [...positionedReasoning].sort(
+    (a, b) => a.index - b.index,
+  ))
+    opaqueBySteps[stepOf(entry.index)]!.push(entry);
+
+  const stepRecords = steps.map((step) => {
+    const toolCallParts = step.parts
+      .map(({ part }) => part)
+      .filter(isExportedToolCall);
+    const content =
+      typeof message.content === "string"
+        ? message.content
+        : extractText(step.parts.map(({ part }) => part));
+    return {
+      content,
+      toolCalls: toolCallParts.map((part) => ({
+        ...normalizeToolCall(part),
+        part,
+      })),
+    };
+  });
+  const firstRecordStep = stepRecords.findIndex(
+    (step) => step.content.length > 0 || step.toolCalls.length > 0,
+  );
+  // The message id goes to the record carrying its prose, as the import fold
+  // keeps the id of the last record with text. A step that only called tools
+  // leaves as the container a run opens for a call, under that call's id, so
+  // a re-import folds it back into this message.
+  const lastTextStep = stepRecords.findLastIndex(
+    (step) => step.content.length > 0,
+  );
+  const ownerStep = lastTextStep >= 0 ? lastTextStep : firstRecordStep;
+  // A step the backend addressed keeps the id it streamed the calls under,
+  // unless another record of this message already goes out under it.
+  const parentIdCounts = new Map<string, number>();
+  const stepParentIds = stepRecords.map((step) => {
+    const ids = new Set(
+      step.toolCalls.flatMap(({ part }) => {
+        const id = getString(part, "parentId");
+        return id?.trim() ? [id] : [];
+      }),
+    );
+    const id = ids.size === 1 ? [...ids][0]! : undefined;
+    if (id !== undefined)
+      parentIdCounts.set(id, (parentIdCounts.get(id) ?? 0) + 1);
+    return id;
+  });
+  const stepParentId = (stepIndex: number) => {
+    const id = stepParentIds[stepIndex];
+    return id !== undefined && id !== messageId && parentIdCounts.get(id) === 1
+      ? id
+      : undefined;
+  };
+
+  let reasoningIndex = 0;
+  for (const [stepIndex, step] of steps.entries()) {
+    const { content, toolCalls } = stepRecords[stepIndex]!;
+    const recordId =
+      stepIndex === ownerStep || ownerStep < 0
+        ? messageId
+        : (stepParentId(stepIndex) ??
+          (content.length === 0 && toolCalls[0] !== undefined
+            ? toolCalls[0].id
+            : `${messageId}:step-${stepIndex}`));
+
+    // An AG-UI assistant record has no reasoning field, so reasoning leaves as
+    // the standalone record it arrived as, ahead of the assistant it belongs
+    // to. A redacted block that rode the metadata goes back to the slot it
+    // arrived in among them.
+    const shellIsDropped = content.length === 0 && toolCalls.length === 0;
+    // A block that arrived after one of the step's calls cannot ride ahead of
+    // them, so it trails the step's results, where the next step would open.
+    const firstCallIndex = step.parts.find(({ part }) =>
+      isExportedToolCall(part),
+    )?.index;
+    const trailing = opaqueBySteps[stepIndex]!.filter(
+      (entry) => firstCallIndex !== undefined && entry.index > firstCallIndex,
+    );
+    const opaque = opaqueBySteps[stepIndex]!.filter(
+      (entry) => !trailing.includes(entry),
+    );
+    let opaqueCursor = 0;
+    const flushOpaqueBefore = (index: number) => {
+      while (
+        opaqueCursor < opaque.length &&
+        opaque[opaqueCursor]!.index <= index
+      )
+        converted.push(toOpaqueRecord(opaque[opaqueCursor++]!));
+    };
+    for (const { index, part } of step.parts) {
+      if (!isObject(part) || part.type !== "reasoning") continue;
+      flushOpaqueBefore(index);
+      if (!isExportableReasoning(part)) continue;
+      const text = getString(part, "text") ?? "";
+      const { encryptedValue, reasoningId, messageMetadata } =
+        readAgUiReasoningMeta(part.providerMetadata);
+      converted.push({
+        // The wire id is what a signature was issued against, so it wins over
+        // a synthesized one whenever the run carried it.
+        id: reasoningId?.trim()
+          ? reasoningId
+          : shellIsDropped && firstRecordStep < 0 && reasoningIndex === 0
+            ? messageId
+            : `${messageId}:reasoning-${reasoningIndex}`,
+        role: "reasoning",
+        content: text,
+        ...(encryptedValue !== undefined ? { encryptedValue } : {}),
+        ...(messageMetadata ? { metadata: messageMetadata } : {}),
+      });
+      reasoningIndex++;
+    }
+    flushOpaqueBefore(Number.POSITIVE_INFINITY);
+
+    // Some providers reject a replayed blank assistant turn, even when it carries metadata.
+    if (shellIsDropped) {
+      for (const entry of trailing) converted.push(toOpaqueRecord(entry));
+      continue;
+    }
+
+    // A subagent's tool calls live on nested assistant messages. Before
+    // subagent attribution they flattened to root and went out with this
+    // assistant record as their antecedent, so the resume payload restores
+    // exactly that shape: the calls join this record's toolCalls and their
+    // results follow as tool records — never a tool record without its call.
+    // The nested assistant content itself is backend-owned state and is not
+    // re-sent.
+    const nestedToolCalls: {
+      id: string;
+      call: AgUiToolCall;
+      part: ToolCallPart;
+    }[] = [];
+    for (const { part } of toolCalls) {
+      for (const { part: nestedToolCall } of walkToolCallTree(
+        part.messages ?? [],
+        { shouldDescend: isExportableNestedToolCall },
+      )) {
+        if (!isExportableNestedToolCall(nestedToolCall)) continue;
+        nestedToolCalls.push({
+          ...normalizeToolCall(nestedToolCall),
+          part: nestedToolCall,
+        });
+      }
+    }
+
+    converted.push({
+      id: recordId,
+      role: "assistant",
+      content,
+      ...(message.name ? { name: message.name } : {}),
+      ...(recordId === messageId
+        ? withAgUiMessageMetadata(message.metadata)
+        : {}),
+      ...(toolCalls.length + nestedToolCalls.length > 0
+        ? {
+            toolCalls: [...toolCalls, ...nestedToolCalls].map(
+              (entry) => entry.call,
+            ),
+          }
+        : {}),
+    });
+
+    for (const { id: toolCallId, part } of toolCalls) {
+      emitToolResult(toolCallId, part, converted);
+    }
+    for (const { id: toolCallId, part } of nestedToolCalls) {
+      // A result recorded while the call's approval gate is still open must
+      // not reach the backend as if the gate had been decided.
+      const gateOpen =
+        part.approval != null &&
+        part.approval.approved === undefined &&
+        part.approval.resolution === undefined;
+      if (gateOpen) continue;
+      emitToolResult(toolCallId, part, converted);
+    }
+    for (const entry of trailing) converted.push(toOpaqueRecord(entry));
+  }
+}
+
+function isToolContentParts(value: unknown): value is ContentPart[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (part) =>
+        isObject(part) &&
+        (part.type === "text"
+          ? typeof part.text === "string"
+          : mediaInputTypes.has(getString(part, "type") ?? "") &&
+            isObject(part.source) &&
+            typeof part.source.value === "string"),
+    )
+  );
+}
+
+function emitToolResult(
+  toolCallId: string,
+  part: ToolCallPart,
+  converted: AgUiMessage[],
+): void {
+  if (part.result === undefined) return;
+
+  let resultContent: string | ContentPart[];
+  if (part.modelContent?.some((content) => content.type === "file")) {
+    resultContent = part.modelContent.flatMap((content) => {
+      const contentPart = toContentPart(
+        content,
+        content.type === "file" ? content.mediaType : undefined,
+      );
+      return contentPart ? [contentPart] : [];
+    });
+  } else if (part.modelContent !== undefined) {
+    resultContent = extractText(part.modelContent);
+  } else if (isToolContentParts(part.result)) {
+    resultContent = part.result;
+  } else if (typeof part.result === "string") {
+    resultContent = part.result;
+  } else {
+    resultContent = JSON.stringify(part.result);
+  }
+  const messageMetadata = readAgUiPartMessageMetadata(part.providerMetadata);
+
+  converted.push({
+    id: part.unstable_toolMessageId ?? `${toolCallId}:tool`,
+    role: "tool",
+    content: resultContent,
+    toolCallId,
+    ...(part.isError
+      ? {
+          error: Array.isArray(resultContent)
+            ? toolContentText(resultContent)
+            : resultContent,
+        }
+      : {}),
+    ...(messageMetadata ? { metadata: messageMetadata } : {}),
+  });
+}
+
+function convertToolMessage(
+  message: NormalizedThreadMessageLike,
+  converted: AgUiMessage[],
+): void {
+  const content = isToolContentParts(message.content)
+    ? message.content
+    : extractText(message.content);
+  const toolCallId = message.toolCallId ?? generateId();
+
+  converted.push({
+    id: agUiWireMessageId(message),
+    role: "tool",
+    content,
+    toolCallId,
+    ...(typeof message.error === "string" ? { error: message.error } : {}),
+    ...withAgUiMessageMetadata(message.metadata),
+  });
+}
+
+export function toAgUiMessages(
+  messages: readonly ThreadMessageLike[],
+): AgUiMessage[] {
+  const converted: AgUiMessage[] = [];
+
+  for (const rawMessage of messages) {
+    const message: NormalizedThreadMessageLike = {
+      ...rawMessage,
+      id: rawMessage.id ?? generateId(),
+    };
+    const messageId = agUiWireMessageId(message);
+    const opaqueReasoning = readOpaqueReasoning(message.metadata);
+    const toOpaqueRecord = (entry: AgUiOpaqueReasoning): AgUiMessage => ({
+      id: entry.id,
+      role: "reasoning",
+      content: "",
+      encryptedValue: entry.encryptedValue,
+      ...(entry.metadata ? { metadata: entry.metadata } : {}),
+    });
+    // Inside an assistant message, an entry that knows its content slot goes
+    // back to the step it arrived in; anywhere else it leads the message.
+    const positioned =
+      message.role === "assistant"
+        ? opaqueReasoning.filter(
+            (entry): entry is AgUiOpaqueReasoning & { index: number } =>
+              entry.after !== true && entry.index !== undefined,
+          )
+        : [];
+    for (const entry of opaqueReasoning) {
+      if (entry.after !== true && !positioned.includes(entry as never))
+        converted.push(toOpaqueRecord(entry));
+    }
+    const flushTrailingOpaqueReasoning = () => {
+      for (const entry of opaqueReasoning) {
+        if (entry.after === true) converted.push(toOpaqueRecord(entry));
+      }
+    };
+
+    if (message.role === "assistant") {
+      convertAssistantMessage(message, converted, positioned, toOpaqueRecord);
+      flushTrailingOpaqueReasoning();
+      continue;
+    }
+
+    if (message.role === "tool") {
+      convertToolMessage(message, converted);
+      flushTrailingOpaqueReasoning();
+      continue;
+    }
+
+    if (message.role === "user") {
+      converted.push({
+        id: messageId,
+        role: "user",
+        content: buildUserContent(message),
+        ...(message.name ? { name: message.name } : {}),
+        ...withAgUiMessageMetadata(message.metadata),
+      });
+      flushTrailingOpaqueReasoning();
+      continue;
+    }
+
+    if (message.role === "system" || message.role === "developer") {
+      const custom = isObject(message.metadata)
+        ? message.metadata.custom
+        : undefined;
+      const namespaced = isObject(custom)
+        ? custom[AG_UI_METADATA_NAMESPACE]
+        : undefined;
+      const wireRole =
+        message.role === "system" &&
+        isObject(namespaced) &&
+        namespaced.role === "developer"
+          ? ("developer" as const)
+          : message.role;
+      converted.push({
+        id: messageId,
+        role: wireRole,
+        content: extractText(message.content),
+        ...(message.name ? { name: message.name } : {}),
+        ...withAgUiMessageMetadata(message.metadata),
+      });
+      flushTrailingOpaqueReasoning();
+      continue;
+    }
+
+    if (message.role === "reasoning") {
+      converted.push({
+        id: messageId,
+        role: "reasoning",
+        content: extractText(message.content),
+        ...withAgUiMessageMetadata(message.metadata),
+      });
+      flushTrailingOpaqueReasoning();
+      continue;
+    }
+
+    flushTrailingOpaqueReasoning();
+  }
+
+  return converted;
+}
+
+type AgUiTool = NonNullable<RunAgentParameters["tools"]>[number];
+
+export function toAgUiTools(
+  tools: Record<string, Tool> | undefined,
+): AgUiTool[] {
+  if (!tools) return [];
+
+  const toolsSchema = toToolsJSONSchema(tools);
+  return Object.entries(toolsSchema).map(([name, tool]) => ({
+    name,
+    description: tool.description ?? "",
+    parameters: tool.parameters,
+  }));
+}

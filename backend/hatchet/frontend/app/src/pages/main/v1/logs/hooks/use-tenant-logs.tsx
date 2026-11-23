@@ -1,0 +1,377 @@
+import { parseLogQuery } from '@/components/v1/cloud/logging/log-search/parser';
+import { LOG_LEVEL_TO_API } from '@/components/v1/cloud/logging/log-search/types';
+import { LogLine } from '@/components/v1/cloud/logging/log-search/use-logs';
+import { useRefetchInterval } from '@/contexts/refetch-interval-context';
+import useControlPlane from '@/hooks/use-control-plane';
+import { useRetentionGate } from '@/hooks/use-retention-gate';
+import { useTenantDetails } from '@/hooks/use-tenant';
+import {
+  V1LogLine,
+  V1LogLineOrderByDirection,
+  V1LogsPointMetric,
+  queries,
+} from '@/lib/api';
+import api, { SELF_HOSTED_LIST_TIMEOUT_MS } from '@/lib/api/api';
+import { useSearchParams } from '@/lib/router-helpers';
+import {
+  defaultTimeWindowForRetention,
+  getRetentionBoundary,
+  isBeforeRetention,
+  isTimeWindowOutsideRetention,
+  largestAllowedTimeWindow,
+  TIME_WINDOW_HOURS,
+  TIME_WINDOW_PRESETS,
+  type TimeWindowPreset,
+} from '@/lib/utils/retention';
+import { appRoutes } from '@/router';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { useParams } from '@tanstack/react-router';
+import { AxiosError } from 'axios';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { z } from 'zod';
+
+const LOGS_PER_PAGE = 100;
+const FILTER_KEY = 'tenant-logs-filters';
+
+export type TimeWindow = TimeWindowPreset;
+
+const filterSchema = z.object({
+  q: z.string().optional(),
+  tw: z.enum(TIME_WINDOW_PRESETS).default('1d'),
+  // custom time range set by chart drag; overrides tw when present
+  since: z.string().optional(),
+  until: z.string().optional(),
+});
+
+type FilterState = z.infer<typeof filterSchema>;
+
+function getSinceFromTimeWindow(tw: TimeWindow): string {
+  return new Date(
+    Date.now() - TIME_WINDOW_HOURS[tw] * 60 * 60 * 1000,
+  ).toISOString();
+}
+
+function logKey(log: LogLine): string {
+  return `${log.timestamp ?? ''}-${log.line ?? ''}`;
+}
+
+function mapToLogLines(rows: V1LogLine[]): LogLine[] {
+  return rows.map((row) => ({
+    timestamp: row.createdAt,
+    line: row.message,
+    level: row.level,
+    metadata: row.metadata as Record<string, unknown> | undefined,
+    attempt: row.attempt,
+    taskExternalId: row.taskExternalId,
+    taskDisplayName: row.taskDisplayName,
+  }));
+}
+
+export function useTenantLogs() {
+  const { tenant: tenantId } = useParams({ from: appRoutes.tenantRoute.to });
+  const { tenant } = useTenantDetails();
+  const retentionPeriod = tenant?.dataRetentionPeriod;
+  const retentionGate = useRetentionGate(retentionPeriod);
+  const { refetchInterval } = useRefetchInterval();
+  const { isSelfHosted } = useControlPlane();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [fetchTimedOut, setFetchTimedOut] = useState(false);
+  const workflowsQuery = useQuery({
+    ...queries.workflows.list(tenantId, { limit: 1000 }),
+    refetchInterval,
+  });
+
+  const workflowNameToId = useMemo(
+    () =>
+      (workflowsQuery.data?.rows ?? []).reduce(
+        (acc, wf) => {
+          acc[wf.name] = wf.metadata.id;
+          return acc;
+        },
+        {} as Record<string, string>,
+      ),
+    [workflowsQuery.data?.rows],
+  );
+
+  // URL-stored filter state
+  const filters = useMemo<FilterState>(() => {
+    const raw = searchParams.get(FILTER_KEY);
+    try {
+      return filterSchema.parse(raw ? JSON.parse(raw) : {});
+    } catch {
+      return filterSchema.parse({});
+    }
+  }, [searchParams]);
+
+  const setFilters = useCallback(
+    (update: Partial<FilterState>) => {
+      setSearchParams((prev) => ({
+        ...Object.fromEntries(prev.entries()),
+        [FILTER_KEY]: JSON.stringify({ ...filters, ...update }),
+      }));
+    },
+    [filters, setSearchParams],
+  );
+
+  const parsedQuery = useMemo(
+    () => parseLogQuery(filters.q ?? ''),
+    [filters.q],
+  );
+
+  const workflowIds = useMemo(() => {
+    if (!parsedQuery.workflow) {
+      return undefined;
+    }
+    const id = workflowNameToId[parsedQuery.workflow];
+    return id ? [id] : undefined;
+  }, [parsedQuery.workflow, workflowNameToId]);
+
+  const since = useMemo(
+    () => filters.since ?? getSinceFromTimeWindow(filters.tw),
+    [filters.since, filters.tw],
+  );
+
+  const logsQuery = useInfiniteQuery({
+    queryKey: [
+      'tenant-logs',
+      tenantId,
+      since,
+      filters.until,
+      parsedQuery.level,
+      parsedQuery.search,
+      workflowIds,
+    ],
+    queryFn: async ({
+      pageParam,
+      signal,
+    }: {
+      pageParam: string | undefined;
+      signal: AbortSignal;
+    }) => {
+      const timeout = isSelfHosted ? SELF_HOSTED_LIST_TIMEOUT_MS : undefined;
+
+      try {
+        const response = await api.v1TenantLogLineList(
+          tenantId,
+          {
+            limit: LOGS_PER_PAGE,
+            since,
+            ...(pageParam
+              ? { until: pageParam }
+              : filters.until
+                ? { until: filters.until }
+                : {}),
+            ...(parsedQuery.level && {
+              levels: [LOG_LEVEL_TO_API[parsedQuery.level]],
+            }),
+            ...(parsedQuery.search && { search: parsedQuery.search }),
+            ...(workflowIds && { workflow_ids: workflowIds }),
+            order_by_direction: V1LogLineOrderByDirection.DESC,
+          },
+          { timeout, signal },
+        );
+        setFetchTimedOut(false);
+        return response.data;
+      } catch (e) {
+        if (e instanceof AxiosError && e.code === 'ECONNABORTED') {
+          setFetchTimedOut(true);
+          return { rows: [] };
+        }
+
+        setFetchTimedOut(false);
+        throw e;
+      }
+    },
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => {
+      const rows = lastPage.rows ?? [];
+      if (rows.length < LOGS_PER_PAGE) {
+        return undefined;
+      }
+      return rows[rows.length - 1].createdAt;
+    },
+    refetchInterval,
+    enabled: !!tenantId,
+  });
+
+  const logs = useMemo<LogLine[]>(() => {
+    const seen = new Set<string>();
+    const result: LogLine[] = [];
+    for (const page of logsQuery.data?.pages ?? []) {
+      for (const log of mapToLogLines(page.rows ?? [])) {
+        const k = logKey(log);
+        if (!seen.has(k)) {
+          seen.add(k);
+          result.push(log);
+        }
+      }
+    }
+    return result;
+  }, [logsQuery.data]);
+
+  const fetchOlderLogs = useCallback(() => {
+    if (logsQuery.hasNextPage && !logsQuery.isFetchingNextPage) {
+      logsQuery.fetchNextPage();
+    }
+  }, [logsQuery]);
+
+  const metricsQuery = useQuery({
+    queryKey: [
+      'tenant-log-metrics',
+      tenantId,
+      since,
+      filters.until,
+      parsedQuery.level,
+      parsedQuery.search,
+      workflowIds,
+    ],
+    queryFn: async ({ signal }) => {
+      const response = await api.v1TenantLogLineGetPointMetrics(
+        tenantId,
+        {
+          since,
+          ...(filters.until && { until: filters.until }),
+          ...(parsedQuery.level && {
+            levels: [LOG_LEVEL_TO_API[parsedQuery.level]],
+          }),
+          ...(parsedQuery.search && { search: parsedQuery.search }),
+          ...(workflowIds && { workflow_ids: workflowIds }),
+        },
+        { signal },
+      );
+      return response.data;
+    },
+    refetchInterval,
+    enabled: !!tenantId,
+  });
+
+  const setCustomTimeRange = useCallback(
+    (newSince: string, newUntil: string) => {
+      retentionGate.trySince(newSince, () => {
+        setFilters({ since: newSince, until: newUntil });
+      });
+    },
+    [setFilters, retentionGate],
+  );
+
+  const setTimeWindow = useCallback(
+    (tw: TimeWindow) => {
+      retentionGate.tryTimeWindow(tw, () => {
+        setSearchParams((prev) => ({
+          ...Object.fromEntries(prev.entries()),
+          [FILTER_KEY]: JSON.stringify({
+            ...filters,
+            tw,
+            since: undefined,
+            until: undefined,
+          }),
+        }));
+      });
+    },
+    [filters, setSearchParams, retentionGate],
+  );
+
+  useEffect(() => {
+    if (!retentionPeriod) {
+      return;
+    }
+    if (filters.since && isBeforeRetention(filters.since, retentionPeriod)) {
+      const boundary = getRetentionBoundary(retentionPeriod);
+      if (boundary) {
+        setFilters({ since: boundary.toISOString() });
+      }
+      return;
+    }
+    if (
+      !filters.since &&
+      isTimeWindowOutsideRetention(filters.tw, retentionPeriod)
+    ) {
+      const next = largestAllowedTimeWindow(retentionPeriod);
+      setSearchParams((prev) => ({
+        ...Object.fromEntries(prev.entries()),
+        [FILTER_KEY]: JSON.stringify({
+          ...filters,
+          tw: next,
+          since: undefined,
+          until: undefined,
+        }),
+      }));
+    }
+  }, [retentionPeriod, filters, setFilters, setSearchParams]);
+
+  const clearTimeRange = useCallback(() => {
+    setSearchParams((prev) => ({
+      ...Object.fromEntries(prev.entries()),
+      [FILTER_KEY]: JSON.stringify({
+        ...filters,
+        since: undefined,
+        until: undefined,
+      }),
+    }));
+  }, [filters, setSearchParams]);
+
+  const setCustomSince = useCallback(
+    (newSince: string | undefined) => {
+      retentionGate.trySince(newSince, () => {
+        setFilters({ since: newSince });
+      });
+    },
+    [setFilters, retentionGate],
+  );
+
+  const setCustomUntil = useCallback(
+    (newUntil: string | undefined) => setFilters({ until: newUntil }),
+    [setFilters],
+  );
+
+  const isCustomTimeRange = !!filters.since;
+
+  const hasActiveFilters =
+    (filters.q ?? '').trim() !== '' || isCustomTimeRange || filters.tw !== '1d';
+  const isDefaultOneDayWindow =
+    !isCustomTimeRange &&
+    filters.tw === defaultTimeWindowForRetention(retentionPeriod);
+
+  const resetFilters = useCallback(() => {
+    setSearchParams((prev) => {
+      const next = Object.fromEntries(prev.entries());
+      delete next[FILTER_KEY];
+      return next;
+    });
+  }, [setSearchParams]);
+
+  return {
+    logs,
+    fetchTimedOut,
+    isLoading: logsQuery.isLoading,
+    isRefetching: logsQuery.isRefetching,
+    isFetchingMore: logsQuery.isFetchingNextPage,
+    refetch: logsQuery.refetch,
+    fetchOlderLogs,
+    queryString: filters.q ?? '',
+    setQueryString: (q: string) => setFilters({ q }),
+    parsedQuery,
+    // chart
+    chartSince: since,
+    chartUntil: filters.until,
+    chartMetrics: (metricsQuery.data?.results ?? []) as V1LogsPointMetric[],
+    setCustomTimeRange,
+    // time window selector
+    timeWindow: filters.tw,
+    isCustomTimeRange,
+    customSince: filters.since,
+    customUntil: filters.until,
+    setTimeWindow,
+    clearTimeRange,
+    setCustomSince,
+    setCustomUntil,
+    workflowNames: Object.keys(workflowNameToId),
+    hasActiveFilters,
+    isDefaultOneDayWindow,
+    resetFilters,
+    searchAllRetainedHistory: () =>
+      setTimeWindow(largestAllowedTimeWindow(retentionPeriod)),
+    retentionPeriod,
+    retentionGate,
+  };
+}

@@ -1,0 +1,57 @@
+from uuid import UUID
+
+from polar.kit.email import normalize_email
+from polar.models import Customer, Organization, Product, TrialRedemption
+from polar.postgres import AsyncSession
+from polar.trial_redemption.repository import TrialRedemptionRepository
+
+
+class TrialRedemptionService:
+    async def check_trial_already_redeemed(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+        *,
+        customer_email: str | None,
+        customer_id: UUID | None = None,
+        product: Product | None = None,
+        payment_method_fingerprint: str | None = None,
+    ) -> bool:
+        if customer_email is None and customer_id is None:
+            return False
+
+        repository = TrialRedemptionRepository.from_session(session)
+        trial_redemption = await repository.get_first_by_organization_and_hints(
+            organization.id,
+            customer_email=normalize_email(customer_email)
+            if customer_email is not None
+            else None,
+            customer_id=customer_id,
+            product=product.id if product else None,
+            payment_method_fingerprint=payment_method_fingerprint,
+        )
+        return trial_redemption is not None
+
+    async def create_trial_redemption(
+        self,
+        session: AsyncSession,
+        *,
+        customer: Customer,
+        product: Product | None = None,
+        payment_method_fingerprint: str | None = None,
+    ) -> TrialRedemption | None:
+        if customer.email is None:
+            return None
+
+        repository = TrialRedemptionRepository.from_session(session)
+        return await repository.create(
+            TrialRedemption(
+                customer_email=normalize_email(customer.email),
+                customer=customer,
+                product=product,
+                payment_method_fingerprint=payment_method_fingerprint,
+            )
+        )
+
+
+trial_redemption = TrialRedemptionService()

@@ -1,0 +1,295 @@
+/**
+ * `createPiHttpClient` — the browser-side `PiClient`, backed by a small HTTP/SSE
+ * route layer over a `createPiNodeClient` supervisor running on the server.
+ *
+ * The counterpart to the in-process `createPiNodeClient`: same `PiClient`
+ * contract, different wire. Reads/writes go over `fetch`; the live event
+ * stream goes over SSE via `openPiEventStream`.
+ *
+ * Browser-safe: imports no `@earendil-works/pi-*`. The route layer is the only
+ * thing that touches the Pi SDK, and it lives behind `./node` on the server.
+ *
+ * Wire contract (relative to `baseUrl`, default `/api/pi`):
+ *   GET    /threads                 → PiThreadMetadata[]
+ *   POST   /threads                 → PiThreadSnapshot      (body: create input)
+ *   GET    /threads/:id             → PiThreadSnapshot
+ *   PATCH  /threads/:id             → 204                   (body: { title })
+ *   POST   /threads/:id/messages    → 204                   (body: { input })
+ *   POST   /threads/:id/cancel      → 204
+ *   POST   /threads/:id/queue/clear → { steering, followUp } (cleared text)
+ *   GET    /models                  → PiModelInfo[]
+ *   POST   /threads/:id/model       → 204                   (body: { provider, modelId })
+ *   POST   /threads/:id/thinking    → 204                   (body: { level })
+ *   POST   /threads/:id/archive     → 204
+ *   POST   /threads/:id/unarchive   → 204
+ *   DELETE /threads/:id             → 204 (also when the thread is already gone)
+ *   POST   /threads/:id/host-ui     → 204                   (body: { response })
+ *   GET    /threads/:id/events      → SSE of PiClientEvent (?snapshot=false skips initial snapshot)
+ */
+import { isRecord } from "@assistant-ui/core/internal";
+import { createSharedStreamCache } from "./sharedStreamCache";
+import { isThreadMetadata, isThreadSnapshot } from "./validation";
+import type {
+  PiClient,
+  PiHostUiResponse,
+  PiModelInfo,
+  PiSendMessageInput,
+  PiThinkingLevel,
+  PiThreadMetadata,
+  PiThreadSnapshot,
+} from "../types";
+
+export interface PiHttpClientOptions {
+  /** Base path/URL of the route layer. Default: `/api/pi`. */
+  baseUrl?: string;
+  /** Injected `fetch` (defaults to the global). */
+  fetchImpl?: typeof fetch;
+  /** Extra headers applied to every request (e.g. auth). */
+  headers?: Record<string, string>;
+  /** SSE stream errors. Reconnects follow, except after a decoder limit error, which ends the stream and sends its listeners an error event. */
+  onStreamError?: (error: unknown) => void;
+  /** Reconnect backoff for the event stream; injectable for tests. */
+  reconnectDelay?: () => Promise<void>;
+  /** Delay before closing an idle shared event stream. Defaults to 30s. */
+  streamCloseDelayMs?: number;
+  /** Maximum UTF-16 code units accepted in one SSE line. Defaults to 16 MiB. */
+  maxStreamLineLength?: number | undefined;
+  /** Maximum UTF-16 code units retained across one SSE event. Defaults to 16 MiB. */
+  maxStreamEventLength?: number | undefined;
+}
+
+const trimTrailingSlash = (value: string): string =>
+  value.endsWith("/") ? value.slice(0, -1) : value;
+
+/** Throw a descriptive error for any non-2xx response, including the body. */
+const assertOk = async (response: Response): Promise<void> => {
+  if (response.ok) return;
+  const body = await response.text().catch(() => "");
+  throw new Error(
+    `Pi HTTP request failed: ${response.status} ${response.statusText}${
+      body ? ` — ${body}` : ""
+    }`,
+  );
+};
+
+const invalidResponse = (
+  operation: string,
+  expectation: string,
+  cause?: unknown,
+): Error =>
+  new Error(
+    `Invalid Pi HTTP response while ${operation}: ${expectation}`,
+    cause === undefined ? undefined : { cause },
+  );
+
+const readJson = async (
+  response: Response,
+  operation: string,
+): Promise<unknown> => {
+  await assertOk(response);
+  try {
+    return await response.json();
+  } catch (error) {
+    throw invalidResponse(operation, "expected valid JSON.", error);
+  }
+};
+
+const parseThreadListResponse = (value: unknown): PiThreadMetadata[] => {
+  if (!Array.isArray(value)) {
+    throw invalidResponse("listing threads", "expected an array of threads.");
+  }
+
+  for (const [index, thread] of value.entries()) {
+    if (!isThreadMetadata(thread)) {
+      throw invalidResponse(
+        "listing threads",
+        `thread at index ${index} must have a non-empty string "id", a string "status", and correctly typed known fields.`,
+      );
+    }
+  }
+  return value;
+};
+
+const parseThreadSnapshotResponse = (
+  value: unknown,
+  operation: "creating a thread" | "fetching a thread",
+): PiThreadSnapshot => {
+  if (!isThreadSnapshot(value)) {
+    throw invalidResponse(
+      operation,
+      'expected a thread snapshot with valid "metadata", a "messages" array, and valid host UI requests when present.',
+    );
+  }
+  return value as PiThreadSnapshot;
+};
+
+const parseClearQueueResponse = (
+  value: unknown,
+): { steering: string[]; followUp: string[] } => {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.steering) ||
+    !value.steering.every((item) => typeof item === "string") ||
+    !Array.isArray(value.followUp) ||
+    !value.followUp.every((item) => typeof item === "string")
+  ) {
+    throw invalidResponse(
+      "clearing a thread queue",
+      'expected an object with string arrays "steering" and "followUp".',
+    );
+  }
+  return value as { steering: string[]; followUp: string[] };
+};
+
+const isModelInfo = (value: unknown): value is PiModelInfo =>
+  isRecord(value) &&
+  typeof value.provider === "string" &&
+  value.provider.length > 0 &&
+  typeof value.modelId === "string" &&
+  value.modelId.length > 0;
+
+const parseModelListResponse = (value: unknown): PiModelInfo[] => {
+  if (!Array.isArray(value)) {
+    throw invalidResponse("listing models", "expected an array of models.");
+  }
+
+  for (const [index, model] of value.entries()) {
+    if (!isModelInfo(model)) {
+      throw invalidResponse(
+        "listing models",
+        `model at index ${index} must have non-empty string "provider" and "modelId" fields.`,
+      );
+    }
+  }
+  return value;
+};
+
+export const createPiHttpClient = (
+  options: PiHttpClientOptions = {},
+): PiClient => {
+  const { baseUrl = "/api/pi", fetchImpl = fetch, headers } = options;
+
+  const base = trimTrailingSlash(baseUrl);
+  const threadUrl = (threadId: string) =>
+    `${base}/threads/${encodeURIComponent(threadId)}`;
+
+  const jsonHeaders = { "content-type": "application/json", ...headers };
+  const subscribe = createSharedStreamCache({
+    ...options,
+    base,
+    threadUrl,
+    fetchImpl,
+  });
+
+  const send = (url: string, method: string, body?: unknown) =>
+    fetchImpl(url, {
+      method,
+      ...(body !== undefined
+        ? { headers: jsonHeaders, body: JSON.stringify(body) }
+        : headers
+          ? { headers }
+          : {}),
+    });
+
+  return {
+    listThreads: async (input) => {
+      const params = new URLSearchParams();
+      if (input?.workspacePath)
+        params.set("workspacePath", input.workspacePath);
+      if (input?.includeArchived) params.set("includeArchived", "true");
+      const query = params.toString();
+      return parseThreadListResponse(
+        await readJson(
+          await send(`${base}/threads${query ? `?${query}` : ""}`, "GET"),
+          "listing threads",
+        ),
+      );
+    },
+
+    createThread: async (input) =>
+      parseThreadSnapshotResponse(
+        await readJson(
+          await send(`${base}/threads`, "POST", input ?? {}),
+          "creating a thread",
+        ),
+        "creating a thread",
+      ),
+
+    getThread: async (threadId) =>
+      parseThreadSnapshotResponse(
+        await readJson(
+          await send(threadUrl(threadId), "GET"),
+          "fetching a thread",
+        ),
+        "fetching a thread",
+      ),
+
+    sendMessage: async (threadId, input: PiSendMessageInput) => {
+      await assertOk(
+        await send(`${threadUrl(threadId)}/messages`, "POST", { input }),
+      );
+    },
+
+    cancelRun: async (threadId) => {
+      await assertOk(await send(`${threadUrl(threadId)}/cancel`, "POST"));
+    },
+
+    clearQueue: async (threadId) =>
+      parseClearQueueResponse(
+        await readJson(
+          await send(`${threadUrl(threadId)}/queue/clear`, "POST"),
+          "clearing a thread queue",
+        ),
+      ),
+
+    getAvailableModels: async (input) => {
+      const params = new URLSearchParams();
+      if (input?.workspacePath)
+        params.set("workspacePath", input.workspacePath);
+      if (input?.threadId) params.set("threadId", input.threadId);
+      const query = params.toString();
+      return parseModelListResponse(
+        await readJson(
+          await send(`${base}/models${query ? `?${query}` : ""}`, "GET"),
+          "listing models",
+        ),
+      );
+    },
+
+    setModel: async (threadId, input) => {
+      await assertOk(await send(`${threadUrl(threadId)}/model`, "POST", input));
+    },
+
+    setThinkingLevel: async (threadId, level: PiThinkingLevel) => {
+      await assertOk(
+        await send(`${threadUrl(threadId)}/thinking`, "POST", { level }),
+      );
+    },
+
+    renameThread: async (threadId, title) => {
+      await assertOk(await send(threadUrl(threadId), "PATCH", { title }));
+    },
+
+    archiveThread: async (threadId) => {
+      await assertOk(await send(`${threadUrl(threadId)}/archive`, "POST"));
+    },
+
+    unarchiveThread: async (threadId) => {
+      await assertOk(await send(`${threadUrl(threadId)}/unarchive`, "POST"));
+    },
+
+    deleteThread: async (threadId) => {
+      const response = await send(threadUrl(threadId), "DELETE");
+      if (response.status === 404) return;
+      await assertOk(response);
+    },
+
+    respondToHostUiRequest: async (threadId, response: PiHostUiResponse) => {
+      await assertOk(
+        await send(`${threadUrl(threadId)}/host-ui`, "POST", { response }),
+      );
+    },
+
+    subscribe,
+  };
+};

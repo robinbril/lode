@@ -1,0 +1,33 @@
+// this file is @generated
+use serde::{Deserialize, Serialize};
+
+use super::{connector_in::ConnectorIn, event_type_in::EventTypeIn};
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct EnvironmentIn {
+    #[serde(rename = "eventTypes")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_types: Option<Vec<EventTypeIn>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectors: Option<Vec<ConnectorIn>>,
+}
+
+impl EnvironmentIn {
+    pub fn new() -> Self {
+        Self {
+            event_types: None,
+            settings: None,
+            connectors: None,
+        }
+    }
+}
+
+impl Default for EnvironmentIn {
+    fn default() -> Self {
+        Self::new()
+    }
+}

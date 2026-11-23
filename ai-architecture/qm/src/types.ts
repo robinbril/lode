@@ -1,0 +1,535 @@
+import type { ClientSurface } from "../plugins/chassis/src/client-surface.ts";
+import type { ResolvedSecurityPolicy } from "./security/security-posture.ts";
+import type { SharingPosture } from "./resolution/sharing-posture.ts";
+import type { SurfaceAccount, TurnSurfaceOrigin } from "./surfaces/contract.ts";
+import type { SessionOrigin } from "./sessions/session-store.ts";
+import type { ProjectIcon } from "./projects/project-store.ts";
+
+export type PrincipalType = "internal" | "guest";
+
+export const PRINCIPAL_TYPES = ["internal", "guest"] as const satisfies readonly PrincipalType[];
+
+export function isPrincipalType(value: unknown): value is PrincipalType {
+  return typeof value === "string" && (PRINCIPAL_TYPES as readonly string[]).includes(value);
+}
+
+export interface Principal {
+  id: string;
+  type: PrincipalType;
+  teamIds?: string[];
+  displayName?: string;
+}
+
+export const SCOPE_KINDS = ["personal", "channel", "team", "org", "group", "persona"] as const;
+export type ScopeKind = (typeof SCOPE_KINDS)[number];
+
+export type ScopeId = string;
+
+function isScopeKind(s: string): s is ScopeKind {
+  return (SCOPE_KINDS as readonly string[]).includes(s);
+}
+
+export function scopeId(kind: ScopeKind, ref: string): ScopeId {
+  return `${kind}:${ref}`;
+}
+
+export interface WornPersona {
+  id: string;
+  name: string;
+  icon?: ProjectIcon;
+}
+
+export function personalScope(principalId: string): ScopeId {
+  return scopeId("personal", principalId);
+}
+
+export function scopeActor(scope: ScopeId): string {
+  return `system:${scope}`;
+}
+
+export function actsAsScope(principalId: string, scope: ScopeId): boolean {
+  return principalId === scopeActor(scope);
+}
+
+export function isSystemActor(actorId: string | undefined): boolean {
+  return !!actorId?.startsWith("system:");
+}
+
+export function parseScopeId(id: ScopeId): { kind: ScopeKind | null; ref: string } {
+  const sep = id.indexOf(":");
+  if (sep < 0) return { kind: null, ref: "" };
+  const raw = id.slice(0, sep);
+  return { kind: isScopeKind(raw) ? raw : null, ref: id.slice(sep + 1) };
+}
+
+export function isManageableCreationScope(id: ScopeId | undefined): boolean {
+  if (!id) return false;
+  const { kind } = parseScopeId(id);
+  return kind === "channel" || kind === "team";
+}
+
+export function isSharedScope(id: ScopeId | undefined): boolean {
+  if (!id) return false;
+  const { kind } = parseScopeId(id);
+  return kind === "channel" || kind === "group";
+}
+
+export type ConversationKind = "dm" | "channel" | "group";
+
+export interface Conversation {
+  teamIds?: string[];
+  kind: ConversationKind;
+  threadRef: string;
+  channelRef?: string;
+  channelName?: string;
+  audience: Principal[];
+  isPrivate?: boolean;
+  isMpim?: boolean;
+  publishMembers?: Principal[];
+}
+
+export type SessionType = "dm" | "channel" | "group";
+
+export interface SurfaceBriefing {
+  name: string;
+  state?: string;
+  instructions?: string;
+}
+
+export type ChildIsolationMode = "shared" | "worktree" | "sandbox";
+
+export interface ChildWorkdir {
+  workdir: string;
+  branch: string;
+  base?: string;
+}
+
+export interface ChildIsolation {
+  mode: ChildIsolationMode;
+  sandboxId?: string;
+  workdir?: string;
+  branch?: string;
+  base?: string;
+  baseChain?: ChildWorkdir[];
+}
+
+export interface SpawnMeta {
+  surfaceOrigin?: TurnSurfaceOrigin;
+  surfaceTools?: boolean;
+  liveReplies?: boolean;
+  deliveryCandidates?: TurnRequest["deliveryCandidates"];
+  origin?: TurnOrigin;
+  openFingerprint?: string;
+  scopeVersion?: string;
+  sessionParticipantIds?: readonly string[];
+  surface: string;
+  conversation: Conversation;
+  actor: Principal;
+  deliveryTarget?: string;
+  timezone?: string;
+  readOnly?: boolean;
+  memoryNotebookOnly?: boolean;
+  botActor?: boolean;
+  model?: string;
+  thinkingLevel?: string;
+  fastMode?: boolean;
+  isolation?: ChildIsolation;
+  persistent?: boolean;
+  retired?: boolean;
+}
+
+export interface Session {
+  clientTools?: ClientToolDeclaration[];
+  id: string;
+  type: SessionType;
+  scopeId: ScopeId;
+  threadRef: string;
+  surface?: string;
+  createdAt: number;
+  channelName?: string;
+  title?: string | null;
+  archived?: boolean;
+  pinned?: boolean;
+  color?: string;
+  unread?: boolean;
+  forkedFrom?: { sessionId: string; title?: string | null };
+  forkBoundarySeq?: number;
+  sideChat?: { entrySeq: number; quote: string; occurrence: number; expanded: boolean };
+  parentSessionId?: string;
+  origin?: SessionOrigin;
+  spawnMeta?: SpawnMeta;
+  botWork?: true;
+  surfaceBinding?: TurnSurfaceOrigin;
+  runtime?: TurnRuntime;
+  personaId?: string;
+  lastActivityAt?: number;
+  hasEntries?: boolean;
+  working?: boolean;
+  awaitingInput?: boolean;
+  lastTurnFailed?: boolean;
+  canContinue?: boolean;
+  backgroundJobs?: number;
+  watches?: number;
+  crons?: number;
+  goal?: { objective: string; activeMs: number; runningSince?: number; floor?: Record<string, number> };
+  subagents?: { running: number; waiting: number };
+  workingSince?: number;
+  purpose?: string;
+}
+
+export interface Resolution {
+  writableScopeId: ScopeId;
+  readOnlyScopeIds: ScopeId[];
+  systemPrompt: string;
+  egress: EgressPolicy;
+  commandPolicy: CommandPolicy;
+  securityPolicy: ResolvedSecurityPolicy;
+  sharingPosture?: SharingPosture;
+  approvalGrantModes: ApprovalGrantModes;
+  orgScopeId: ScopeId;
+  grantedHandles: GrantedHandle[];
+  guidance?: string;
+  soulScopeId?: ScopeId;
+}
+
+export type Permission = "read" | "write";
+
+export interface Grant {
+  ownerScopeId: ScopeId;
+  ref: string;
+  granteeScopeId: ScopeId;
+  permission: Permission;
+  grantedBy: string;
+}
+
+export interface GrantedHandle {
+  carried?: true;
+  handlePath: string;
+  ownerScopeId: ScopeId;
+  fileId: string;
+  permission: Permission;
+}
+
+export interface Destination {
+  account?: SurfaceAccount;
+  keychainAskId?: string;
+  deploymentAccess?: { deploymentId: string; requesterId: string };
+  commandApprovalId?: string;
+  type: string;
+  target: string;
+  audienceScopeId?: ScopeId;
+  onBehalfOf?: string;
+  relaySender?: string;
+  persona?: WornPersona;
+  project?: { id: string; name: string };
+  threadTs?: string;
+  editRef?: string;
+  unfurlLinks?: boolean;
+  react?: { messageTs: string; emoji: string };
+  delete?: { messageTs: string };
+  edit?: { messageTs: string };
+  pin?: { messageTs: string; remove?: boolean };
+  identity?: string;
+  debugFooter?: string;
+  editNote?: string;
+  webTranscript?:
+    | { kind: "reply" }
+    | { kind: "slack_reply"; sessionId: string; ts: string; name: string; speakerId: string }
+    | { kind: "turn_failure"; notBefore: number; runId?: string };
+}
+
+export interface CandidateDestination extends Destination {
+  key: string;
+  label: string;
+}
+
+export type BackgroundWakeTrigger = "cron" | "webhook" | "monitor" | (string & {});
+
+export interface DeliveryProvenance {
+  sourceTitle?: string;
+  sourceId?: string;
+  trigger: BackgroundWakeTrigger;
+  surface: string;
+  fireKey: string;
+  sourceScopeId: ScopeId;
+  sourceThreadRef: string;
+  sourceSessionId?: string;
+  sourceUserSeq?: number;
+  sourceAssistantEntrySeq?: number;
+}
+
+export interface Delivery {
+  id: string;
+  destination: Destination;
+  text: string;
+  attachments?: OutgoingAttachment[];
+  provenance?: DeliveryProvenance;
+  idempotencyKey: string;
+  createdAt: number;
+  deliveredAt: number | null;
+  expiredAt?: number;
+  failedReason?: string;
+  shadow?: boolean;
+  recipientThreadRef?: string;
+  deliverLatencyMs?: number;
+  slackApiMs?: number;
+  messageTs?: string;
+}
+
+export interface EgressPolicy {
+  allowedHosts: string[];
+  denyPrivateNetworks?: boolean;
+  privateNetworkAllowedHosts?: string[];
+  deniedHosts?: string[];
+}
+
+export type CommandDecision = "allow" | "deny" | "require_approval";
+
+export interface CommandRule {
+  pattern: string;
+  decision: CommandDecision;
+  reason?: string;
+}
+
+type CommandPolicyMode = "denylist" | "allowlist";
+
+export interface CommandPolicy {
+  mode: CommandPolicyMode;
+  rules: CommandRule[];
+}
+
+interface BlobAttachment {
+  name: string;
+  mimetype: string;
+  sizeBytes: number;
+  blobId: string;
+}
+
+export type IncomingAttachment = BlobAttachment & {
+  sourceId?: string;
+  author?: string;
+};
+
+export type OutgoingAttachment = BlobAttachment & {
+  artifactId?: string;
+  artifactViewerId?: string;
+};
+
+export interface AttachmentMeta {
+  name: string;
+  mimetype: string;
+  sizeBytes: number;
+  direction: "in" | "out";
+  author?: string;
+  artifactId?: string;
+  sourceId?: string;
+}
+
+export interface GatewayContext {
+  location?: string;
+  details?: Record<string, string>;
+  hostIds?: Record<string, string>;
+  instructions?: string;
+  reactionGuidance?: string;
+  botHandle?: string;
+}
+
+export interface ConversationTurn {
+  role: "user" | "bot" | "assistant";
+  name?: string;
+  text: string;
+}
+
+export interface OverheardMessage {
+  ts: string;
+  role: "user" | "bot" | "self";
+  name?: string;
+  speakerId?: string;
+  text: string;
+  files?: string[];
+  mentions?: Record<string, string>;
+}
+
+export type TurnOrigin =
+  | { kind: "human"; messageTs?: string; entryTs?: string }
+  | { kind: "ambient"; entryTs?: string; live?: boolean }
+  | {
+      kind: "automation";
+      screenData?: string;
+      destination?: Destination;
+      useOwnerKeychain?: boolean;
+      ownerFire?: true;
+    }
+  | { kind: "direct" };
+
+export interface ClientToolDeclaration {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  timeoutMs?: number;
+}
+
+export interface ClientToolResult {
+  images?: Array<{ data: string; mimeType: "image/png" | "image/jpeg" }>;
+  content: string;
+  structured?: unknown;
+  isError?: boolean;
+}
+
+export interface TurnRequest {
+  desktopClientId?: string;
+  clientSurface?: ClientSurface;
+  midTurn?: "steer" | "queue";
+  surfaceOrigin?: TurnSurfaceOrigin;
+  sessionSenderId?: string;
+  delegatingRunId?: string;
+  privateSessionMessage?: true;
+  sessionMessageDepth?: number;
+  surface: string;
+  scopeVersion?: string;
+  deliveryTarget?: string;
+  deliveryCandidates?: { target: string; label: string }[];
+  actor: ActorAssertion;
+  conversation: {
+    kind: ConversationKind;
+    threadRef: string;
+    channelRef?: string;
+    channelName?: string;
+    audience?: ActorAssertion[];
+    isPrivate?: boolean;
+    isMpim?: boolean;
+    publishMembers?: ActorAssertion[];
+  };
+  text: string;
+  origin?: TurnOrigin;
+  gatewayContext?: GatewayContext;
+  cronScript?: import("./triggers/types.ts").CronScript;
+  infrequentCron?: boolean;
+  personaId?: string;
+  botActor?: boolean;
+  conversationHeader?: string;
+  priorTurns?: ConversationTurn[];
+  overheard?: OverheardMessage[];
+  detectContext?: string;
+  detectOpener?: string;
+  attachments?: IncomingAttachment[];
+  inboundNotes?: string[];
+  model?: string;
+  thinkingLevel?: string;
+  fastMode?: boolean;
+  readOnly?: boolean;
+  skipMemory?: boolean;
+  memoryNotebookOnly?: boolean;
+  surfaceTools?: boolean;
+  addressed?: boolean;
+  liveReplies?: boolean;
+  envelopeWrapped?: boolean;
+  displayText?: string;
+  turnWallClockMs?: number;
+  timezone?: string;
+  approval?: { requestId: string; approved: boolean; scope?: ApprovalScope };
+  proactiveOpener?: boolean;
+  spawned?: boolean;
+  idempotencyKey?: string;
+  redeliveryKey?: string;
+  async?: boolean;
+  clientTools?: ClientToolDeclaration[];
+  surfaceBriefing?: SurfaceBriefing;
+}
+
+export interface ActorAssertion {
+  externalId: string;
+  isExternalGuest?: boolean;
+  isBot?: boolean;
+  teamIds?: string[];
+  displayName?: string;
+}
+
+export interface PendingApproval {
+  requestId: string;
+  command: string;
+  reason: string;
+  matched?: string;
+  purpose?: string;
+  summary?: string;
+  summaryDetail?: string;
+  approvalKey?: string;
+  grantModes?: ApprovalGrantModes;
+  blocksInput?: boolean;
+  kind?: "approval" | "input";
+  executesOnApprove?: boolean;
+}
+
+export interface ApprovedToolCallSpec {
+  tool: string;
+  input: Record<string, unknown>;
+}
+
+export const APPROVAL_LIFETIME_MS = 60 * 60_000;
+
+export interface PendingApprovalRecord {
+  screenedOutput?: { tool: string; text: string; sourceScopeId?: ScopeId };
+  sessionId: string;
+  command: string;
+  createdAt?: number;
+  reason?: string;
+  matched?: string;
+  purpose?: string;
+  summary?: string;
+  summaryDetail?: string;
+  approvalKey?: string;
+  grantModes?: ApprovalGrantModes;
+  request?: TurnRequest;
+  homeChannel?: string;
+  blocksInput?: boolean;
+  kind?: "approval" | "input";
+  call?: ApprovedToolCallSpec;
+}
+
+type ApprovalScope = "once" | "session" | "always";
+
+export interface ApprovalGrantModes {
+  session: boolean;
+  always: boolean;
+}
+
+export interface CommandApprovalGrant {
+  actorId: string;
+  command: string;
+  scope: Exclude<ApprovalScope, "once">;
+  createdAt: number;
+  sessionId?: string;
+  approvalKey?: string;
+}
+
+export interface TurnRuntime {
+  modelId: string;
+  label?: string;
+  change?: { rule: string } | { agent: "task" | "scope" };
+}
+
+export type StopScope = "run" | "session" | "tree" | "ancestor";
+
+export interface TurnResult {
+  status: "ok" | "refused" | "failed" | "pending_approval" | "queued" | "silent" | "react";
+  sessionId?: string;
+  reply?: string;
+  reactions?: string[];
+  reason?: string;
+  refusalKind?: "security_quarantine" | "model_budget" | "approval_denied" | "internal_only" | "linked_bot";
+  errorCode?: string;
+  adminUrl?: string;
+  runId?: string;
+  steered?: true;
+  steerTs?: string;
+  stopped?: boolean;
+  stopScope?: StopScope;
+  pendingApprovals?: PendingApproval[];
+  attachments?: OutgoingAttachment[];
+  sourceUserSeq?: number;
+  sourceAssistantEntrySeq?: number;
+  runtime?: TurnRuntime;
+  scriptVerdict?: string;
+  retracted?: string[];
+  persona?: WornPersona;
+}

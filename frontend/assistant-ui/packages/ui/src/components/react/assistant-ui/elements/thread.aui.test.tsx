@@ -1,0 +1,873 @@
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import {
+  AssistantRuntimeProvider,
+  type ChatModelAdapter,
+  ExportedMessageRepository,
+  type RealtimeVoiceAdapter,
+  type ThreadMessage,
+  type ThreadMessageLike,
+  useAui,
+  useExternalStoreRuntime,
+  useLocalRuntime,
+} from "@assistant-ui/react";
+import { useEffect, useState } from "react";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+import { Thread, type ThreadProps } from "./thread.aui";
+
+const adapter: ChatModelAdapter = {
+  async *run() {},
+};
+
+const createVoiceAdapter = () => {
+  let transcriptCallback:
+    | ((transcript: RealtimeVoiceAdapter.TranscriptItem) => void)
+    | undefined;
+  const session: RealtimeVoiceAdapter.Session = {
+    status: { type: "running" },
+    isMuted: false,
+    disconnect: vi.fn(),
+    mute: vi.fn(),
+    unmute: vi.fn(),
+    onStatusChange: () => () => {},
+    onTranscript: (callback) => {
+      transcriptCallback = callback;
+      return () => {
+        transcriptCallback = undefined;
+      };
+    },
+    onModeChange: () => () => {},
+    onVolumeChange: () => () => {},
+  };
+
+  return {
+    adapter: { connect: () => session },
+    emitTranscript: (transcript: RealtimeVoiceAdapter.TranscriptItem) =>
+      transcriptCallback?.(transcript),
+  } satisfies {
+    adapter: RealtimeVoiceAdapter;
+    emitTranscript: (transcript: RealtimeVoiceAdapter.TranscriptItem) => void;
+  };
+};
+
+function TestThread(props: ThreadProps) {
+  const runtime = useLocalRuntime(adapter);
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread {...props} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+function RunningAssistantTestThread(props: ThreadProps) {
+  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
+    messages: [
+      {
+        id: "running-assistant",
+        role: "assistant",
+        content: [],
+        status: { type: "running" },
+      },
+    ],
+    isRunning: true,
+    convertMessage: (message) => message,
+    onNew: async () => {},
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread {...props} autoFocus={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+function ResumableTestThread({
+  onResume,
+  onNew,
+}: {
+  onResume: () => Promise<void>;
+  onNew: () => Promise<void>;
+}) {
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages: [],
+    isRunning: false,
+    canResume: true,
+    onResume,
+    onNew,
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread />
+    </AssistantRuntimeProvider>
+  );
+}
+
+const userBranch = (text: string) =>
+  ExportedMessageRepository.fromArray([
+    { role: "user", content: [{ type: "text", text }] },
+  ]).messages;
+
+function UserMessageTestThread() {
+  const runtime = useLocalRuntime(adapter);
+
+  useEffect(() => {
+    runtime.thread.import({
+      messages: [...userBranch("Hello"), ...userBranch("Hello again")],
+    });
+  }, [runtime]);
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread autoFocus={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+function FeedbackTestThread({ submit }: { submit?: () => void }) {
+  const runtime = useLocalRuntime(adapter, {
+    initialMessages: [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Hello" }],
+        status: { type: "complete", reason: "stop" },
+      },
+    ],
+    ...(submit ? { adapters: { feedback: { submit } } } : {}),
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread />
+    </AssistantRuntimeProvider>
+  );
+}
+
+function AssistantContentTestThread({
+  content,
+}: {
+  content: Exclude<ThreadMessageLike["content"], string>;
+}) {
+  const runtime = useLocalRuntime(adapter, {
+    initialMessages: [
+      {
+        role: "assistant",
+        content,
+        status: { type: "complete", reason: "stop" },
+      },
+    ],
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread autoFocus={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+/** Hands parts to the components as-is: no `convertMessage`, so core never filters them. */
+function RawAssistantPartsTestThread({ content }: { content: unknown[] }) {
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages: [
+      {
+        id: "raw-message",
+        role: "assistant",
+        createdAt: new Date(0),
+        content: content as ThreadMessage["content"],
+        status: { type: "complete", reason: "stop" },
+        metadata: {
+          unstable_state: null,
+          unstable_annotations: [],
+          unstable_data: [],
+          steps: [],
+          custom: {},
+        },
+      } as ThreadMessage,
+    ],
+    isRunning: false,
+    onNew: async () => {},
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread autoFocus={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+function ApprovalTestThread({ pending }: { pending: boolean }) {
+  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
+    messages: [
+      {
+        id: "approval-message",
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "first",
+            toolName: "first",
+            args: {},
+            result: "done",
+          },
+          {
+            type: "tool-call",
+            toolCallId: "second",
+            toolName: "second",
+            args: {},
+            ...(pending
+              ? { interrupt: { type: "human" as const, payload: {} } }
+              : { result: "done" }),
+          },
+        ],
+        status: pending
+          ? { type: "requires-action", reason: "interrupt" }
+          : { type: "complete", reason: "stop" },
+      },
+    ],
+    convertMessage: (message) => message,
+    onNew: async () => {},
+    onResumeToolCall: () => {},
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread autoFocus={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+const PNG_DATA_URI =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+function ReasoningTestThread() {
+  const runtime = useLocalRuntime(adapter, {
+    initialMessages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            text: "First thought",
+            timing: { startedAt: 1_000, completedAt: 4_000 },
+          },
+          {
+            type: "reasoning",
+            text: "Second thought",
+            timing: { startedAt: 6_000, completedAt: 13_400 },
+          },
+          { type: "text", text: "Answer" },
+        ],
+        status: { type: "complete", reason: "stop" },
+      },
+    ],
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread autoFocus={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+const pagedMessages: ThreadMessageLike[] = [
+  { id: "m1", role: "user", content: [{ type: "text", text: "First" }] },
+  { id: "m2", role: "assistant", content: [{ type: "text", text: "Second" }] },
+  { id: "m3", role: "user", content: [{ type: "text", text: "Third" }] },
+];
+
+function PagedTestThread({
+  onLoadEarlier,
+}: {
+  onLoadEarlier: () => Promise<void>;
+}) {
+  const [messages, setMessages] = useState(pagedMessages.slice(2));
+  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
+    messages,
+    convertMessage: (message) => message,
+    onNew: async () => {},
+    hasEarlier: messages.length < pagedMessages.length,
+    onLoadEarlier: async () => {
+      await onLoadEarlier();
+      setMessages(pagedMessages);
+    },
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread autoFocus={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+function VoiceRuntimeAccess({
+  onReady,
+}: {
+  onReady: (aui: ReturnType<typeof useAui>) => void;
+}) {
+  onReady(useAui());
+  return null;
+}
+
+function VoiceTestThread({
+  voice,
+  onReady,
+}: {
+  voice: RealtimeVoiceAdapter;
+  onReady: (aui: ReturnType<typeof useAui>) => void;
+}) {
+  const runtime = useLocalRuntime(adapter, { adapters: { voice } });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <VoiceRuntimeAccess onReady={onReady} />
+      <Thread />
+    </AssistantRuntimeProvider>
+  );
+}
+
+const renderVoiceThread = () => {
+  const voice = createVoiceAdapter();
+  let aui: ReturnType<typeof useAui> | undefined;
+
+  render(
+    <VoiceTestThread
+      voice={voice.adapter}
+      onReady={(nextAui) => {
+        aui = nextAui;
+      }}
+    />,
+  );
+
+  if (aui === undefined) throw new Error("Runtime was not initialized");
+  return { aui, voice };
+};
+
+beforeAll(() => {
+  HTMLElement.prototype.scrollTo ??= () => {};
+  globalThis.ResizeObserver ??= class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+});
+
+afterEach(async () => {
+  await act(async () => {
+    cleanup();
+  });
+  document.body.replaceChildren();
+});
+
+describe("Thread", () => {
+  it("opens the tool group while an interrupt requires action and restores the user's open state", async () => {
+    const view = render(<ApprovalTestThread pending={false} />);
+    const group = screen.getByRole("button", { name: "2 tool calls" });
+    expect(group.getAttribute("aria-expanded")).toBe("false");
+
+    view.rerender(<ApprovalTestThread pending />);
+    await waitFor(() =>
+      expect(group.getAttribute("aria-expanded")).toBe("true"),
+    );
+    expect(screen.getByRole("button", { name: "Allow" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+
+    view.rerender(<ApprovalTestThread pending={false} />);
+    await waitFor(() =>
+      expect(group.getAttribute("aria-expanded")).toBe("false"),
+    );
+    fireEvent.click(group);
+    expect(group.getAttribute("aria-expanded")).toBe("true");
+
+    view.rerender(<ApprovalTestThread pending />);
+    expect(group.getAttribute("aria-expanded")).toBe("true");
+    view.rerender(<ApprovalTestThread pending={false} />);
+    expect(group.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("does not resume when Enter is pressed in an empty composer with a checkpoint", async () => {
+    const onResume = vi.fn(async () => {});
+    const onNew = vi.fn(async () => {});
+    render(<ResumableTestThread onResume={onResume} onNew={onNew} />);
+    await screen.findByRole("button", { name: "Resume generating" });
+    const input = screen.getByRole("textbox");
+    act(() => input.focus());
+    expect(document.activeElement).toBe(input);
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    fireEvent.keyUp(input, { key: "Enter", code: "Enter" });
+    await act(async () => {});
+    expect(onResume).not.toHaveBeenCalled();
+    expect(onNew).not.toHaveBeenCalled();
+  });
+
+  it("resumes once when the focused Resume button is activated with Enter", async () => {
+    const onResume = vi.fn(async () => {});
+    const onNew = vi.fn(async () => {});
+    render(<ResumableTestThread onResume={onResume} onNew={onNew} />);
+    const resume = await screen.findByRole("button", {
+      name: "Resume generating",
+    });
+    act(() => resume.focus());
+    expect(document.activeElement).toBe(resume);
+    expect(resume.tagName).toBe("BUTTON");
+    expect(fireEvent.keyDown(resume, { key: "Enter", code: "Enter" })).toBe(
+      true,
+    );
+    fireEvent.click(resume, { detail: 0 });
+    fireEvent.keyUp(resume, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(onResume).toHaveBeenCalledOnce());
+    expect(onNew).not.toHaveBeenCalled();
+  });
+
+  it("resumes an available checkpoint from an empty composer without sending", async () => {
+    const onResume = vi.fn(async () => {});
+    const onNew = vi.fn(async () => {});
+    render(<ResumableTestThread onResume={onResume} onNew={onNew} />);
+
+    const resume = await screen.findByRole("button", {
+      name: "Resume generating",
+    });
+    expect(screen.queryByRole("button", { name: "Send message" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(resume);
+    });
+
+    expect(onResume).toHaveBeenCalledOnce();
+    expect(onNew).not.toHaveBeenCalled();
+  });
+
+  it("shows Send for a draft and restores Resume when the draft is cleared", async () => {
+    const onResume = vi.fn(async () => {});
+    const onNew = vi.fn(async () => {});
+    render(<ResumableTestThread onResume={onResume} onNew={onNew} />);
+    await screen.findByRole("button", { name: "Resume generating" });
+    const input = screen.getByRole("textbox");
+
+    fireEvent.change(input, { target: { value: "A new request" } });
+    expect(
+      await screen.findByRole("button", { name: "Send message" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Resume generating" }),
+    ).toBeNull();
+
+    fireEvent.change(input, { target: { value: "" } });
+    expect(
+      await screen.findByRole("button", { name: "Resume generating" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Send message" })).toBeNull();
+    expect(onResume).not.toHaveBeenCalled();
+    expect(onNew).not.toHaveBeenCalled();
+  });
+
+  it("focuses the composer by default", async () => {
+    render(<TestThread />);
+
+    const composer = screen.getByRole("textbox");
+    await waitFor(() => expect(document.activeElement).toBe(composer));
+  });
+
+  it("keeps the page focus when autoFocus is false", () => {
+    const pageControl = document.body.appendChild(
+      document.createElement("button"),
+    );
+    pageControl.focus();
+
+    render(<TestThread autoFocus={false} />);
+
+    expect(document.activeElement).toBe(pageControl);
+  });
+
+  it("renders ComposerExtra in the composer action row", () => {
+    const ModeToggle = () => <button type="button">Mode</button>;
+    render(<TestThread components={{ ComposerExtra: ModeToggle }} />);
+
+    const toggle = screen.getByRole("button", { name: "Mode" });
+    expect(toggle.closest(".aui-composer-action-wrapper")).not.toBeNull();
+  });
+
+  it("leaves the composer action row unchanged without ComposerExtra", () => {
+    const { container } = render(<TestThread />);
+
+    expect(container.querySelector(".aui-composer-action-start")).toBeNull();
+  });
+
+  it("keeps the default indicator for an empty running assistant message", () => {
+    const { container } = render(<RunningAssistantTestThread />);
+
+    const indicator = container.querySelector(
+      '[data-slot="aui_assistant-message-indicator"]',
+    );
+    expect(indicator?.tagName).toBe("SPAN");
+    expect(indicator?.textContent).toBe("●");
+    expect(indicator?.getAttribute("aria-label")).toBe("Assistant is working");
+  });
+
+  it("replaces the pending indicator with a custom component", () => {
+    const Indicator = () => <span data-testid="custom-indicator">Waiting</span>;
+    const { container } = render(
+      <RunningAssistantTestThread components={{ Indicator }} />,
+    );
+
+    const content = container.querySelector(
+      '[data-slot="aui_assistant-message-content"]',
+    );
+    expect(
+      content?.querySelector('[data-testid="custom-indicator"]')?.textContent,
+    ).toBe("Waiting");
+    expect(
+      content?.querySelector('[data-slot="aui_assistant-message-indicator"]'),
+    ).toBeNull();
+  });
+
+  it("hides the empty user attachment wrapper", async () => {
+    render(<UserMessageTestThread />);
+
+    await waitFor(() => expect(screen.getByText("Hello again")).toBeTruthy());
+
+    const root = document.querySelector('[data-slot="aui_user-message-root"]');
+    const attachments = root?.querySelector(
+      ".aui-user-message-attachments-end",
+    );
+
+    expect(attachments).toBeTruthy();
+    expect(attachments?.matches(":empty")).toBe(true);
+    expect(attachments?.classList.contains("empty:hidden")).toBe(true);
+  });
+
+  it("lets the user branch picker follow the rendered rows", async () => {
+    render(<UserMessageTestThread />);
+
+    const picker = await waitFor(() => {
+      const element = document.querySelector(
+        '[data-slot="aui_user-branch-picker"]',
+      );
+      expect(element).toBeTruthy();
+      return element as HTMLElement;
+    });
+
+    expect(picker.classList.contains("col-span-full")).toBe(true);
+    expect(picker.className).not.toMatch(/row-start-/);
+  });
+
+  it("previews image file parts and names unnamed files by type", () => {
+    render(
+      <AssistantContentTestThread
+        content={[
+          { type: "file", mimeType: "image/png", data: PNG_DATA_URI },
+          {
+            type: "file",
+            mimeType: "text/plain",
+            data: "data:text/plain;base64,aGk=",
+          },
+        ]}
+      />,
+    );
+
+    const files = document.querySelectorAll<HTMLElement>(
+      '[data-slot="aui_assistant-message-file"]',
+    );
+    expect(files).toHaveLength(2);
+    expect(
+      files[0]!
+        .querySelector('[data-slot="image-preview"] img')
+        ?.getAttribute("src"),
+    ).toBe(PNG_DATA_URI);
+    expect(files[0]!.querySelector('[data-slot="file-name"]')).toBeNull();
+    expect(
+      files[1]!.querySelector('[data-slot="file-name"]')?.textContent,
+    ).toBe("Text file");
+    expect(screen.queryByText("Unnamed file")).toBeNull();
+  });
+
+  it("renders the well-formed file parts beside ones with fields of the wrong type", () => {
+    render(
+      <AssistantContentTestThread
+        content={
+          [
+            {
+              type: "file",
+              mimeType: { type: "image/png" },
+              data: PNG_DATA_URI,
+            },
+            { type: "file", mimeType: "image/png", data: { nested: true } },
+            { type: "file", mimeType: "image/png", data: PNG_DATA_URI },
+          ] as never
+        }
+      />,
+    );
+
+    const files = document.querySelectorAll<HTMLElement>(
+      '[data-slot="aui_assistant-message-file"]',
+    );
+    expect(files).toHaveLength(1);
+    expect(
+      files[0]!
+        .querySelector('[data-slot="image-preview"] img')
+        ?.getAttribute("src"),
+    ).toBe(PNG_DATA_URI);
+  });
+
+  it("renders a file card, not an image, for a file part that reaches the component with fields of the wrong type", () => {
+    render(
+      <RawAssistantPartsTestThread
+        content={[
+          { type: "file", mimeType: { type: "image/png" }, data: PNG_DATA_URI },
+          { type: "file", mimeType: "image/png", data: { nested: true } },
+        ]}
+      />,
+    );
+
+    const files = document.querySelectorAll<HTMLElement>(
+      '[data-slot="aui_assistant-message-file"]',
+    );
+    expect(files).toHaveLength(2);
+    for (const file of files) {
+      expect(file.querySelector('[data-slot="image-preview"]')).toBeNull();
+      expect(file.querySelector(".aui-file-root")).not.toBeNull();
+    }
+  });
+
+  it("shows feedback actions only when the runtime supports feedback", () => {
+    const { unmount } = render(<FeedbackTestThread />);
+
+    expect(screen.queryByRole("button", { name: "Helpful" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Not helpful" })).toBeNull();
+
+    unmount();
+    render(<FeedbackTestThread submit={vi.fn()} />);
+
+    expect(screen.getByRole("button", { name: "Helpful" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Not helpful" })).toBeTruthy();
+  });
+
+  it("submits the rating through the feedback adapter", () => {
+    const submit = vi.fn();
+    render(<FeedbackTestThread submit={submit} />);
+
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Not helpful" }));
+    });
+
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(submit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: "negative" }),
+    );
+  });
+
+  it("labels a settled reasoning group with its span from part timing", async () => {
+    render(<ReasoningTestThread />);
+
+    expect(
+      await screen.findByRole("button", { name: /Reasoning \(12s\)/ }),
+    ).toBeTruthy();
+  });
+
+  it("loads an earlier page from the top of the list while one exists", async () => {
+    let finish!: () => void;
+    const onLoadEarlier = vi.fn(
+      () => new Promise<void>((resolve) => (finish = resolve)),
+    );
+    render(<PagedTestThread onLoadEarlier={onLoadEarlier} />);
+
+    const loadEarlier = await screen.findByRole("button", {
+      name: "Load earlier messages",
+    });
+    expect(screen.queryByText("First")).toBeNull();
+
+    loadEarlier.focus();
+    fireEvent.click(loadEarlier);
+    const loading = await screen.findByRole("button", {
+      name: "Loading earlier messages",
+    });
+    expect(
+      screen.getByText("Loading earlier messages", {
+        selector: '[role="status"]',
+      }),
+    ).toBeTruthy();
+    expect(document.activeElement).toBe(loading);
+    fireEvent.click(loading);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+
+    await act(async () => finish());
+    expect(await screen.findByText("First")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /earlier messages/ }),
+    ).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(
+      document.activeElement?.closest('[data-slot="aui_thread-viewport"]'),
+    ).not.toBeNull();
+  });
+
+  it("groups final voice transcripts into spoken rows", async () => {
+    const { aui, voice } = renderVoiceThread();
+
+    await act(async () => {
+      aui.thread.connectVoice();
+      voice.emitTranscript({ role: "user", text: "Hello", isFinal: true });
+      voice.emitTranscript({
+        role: "assistant",
+        text: "Hi there",
+        isFinal: true,
+      });
+      await Promise.resolve();
+    });
+
+    const spokenMessages = document.querySelectorAll<HTMLElement>(
+      '[data-slot="aui_spoken-message-root"]',
+    );
+    expect(spokenMessages).toHaveLength(2);
+    expect(spokenMessages[0]?.getAttribute("data-voice-run")).toBe("start");
+    expect(spokenMessages[1]?.getAttribute("data-voice-run")).toBe("end");
+    expect(
+      document.querySelectorAll('[data-slot="aui_spoken-exchange-header"]'),
+    ).toHaveLength(1);
+    expect(
+      within(spokenMessages[0]!)
+        .getByText("You said")
+        .classList.contains("sr-only"),
+    ).toBe(true);
+    expect(
+      within(spokenMessages[1]!)
+        .getByText("Assistant said")
+        .classList.contains("sr-only"),
+    ).toBe(true);
+
+    for (const spokenMessage of spokenMessages) {
+      expect(
+        within(spokenMessage).queryByRole("button", { name: "Edit" }),
+      ).toBeNull();
+      expect(
+        within(spokenMessage).queryByRole("button", { name: "Refresh" }),
+      ).toBeNull();
+    }
+  });
+
+  it("marks a single final voice transcript as a single spoken row", async () => {
+    const { aui, voice } = renderVoiceThread();
+
+    await act(async () => {
+      aui.thread.connectVoice();
+      voice.emitTranscript({ role: "user", text: "Hello", isFinal: true });
+      await Promise.resolve();
+    });
+
+    const [spokenMessage] = document.querySelectorAll<HTMLElement>(
+      '[data-slot="aui_spoken-message-root"]',
+    );
+    expect(spokenMessage?.getAttribute("data-voice-run")).toBe("single");
+  });
+
+  it("shows the speaking indicator for a partial assistant transcript", async () => {
+    const { aui, voice } = renderVoiceThread();
+
+    await act(async () => {
+      aui.thread.connectVoice();
+      voice.emitTranscript({ role: "assistant", text: "Hi", isFinal: false });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByLabelText("Assistant is speaking")).toBeTruthy();
+  });
+
+  it("keeps the send button instead of stop while a spoken reply is in progress", async () => {
+    const { aui, voice } = renderVoiceThread();
+
+    await act(async () => {
+      aui.thread.connectVoice();
+      voice.emitTranscript({ role: "assistant", text: "Hi", isFinal: false });
+      await Promise.resolve();
+    });
+
+    expect(aui.thread.getState().isRunning).toBe(true);
+    expect(screen.getByRole("button", { name: "Send message" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Stop generating" }),
+    ).toBeNull();
+  });
+
+  it("marks the middle of a three-turn voice run", async () => {
+    const { aui, voice } = renderVoiceThread();
+
+    await act(async () => {
+      aui.thread.connectVoice();
+      voice.emitTranscript({ role: "user", text: "Hello", isFinal: true });
+      voice.emitTranscript({
+        role: "assistant",
+        text: "Hi there",
+        isFinal: true,
+      });
+      voice.emitTranscript({ role: "user", text: "Thanks", isFinal: true });
+      await Promise.resolve();
+    });
+
+    const positions = [
+      ...document.querySelectorAll<HTMLElement>(
+        '[data-slot="aui_spoken-message-root"]',
+      ),
+    ].map((row) => row.getAttribute("data-voice-run"));
+    expect(positions).toEqual(["start", "middle", "end"]);
+    expect(
+      document.querySelectorAll('[data-slot="aui_spoken-exchange-header"]'),
+    ).toHaveLength(1);
+  });
+
+  it("starts a new voice conversation block after a typed message", async () => {
+    const { aui, voice } = renderVoiceThread();
+
+    await act(async () => {
+      aui.thread.connectVoice();
+      voice.emitTranscript({ role: "user", text: "Hello", isFinal: true });
+      voice.emitTranscript({
+        role: "assistant",
+        text: "Hi there",
+        isFinal: true,
+      });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      aui.thread.disconnectVoice();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await aui.thread.append({
+        role: "user",
+        content: [{ type: "text", text: "Typed follow up" }],
+      });
+    });
+    await waitFor(() => {
+      const state = aui.thread.getState();
+      expect(state.messages).toHaveLength(4);
+      expect(state.isRunning).toBe(false);
+    });
+    await act(async () => {
+      aui.thread.connectVoice();
+      voice.emitTranscript({ role: "user", text: "Back", isFinal: true });
+      voice.emitTranscript({
+        role: "assistant",
+        text: "Welcome back",
+        isFinal: true,
+      });
+      await Promise.resolve();
+    });
+
+    const positions = [
+      ...document.querySelectorAll<HTMLElement>(
+        '[data-slot="aui_spoken-message-root"]',
+      ),
+    ].map((row) => row.getAttribute("data-voice-run"));
+    expect(positions).toEqual(["start", "end", "start", "end"]);
+    expect(
+      document.querySelectorAll('[data-slot="aui_spoken-exchange-header"]'),
+    ).toHaveLength(2);
+  });
+});

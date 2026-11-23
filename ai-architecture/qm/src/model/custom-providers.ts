@@ -1,0 +1,174 @@
+import { isModelProvider, parseProviderBaseUrl } from "./provider-endpoints.ts";
+import { perTenant } from "../tenants/cache.ts";
+import { boundTenant } from "../tenants/context.ts";
+
+export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
+export type CustomProviderProtocol = (typeof CUSTOM_PROVIDER_PROTOCOLS)[number];
+
+interface CustomModelSpec {
+  id: string;
+  name?: string;
+  reasoning?: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
+  input?: number;
+  output?: number;
+}
+
+export interface CustomProviderSpec {
+  id: string;
+  name: string;
+  protocol: CustomProviderProtocol;
+  baseUrl: string;
+  models: CustomModelSpec[];
+}
+
+const SLUG_RE = /^[a-z][a-z0-9-]+$/;
+
+export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
+  if (!SLUG_RE.test(spec.id)) {
+    throw new Error(`provider id must match ${SLUG_RE} (lowercase slug), got "${spec.id}"`);
+  }
+  if (isModelProvider(spec.id)) throw new Error(`provider id "${spec.id}" is reserved`);
+  if (!spec.name.trim()) throw new Error("provider name is required");
+  if (!CUSTOM_PROVIDER_PROTOCOLS.includes(spec.protocol)) {
+    throw new Error(`protocol must be one of ${CUSTOM_PROVIDER_PROTOCOLS.join(", ")}`);
+  }
+  parseProviderBaseUrl(`custom provider ${spec.id} baseUrl`, spec.baseUrl);
+  if (!Array.isArray(spec.models) || spec.models.length === 0) {
+    throw new Error("at least one model is required");
+  }
+  const seen = new Set<string>();
+  for (const m of spec.models) {
+    if (!m.id?.trim()) throw new Error("every model needs an id");
+    if (m.name !== undefined && typeof m.name !== "string") throw new Error(`model "${m.id}": name must be a string`);
+    if (m.reasoning !== undefined && typeof m.reasoning !== "boolean")
+      throw new Error(`model "${m.id}": reasoning must be a boolean`);
+    if (seen.has(m.id)) throw new Error(`duplicate model id "${m.id}"`);
+    seen.add(m.id);
+    for (const [field, v] of [
+      ["contextWindow", m.contextWindow],
+      ["maxTokens", m.maxTokens],
+    ] as const) {
+      if (v !== undefined && (!Number.isSafeInteger(v) || v <= 0)) {
+        throw new Error(`model "${m.id}": ${field} must be a positive safe integer`);
+      }
+    }
+    for (const [field, v] of [
+      ["input", m.input],
+      ["output", m.output],
+    ] as const) {
+      if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
+        throw new Error(`model "${m.id}": ${field} must be a non-negative number`);
+      }
+    }
+  }
+}
+
+export interface CustomRuntimeModel {
+  id: string;
+  upstreamId: string;
+  name: string;
+  provider: string;
+  api: "openai-completions" | "openai-responses" | "anthropic-messages";
+  baseUrl: string;
+  reasoning: boolean;
+  input: ("text" | "image")[];
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow: number;
+  maxTokens: number;
+}
+
+const CUSTOM_MODEL_PREFIX = "custom/";
+const DEFAULT_CONTEXT_WINDOW = 128_000;
+const DEFAULT_MAX_TOKENS = 8_192;
+
+function customProviderApi(protocol: CustomProviderProtocol): CustomRuntimeModel["api"] {
+  if (protocol === "anthropic") return "anthropic-messages";
+  if (protocol === "openai-responses") return "openai-responses";
+  return "openai-completions";
+}
+
+function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): CustomRuntimeModel {
+  return {
+    id: `${CUSTOM_MODEL_PREFIX}${provider.id}/${m.id}`,
+    upstreamId: m.id,
+    name: m.name?.trim() || m.id,
+    provider: provider.id,
+    api: customProviderApi(provider.protocol),
+    baseUrl: provider.baseUrl,
+    reasoning: m.reasoning ?? false,
+    input: ["text"],
+    cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    maxTokens: m.maxTokens ?? DEFAULT_MAX_TOKENS,
+  };
+}
+
+const state = perTenant(() => ({
+  registry: new Map<string, CustomRuntimeModel>(),
+  providers: new Array<CustomProviderSpec>(),
+  version: 0,
+}));
+
+export function setCustomProviders(specs: CustomProviderSpec[]): void {
+  const current = state();
+  if (JSON.stringify(specs) === JSON.stringify(current.providers)) return;
+  const next = new Map<string, CustomRuntimeModel>();
+  for (const spec of specs) {
+    for (const m of spec.models) {
+      const model = toRuntimeModel(spec, m);
+      next.set(model.id, model);
+    }
+  }
+  current.registry = next;
+  current.providers = specs.map((s) => ({ ...s, models: [...s.models] }));
+  current.version += 1;
+}
+
+export function customProvidersVersion(): number {
+  return state().version;
+}
+
+export function hasCustomModelPrefix(id: string): boolean {
+  return id.startsWith(CUSTOM_MODEL_PREFIX);
+}
+
+export function resolveCustomModel(id: string): CustomRuntimeModel | undefined {
+  return state().registry.get(id);
+}
+
+export function isCustomModelId(id: string): boolean {
+  return boundTenant() !== undefined && state().registry.has(id);
+}
+
+export function customModelCatalog(): Array<{ id: string; name: string; provider: string }> {
+  return [...state().registry.values()].map((m) => ({ id: m.id, name: m.name, provider: m.provider }));
+}
+
+export function customModelsJson(): { providers: Record<string, unknown> } | undefined {
+  const { registry, providers } = state();
+  if (providers.length === 0) return undefined;
+  return {
+    providers: Object.fromEntries(
+      providers.map((spec) => [
+        spec.id,
+        {
+          name: spec.name,
+          baseUrl: spec.baseUrl,
+          api: customProviderApi(spec.protocol),
+          models: [...registry.values()]
+            .filter((m) => m.provider === spec.id)
+            .map(({ id, name, reasoning, contextWindow, maxTokens, cost }) => ({
+              id,
+              name,
+              reasoning,
+              contextWindow,
+              maxTokens,
+              cost,
+            })),
+        },
+      ]),
+    ),
+  };
+}

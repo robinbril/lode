@@ -1,0 +1,155 @@
+import asyncio
+import time
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any
+
+from hatchet_sdk.clients.listeners.run_event_listener import (
+    RunEventListener,
+    RunEventListenerClient,
+)
+from hatchet_sdk.clients.listeners.workflow_listener import PooledWorkflowRunListener
+from hatchet_sdk.exceptions import (
+    CancelledRunError,
+    FailedTaskRunExceptionGroup,
+    TaskRunError,
+)
+
+if TYPE_CHECKING:
+    from hatchet_sdk.clients.admin import AdminClient
+
+MAX_FETCH_RETRIES = 10
+MINIMUM_SYNC_RESULT_POLL_INTERVAL = timedelta(seconds=1)
+
+
+def _seconds_until_next_poll(interval_seconds: float, deadline: float | None) -> float:
+    if deadline is None:
+        return interval_seconds
+
+    return max(0.0, min(interval_seconds, deadline - time.monotonic()))
+
+
+class WorkflowRunRef:
+    def __init__(
+        self,
+        workflow_run_id: str,
+        workflow_run_listener: PooledWorkflowRunListener,
+        workflow_run_event_listener: RunEventListenerClient,
+        admin_client: "AdminClient",
+    ) -> None:
+        self._workflow_run_id = workflow_run_id
+        self._workflow_run_listener = workflow_run_listener
+        self._workflow_run_event_listener = workflow_run_event_listener
+        self._admin_client = admin_client
+
+    def __str__(self) -> str:
+        return self.workflow_run_id
+
+    @property
+    def workflow_run_id(self) -> str:
+        return self._workflow_run_id
+
+    def _stream(self) -> RunEventListener:
+        return self._workflow_run_event_listener.stream(self.workflow_run_id)
+
+    async def aio_result(
+        self,
+        timeout: timedelta | None = None,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        """
+        Wait for the workflow run to complete and return its result.
+
+        :param timeout: The maximum time to wait for the run to complete. Waits indefinitely if not provided.
+        :return: A dictionary mapping each task name in the run to its output.
+        :raises TimeoutError: If the run does not complete within the timeout.
+        """
+        coro = self._workflow_run_listener.aio_result(self.workflow_run_id)
+
+        if timeout is None:
+            return await coro
+
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout.total_seconds())
+        except TimeoutError:
+            raise TimeoutError(
+                f"Timed out waiting for workflow run {self.workflow_run_id} to complete after {timeout}."
+            ) from None
+
+    def result(
+        self,
+        timeout: timedelta | None = None,
+        *,
+        poll_interval: timedelta | None = None,
+    ) -> dict[str, Any]:
+        """
+        Wait for the workflow run to complete and return its result, polling for completion.
+
+        :param timeout: The maximum time to wait for the run to complete. Waits indefinitely if not provided.
+        :param poll_interval: The time between polls for the run's status. Defaults to the
+            client ``sync_result_poll_interval`` (1 second). Values below 1 second are
+            raised to 1 second.
+        :return: A dictionary mapping each task name in the run to its output.
+        :raises TimeoutError: If the run does not complete within the timeout.
+        :raises RuntimeError: If fetching the run's status fails repeatedly.
+        :raises FailedTaskRunExceptionGroup: If the run fails.
+        :raises CancelledRunError: If the run is cancelled.
+        :raises ValueError: If the run is in an unexpected state.
+        """
+        deadline = (
+            time.monotonic() + timeout.total_seconds() if timeout is not None else None
+        )
+        fetch_failures = 0
+
+        interval_seconds = max(
+            MINIMUM_SYNC_RESULT_POLL_INTERVAL,
+            (
+                poll_interval
+                if poll_interval is not None
+                else self._admin_client.config.sync_result_poll_interval
+            ),
+        ).total_seconds()
+
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for workflow run {self.workflow_run_id} to complete after {timeout}."
+                )
+
+            try:
+                details = self._admin_client.get_details(self.workflow_run_id)
+            except Exception as e:
+                fetch_failures += 1
+
+                if fetch_failures > MAX_FETCH_RETRIES:
+                    raise RuntimeError(
+                        f"Failed to fetch workflow run {self.workflow_run_id} after {MAX_FETCH_RETRIES} attempts."
+                    ) from e
+
+                time.sleep(_seconds_until_next_poll(interval_seconds, deadline))
+                continue
+
+            if details.status in ["QUEUED", "RUNNING"] or details.done is False:
+                time.sleep(_seconds_until_next_poll(interval_seconds, deadline))
+                continue
+
+            if details.status == "FAILED":
+                raise FailedTaskRunExceptionGroup(
+                    f"Workflow run {self.workflow_run_id} failed.",
+                    [
+                        TaskRunError._deserialize(run.error)
+                        for run in details.task_runs.values()
+                        if run.error
+                    ],
+                )
+
+            if details.status == "COMPLETED":
+                return {
+                    readable_id: run.output
+                    for readable_id, run in details.task_runs.items()
+                } or {}
+
+            if details.status == "CANCELLED":
+                raise CancelledRunError(self.workflow_run_id)
+
+            raise ValueError(
+                f"Workflow run {self.workflow_run_id} has not completed yet."
+            )

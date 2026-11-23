@@ -1,0 +1,45 @@
+import { useWorkflowDetails } from '../../hooks/use-workflow-details';
+import { Button } from '@/components/v1/ui/button';
+import { preferredWorkflowRunViewAtom } from '@/lib/atoms';
+import { type ViewOptions } from '@/lib/atoms';
+import { useAtom } from 'jotai';
+import { FaSitemap } from 'react-icons/fa6';
+import { PiTextColumnsBold } from 'react-icons/pi';
+
+const ToggleIcon = ({ view }: { view: ViewOptions | undefined }) => {
+  switch (view) {
+    case 'graph':
+      return <PiTextColumnsBold />;
+    case 'minimap':
+      return <FaSitemap />;
+    case undefined:
+      return null;
+    default:
+      const exhaustiveCheck: never = view;
+      throw new Error(`Unhandled case: ${exhaustiveCheck}`);
+  }
+};
+
+export const ViewToggle = () => {
+  const [view, setView] = useAtom(preferredWorkflowRunViewAtom);
+  const otherView = view === 'graph' ? 'minimap' : 'graph';
+
+  const { shape, isLoading, isError } = useWorkflowDetails();
+
+  if (isLoading || isError) {
+    return null;
+  }
+
+  // only render if there are at least two dependent steps, otherwise the view toggle is not needed
+  if (!shape.some((t) => t.childrenStepIds.length > 0)) {
+    return null;
+  }
+
+  return (
+    <div className="sticky bottom-2 right-2 z-20 ml-auto mt-auto">
+      <Button variant="outline" size="icon" onClick={() => setView(otherView)}>
+        <ToggleIcon view={view} />
+      </Button>
+    </div>
+  );
+};

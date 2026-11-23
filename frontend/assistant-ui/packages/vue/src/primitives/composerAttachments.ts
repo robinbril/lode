@@ -1,0 +1,201 @@
+import {
+  defineComponent,
+  h,
+  mergeProps,
+  onScopeDispose,
+  ref,
+  watch,
+  type SlotsType,
+  type VNodeChild,
+} from "vue";
+import { isAttrDisabled } from "./attrDisabled";
+import { useAui } from "../useAui";
+import { useAuiState } from "../useAuiState";
+import { AttachmentByIndexProvider } from "./AttachmentByIndexProvider";
+import { getAttachmentKeys } from "@assistant-ui/core/internal";
+import { useStableKeys } from "./stableKeys";
+
+/**
+ * Renders the composer's pending attachments in order, each scoped through
+ * {@link AttachmentByIndexProvider}; the `default` slot renders each
+ * attachment.
+ */
+export const ComposerPrimitiveAttachments = defineComponent({
+  name: "ComposerPrimitiveAttachments",
+  slots: Object as SlotsType<{ default?: () => VNodeChild[] }>,
+  setup(_, { slots }) {
+    const attachments = useAuiState((s) => s.composer.attachments);
+    const attachmentKeys = useStableKeys(() =>
+      getAttachmentKeys(attachments.value),
+    );
+    return () =>
+      attachmentKeys.value.map((key, index) =>
+        h(
+          AttachmentByIndexProvider,
+          { source: "composer", index, key },
+          { default: () => slots.default?.() },
+        ),
+      );
+  },
+});
+
+/**
+ * A button that opens a file picker and adds the selected files to the
+ * composer. Disabled while the thread is disabled or the composer is not
+ * editable. The picker's accept filter follows the composer's `attachmentAccept`.
+ */
+export const ComposerPrimitiveAddAttachment = defineComponent({
+  name: "ComposerPrimitiveAddAttachment",
+  inheritAttrs: false,
+  props: {
+    multiple: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  slots: Object as SlotsType<{ default?: () => VNodeChild[] }>,
+  setup(props, { attrs, slots }) {
+    const aui = useAui();
+    const threadId = useAuiState((s) => s.optional.threads?.mainThreadId);
+    let scopeGeneration = 0;
+    watch(threadId, () => scopeGeneration++, { flush: "sync" });
+    onScopeDispose(() => scopeGeneration++);
+    const disabled = useAuiState(
+      (s) => s.thread.isDisabled || !s.composer.isEditing,
+    );
+    const onClick = (event: MouseEvent) => {
+      if (event.defaultPrevented || disabled.value || isAttrDisabled(attrs))
+        return;
+
+      const pickerScopeGeneration = scopeGeneration;
+      const input = document.createElement("input");
+      input.type = "file";
+      input.multiple = props.multiple;
+      input.hidden = true;
+
+      const attachmentAccept = aui.composer.getState().attachmentAccept;
+      if (attachmentAccept !== "*") {
+        input.accept = attachmentAccept;
+      }
+
+      document.body.appendChild(input);
+
+      input.onchange = (e) => {
+        const fileList = (e.target as HTMLInputElement).files;
+        if (fileList && scopeGeneration === pickerScopeGeneration) {
+          for (const file of Array.from(fileList)) {
+            aui.composer.addAttachment(file).catch(() => {});
+          }
+        }
+        input.remove();
+      };
+      input.oncancel = () => input.remove();
+
+      input.click();
+    };
+    return () =>
+      h(
+        "button",
+        mergeProps(attrs, {
+          type: "button",
+          disabled: disabled.value || isAttrDisabled(attrs),
+          onClick,
+        }),
+        slots.default?.(),
+      );
+  },
+});
+
+/**
+ * A drop target that adds dropped files to the composer. `data-dragging` is
+ * present while a file drag hovers the element. File drags are claimed via
+ * `preventDefault` even when the runtime does not support attachments, since
+ * an unprevented file drop navigates the tab to the file.
+ */
+export const ComposerPrimitiveAttachmentDropzone = defineComponent({
+  name: "ComposerPrimitiveAttachmentDropzone",
+  inheritAttrs: false,
+  props: {
+    disabled: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  slots: Object as SlotsType<{ default?: () => VNodeChild[] }>,
+  setup(props, { attrs, slots }) {
+    const aui = useAui();
+    const isDragging = ref(false);
+    const threadDisabled = useAuiState((s) => s.thread.isDisabled);
+
+    watch(
+      () => props.disabled || threadDisabled.value,
+      (disabled) => {
+        if (disabled) isDragging.value = false;
+      },
+    );
+
+    const isFileDrag = (event: DragEvent) =>
+      event.dataTransfer?.types.includes("Files") === true;
+
+    const onDragenterCapture = (event: DragEvent) => {
+      if (props.disabled || !isFileDrag(event)) return;
+      event.preventDefault();
+      if (
+        threadDisabled.value ||
+        !aui.thread.getState().capabilities.attachments
+      ) {
+        event.dataTransfer!.dropEffect = "none";
+        return;
+      }
+      isDragging.value = true;
+    };
+    const onDragoverCapture = (event: DragEvent) => {
+      if (props.disabled || !isFileDrag(event)) return;
+      event.preventDefault();
+      if (
+        threadDisabled.value ||
+        !aui.thread.getState().capabilities.attachments
+      ) {
+        event.dataTransfer!.dropEffect = "none";
+        return;
+      }
+      if (!isDragging.value) isDragging.value = true;
+    };
+    const onDragleaveCapture = (event: DragEvent) => {
+      if (props.disabled || !isFileDrag(event)) return;
+      const related = event.relatedTarget as Node | null;
+      if (related && (event.currentTarget as Node).contains(related)) return;
+      isDragging.value = false;
+    };
+    const onDropCapture = (event: DragEvent) => {
+      if (props.disabled || !isFileDrag(event)) return;
+      isDragging.value = false;
+      event.preventDefault();
+      const files = Array.from(event.dataTransfer?.files ?? []);
+      if (
+        threadDisabled.value ||
+        !aui.thread.getState().capabilities.attachments ||
+        files.length === 0
+      )
+        return;
+      for (const file of files) {
+        aui.composer.addAttachment(file).catch(() => {});
+      }
+    };
+
+    return () =>
+      h(
+        "div",
+        mergeProps(attrs, {
+          ...(!props.disabled &&
+            !threadDisabled.value &&
+            isDragging.value && { "data-dragging": "true" }),
+          onDragenterCapture,
+          onDragoverCapture,
+          onDragleaveCapture,
+          onDropCapture,
+        }),
+        slots.default?.(),
+      );
+  },
+});

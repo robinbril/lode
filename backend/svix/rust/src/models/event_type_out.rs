@@ -1,0 +1,43 @@
+// this file is @generated
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct EventTypeOut {
+    /// The event type's name
+    pub name: String,
+
+    pub description: String,
+
+    /// Translated descriptions keyed by BCP 47 language tag.
+    #[serde(rename = "descriptionTranslations")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_translations: Option<std::collections::BTreeMap<String, String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+
+    pub deprecated: bool,
+
+    /// The schema for the event type for a specific version as a JSON schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schemas: Option<serde_json::Value>,
+
+    #[serde(rename = "createdAt")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+
+    #[serde(rename = "updatedAt")]
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+
+    /// The event type group's name
+    #[serde(rename = "groupName")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+
+    #[serde(rename = "featureFlags")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_flags: Option<std::collections::BTreeSet<String>>,
+
+    #[serde(rename = "featureFlag")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_flag: Option<String>,
+}

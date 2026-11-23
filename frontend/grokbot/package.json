@@ -1,0 +1,18 @@
+{
+  "name": "grokbot-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "setup": "npm ci --prefix apps/web --no-audit --no-fund",
+    "start": "node --env-file-if-exists=.env apps/web/server.mjs",
+    "check:structure": "node .harness/projectstructuur/tools/project-structure-check.js --repo .",
+    "check:push": "node apps/web/.poort/poort.mjs run push",
+    "verify:model": "node --env-file-if-exists=.env apps/web/scripts/verify-model-stream.mjs",
+    "setup:desktop": "npm ci --prefix apps/desktop --no-audit --no-fund",
+    "desktop": "npm start --prefix apps/desktop",
+    "test:desktop": "npm test --prefix apps/desktop"
+  }
+}

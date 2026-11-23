@@ -1,0 +1,101 @@
+import { skillVisibilityContext } from "./app-skills.ts";
+import { visibleSkillRows } from "../skills/skill-store.ts";
+import type { App, AppDeps } from "./app-types.ts";
+import type { AppHelpers } from "./app-helpers.ts";
+import { cronVisibility } from "./app-messaging.ts";
+import { canAdministerWebhook } from "./control-service.ts";
+import {
+  resourceHit,
+  type ResourceCandidate,
+  type ResourceKind,
+  type ResourceSearchHit,
+} from "../search/resource-search.ts";
+import { matchesSearchTerms, searchTerms } from "../sessions/entry-search.ts";
+import { scopeId } from "../types.ts";
+
+export function createResourceSearchMethods(
+  deps: AppDeps,
+  app: App,
+  helpers: AppHelpers,
+): Pick<App, "searchResources"> {
+  const store = deps.resourceSearch;
+  return {
+    async searchResources(tenant, principalId, query) {
+      query = query.slice(0, 500);
+      if (query.trim().length < 2 || !searchTerms(query).length) return { hits: [], failed: [], limited: [] };
+      let visibleSkills = new Set<string>();
+      let manageable = new Set<string>();
+      let crons: ReturnType<typeof cronVisibility> | undefined;
+      let person: ReturnType<App["personMatcher"]> | undefined;
+      const canSee = async (kind: Exclude<ResourceKind, "apps">, row: ResourceCandidate): Promise<boolean> => {
+        switch (kind) {
+          case "skills":
+            if (manageable.has(row.id)) return true;
+            if (row.status !== "published") return false;
+            return visibleSkills.has(row.id);
+          case "crons":
+            crons ??= cronVisibility(deps, helpers, principalId);
+            return (await crons).canSee(row);
+          case "webhooks":
+            person ??= app.personMatcher(principalId);
+            return canAdministerWebhook(app, row, { actorId: principalId }, await person);
+        }
+      };
+      const kinds: ResourceKind[] = ["skills", "crons", "apps", "webhooks"];
+      const limited: string[] = [];
+      const search = async (kind: ResourceKind): Promise<ResourceSearchHit[]> => {
+        const hits: ResourceSearchHit[] = [];
+        const candidates = await store.search(kind, query, 201);
+        const rows = candidates.slice(0, 200);
+        if (kind === "skills" && rows.length) {
+          const { skills, homes } = await store.skillMetadata([...new Set(rows.map((r) => r.title))]);
+          const { ordered, granted } = await skillVisibilityContext(deps, helpers, principalId, homes, false);
+          visibleSkills = new Set(visibleSkillRows(skills, ordered, granted).map((r) => r.skill.id));
+          manageable = await helpers.manageableSkills(tenant, rows, principalId, false);
+        }
+        const appPermissions = kind === "apps" ? await helpers.appPermissions(tenant, rows, principalId) : [];
+        for (let i = 0; i < rows.length; i += 20) {
+          const batch = rows.slice(i, i + 20);
+          const allowed =
+            kind === "apps"
+              ? appPermissions.slice(i, i + 20).map((permission) => permission !== null)
+              : await Promise.all(batch.map((row) => canSee(kind, row)));
+          for (const [j, row] of batch.entries()) {
+            if (allowed[j]) hits.push(resourceHit(kind, row, query));
+            if (hits.length === 8) {
+              if (!limited.includes(kind)) limited.push(kind);
+              return hits;
+            }
+          }
+        }
+        return hits;
+      };
+      const projects = async (): Promise<ResourceSearchHit[]> => {
+        const [projects, channels] = await Promise.all([
+          helpers.projectsForViewer(principalId),
+          deps.identity.isInternal(deps.identity.classify(principalId))
+            ? deps.directory.listChannelsFor(principalId)
+            : Promise.resolve([]),
+        ]);
+        return [
+          { id: scopeId("personal", principalId), title: "Personal", description: "Personal project" },
+          ...projects.map((p) => ({ id: p.scopeId, title: p.name, description: "Project" })),
+          ...channels.map((c) => ({
+            id: scopeId("channel", c.channelId),
+            title: c.name ?? c.channelId,
+            description: "Channel project",
+          })),
+        ]
+          .filter((r) => matchesSearchTerms(`${r.title} ${r.description}`, searchTerms(query)))
+          .slice(0, 8)
+          .map((r) => resourceHit("contexts", r, query));
+      };
+      const results = await Promise.allSettled([...kinds.map(search), projects()]);
+      return {
+        hits: results.flatMap((r) => (r.status === "fulfilled" ? r.value : [])),
+        limited,
+        failed: results.flatMap((r, i) => (r.status === "rejected" ? [[...kinds, "contexts"][i]!] : [])),
+      };
+    },
+  };
+}

@@ -1,0 +1,54 @@
+import asyncio
+
+from pydantic import BaseModel
+
+from hatchet_sdk import (
+    ConcurrencyStrategy,
+    Context,
+    Hatchet,
+)
+
+hatchet = Hatchet()
+
+
+class WorkflowInput(BaseModel):
+    group: str
+
+
+# The concurrency is declared on the TASK, not on the workflow. Task-level concurrency
+# is the only path served by the in-memory concurrency index, so this exercises that code path
+# rather than the legacy workflow-level DB path.
+concurrency_cancel_in_progress_task_level_workflow = hatchet.workflow(
+    name="ConcurrencyCancelInProgressTaskLevel",
+    input_validator=WorkflowInput,
+)
+
+
+# > Task-Level Cancel In Progress
+@concurrency_cancel_in_progress_task_level_workflow.task(
+    concurrency=[
+        ConcurrencyStrategy(
+            expression="input.group",
+            max_runs=1,
+            strategy="CANCEL_IN_PROGRESS",
+        )
+    ],
+)
+async def task(input: WorkflowInput, ctx: Context) -> None:
+    for _ in range(50):
+        await asyncio.sleep(0.10)
+
+
+# !!
+
+
+def main() -> None:
+    worker = hatchet.worker(
+        "concurrency-cancel-in-progress-task-level-worker",
+        workflows=[concurrency_cancel_in_progress_task_level_workflow],
+    )
+    worker.start()
+
+
+if __name__ == "__main__":
+    main()

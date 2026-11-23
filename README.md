@@ -1,20 +1,20 @@
-<p align="center"><img src="docs/assets/banner.svg" alt="lode: de broncode van 29 programma's, 111 lessen en zes werkwijzen voor Claude Code, Codex en Cursor" width="100%"></p>
+<p align="center"><img src="docs/assets/banner.svg" alt="lode: de broncode van 29 projecten, 111 lessen en zes werkwijzen voor Claude Code, Codex en Cursor" width="100%"></p>
 
 <p align="center">
-<img src="https://img.shields.io/badge/programma's-29-1D5FD1" alt="29 programma's">
+<img src="https://img.shields.io/badge/projecten-29-1D5FD1" alt="29 projecten">
 <img src="https://img.shields.io/badge/lessen-111-111827" alt="111 lessen">
 <img src="https://img.shields.io/badge/werkwijzen-6-111827" alt="6 werkwijzen">
 </p>
 
-<p align="center"><b>De broncode van 29 goede programma's, zodat Claude Code, Codex en Cursor daarvan kunnen afkijken.</b></p>
+<p align="center"><b>De broncode van Codex, OpenBot, Onyx, Polar en 25 andere projecten, als voorbeeld voor Claude Code, Codex en Cursor.</b></p>
 
-<p align="center"><a href="#installeren">Installeren</a> · <a href="#wat-je-typt">Wat je typt</a> · <a href="#zo-zit-het-in-elkaar">Diagram</a> · <a href="#de-programmas">De programma's</a> · <a href="#de-lessen">De lessen</a> · <a href="#wat-je-moet-weten">Wat je moet weten</a></p>
+<p align="center"><a href="#installeren">Installeren</a> · <a href="#wat-je-typt">Wat je typt</a> · <a href="#zo-zit-het-in-elkaar">Diagram</a> · <a href="#de-projecten">De projecten</a> · <a href="#de-lessen">De lessen</a> · <a href="#wat-je-moet-weten">Wat je moet weten</a></p>
 
 ## Waarom dit bestaat
 
 Vraag Claude of Codex om een scherm en je krijgt meestal het scherm dat het vaakst in het trainingsmateriaal zat: drie kaarten op een rij met dezelfde iconen. Aan een lege lijst of een laadfout is niet gedacht. Aan de serverkant zie je het minder snel, maar daar gebeurt hetzelfde. Voorbeelden op internet laten zelden zien wie wat mag, of wat er gebeurt als een proces halverwege omvalt en iemand nog een keer klikt, en het model bedenkt dat dan ook niet vanzelf.
 
-Mijn eerste versie van lode bestond uit losse stukjes code. Je kon er een idee uit halen, maar geen heel chatvenster of goedkeuringsknop mee overnemen. Nu staat van elk programma de broncode erin. Codex van OpenAI, het chatprogramma van Vercel, het betaalplatform Polar en de zoekmachine Onyx bijvoorbeeld. Zeg je dat je een chatvenster wilt, dan kijkt je model eerst hoe Vercel het gemaakt heeft en bouwt het daarna na in jouw project.
+Mijn eerste versie van lode bestond uit losse stukjes code. Je kon er een idee uit halen, maar geen heel chatvenster of goedkeuringsknop mee overnemen. Nu staat van elk project de broncode erin. Codex van OpenAI, de chat-app van Vercel, het betaalplatform Polar en de zoekmachine Onyx bijvoorbeeld. Zeg je dat je een chatvenster wilt, dan kijkt je model eerst hoe Vercel het gemaakt heeft en bouwt het daarna na in jouw project.
 
 <img src="docs/assets/zo-werkt-het.svg" alt="Opdracht, voorbeeld, toets, akkoord, eerste stap" width="100%">
 
@@ -22,9 +22,9 @@ Mijn eerste versie van lode bestond uit losse stukjes code. Je kon er een idee u
 
 | Wat | Waar het je mee helpt |
 |---|---|
-| **De broncode van 29 programma's** | Je model leest hoe een echt programma het doet, en neemt een scherm of onderdeel over |
+| **De broncode van 29 projecten** | Je model leest hoe het daar gemaakt is, en neemt een scherm of onderdeel over |
 | **Een gids per map** (`CODEBASES.md`) | Vertelt in welk bestand het chatvenster, de rechtencontrole of de wachtrij zit, want Codex alleen al heeft meer dan 8.000 bestanden |
-| **111 lessen** | Korte uitleg van één probleem en hoe een van die programma's het oplost, zie [De lessen](#de-lessen) |
+| **111 lessen** | Korte uitleg van één probleem en hoe een van die projecten het oplost, zie [De lessen](#de-lessen) |
 | **6 werkwijzen** | Opdrachten zoals `/lode` waarmee je model stap voor stap werkt (Claude Code noemt ze skills) |
 
 ## Installeren
@@ -37,7 +37,7 @@ git clone --depth 1 https://github.com/robinbril/lode.git
 python3 lode/install.py
 ```
 
-Het script koppelt de werkwijzen aan Claude Code, Codex en Cursor. Wat je al hebt blijft staan, en van de programma's wordt niets geïnstalleerd of gestart.
+Het script koppelt de werkwijzen aan Claude Code, Codex en Cursor. Wat je al hebt blijft staan, en van de projecten wordt niets geïnstalleerd of gestart.
 
 ## Wat je typt
 
@@ -55,39 +55,39 @@ Elk plan gaat eerst langs `airesearch` of `council`, omdat een model uit zichzel
 <p align="center">
 <picture>
 <source media="(prefers-color-scheme: dark)" srcset="docs/lode-dark.png">
-<img src="docs/lode.png" alt="De programma's, lessen en hulpmiddelen komen samen in lode; AGENTS.md kiest per taak; Claude Code en Codex bouwen in jouw project" width="100%">
+<img src="docs/lode.png" alt="De projecten, lessen en hulpmiddelen komen samen in lode; AGENTS.md kiest per taak; Claude Code en Codex bouwen in jouw project" width="100%">
 </picture>
 </p>
 
-## De programma's
+## De projecten
 
 ### AI en agents - goedkeuring, afscherming, bedrijfskennis
 
-| Programma | Wat het is | Wat je eruit haalt |
+| Project | Wat het is | Wat je eruit haalt |
 |---|---|---|
 | [`codex`](ai-architecture/codex-commandos-en-afscherming) - commando's en afscherming | De programmeeragent van OpenAI voor de terminal, in Rust | Welk commando een agent mag uitvoeren en hoe je hem afschermt van de rest van je computer |
 | [`opencode`](ai-architecture/opencode-agent-in-typescript) - agent in TypeScript | Open programmeeragent in TypeScript | Hoe een agent werkt met verschillende modellen en zijn gesprekken bewaart |
-| [`deepseek-harness`](ai-architecture/deepseek-harness-uitbreidbare-agent) - uitbreidbare agent | Het agentprogramma van DeepSeek, waarin elk onderdeel los te vervangen is | Een agent bouwen die je kan uitbreiden, met een logboek van alles wat hij doet |
+| [`deepseek-harness`](ai-architecture/deepseek-harness-uitbreidbare-agent) - uitbreidbare agent | De agent van DeepSeek, waarin elk onderdeel los te vervangen is | Een agent bouwen die je kan uitbreiden, met een logboek van alles wat hij doet |
 | [`claude-agent-sdk`](ai-architecture/claude-agent-sdk-claude-code-in-je-product) - Claude Code in je product | Het pakket van Anthropic om Claude Code vanuit Python te gebruiken | Claude Code in je eigen product zetten en ingrijpen voordat hij iets doet |
 | [`openai-agents`](ai-architecture/openai-agents-werk-doorgeven) - werk doorgeven | Het pakket van OpenAI om agents te maken in Python | Een agent die werk doorgeeft aan een andere, en wacht op goedkeuring |
 | [`pydantic-ai`](ai-architecture/pydantic-ai-agent-in-python) - agent in Python | Agents in Python van de makers van Pydantic | Een agent die na een herstart verdergaat waar hij was, en hoe je test of hij goed antwoordt |
-| [`open-multi-agent`](ai-architecture/open-multi-agent-taken-verdelen) - taken verdelen | Programma dat meerdere agents laat samenwerken, in TypeScript | Taken verdelen over agents en achteraf zien wie wat deed |
-| [`openbot`](ai-architecture/openbot-goedkeuring-en-logboek) - goedkeuring en logboek | Desktopprogramma met AI-collega's die elk een eigen computer hebben | De goedkeuringsknop, de regels daarachter en het logboek |
+| [`open-multi-agent`](ai-architecture/open-multi-agent-taken-verdelen) - taken verdelen | Laat meerdere agents samenwerken, in TypeScript | Taken verdelen over agents en achteraf zien wie wat deed |
+| [`openbot`](ai-architecture/openbot-goedkeuring-en-logboek) - goedkeuring en logboek | Desktop-app met AI-collega's die elk een eigen computer hebben | De goedkeuringsknop, de regels daarachter en het logboek |
 | [`qm`](ai-architecture/qm-teamagent-in-slack) - teamagent in Slack | Eén agent voor een heel team, in Slack en op het web | Een agent die per persoon en per kanaal onthoudt wat hij mag en weet |
-| [`onyx`](ai-architecture/onyx-bedrijfskennis-met-rechten) - bedrijfskennis met rechten | Zoekmachine over je bedrijfskennis, gekoppeld aan meer dan 50 programma's | Zoeken in documenten waarbij iedereen alleen vindt wat hij mag zien |
+| [`onyx`](ai-architecture/onyx-bedrijfskennis-met-rechten) - bedrijfskennis met rechten | Zoekmachine over je bedrijfskennis, gekoppeld aan meer dan 50 apps | Zoeken in documenten waarbij iedereen alleen vindt wat hij mag zien |
 
 ### Schermen - chat, menu's, meldingen, takenbord
 
-| Programma | Wat het is | Wat je eruit haalt |
+| Project | Wat het is | Wat je eruit haalt |
 |---|---|---|
-| [`chatbot`](frontend/chatbot-compleet-chatprogramma) - compleet chatprogramma | Het voorbeeld-chatprogramma van Vercel, in Next.js | Een compleet chatprogramma om mee te beginnen |
+| [`chatbot`](frontend/chatbot-compleet-chatprogramma) - complete chat-app | De voorbeeldchat van Vercel, in Next.js | Een complete chat-app om mee te beginnen |
 | [`grokbot`](frontend/grokbot-invoerveld-en-werkplek) - invoerveld en werkplek | Mijn eigen nabouw van Grok Bot, in gewoon JavaScript | Het invoerveld, de gesprekkenlijst en het computerpaneel |
-| [`openmausbot`](frontend/openmausbot-bots-en-meekijken) - bots en meekijken | Chatprogramma met een team van bots die op je eigen computer draaien | De goedkeuringskaart, en meekijken terwijl een bot werkt |
+| [`openmausbot`](frontend/openmausbot-bots-en-meekijken) - bots en meekijken | Chat-app met een team van bots die op je eigen computer draaien | De goedkeuringskaart, en meekijken terwijl een bot werkt |
 | [`assistant-ui`](frontend/assistant-ui-chatonderdelen) - chatonderdelen | Onderdelen voor een chat zoals ChatGPT, in React | Meescrollen met het antwoord, berichten bewerken, bijlagen |
 | [`ai-elements`](frontend/ai-elements-antwoorden-tonen) - antwoorden tonen | Onderdelen van Vercel om antwoorden van een model te tonen, gaat op in shadcn/ui | Codeblokken, bronnen en denkstappen in een antwoord |
 | [`aicss`](frontend/aicss-agentgesprekken) - agentgesprekken | Kant-en-klare onderdelen voor gesprekken met een agent, in React | Laten zien dat een agent nadenkt of ergens mee bezig is |
 | [`json-render`](frontend/json-render-scherm-door-model) - scherm door model | Laat een model zelf een scherm samenstellen uit onderdelen die jij kiest | Een dashboard op verzoek, zonder dat het model onderdelen verzint |
-| [`shadcn-ui`](frontend/shadcn-ui-knoppen-en-formulieren) - knoppen en formulieren | Knoppen, formulieren en tabellen die je in je project kopieert | Een net begin dat je zelf kan aanpassen |
+| [`shadcn-ui`](frontend/shadcn-ui-knoppen-en-formulieren) - knoppen en formulieren | Knoppen, formulieren en tabellen die je in je project kopieert | Onderdelen die je zelf aanpast in plaats van installeert |
 | [`radix-primitives`](frontend/radix-primitives-menus-en-dialogen) - menu's en dialogen | De ongestylede basis onder menu's, dialogen en hulpteksten | Menu's die ook met het toetsenbord en een schermlezer werken |
 | [`cmdk`](frontend/cmdk-zoekvenster) - zoekvenster | Het zoekvenster dat je met ⌘K opent | Snel zoeken en opdrachten geven |
 | [`sonner`](frontend/sonner-meldingen) - meldingen | De korte meldingen die in een hoek verschijnen | Meldingen die netjes stapelen en verdwijnen |
@@ -96,13 +96,13 @@ Elk plan gaat eerst langs `airesearch` of `council`, omdat een model uit zichzel
 
 ### Server - inloggen, betalen, achtergrondwerk, rechten
 
-| Programma | Wat het is | Wat je eruit haalt |
+| Project | Wat het is | Wat je eruit haalt |
 |---|---|---|
 | [`fastapi-template`](backend/fastapi-template-inloggen-en-database) - inloggen en database | De officiële startversie van een webdienst met FastAPI, Postgres en React | Inloggen, gebruikers en een database die meteen werken |
 | [`polar`](backend/polar-betalen-en-abonnementen) - betalen en abonnementen | Betaalplatform voor softwarebedrijven | Abonnementen, verbruik afrekenen, proefperiodes en kortingen |
 | [`hatchet`](backend/hatchet-achtergrondwerk) - achtergrondwerk | Voert zwaar werk uit op de achtergrond, in Go | Een wachtrij waarin één grote klant de rest niet ophoudt |
 | [`dbos`](backend/dbos-hervatten-na-storing) - hervatten na storing | Pakket voor Python dat werk laat doorgaan na een storing, met alleen Postgres | Een bestelling of import die na uitval verdergaat waar hij was |
-| [`svix`](backend/svix-webhooks-versturen) - webhooks versturen | Verstuurt webhooks: berichten waarmee jouw programma een ander programma waarschuwt | Ondertekenen, opnieuw proberen en bijhouden wat is aangekomen |
+| [`svix`](backend/svix-webhooks-versturen) - webhooks versturen | Verstuurt webhooks: berichten waarmee jouw app een andere app waarschuwt | Ondertekenen, opnieuw proberen en bijhouden wat is aangekomen |
 | [`openfga`](backend/openfga-wie-mag-wat) - wie mag wat | Houdt bij wie wat mag, naar het voorbeeld van Google Zanzibar | Rechten zoals in Google Drive, waar toegang tot een map ook voor de bestanden geldt |
 
 ## De lessen
@@ -134,14 +134,14 @@ Of je resultaat er echt beter van wordt, heb ik nog niet gemeten. Eén keer heb 
 
 Verder:
 
-- De programma's zijn om te lezen. Start of installeer ze niet vanuit deze map, want ze krijgen hier geen beveiligingsupdates.
+- De projecten zijn om te lezen. Start of installeer ze niet vanuit deze map, want ze krijgen hier geen beveiligingsupdates.
 - De code van Claude Code zelf is gesloten en staat er niet in, alleen het pakket om het aan te sturen.
 - Grote bestanden, foto's en video's zijn weggelaten, en ook de onderdelen met een betaalde licentie. Bij `grokbot` ontbreken de lettertypes, iconen en animaties van Grok, dus die start niet zomaar.
 - Een `AGENTS.md` van een ander heet hier `AGENTS.md.bron`, zodat jouw model niet per ongeluk diens regels volgt.
 
 ## Bijwerken
 
-Van elk programma staat in `codebases.json` welke versie erin zit. Zet daar een nieuwere neer en haal hem op:
+Van elk project staat in `codebases.json` welke versie erin zit. Zet daar een nieuwere neer en haal hem op:
 
 ```bash
 python3 copy.py take sonner
@@ -154,9 +154,9 @@ Met `python3 copy.py check` zie je of de bestanden nog hetzelfde zijn als bij de
 De code is van de makers en houdt hun licentie. Neem je iets over, neem dan ook de licentietekst mee. Wat ik wel gelezen heb maar niet gekopieerd, staat in [`sources.json`](sources.json).
 
 <details>
-<summary>Alle 29 programma's met bron, versie en licentie</summary>
+<summary>Alle 29 projecten met bron, versie en licentie</summary>
 
-| Programma | Bron | Versie | Licentie |
+| Project | Bron | Versie | Licentie |
 |---|---|---|---|
 | `deepseek-harness` | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | [`4b399c39a`](https://github.com/deepseek-ai/deepseek-harness/tree/4b399c39a6d1479cd84ca591b4d7c88e24d38a96) | MIT |
 | `opencode` | [anomalyco/opencode](https://github.com/anomalyco/opencode) | [`0089ba9e3`](https://github.com/anomalyco/opencode/tree/0089ba9e39a9ff7701b83fa87d62964612b61a66) | MIT |

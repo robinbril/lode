@@ -10,13 +10,13 @@
   },
   "banner": {
     "file": "banner.svg",
-    "alt": "lode: de broncode van 29 programma's, 111 lessen en zes werkwijzen voor Claude Code, Codex en Cursor",
+    "alt": "lode: de broncode van 29 projecten, 111 lessen en zes werkwijzen voor Claude Code, Codex en Cursor",
     "title": "lode",
-    "tagline": "Goede code om van af te kijken, voor Claude Code, Codex en Cursor.",
+    "tagline": "Broncode en lessen als voorbeeld voor Claude Code, Codex en Cursor.",
     "pillars": [
       {
         "icon": "blokken",
-        "title": "Programma's",
+        "title": "Projecten",
         "text": "volledige broncode"
       },
       {
@@ -53,7 +53,7 @@
           "icon": "zoek",
           "title": "Voorbeeld",
           "lines": [
-            "Eén programma en",
+            "Eén project en",
             "hooguit zes lessen"
           ]
         },

@@ -26,7 +26,7 @@ Wat dit niet garandeert: matchen gaat op een tokenvoorvoegsel van het commando, 
 
 Waarom het werkt: een verzameling uitkomsten met een totale volgorde maakt "strengste wint" een max() en geen optelsom van uitzonderingen.
 
-Niet doen als: een specifieke allow een brede deny moet kunnen overrulen, daar past last-match-wins bij (kaart 82).
+Niet doen als: een specifieke allow een brede deny moet kunnen overrulen, daar past last-match-wins bij (les 82).
 
 Toetsvraag: wordt een samengesteld commando met een allow-deel en een forbidden-deel in een test als forbidden beoordeeld?
 

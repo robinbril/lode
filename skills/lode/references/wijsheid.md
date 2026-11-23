@@ -1,13 +1,13 @@
 # Wijsheid
 
-Per regel één inzicht. `ai`, `be` en `fe` verwijzen naar een kaart in `LODE/ai-architecture`, `backend` en `frontend`, map `kaarten/`. Lees de kaart voor je hem toepast.
+Per regel één inzicht. `ai`, `be` en `fe` verwijzen naar een les in `LODE/ai-architecture`, `backend` en `frontend`, map `lessen-per-probleem/`. Lees de les voor je hem toepast.
 
 ## Plannen
 
 1. De werkmap liegt vaak. Een keuring op een map die 1.636 commits achterliep gaf 44 punten en een vals alarm; op de echte tak was het 54.
 2. Wat je wilt bouwen bestaat vaak al onder een andere naam. Zoek het concept, niet jouw woord.
 3. Zonder noemer is elk percentage verzonnen. Een eindige lijst (pagina's, operaties, gevallen) verslaat "bijna alles gezien".
-4. Een bronregel die klopt bewijst de uitleg niet. Bij de eerste 92 kaarten klopte elke verwijzing en moesten 81 toch worden aangepast.
+4. Een bronregel die klopt bewijst de uitleg niet. Bij de eerste 92 lessen klopte elke verwijzing en moesten 81 toch worden aangepast.
 5. Laat iemand anders weerleggen. Wie het schreef, leest wat hij bedoelde.
 6. Vraag bij een aanval apart: verkeerd doel of verkeerde volgorde. Meestal is het de volgorde.
 7. Het eenvoudigste ontwerp dat de meting haalt wint (ai 78).

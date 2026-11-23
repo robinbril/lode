@@ -11,7 +11,7 @@ Paden zijn upstream-paden op de gepinde commit uit `codebases.json`. In de kopie
 | Webhook-verzending met signing en retries | svix | `server/svix-server/src/worker.rs` | Rust, axum, Postgres, Redis of RabbitMQ |
 | Fijnmazige autorisatie, check en list-objects | openfga | `pkg/server/check.go` | Go, gRPC plus HTTP-gateway, Postgres/MySQL/SQLite |
 
-## fastapi-template
+## fastapi-template-inloggen-en-database
 - Wat: backend van het full-stack-template met e-mail/wachtwoord-login (JWT), gebruikersbeheer, een voorbeeldentiteit `Item`, Alembic-migraties en SMTP-mails.
 - Paden: `backend/app/api/deps.py` (`SessionDep`, `CurrentUser`, `get_current_active_superuser`) ; `backend/app/models.py` (patroon Base/Create/Update/Public/tabel, UUID-sleutels, `cascade_delete`) ; `backend/app/core/security.py` (`create_access_token` HS256, pwdlib Argon2 plus Bcrypt, rehash bij login) ; `backend/app/crud.py` (`authenticate` met dummy-hash tegen timing-aanvallen) ; `backend/app/core/config.py` (pydantic-settings, weigert `changethis` buiten development) ; `backend/app/api/routes/login.py` en `backend/app/api/main.py`.
 - Leesvolgorde: `backend/app/models.py` > `backend/app/core/security.py` > `backend/app/api/deps.py` > `backend/app/crud.py` > `backend/app/api/routes/login.py`.
@@ -20,7 +20,7 @@ Paden zijn upstream-paden op de gepinde commit uit `codebases.json`. In de kopie
 - Niet overnemen: `frontend/src/client` (gegenereerd door openapi-ts); Traefik en Adminer in `compose.yml` (deploy-keuzes); Sentry (extern, optioneel via `SENTRY_DSN`). Grep op user-agent, stealth, fingerprint, captcha, redis, celery in `backend/` en `compose.yml`: niets.
 - Licentie en commit: MIT (LICENSE: Sebastian Ramirez, 2019) ; 77e550a73bb4.
 
-## polar
+## polar-betalen-en-abonnementen
 - Wat: backend van een betaalplatform voor ontwikkelaars (Merchant of Record) met organisaties, producten, orders, abonnementen, benefits en uitgaande webhooks, als modules onder `server/polar/`.
 - Paden: `server/polar/webhook/service.py` en `webhook/tasks.py` (endpoints, geheimen; `webhook_event_send` ondertekent met standardwebhooks, retries, volgorde-bewaking) ; `server/polar/models/webhook_endpoint.py` (`WebhookEventType`) ; `server/polar/worker/_broker.py` en `_enqueue.py` (Dramatiq met retries, cron via APScheduler; jobs pas na de databasecommit geflusht, optioneel via SQS).
 - Meer paden: `server/polar/authz/service.py` en `authz/policies/organization.py` (toegang per organisatie en rol) ; `server/polar/benefit/registry.py` (strategieregister per benefit-type) ; `server/polar/kit/repository/base.py` (generieke repository, soft-delete, sortering) ; `server/polar/benefit/service.py` (servicepatroon).
@@ -30,7 +30,7 @@ Paden zijn upstream-paden op de gepinde commit uit `codebases.json`. In de kopie
 - Niet overnemen: vendor-diensten (Stripe, Tinybird, ClickHouse, Logfire, PostHog, Plain, Firecrawl, Discord, GitHub, Slack). `server/polar/organization_review/collectors/website.py` laat een agent een headless browser starten (alleen via grep gezien, niet gelezen). Geen user-agent-spoofing of captcha-omzeiling gevonden: `auth/turnstile.py` verifieert alleen Cloudflare Turnstile.
 - Licentie en commit: Apache-2.0 (root-LICENSE; `sdk/python/LICENSE` is MIT; geen `ee`-map gevonden) ; b0be821b5c47.
 
-## hatchet
+## hatchet-achtergrondwerk
 - Wat: durable taskqueue en workflow-orchestrator in Go met Postgres als opslag voor runtime en observability; losse diensten (API, engine, dispatcher, scheduler, ticker, controllers).
 - Paden: `pkg/scheduling/v1/scheduler.go` en `queuer.go` (per-tenant scheduler, queue-polling met backoff en notify) ; `internal/msgqueue/msgqueue.go` en `internal/msgqueue/postgres/msgqueue.go` (`Queue`-interface; backends rabbitmq, nats, postgres) ; `internal/services/controllers/task/controller.go` (retries, timeouts, sleeps) ; `internal/services/ticker/ticker.go` en `cron_v1.go` (gocron).
 - Meer paden: `internal/services/dispatcher/dispatcher.go` en `api-contracts/v1/dispatcher.proto` (gRPC-dispatch naar workers) ; `sql/schema/v1-core.sql` (`v1_task`, `v1_queue_item`, `v1_dag`, `v1_match`, concurrency, rate limits).
@@ -40,7 +40,7 @@ Paden zijn upstream-paden op de gepinde commit uit `codebases.json`. In de kopie
 - Niet overnemen: gegenereerde code (sqlc in `pkg/repository/sqlcv1`, OpenAPI in `api/v1/server/oas/gen`, proto-stubs); de `ee`-map ontbreekt; `hatchet-lite` roept `RequireFIPSBuild()` aan (gevolgen niet vastgesteld). Grep op stealth, fingerprint, captcha, user-agent in `*.go`: alleen testcases rond IP-spoofing in `api/v1/server/run/ip_extractor_test.go` (verdediging).
 - Licentie en commit: MIT (root-LICENSE: Hatchet Technologies Inc.) ; 2a0b386361ab.
 
-## dbos
+## dbos-hervatten-na-storing
 - Wat: Python-bibliotheek (dbos-transact-py) die workflows en steps checkpoint in een Postgres- of SQLite-systeemdatabase, zodat een herstart bij de laatste voltooide step verdergaat.
 - Paden: `dbos/_dbos.py` (publieke API: `DBOS.launch`, `workflow`, `step`, `start_workflow`, `register_queue`, `send`) ; `dbos/_core.py` (uitvoering en replay) ; `dbos/_sys_db.py` (alle SQL op de systeemdatabase, dequeue met `FOR UPDATE SKIP LOCKED`) ; `dbos/_schemas/system_database.py` (tabellen, o.a. `workflow_status`) ; `dbos/_queue.py` (concurrency, rate limit, partities) ; `dbos/_recovery.py` (hervat pending workflows door opnieuw te enqueuen) ; `dbos/_migration.py` ; `dbos/_scheduler.py` (cron via croniter).
 - Leesvolgorde: `dbos/_schemas/system_database.py` > `dbos/_queue.py` > `dbos/_sys_db.py` > `dbos/_core.py` > `dbos/_recovery.py`.
@@ -49,7 +49,7 @@ Paden zijn upstream-paden op de gepinde commit uit `codebases.json`. In de kopie
 - Niet overnemen: `dbos/_enterprise.py` laadt het propriëtaire pakket dbos-enterprise (andere licentie, wijzigen of omzeilen van de entitlement-checks verboden); daaraan hangen sharding, archivering naar Parquet, suspend-modus, auto-upgrade en Conductor. Grep op stealth, fingerprint, captcha, spoof, headless, playwright, selenium: niets; de entitlement-aanroep stuurt een eerlijke User-Agent.
 - Licentie en commit: MIT (LICENSE; alleen de open-source kern) ; 28192bd87ee8.
 
-## svix
+## svix-webhooks-versturen
 - Wat: webhooks-as-a-service: Rust-server met REST-API (applications, endpoints, messages, attempts) en een workerpool die berichten per endpoint ondertekent, bezorgt en herprobeert.
 - Paden: `server/svix-server/src/worker.rs` (verzenden, `sign_msg`, headers, retry-delay, `Retry-After`) ; `server/svix-server/src/core/cryptography.rs` (Ed25519, versleuteling van secrets) ; `server/svix-server/src/core/types/mod.rs` (`EndpointSecretType`: `whsec_`, `whsk_`/`whpk_`) ; `server/svix-server/src/core/webhook_http_client.rs` (blokkeert private IP's, whitelist) ; `server/svix-server/src/queue/mod.rs` (ack/nack, uitgestelde taken) ; `server/svix-server/src/cfg.rs` en `config.default.toml` (`retry_schedule`, `queue_type`, `cache_type`) ; `server/svix-server/migrations/20220123205937_initial.up.sql` ; `rust/src/webhooks.rs` (verificatie bij de ontvanger).
 - Leesvolgorde: `server/svix-server/config.default.toml` > `server/svix-server/src/worker.rs` > `server/svix-server/src/core/webhook_http_client.rs` > `server/svix-server/src/queue/mod.rs` > `rust/src/webhooks.rs`.
@@ -58,7 +58,7 @@ Paden zijn upstream-paden op de gepinde commit uit `codebases.json`. In de kopie
 - Niet overnemen: gegenereerde SDK's en CLI-API (`python/svix/api`, `javascript/src/api` en models, `svix-cli/src/cmds/api`, `server/openapi.json`; zie `.gitattributes`); de binaire plugin `server/rabbit/plugins/rabbitmq_delayed_message_exchange-3.11.1.ez`. Talen go, java, kotlin, php, ruby, csharp zijn niet meegenomen; server, rust, python, javascript, svix-cli, bridge en codegen staan er wel. De worker stuurt een eerlijke User-Agent; grep op stealth, fingerprint, captcha, spoof, headless, selenium, chrome: niets.
 - Licentie en commit: MIT (LICENSE) ; c35d595bcb3d.
 
-## openfga
+## openfga-wie-mag-wat
 - Wat: relationship-based autorisatieserver (Zanzibar-stijl): autorisatiemodel plus relatie-tuples per store, met Check, ListObjects, ListUsers en Expand via gRPC en HTTP.
 - Paden: `pkg/server/check.go` en `pkg/server/list_objects.go` (API-handlers) ; `pkg/typesystem/typesystem.go` (valideert het model) ; `internal/check/check.go` en `strategies.go` (strategieen `default`, `weight2`, `recursive`) ; `internal/listobjects/pipeline/doc.go` (reverse expansion) ; `pkg/storage/storage.go` (interfaces `TupleBackend`, `AuthorizationModelBackend`, `StoresBackend`, `ChangelogBackend`, `OpenFGADatastore`) ; `pkg/storage/postgres/postgres.go` en `pkg/storage/sqlcommon/sqlcommon.go` ; `assets/migrations/postgres/001_initialize_schema.sql` (tabel `tuple`).
 - Leesvolgorde: `docs/architecture/architecture.md` > `docs/check/README.md` > `pkg/storage/storage.go` > `pkg/typesystem/typesystem.go` > `internal/check/check.go` > `pkg/server/check.go`.

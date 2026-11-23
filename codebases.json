@@ -1,6 +1,7 @@
 {
  "deepseek-harness": {
   "area": "ai-architecture",
+  "map": "deepseek-harness-uitbreidbare-agent",
   "url": "https://github.com/deepseek-ai/deepseek-harness",
   "commit": "4b399c39a6d1479cd84ca591b4d7c88e24d38a96",
   "license": "MIT",
@@ -14,6 +15,7 @@
  },
  "opencode": {
   "area": "ai-architecture",
+  "map": "opencode-agent-in-typescript",
   "url": "https://github.com/anomalyco/opencode",
   "commit": "0089ba9e39a9ff7701b83fa87d62964612b61a66",
   "license": "MIT",
@@ -24,6 +26,7 @@
  },
  "codex": {
   "area": "ai-architecture",
+  "map": "codex-commandos-en-afscherming",
   "url": "https://github.com/openai/codex",
   "commit": "02390c8d8e39a9b72d12e04e83987d5eb6801310",
   "license": "Apache-2.0",
@@ -31,6 +34,7 @@
  },
  "openbot": {
   "area": "ai-architecture",
+  "map": "openbot-goedkeuring-en-logboek",
   "url": "https://github.com/robinbril/OpenBot",
   "commit": "f8af37ab73e96784f174a11104505a965e722cab",
   "license": "MIT",
@@ -38,6 +42,7 @@
  },
  "qm": {
   "area": "ai-architecture",
+  "map": "qm-teamagent-in-slack",
   "url": "https://github.com/yc-software/qm",
   "commit": "9dd19899b0414bad494eedbd87696eaab23a9907",
   "license": "MIT",
@@ -45,6 +50,7 @@
  },
  "pydantic-ai": {
   "area": "ai-architecture",
+  "map": "pydantic-ai-agent-in-python",
   "url": "https://github.com/pydantic/pydantic-ai",
   "commit": "d32d5c648bec67496dfcfb93803d257e6996d9c8",
   "license": "MIT",
@@ -52,6 +58,7 @@
  },
  "onyx": {
   "area": "ai-architecture",
+  "map": "onyx-bedrijfskennis-met-rechten",
   "url": "https://github.com/onyx-dot-app/onyx",
   "commit": "2582a29ef5a52ffff360777b02c47ebff48478ff",
   "license": "MIT buiten ee; ee niet meegenomen",
@@ -62,6 +69,7 @@
  },
  "claude-agent-sdk": {
   "area": "ai-architecture",
+  "map": "claude-agent-sdk-claude-code-in-je-product",
   "url": "https://github.com/anthropics/claude-agent-sdk-python",
   "commit": "3184360393a92ca8a6ec7bbbdee571afd1ce1c56",
   "license": "MIT",
@@ -69,6 +77,7 @@
  },
  "openai-agents": {
   "area": "ai-architecture",
+  "map": "openai-agents-werk-doorgeven",
   "url": "https://github.com/openai/openai-agents-python",
   "commit": "6c4e4a29cd08eef454db6980d74da6afc8939d24",
   "license": "MIT",
@@ -76,6 +85,7 @@
  },
  "open-multi-agent": {
   "area": "ai-architecture",
+  "map": "open-multi-agent-taken-verdelen",
   "url": "https://github.com/open-multi-agent/open-multi-agent",
   "commit": "e1059babc907663444a2a475e2548c61b85cea9b",
   "license": "MIT",
@@ -83,6 +93,7 @@
  },
  "grokbot": {
   "area": "frontend",
+  "map": "grokbot-invoerveld-en-werkplek",
   "url": "https://github.com/robinbril/grokbot-reconstruction",
   "commit": "b2e1c8629027d05ff61f5c84ab42a1c6c2c9417b",
   "license": "geen licentiebestand",
@@ -100,6 +111,7 @@
  },
  "openmausbot": {
   "area": "frontend",
+  "map": "openmausbot-bots-en-meekijken",
   "url": "https://github.com/milind-soni/OpenMausBot",
   "commit": "77f41d3522217a484b4abdffa9d5f6ba651f84bd",
   "license": "Apache-2.0 buiten enterprise; enterprise niet meegenomen",
@@ -110,6 +122,7 @@
  },
  "assistant-ui": {
   "area": "frontend",
+  "map": "assistant-ui-chatonderdelen",
   "url": "https://github.com/assistant-ui/assistant-ui",
   "commit": "8227544705c6045e70545711ee38d09040e1a282",
   "license": "MIT",
@@ -117,6 +130,7 @@
  },
  "ai-elements": {
   "area": "frontend",
+  "map": "ai-elements-antwoorden-tonen",
   "url": "https://github.com/vercel/ai-elements",
   "commit": "ca8be600bfd01b3131f9bf6134b51602a71f4374",
   "license": "Apache-2.0",
@@ -124,6 +138,7 @@
  },
  "chatbot": {
   "area": "frontend",
+  "map": "chatbot-compleet-chatprogramma",
   "url": "https://github.com/vercel/chatbot",
   "commit": "a8989b522fa3672a2ae52f053105e40993b36ca1",
   "license": "Apache-2.0",
@@ -131,6 +146,7 @@
  },
  "shadcn-ui": {
   "area": "frontend",
+  "map": "shadcn-ui-knoppen-en-formulieren",
   "url": "https://github.com/shadcn-ui/ui",
   "commit": "055aa6b7837b1808456a24beb4c97a677864aa82",
   "license": "MIT",
@@ -138,6 +154,7 @@
  },
  "radix-primitives": {
   "area": "frontend",
+  "map": "radix-primitives-menus-en-dialogen",
   "url": "https://github.com/radix-ui/primitives",
   "commit": "eb3a2b7091293e27df8f9ba906632d8daa3d81a3",
   "license": "MIT",
@@ -145,6 +162,7 @@
  },
  "sonner": {
   "area": "frontend",
+  "map": "sonner-meldingen",
   "url": "https://github.com/emilkowalski/sonner",
   "commit": "8e4662b39255120b62138312058f5d77c0139a5e",
   "license": "MIT",
@@ -152,6 +170,7 @@
  },
  "cmdk": {
   "area": "frontend",
+  "map": "cmdk-zoekvenster",
   "url": "https://github.com/dip/cmdk",
   "commit": "dd2250ed608443e8f32bafc5fa2d1d07a3746aa3",
   "license": "MIT",
@@ -159,6 +178,7 @@
  },
  "tanstack-virtual": {
   "area": "frontend",
+  "map": "tanstack-virtual-lange-lijsten",
   "url": "https://github.com/TanStack/virtual",
   "commit": "ec46ffc40078de88e18bd8a5e2ff41689d5bfcaa",
   "license": "MIT",
@@ -166,6 +186,7 @@
  },
  "json-render": {
   "area": "frontend",
+  "map": "json-render-scherm-door-model",
   "url": "https://github.com/vercel-labs/json-render",
   "commit": "c926907855d95dde328264350ac5464b60be201d",
   "license": "Apache-2.0",
@@ -173,6 +194,7 @@
  },
  "aicss": {
   "area": "frontend",
+  "map": "aicss-agentgesprekken",
   "url": "https://github.com/kvnkld/aicss",
   "commit": "7f9dc408ec1137db52e0b1753e72b49b2363d947",
   "license": "MIT",
@@ -180,6 +202,7 @@
  },
  "circle": {
   "area": "frontend",
+  "map": "circle-takenbord",
   "url": "https://github.com/ln-dev7/circle",
   "commit": "b0ba7ddcc3d0f4c16092236ca6a01b56c0614810",
   "license": "MIT",
@@ -187,6 +210,7 @@
  },
  "fastapi-template": {
   "area": "backend",
+  "map": "fastapi-template-inloggen-en-database",
   "url": "https://github.com/fastapi/full-stack-fastapi-template",
   "commit": "77e550a73bb49dd2967622c5ed11bf7a49603c93",
   "license": "MIT",
@@ -194,6 +218,7 @@
  },
  "polar": {
   "area": "backend",
+  "map": "polar-betalen-en-abonnementen",
   "url": "https://github.com/polarsource/polar",
   "commit": "b0be821b5c47ae86ffd50556b44829051c9dd329",
   "license": "Apache-2.0",
@@ -204,6 +229,7 @@
  },
  "hatchet": {
   "area": "backend",
+  "map": "hatchet-achtergrondwerk",
   "url": "https://github.com/hatchet-dev/hatchet",
   "commit": "2a0b386361abbb0164b454b5cf24e668a671d101",
   "license": "MIT",
@@ -215,6 +241,7 @@
  },
  "dbos": {
   "area": "backend",
+  "map": "dbos-hervatten-na-storing",
   "url": "https://github.com/dbos-inc/dbos-transact-py",
   "commit": "28192bd87ee81891546803fb583ea6a22c08d1ce",
   "license": "MIT",
@@ -222,6 +249,7 @@
  },
  "svix": {
   "area": "backend",
+  "map": "svix-webhooks-versturen",
   "url": "https://github.com/svix/svix-webhooks",
   "commit": "c35d595bcb3de3ccecc4d2b49e98669c66c05a72",
   "license": "MIT",
@@ -237,6 +265,7 @@
  },
  "openfga": {
   "area": "backend",
+  "map": "openfga-wie-mag-wat",
   "url": "https://github.com/openfga/openfga",
   "commit": "d67ba7b1d2eaf945cffab3a9129ca1a4c7ad5251",
   "license": "Apache-2.0",

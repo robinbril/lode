@@ -10,24 +10,24 @@
   },
   "banner": {
     "file": "banner.svg",
-    "alt": "lode: complete codebases, ontwerpkaarten en skills voor Claude Code en Codex",
+    "alt": "lode: de broncode van 29 programma's, 111 lessen en zes werkwijzen voor Claude Code, Codex en Cursor",
     "title": "lode",
-    "tagline": "Je model kent veel code. Lode laat het bouwen naar goede code.",
+    "tagline": "Goede code om van af te kijken, voor Claude Code, Codex en Cursor.",
     "pillars": [
       {
         "icon": "blokken",
-        "title": "Codebases",
-        "text": "compleet en vast"
+        "title": "Programma's",
+        "text": "volledige broncode"
       },
       {
         "icon": "boek",
-        "title": "Kaarten",
-        "text": "één idee per kaart"
+        "title": "Lessen",
+        "text": "één probleem elk"
       },
       {
         "icon": "schild",
         "title": "Toets",
-        "text": "twee skills"
+        "text": "twee werkwijzen"
       },
       {
         "icon": "check",
@@ -39,7 +39,7 @@
   "flows": [
     {
       "file": "zo-werkt-het.svg",
-      "alt": "Van opdracht naar bron, toets, akkoord en eerste werkende plak",
+      "alt": "Van opdracht naar voorbeeld, toets, akkoord en eerste werkende stap",
       "steps": [
         {
           "icon": "vraag",
@@ -51,10 +51,10 @@
         },
         {
           "icon": "zoek",
-          "title": "Bron",
+          "title": "Voorbeeld",
           "lines": [
-            "Eén codebase en",
-            "hooguit zes kaarten"
+            "Eén programma en",
+            "hooguit zes lessen"
           ]
         },
         {
@@ -75,7 +75,7 @@
         },
         {
           "icon": "bouw",
-          "title": "Eerste plak",
+          "title": "Eerste stap",
           "lines": [
             "Van database tot",
             "scherm, met test"

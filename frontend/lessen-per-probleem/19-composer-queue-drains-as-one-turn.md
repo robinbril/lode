@@ -33,7 +33,7 @@ function reduce(queue: Msg[], a: Act): { queue: Msg[]; run: string | null } {
 
 Waarom het werkt: drie snelle correcties zijn meestal één correctie in drie ademhalingen, en een beurt per bericht laat de bot eerst op de eerste handelen.
 
-Niet doen als: elk bericht een eigen onomkeerbare actie is; dan wil je ze niet samenvoegen. Moet een bericht een reload overleven, dan wint kaart 20.
+Niet doen als: elk bericht een eigen onomkeerbare actie is; dan wil je ze niet samenvoegen. Moet een bericht een reload overleven, dan wint les 20.
 
 Toetsvraag: staat een correctie die tijdens de beurt is getypt in de volgende beurt altijd na de zin die ze corrigeert?
 

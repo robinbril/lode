@@ -1,16 +1,16 @@
 # Zo gebruik je lode
 
-Je hebt veel code gezien, goede en slechte door elkaar. Hier staan gekozen codebases en ontwerpkaarten. Gebruik ze in plaats van je standaardkeuze.
+Je hebt veel code gezien, goede en slechte door elkaar. Hier staan gekozen codebases en lessen. Gebruik ze in plaats van je standaardkeuze.
 
 ## Werkwijze
 
 1. Lees eerst de code van het project waar je in werkt. Het project wint van lode.
 2. Overnemen of nabouwen: open `<map>/CODEBASES.md`, kies één codebase en lees alleen de paden die daar staan. Doorzoek nooit de hele repo.
-3. Ontwerpen of toetsen: zoek je taak in de tabellen hieronder. Laad hooguit 6 kaarten, ongeveer 6.000 tokens.
-4. Een kaart geldt alleen als "Niet doen als" niet geldt. Beantwoord voor je klaar meldt elke Toetsvraag met `bestand:regel` uit het project.
+3. Ontwerpen of toetsen: zoek je taak in de tabellen hieronder. Laad hooguit 6 lessen, ongeveer 6.000 tokens.
+4. Een les geldt alleen als "Niet doen als" niet geldt. Beantwoord voor je klaar meldt elke Toetsvraag met `bestand:regel` uit het project.
 5. Neem gedrag, toestanden en grenzen over. Vormtaal, namen en tokens komen uit het doelproject.
 6. Neem je code over, neem dan de licentietekst mee (`codebases.json`). Bronnen met AGPL, FSL, proprietary of zonder licentie zijn alleen om te lezen (`sources.json`).
-7. Architectuurkeuze: lees `ai-architecture/kaarten/00-keuze.md`.
+7. Architectuurkeuze: lees `ai-architecture/lessen-per-probleem/00-keuze.md`.
 8. Interface die hier niet staat: `frontend/skills/ui-ophalen`.
 9. AI-ontwerp beoordelen: `ai-architecture/skills/airesearch`. Lastige keuze met meer wegen: `ai-architecture/skills/council`.
 10. Plan of bouw je iets groters: volg `skills/lode/SKILL.md`.
@@ -24,7 +24,7 @@ Je hebt veel code gezien, goede en slechte door elkaar. Hier staan gekozen codeb
 
 ## AI-architectuur
 
-| Taak | Kaarten in `ai-architecture/kaarten/` |
+| Taak | Lessen in `ai-architecture/lessen-per-probleem/` |
 |---|---|
 | LLM-functie in bestaand product | 11, 12, 10, 30, 55, 71 |
 | Nieuw agentproject | 78, 50, 30, 55, 61, 71 |
@@ -51,7 +51,7 @@ Je hebt veel code gezien, goede en slechte door elkaar. Hier staan gekozen codeb
 
 ## Backend
 
-| Taak | Kaarten in `backend/kaarten/` |
+| Taak | Lessen in `backend/lessen-per-probleem/` |
 |---|---|
 | Nieuwe module of project | 01, 09, 10, 17 |
 | Multi-tenant data en rechten | 02, 03, 17, 11 |
@@ -63,7 +63,7 @@ Je hebt veel code gezien, goede en slechte door elkaar. Hier staan gekozen codeb
 
 ## Frontend
 
-| Taak | Kaarten in `frontend/kaarten/` |
+| Taak | Lessen in `frontend/lessen-per-probleem/` |
 |---|---|
 | Chatvenster | 01, 02, 08, 16, 18, 23 |
 | Composer en verzenden | 19, 20, 04, 23 |

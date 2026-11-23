@@ -33,7 +33,7 @@ Wat dit niet garandeert: uit deze code volgt niet dat het model het bestand daar
 
 Waarom het werkt: het model ziet dat er meer is en waar, dus een gerichte vervolgread kost minder dan alles meenemen.
 
-Niet doen als: de uitvoer geheimen kan bevatten, want de volledige tekst staat dan zeven dagen op schijf. Voor het opruimen van oude resultaten later in het gesprek geldt kaart 81.
+Niet doen als: de uitvoer geheimen kan bevatten, want de volledige tekst staat dan zeven dagen op schijf. Voor het opruimen van oude resultaten later in het gesprek geldt les 81.
 
 Toetsvraag: staat in elke afgekapte uitvoer het totaal plus een pad dat bestaat, of de reden als het schrijven mislukte?
 

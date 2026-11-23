@@ -25,7 +25,7 @@ Stel de eerste week voor, per dag één werkend resultaat. Vraag mijn akkoord en
 
 ```text
 /lode
-Neem [composer | goedkeuringskaart | chat | tabel] over uit [frontend/grokbot] in [project], in [Vue 3 | vanilla JS | React]
+Neem [composer | goedkeuringskaart | chat | tabel] over uit [frontend/grokbot-invoerveld-en-werkplek] in [project], in [Vue 3 | vanilla JS | React]
 en in onze eigen tokens. Laat eerst zien welke toestanden, toetsen en randgevallen je overneemt en vraag mijn akkoord. Bouw het daarna af,
 met beeld op 1440 en 390 px, licht en donker.
 ```
@@ -34,7 +34,7 @@ met beeld op 1440 en 390 px, licht en donker.
 
 ```text
 /lode
-Start [project] vanuit [frontend/chatbot | backend/fastapi-template]. Schrijf uit wat we houden en weghalen en vraag mijn akkoord.
+Start [project] vanuit [frontend/chatbot-compleet-chatprogramma | backend/fastapi-template-inloggen-en-database]. Schrijf uit wat we houden en weghalen en vraag mijn akkoord.
 Zet daarna onze naam en tokens erin en laat één taak van begin tot eind werken.
 ```
 

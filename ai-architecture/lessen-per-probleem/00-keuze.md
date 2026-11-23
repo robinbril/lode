@@ -8,7 +8,7 @@ Eén repo die alles goed voordoet bestaat niet. Per situatie:
 
 | Situatie | Vertrekpunt | Waarom |
 |---|---|---|
-| LLM-functies in een bestaand product | Het actieregister dat er al is; anders zelf bouwen met kaarten 11, 12, 30, 55, 56 | Eén dispatcher: onbekend weigeren, invoer toetsen, rechten van de persoon, lezen direct, schrijven als voorstel. Rechten en data blijven in het product |
+| LLM-functies in een bestaand product | Het actieregister dat er al is; anders zelf bouwen met lessen 11, 12, 30, 55, 56 | Eén dispatcher: onbekend weigeren, invoer toetsen, rechten van de persoon, lezen direct, schrijven als voorstel. Rechten en data blijven in het product |
 | Nieuw project in Python | Het register, plus pydantic-ai voor de modellus | Getypte tools, uitgestelde goedkeuring, limieten. Duurzaamheid blijft van de app |
 | Nieuw project in TypeScript | agent-native als ontwerp | Eén actie voor UI, HTTP, agent en MCP, met `authorize` rond `run` zelf |
 | Bedrijfskennis | Onyx als ontwerp, eigen Postgres als opslag | Toegangslijst zit in de zoekvraag, niet in een filter achteraf |

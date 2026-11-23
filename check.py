@@ -72,7 +72,7 @@ def check_index(cards):
     if not path.is_file():
         return ["AGENTS.md ontbreekt"]
     for line in path.read_text(encoding="utf-8").splitlines():
-        if match := re.search(r"Kaarten in `([\w-]+)/kaarten/`", line):
+        if match := re.search(r"Lessen in `([\w-]+)/lessen-per-probleem/`", line):
             area = match.group(1)
         elif line.startswith("## "):
             area = None
@@ -90,7 +90,7 @@ def known_repos():
 
 def main():
     cards = [pathlib.Path(a).resolve() for a in sys.argv[1:]] or sorted(
-        card for area in AREAS for card in (ROOT / area / "kaarten").glob("[0-9][0-9]-*.md") if card.name != "00-keuze.md")
+        card for area in AREAS for card in (ROOT / area / "lessen-per-probleem").glob("[0-9][0-9]-*.md") if card.name != "00-keuze.md")
     failures, jobs, web_total, repos = [], [], 0, known_repos()
     if not sys.argv[1:]:
         failures += check_index(cards)
@@ -108,7 +108,7 @@ def main():
             failures.append(f"{card.relative_to(ROOT)}: {match.group(1)} staat niet in sources.json")
     good = sum(1 for error in results if error is None)
     print(*failures, sep="\n")
-    print(f"{len(cards)} kaarten, {good} van {len(jobs)} codebronnen goed, {web_total} webbronnen niet gecontroleerd, {len(failures)} fouten")
+    print(f"{len(cards)} lessen, {good} van {len(jobs)} codebronnen goed, {web_total} webbronnen niet gecontroleerd, {len(failures)} fouten")
     sys.exit(1 if failures or not cards else 0)
 
 

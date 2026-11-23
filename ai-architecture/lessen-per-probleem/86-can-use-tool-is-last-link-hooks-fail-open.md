@@ -28,7 +28,7 @@ Wat dit niet garandeert: rond de callback staat in de SDK geen timeout. Wat de C
 
 Waarom het werkt: met `on_failure="block"` telt een kapotte of zwijgende hook als weigering, dus de keten faalt dicht op de plek die je zelf kiest.
 
-Niet doen als: je alleen een vraag aan de gebruiker wilt tonen, dan is `can_use_tool` genoeg. Voor shell-hooks en de sandbox geldt kaart 64.
+Niet doen als: je alleen een vraag aan de gebruiker wilt tonen, dan is `can_use_tool` genoeg. Voor shell-hooks en de sandbox geldt les 64.
 
 Toetsvraag: staat er een test die een aanroep via `allowed_tools` of bypass laat zien waarbij de callback niet draait, plus een hook die faalt met `on_failure` ingesteld?
 

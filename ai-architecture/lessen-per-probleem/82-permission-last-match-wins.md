@@ -28,7 +28,7 @@ Wat dit niet garandeert: `denied()` gebruikt dezelfde `evaluate`, dus een latere
 
 Waarom het werkt: de volgorde van de regels is de enige voorrangsregel die je moet kennen, en een regel achteraan toevoegen is een bewuste keuze.
 
-Niet doen als: je een deny nodig hebt die geen latere regel kan overschrijven, kies dan strengste-wint: kaart 57 wint zodra team en persoon allebei regels zetten, kaart 83 bij shell-commando's.
+Niet doen als: je een deny nodig hebt die geen latere regel kan overschrijven, kies dan strengste-wint: les 57 wint zodra team en persoon allebei regels zetten, les 83 bij shell-commando's.
 
 Toetsvraag: staat er een test die een allow na een deny op hetzelfde pad laat zien met het gedocumenteerde resultaat?
 

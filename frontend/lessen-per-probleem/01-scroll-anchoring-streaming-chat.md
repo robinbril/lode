@@ -23,7 +23,7 @@ new ResizeObserver(() => { if (follow) el.scrollTo({ top: el.scrollHeight, behav
 
 Waarom het werkt: groei van de inhoud laat de afstand tot de bodem toenemen zonder dat scrollTop daalt; alleen een echte opwaartse scroll doet scrollTop dalen, dus de twee gevallen zijn uit elkaar te houden.
 
-Niet doen als: de lijst zelf virtualised is, dan hoort de anchor-logica bij de virtualizer (zie kaart 08), niet bij de scrollcontainer.
+Niet doen als: de lijst zelf virtualised is, dan hoort de anchor-logica bij de virtualizer (zie les 08), niet bij de scrollcontainer.
 
 Toetsvraag: blijft de viewport staan als de gebruiker omhoog scrolt terwijl de inhoud blijft groeien, en volgt hij weer zodra de bodem is bereikt?
 

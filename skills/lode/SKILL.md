@@ -1,6 +1,6 @@
 ---
 name: lode
-description: Ontwerpt en bouwt met lode als voorbeeld - volledige codebases en ontwerpkaarten, getoetst met airesearch en council. Gebruik voor een plan in een bestaand product, een nieuw project, of het overnemen van een app, scherm, component of architectuur. Triggers - "/lode", "gebruik lode", "plan dit goed", "nieuw project opzetten", "neem dit over uit", "hoe doen de besten dit".
+description: Ontwerpt en bouwt met lode als voorbeeld - volledige codebases en lessen, getoetst met airesearch en council. Gebruik voor een plan in een bestaand product, een nieuw project, of het overnemen van een app, scherm, component of architectuur. Triggers - "/lode", "gebruik lode", "plan dit goed", "nieuw project opzetten", "neem dit over uit", "hoe doen de besten dit".
 ---
 
 # lode
@@ -13,31 +13,31 @@ Wat er in het project al staat wint. Lode laat zien hoe goed het kan.
 
 | Je bouwt | Open in `LODE` |
 |---|---|
-| Chatscherm | `frontend/chatbot`, `frontend/assistant-ui` |
-| Composer, gesprekken, werkplek zonder framework | `frontend/grokbot` |
-| Goedkeuringskaart, computerpaneel | `frontend/openmausbot`, `ai-architecture/openbot` |
-| Menu, dialoog, popover, tooltip | `frontend/radix-primitives`, `frontend/shadcn-ui` |
-| Commandomenu, meldingen, lange lijst | `frontend/cmdk`, `frontend/sonner`, `frontend/tanstack-virtual` |
-| Takenbord of issue-scherm | `frontend/circle` |
-| Interface uit modeluitvoer | `frontend/json-render`, `frontend/ai-elements` |
-| Agentlus in Python | `ai-architecture/pydantic-ai`, `ai-architecture/openai-agents` |
-| Agentlus in TypeScript, codeer-agent | `ai-architecture/opencode`, `ai-architecture/codex`, `ai-architecture/deepseek-harness` |
-| Goedkeuring, beleid, audit | `ai-architecture/openbot` |
-| Agent voor een team | `ai-architecture/qm` |
-| Bedrijfskennis met rechten | `ai-architecture/onyx` |
-| Claude Code in je product | `ai-architecture/claude-agent-sdk` |
-| SaaS-backend | `backend/fastapi-template`, `backend/polar` |
-| Achtergrondwerk en herstel | `backend/hatchet`, `backend/dbos` |
-| Webhooks, rechten | `backend/svix`, `backend/openfga` |
+| Chatscherm | `frontend/chatbot-compleet-chatprogramma`, `frontend/assistant-ui-chatonderdelen` |
+| Composer, gesprekken, werkplek zonder framework | `frontend/grokbot-invoerveld-en-werkplek` |
+| Goedkeuringskaart, computerpaneel | `frontend/openmausbot-bots-en-meekijken`, `ai-architecture/openbot-goedkeuring-en-logboek` |
+| Menu, dialoog, popover, tooltip | `frontend/radix-primitives-menus-en-dialogen`, `frontend/shadcn-ui-knoppen-en-formulieren` |
+| Commandomenu, meldingen, lange lijst | `frontend/cmdk-zoekvenster`, `frontend/sonner-meldingen`, `frontend/tanstack-virtual-lange-lijsten` |
+| Takenbord of issue-scherm | `frontend/circle-takenbord` |
+| Interface uit modeluitvoer | `frontend/json-render-scherm-door-model`, `frontend/ai-elements-antwoorden-tonen` |
+| Agentlus in Python | `ai-architecture/pydantic-ai-agent-in-python`, `ai-architecture/openai-agents-werk-doorgeven` |
+| Agentlus in TypeScript, codeer-agent | `ai-architecture/opencode-agent-in-typescript`, `ai-architecture/codex-commandos-en-afscherming`, `ai-architecture/deepseek-harness-uitbreidbare-agent` |
+| Goedkeuring, beleid, audit | `ai-architecture/openbot-goedkeuring-en-logboek` |
+| Agent voor een team | `ai-architecture/qm-teamagent-in-slack` |
+| Bedrijfskennis met rechten | `ai-architecture/onyx-bedrijfskennis-met-rechten` |
+| Claude Code in je product | `ai-architecture/claude-agent-sdk-claude-code-in-je-product` |
+| SaaS-backend | `backend/fastapi-template-inloggen-en-database`, `backend/polar-betalen-en-abonnementen` |
+| Achtergrondwerk en herstel | `backend/hatchet-achtergrondwerk`, `backend/dbos-hervatten-na-storing` |
+| Webhooks, rechten | `backend/svix-webhooks-versturen`, `backend/openfga-wie-mag-wat` |
 | Iets dat hier niet staat | skill `ui-ophalen`, en `pick-ui-library` voor een library |
 
-De precieze bestanden staan in `<map>/CODEBASES.md`. Ontwerpkaarten per taak staan in `LODE/AGENTS.md`. Lees daar ook de grenzen over licenties en data.
+De precieze bestanden staan in `<map>/CODEBASES.md`. Lessen per taak staan in `LODE/AGENTS.md`. Lees daar ook de grenzen over licenties en data.
 
 ## Bestaand product aanpassen
 
 1. **Kijk naar de echte tak** en zoek of het er al is, met twee zoekwoorden, in backend en frontend. Is het er, breid dan uit.
 2. **Vind de plek waar alle paden samenkomen** en elke ingang waar dezelfde gegevens binnenkomen.
-3. **Kies** één codebase en hooguit 6 kaarten. Lees alleen de genoemde paden.
+3. **Kies** één codebase en hooguit 6 lessen. Lees alleen de genoemde paden.
 4. **Ontwerp** de eenvoudigste vorm: toestanden, fouten, rechten, dubbel en gelijktijdig werk. Gaat het over mensen, vul het gegevensblok in `references/aanpassing.md` in.
 5. **Toets** met airesearch of council (zie hieronder) en pas het ontwerp aan.
 6. **Plan en akkoord** (zie hieronder).

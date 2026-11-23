@@ -2,10 +2,10 @@
 """Copy complete codebases into the three areas, byte for byte, and check them.
 
 Usage:
-  python3 copy.py take  [name ...]   stage the codebase in <area>/<name>/
+  python3 copy.py take  [name ...]   stage the codebase in <area>/<map>/
   python3 copy.py check [name ...]   compare the committed copy with the maker's commit
 
-codebases.json names url, commit, licence and area per codebase. Every file that is copied has
+codebases.json names url, commit, licence, area and folder per codebase. Every file that is copied has
 the maker's exact bytes. `reason` says what stays out. Files that steer an agent or git get
 `.bron` after their name, so that nobody's rules load by accident.
 """
@@ -86,7 +86,7 @@ def wanted(spec):
 
 def take(name, spec):
     keep, left = wanted(spec)
-    folder = f"{spec['area']}/{name}"
+    folder = f"{spec['area']}/{spec['map']}"
     git("rm", "-r", "-q", "--cached", "--ignore-unmatch", folder)
     lines = "".join(f"{e.mode} {e.sha}\t{folder}/{target(e.path)}\0" for e in keep)
     git("update-index", "-z", "--index-info", stdin=lines.encode("utf-8", "surrogateescape"))
@@ -99,7 +99,7 @@ def take(name, spec):
 def check(name, spec):
     keep, _ = wanted(spec)
     want = {target(e.path): (e.mode, e.sha) for e in keep}
-    folder = f"{spec['area']}/{name}/"
+    folder = f"{spec['area']}/{spec['map']}/"
     out = git("ls-tree", "-r", "-z", "HEAD", folder).decode("utf-8", "surrogateescape")
     have = {}
     for record in filter(None, out.split("\0")):

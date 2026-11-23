@@ -26,7 +26,7 @@ async def run(cmd, policy, ask, sandboxed, plain):
         return await plain(cmd)
 ```
 
-Wat dit niet garandeert: de functie ruimt niet op wat de eerste poging al deed voor de weigering kwam, en het commando draait bij een herhaling volledig opnieuw. Eén goedkeuring van een gebruiker kan in codex dus twee uitvoeringen dekken; moet een goedkeuring hooguit één uitvoering dekken, dan wint kaart 56.
+Wat dit niet garandeert: de functie ruimt niet op wat de eerste poging al deed voor de weigering kwam, en het commando draait bij een herhaling volledig opnieuw. Eén goedkeuring van een gebruiker kan in codex dus twee uitvoeringen dekken; moet een goedkeuring hooguit één uitvoering dekken, dan wint les 56.
 
 Waarom het werkt: een weigering van de sandbox is het enige signaal dat een verruiming voorstelt, en wordt er gevraagd, dan noemt de vraag het echte bereik van de herhaling.
 
